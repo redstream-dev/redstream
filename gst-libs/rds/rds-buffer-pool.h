@@ -27,6 +27,17 @@ RDS_API void rds_buffer_pool_config_set_surface_params (GstStructure * config, g
 RDS_API gboolean rds_buffer_pool_config_get_surface_params (const GstStructure * config, guint * batch_size,
     RdsBufSurfaceMemType * mem_type, guint * gpu_id);
 
+/* Downstream side (propose_allocation): always advertises GstVideoMeta and GstVideoCropMeta; when the query asks
+ * for a pool and its caps carry memory:RDS, also offers a configured (inactive) RdsBufferPool. FALSE if the query
+ * has no caps or the pool rejects the configuration. */
+RDS_API gboolean rds_propose_allocation (GstQuery * query, guint batch_size, RdsBufSurfaceMemType mem_type,
+    guint gpu_id, guint min_buffers);
+/* Upstream side (decide_allocation): reuses the first RdsBufferPool in the query whose surface params match,
+ * otherwise creates one; merges min/max (max_buffers 0 = no limit of ours); configures it, writes it back as the
+ * query's first pool, and returns a new reference (inactive). NULL if the query has no caps or config fails. */
+RDS_API GstBufferPool *rds_decide_allocation (GstQuery * query, guint batch_size,
+    RdsBufSurfaceMemType mem_type, guint gpu_id, guint min_buffers, guint max_buffers);
+
 G_END_DECLS
 
 #endif /* RDS_BUFFER_POOL_H */

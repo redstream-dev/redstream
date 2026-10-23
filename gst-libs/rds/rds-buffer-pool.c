@@ -22,6 +22,18 @@ G_DEFINE_TYPE (RdsBufferPool, rds_buffer_pool, GST_TYPE_BUFFER_POOL);
 #define CONFIG_MEM_TYPE "rds-mem-type"
 #define CONFIG_GPU_ID "rds-gpu-id"
 
+/* The allocation helpers can log before any pool exists, so the category is created lazily. */
+static void
+ensure_debug_category (void)
+{
+  static gsize initialized = 0;
+
+  if (g_once_init_enter (&initialized)) {
+    GST_DEBUG_CATEGORY_INIT (rds_buffer_pool_debug, "rdsbufferpool", 0, "Redstream memory:RDS buffer pool");
+    g_once_init_leave (&initialized, 1);
+  }
+}
+
 /* D3: single frames are always filled; batches are filled by the producer (the muxer). */
 static guint32
 initial_num_filled (RdsBufferPool * self)
@@ -180,7 +192,7 @@ rds_buffer_pool_class_init (RdsBufferPoolClass * klass)
   pool_class->alloc_buffer = rds_buffer_pool_alloc_buffer;
   pool_class->reset_buffer = rds_buffer_pool_reset_buffer;
 
-  GST_DEBUG_CATEGORY_INIT (rds_buffer_pool_debug, "rdsbufferpool", 0, "Redstream memory:RDS buffer pool");
+  ensure_debug_category ();
 }
 
 static void
@@ -225,4 +237,134 @@ rds_buffer_pool_config_get_surface_params (const GstStructure * config, guint * 
   if (gpu_id)
     *gpu_id = g;
   return TRUE;
+}
+
+static gboolean
+configure_pool (GstBufferPool * pool, GstCaps * caps, guint min, guint max, guint batch_size,
+    RdsBufSurfaceMemType mem_type, guint gpu_id, gboolean video_meta)
+{
+  GstStructure *config = gst_buffer_pool_get_config (pool);
+
+  gst_buffer_pool_config_set_params (config, caps, sizeof (RdsBufSurface), min, max);
+  rds_buffer_pool_config_set_surface_params (config, batch_size, mem_type, gpu_id);
+  if (video_meta)
+    gst_buffer_pool_config_add_option (config, GST_BUFFER_POOL_OPTION_VIDEO_META);
+  return gst_buffer_pool_set_config (pool, config);
+}
+
+static void
+add_meta_once (GstQuery * query, GType api)
+{
+  if (!gst_query_find_allocation_meta (query, api, NULL))
+    gst_query_add_allocation_meta (query, api, NULL);
+}
+
+gboolean
+rds_propose_allocation (GstQuery * query, guint batch_size, RdsBufSurfaceMemType mem_type, guint gpu_id,
+    guint min_buffers)
+{
+  GstCaps *caps = NULL;
+  gboolean need_pool = FALSE;
+  GstBufferPool *pool;
+
+  g_return_val_if_fail (GST_IS_QUERY (query) && GST_QUERY_TYPE (query) == GST_QUERY_ALLOCATION, FALSE);
+  ensure_debug_category ();
+
+  gst_query_parse_allocation (query, &caps, &need_pool);
+  if (caps == NULL) {
+    GST_DEBUG ("allocation query without caps");
+    return FALSE;
+  }
+
+  add_meta_once (query, GST_VIDEO_META_API_TYPE);
+  add_meta_once (query, GST_VIDEO_CROP_META_API_TYPE);
+
+  if (!need_pool || !rds_caps_has_memory_rds (caps))
+    return TRUE;
+
+  pool = rds_buffer_pool_new ();
+  if (!configure_pool (pool, caps, min_buffers, 0, batch_size, mem_type, gpu_id, TRUE)) {
+    GST_WARNING_OBJECT (pool, "cannot configure a pool for %" GST_PTR_FORMAT, caps);
+    gst_object_unref (pool);
+    return FALSE;
+  }
+  gst_query_add_allocation_pool (query, pool, sizeof (RdsBufSurface), min_buffers, 0);
+  gst_object_unref (pool);
+  return TRUE;
+}
+
+/* An inactive RdsBufferPool configured with exactly these surface params. */
+static gboolean
+pool_matches (GstBufferPool * pool, guint batch_size, RdsBufSurfaceMemType mem_type, guint gpu_id)
+{
+  GstStructure *config;
+  guint b, g;
+  RdsBufSurfaceMemType m;
+  gboolean ok;
+
+  if (pool == NULL || !RDS_IS_BUFFER_POOL (pool) || gst_buffer_pool_is_active (pool))
+    return FALSE;
+  config = gst_buffer_pool_get_config (pool);
+  ok = rds_buffer_pool_config_get_surface_params (config, &b, &m, &g)
+      && b == batch_size && m == mem_type && g == gpu_id;
+  gst_structure_free (config);
+  return ok;
+}
+
+GstBufferPool *
+rds_decide_allocation (GstQuery * query, guint batch_size, RdsBufSurfaceMemType mem_type, guint gpu_id,
+    guint min_buffers, guint max_buffers)
+{
+  GstCaps *caps = NULL;
+  GstBufferPool *pool = NULL;
+  guint n_pools, min = 0, max = 0;
+
+  g_return_val_if_fail (GST_IS_QUERY (query) && GST_QUERY_TYPE (query) == GST_QUERY_ALLOCATION, NULL);
+  ensure_debug_category ();
+
+  gst_query_parse_allocation (query, &caps, NULL);
+  if (caps == NULL) {
+    GST_DEBUG ("allocation query without caps");
+    return NULL;
+  }
+
+  n_pools = gst_query_get_n_allocation_pools (query);
+  for (guint i = 0; i < n_pools && pool == NULL; i++) {
+    GstBufferPool *candidate = NULL;
+    guint cmin, cmax;
+
+    gst_query_parse_nth_allocation_pool (query, i, &candidate, NULL, &cmin, &cmax);
+    if (pool_matches (candidate, batch_size, mem_type, gpu_id)) {
+      pool = candidate;
+      min = cmin;
+      max = cmax;
+    } else if (candidate != NULL) {
+      gst_object_unref (candidate);
+    }
+  }
+  if (pool == NULL) {
+    /* Downstream's buffer counts still apply to whatever pool upstream uses. */
+    if (n_pools > 0)
+      gst_query_parse_nth_allocation_pool (query, 0, NULL, NULL, &min, &max);
+    pool = rds_buffer_pool_new ();
+  }
+
+  min = MAX (min, min_buffers);
+  if (max_buffers != 0 && (max == 0 || max > max_buffers))
+    max = max_buffers;
+  if (max != 0 && max < min)
+    max = min;
+
+  if (!configure_pool (pool, caps, min, max, batch_size, mem_type, gpu_id,
+          gst_query_find_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL))) {
+    GST_WARNING_OBJECT (pool, "cannot configure a pool for %" GST_PTR_FORMAT, caps);
+    gst_object_unref (pool);
+    return NULL;
+  }
+
+  if (n_pools > 0)
+    gst_query_set_nth_allocation_pool (query, 0, pool, sizeof (RdsBufSurface), min, max);
+  else
+    gst_query_add_allocation_pool (query, pool, sizeof (RdsBufSurface), min, max);
+  return pool;
 }
