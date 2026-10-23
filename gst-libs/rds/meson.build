@@ -1,9 +1,9 @@
-rds_headers = files('rds-prelude.h', 'rds-compat-remap.h', 'rds_compat.h')
+rds_headers = files('rds-prelude.h', 'rds-compat-remap.h', 'rds_compat.h', 'rds-buf-surface.h')
 install_headers(rds_headers, subdir : 'redstream-' + api_version / 'rds')
 
 # HIP is linked privately; public headers never include it. gst-video is public (GstVideoFormat).
 librds = library('gstrds-' + api_version,
-  files('rds-compat-remap.c'),
+  files('rds-compat-remap.c', 'rds-buf-surface.c'),
   c_args : ['-DG_LOG_DOMAIN="rds"', '-DBUILDING_RDS'],
   include_directories : include_directories('..'),
   dependencies : [gst_dep, gst_video_dep, hip_dep],
