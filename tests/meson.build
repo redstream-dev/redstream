@@ -5,10 +5,11 @@ test_env.set('LSAN_OPTIONS', 'suppressions=@0@:print_suppressions=0'.format(
 test_env.set('ASAN_OPTIONS', 'halt_on_error=1:abort_on_error=1:print_summary=1:allocator_may_return_null=1')
 test_env.set('UBSAN_OPTIONS', 'halt_on_error=1:abort_on_error=1:print_stacktrace=1')
 
-# gst_check_dep is for GstHarness-based tests in later tasks.
+# gst_check_dep: GstHarness-based tests (meta_copy, event).
 test_deps = [rds_dep, gst_check_dep, hip_dep]
 
-# GPU-free tests (hosted CI runs `meson test --suite cpu`).
+# GPU-free tests (hosted CI runs `meson test --suite cpu`): no device needed at run time, but building still
+# needs the ROCm headers and libamdhip64.
 cpu_tests = ['compat_remap', 'compat_header', 'compat_header_nomacros', 'buf_surface', 'memory', 'buffer_pool',
   'allocation', 'meta_batch', 'meta_children',
   'meta_copy', 'event', 'compat_meta', 'compat_aliases']

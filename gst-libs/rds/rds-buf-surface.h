@@ -126,7 +126,8 @@ RDS_API int rds_buf_surface_destroy (RdsBufSurface * surf);
  * memory is mapped to a pinned staging mirror, so the required sequence is:
  *   map -> sync_for_cpu -> read/write through mappedAddr -> sync_for_device -> unmap.
  * sync_for_device writes back the whole plane (pitch * height bytes). If map fails partway through a
- * multi-plane or multi-surface request, some planes may be mapped: call unmap with the same index and plane. */
+ * multi-plane or multi-surface request, some planes may be mapped: call unmap with the same index and plane.
+ * map, unmap and the sync calls are not thread-safe for the same surface (as with NvBufSurface): serialize them. */
 RDS_API int rds_buf_surface_map (RdsBufSurface * surf, int index, int plane, RdsBufSurfaceMemMapFlags type);
 RDS_API int rds_buf_surface_unmap (RdsBufSurface * surf, int index, int plane);
 RDS_API int rds_buf_surface_sync_for_cpu (RdsBufSurface * surf, int index, int plane);

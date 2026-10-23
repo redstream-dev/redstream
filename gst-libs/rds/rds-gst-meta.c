@@ -90,6 +90,7 @@ rds_buffer_add_batch_meta (GstBuffer * buffer, RdsBatchMeta * batch_meta)
   g_return_val_if_fail (GST_IS_BUFFER (buffer), NULL);
   g_return_val_if_fail (gst_buffer_is_writable (buffer), NULL);
   g_return_val_if_fail (batch_meta != NULL, NULL);
+  g_return_val_if_fail (gst_buffer_get_rds_batch_meta (buffer) == NULL, NULL);
 
   m = (RdsMeta *) gst_buffer_add_meta (buffer, rds_meta_get_info (), NULL);
   if (m == NULL)

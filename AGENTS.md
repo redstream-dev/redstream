@@ -144,7 +144,8 @@ Inside the dev container:
 ```bash
 meson setup build          # once; then `meson setup build --reconfigure` after meson.build changes
 meson test -C build --print-errorlogs
-meson test -C build --suite cpu  # GPU-free subset (gpu tests also skip themselves without a device)
+meson test -C build --suite cpu  # GPU-free subset (gpu tests also skip themselves without a device);
+                                 # building still needs the ROCm headers and libamdhip64
 tests/media/make-test-media.sh   # generates .cache/media/*.h264 for pipeline tests and spikes
 
 # ASan + UBSan build; tests/lsan.supp hides HIP runtime leaks

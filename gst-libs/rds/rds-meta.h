@@ -11,7 +11,8 @@
  * race with other threads.
  *
  * Metas must come from the rds_acquire_*_from_pool functions; a meta allocated any other way is refused. A meta
- * can be in one list at a time: adding it again, or to another frame or batch, is refused with a GST_WARNING. Removing releases the meta, so when removing during a traversal save l->next first:
+ * can be in one list at a time: adding it again, or to another frame or batch, is refused with a GST_WARNING.
+ * Removing releases the meta, so when removing during a traversal save l->next first:
  *
  *   for (l = frame->obj_meta_list; l != NULL; l = next) {
  *     next = l->next;
@@ -264,8 +265,8 @@ RDS_API RdsBatchMeta *rds_batch_meta_copy (RdsBatchMeta * src);
 /* Deep-copies one frame into dst and appends it there (rdsstreamdemux's per-source subset). Parents are remapped
  * within the frame only: a parent in another frame, or in no list, becomes NULL. Scalar fields, including
  * batch_id and pad_index, are kept from the source; the caller sets batch_id for its position in dst. Same
- * copy rules as rds_batch_meta_copy otherwise. Returns the copy, or NULL if src does not belong to a batch. Locks src's batch, then dst: never call it with dst's lock held unless
- * you also hold src's. */
+ * copy rules as rds_batch_meta_copy otherwise. Returns the copy, or NULL if src does not belong to a batch.
+ * Locks src's batch, then dst: never call it with dst's lock held unless you also hold src's. */
 RDS_API RdsFrameMeta *rds_copy_frame_meta_to_batch (RdsFrameMeta * src, RdsBatchMeta * dst);
 
 G_END_DECLS

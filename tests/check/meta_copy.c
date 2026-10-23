@@ -448,6 +448,23 @@ test_copy_into_existing (void)
   g_assert_cmpint (released, ==, created + copied);
 }
 
+/* A buffer carries at most one batch meta: a second add is refused and ownership stays with the caller. */
+static void
+test_add_twice_refused (void)
+{
+  GstBuffer *buf = gst_buffer_new ();
+  RdsBatchMeta *first = rds_create_batch_meta (1), *second = rds_create_batch_meta (1);
+
+  g_assert_nonnull (rds_buffer_add_batch_meta (buf, first));
+  g_test_expect_message ("rds", G_LOG_LEVEL_CRITICAL, "*gst_buffer_get_rds_batch_meta (buffer) == NULL*");
+  g_assert_null (rds_buffer_add_batch_meta (buf, second));
+  g_test_assert_expected_messages ();
+  g_assert_true (gst_buffer_get_rds_batch_meta (buf) == first);
+
+  rds_destroy_batch_meta (second);
+  gst_buffer_unref (buf);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -458,6 +475,7 @@ main (int argc, char **argv)
   g_test_add_func ("/meta-copy/gst-buffer", test_copy_gst_buffer);
   g_test_add_func ("/meta-copy/survives-elements", test_survives_elements);
   g_test_add_func ("/meta-copy/parent-in-later-frame", test_copy_parent_in_later_frame);
+  g_test_add_func ("/meta-copy/add-twice-refused", test_add_twice_refused);
   g_test_add_func ("/meta-copy/copy-into-existing", test_copy_into_existing);
   return g_test_run ();
 }

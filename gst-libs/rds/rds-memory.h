@@ -25,6 +25,8 @@ RDS_API GstAllocator *rds_allocator_new (guint gpu_id, RdsBufSurfaceMemType mem_
  * duplicate it. Sub-region shares, partial copies and resized memories are not supported (map and copy fail).
  * Copy-on-write: a GST_MAP_WRITE map of a shared RDS memory (a buffer made writable while another buffer still
  * refs the memory) makes GStreamer swap a private deep copy into the buffer, i.e. a full surface copy.
+ * Copies, including that copy-on-write copy, duplicate only the first numFilled surfaces of the batch, so a
+ * producer must set numFilled before pushing.
  * A buffer must hold exactly one RDS memory: mapping a buffer with several (gst_buffer_map merges them) yields
  * a system-memory copy of the RdsBufSurface structs whose pointers dangle once the merged memory is freed. */
 RDS_API GstMemory *rds_allocator_alloc_surface (GstAllocator * allocator, guint32 batch_size,

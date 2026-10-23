@@ -22,10 +22,12 @@ RDS_API GType rds_meta_api_get_type (void);
 RDS_API const GstMetaInfo *rds_meta_get_info (void);
 
 /* Attaches batch_meta to a writable buffer and takes ownership of it (it is destroyed with the meta). Copying the
- * buffer (gst_buffer_copy, gst_buffer_make_writable) deep-copies it; other transforms drop it. On failure (NULL
+ * buffer (gst_buffer_copy, gst_buffer_make_writable) deep-copies it; other transforms drop it. A buffer carries at
+ * most one batch meta: adding to a buffer that already has one is refused (g_return_val_if_fail). On failure (NULL
  * return) ownership stays with the caller. */
 RDS_API RdsMeta *rds_buffer_add_batch_meta (GstBuffer * buffer, RdsBatchMeta * batch_meta);
-/* The buffer's batch meta, or NULL. Transfer none. */
+/* The buffer's batch meta, or NULL. Transfer none. The add/get names are asymmetric on purpose: the getter mirrors
+ * DeepStream's gst_buffer_get_nvds_batch_meta so ported code maps one to one. */
 RDS_API RdsBatchMeta *gst_buffer_get_rds_batch_meta (GstBuffer * buffer);
 
 G_END_DECLS
