@@ -32,9 +32,13 @@ RDS_API gboolean rds_buffer_pool_config_get_surface_params (const GstStructure *
  * has no caps or the pool rejects the configuration. */
 RDS_API gboolean rds_propose_allocation (GstQuery * query, guint batch_size, RdsBufSurfaceMemType mem_type,
     guint gpu_id, guint min_buffers);
-/* Upstream side (decide_allocation): reuses the first RdsBufferPool in the query whose surface params match,
- * otherwise creates one; merges min/max (max_buffers 0 = no limit of ours); configures it, writes it back as the
- * query's first pool, and returns a new reference (inactive). NULL if the query has no caps or config fails. */
+/* Upstream side (decide_allocation): reuses the first inactive RdsBufferPool in the query whose surface params
+ * match, otherwise creates one (also when reconfiguring the reused pool fails); merges min/max (max_buffers 0 = no
+ * limit of ours); configures it, writes it back as the query's first pool (moving a matched entry rather than
+ * duplicating it), and returns a new reference (inactive). The returned pool may be downstream's own pool,
+ * reconfigured. NULL if the query has no caps, its caps lack memory:RDS, or configuration fails.
+ * A subclass overriding decide_allocation should call this instead of chaining up; it does not filter the
+ * query's metas or set allocation params. */
 RDS_API GstBufferPool *rds_decide_allocation (GstQuery * query, guint batch_size,
     RdsBufSurfaceMemType mem_type, guint gpu_id, guint min_buffers, guint max_buffers);
 
