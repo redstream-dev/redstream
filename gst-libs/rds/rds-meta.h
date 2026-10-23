@@ -253,6 +253,16 @@ RDS_API void rds_remove_user_meta_from_object (RdsObjectMeta * obj_meta, RdsUser
  * >= RDS_START_USER_META. Thread-safe. */
 RDS_API RdsMetaType rds_get_user_meta_type (const gchar * meta_descriptor);
 
+/* Deep copy through the destination's pools: strings, masks, classifiers, labels and display meta are duplicated,
+ * object parent pointers are remapped within the frame (NULL if the parent is elsewhere), and user meta is copied
+ * with its copy_func (user meta without one is skipped, with a one-time warning). Takes src's lock, then the
+ * destination's. Returns NULL if src is NULL. */
+RDS_API RdsBatchMeta *rds_batch_meta_copy (RdsBatchMeta * src);
+/* Deep-copies one frame into dst and appends it there (rdsstreamdemux's per-source subset). Returns the copy, or
+ * NULL if src does not belong to a batch. Locks src's batch, then dst: never call it with dst's lock held unless
+ * you also hold src's. */
+RDS_API RdsFrameMeta *rds_copy_frame_meta_to_batch (RdsFrameMeta * src, RdsBatchMeta * dst);
+
 G_END_DECLS
 
 #endif /* RDS_META_H */

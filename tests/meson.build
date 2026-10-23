@@ -10,7 +10,8 @@ test_deps = [rds_dep, gst_check_dep, hip_dep]
 
 # GPU-free tests (hosted CI runs `meson test --suite cpu`).
 cpu_tests = ['compat_remap', 'compat_header', 'compat_header_nomacros', 'buf_surface', 'memory', 'buffer_pool',
-  'allocation', 'meta_batch', 'meta_children']
+  'allocation', 'meta_batch', 'meta_children',
+  'meta_copy']
 foreach t : cpu_tests
   test(t, executable(t, 'check' / (t + '.c'), dependencies : test_deps),
     suite : 'cpu', env : test_env, protocol : 'tap')
