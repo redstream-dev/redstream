@@ -20,6 +20,12 @@ static const gchar *pipeline_factories[] = {
   "nvstreammux", "nvinfer", "nvmultistreamtiler", "nvvideoconvert", "nvdsosd", "nveglglessink",
 };
 
+typedef struct
+{
+  GMainLoop *loop;
+  gboolean error;
+} BusState;
+
 static void
 on_pad_added (GstElement * decodebin, GstPad * pad, gpointer user_data)
 {
@@ -39,12 +45,12 @@ on_pad_added (GstElement * decodebin, GstPad * pad, gpointer user_data)
 static gboolean
 on_bus_message (GstBus * bus G_GNUC_UNUSED, GstMessage * msg, gpointer user_data)
 {
-  GMainLoop *loop = user_data;
+  BusState *state = user_data;
 
   switch (GST_MESSAGE_TYPE (msg)) {
     case GST_MESSAGE_EOS:
       g_print ("End of stream\n");
-      g_main_loop_quit (loop);
+      g_main_loop_quit (state->loop);
       break;
     case GST_MESSAGE_ERROR:{
       GError *err = NULL;
@@ -53,7 +59,8 @@ on_bus_message (GstBus * bus G_GNUC_UNUSED, GstMessage * msg, gpointer user_data
       g_printerr ("Error from %s: %s\n%s\n", GST_MESSAGE_SRC_NAME (msg), err->message, dbg ? dbg : "");
       g_clear_error (&err);
       g_free (dbg);
-      g_main_loop_quit (loop);
+      state->error = TRUE;
+      g_main_loop_quit (state->loop);
       break;
     }
     default:
@@ -89,6 +96,12 @@ run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config)
 
   for (guint i = 0; i < num_sources; i++) {
     GstElement *src = gst_element_factory_make ("uridecodebin", NULL);
+
+    if (src == NULL) {
+      g_printerr ("Element uridecodebin is not available\n");
+      gst_object_unref (pipeline);
+      return 1;
+    }
     GstPad *mux_pad = gst_element_request_pad_simple (mux, "sink_%u");
 
     g_object_set (src, "uri", uris[i], NULL);
@@ -104,19 +117,19 @@ run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config)
     }
   }
 
-  GMainLoop *loop = g_main_loop_new (NULL, FALSE);
+  BusState state = { g_main_loop_new (NULL, FALSE), FALSE };
   GstBus *bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
-  guint watch = gst_bus_add_watch (bus, on_bus_message, loop);
+  guint watch = gst_bus_add_watch (bus, on_bus_message, &state);
   gst_object_unref (bus);
 
   gst_element_set_state (pipeline, GST_STATE_PLAYING);
-  g_main_loop_run (loop);
+  g_main_loop_run (state.loop);
   gst_element_set_state (pipeline, GST_STATE_NULL);
 
   g_source_remove (watch);
-  g_main_loop_unref (loop);
+  g_main_loop_unref (state.loop);
   gst_object_unref (pipeline);
-  return 0;
+  return state.error ? 1 : 0;
 }
 
 int
