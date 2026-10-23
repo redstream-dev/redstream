@@ -40,13 +40,18 @@ Status: **pre-alpha.** Phase 0 spikes are done; the walking skeleton (build, com
 | `nvtracker` | `rdstracker` | IOU/SORT-class first |
 | `nvdsosd` | `rdsosd` | bbox, text, lines, circles |
 | `nvdsanalytics` | `rdsanalytics` | ROI, line crossing, direction, overcrowding (M2) |
+| `nveglglessink` / `nv3dsink` | `rdsvideosink` | display sink |
+| `nvdslogger` | `rdslogger` | per-stream FPS |
+| `nvv4l2h264enc` / `nvv4l2h265enc` | `rdsh264enc` / `rdsh265enc` | VA (VCN) encode with DeepStream property names (M2) |
 | `NvDsBatchMeta` & co. | `RdsBatchMeta` & co. + `rds/rds_compat.h` | |
+
+The authoritative runtime mapping is the alias table in `gst-libs/rds/rds-compat-remap.c`.
 
 Naming convention: elements `rds<name>`, types `Rds<Name>`, functions `rds_<name>`. This mirrors NVIDIA's `nv`/`NvDs`/`nvds_`, so ports are near-mechanical renames.
 
 ## MVP milestones
 
-- **M1, multi-stream detector.** File/RTSP → VA decode → `rdsstreammux` → `rdsinfer` (YOLO primary detector with
+- **M1, multi-stream detector.** File/RTSP → rocDecode decode (`rdsvideodec`) → `rdsstreammux` → `rdsinfer` (YOLO primary detector with
   custom bbox parser) → `rdstracker` → `rdsosd` → sink/appsink. Acceptance: NVIDIA's `deepstream-test3`
   sample ported with `#ifdef`s only, producing equivalent detections to DeepStream on the same video and model.
 - **M2, production-style multi-model app.** Pose primary detector (custom parser, keypoints), secondary models in

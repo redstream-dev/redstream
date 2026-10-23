@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* Decode an H.264 byte-stream with vah264dec into system-memory NV12 and print per-frame CRC32s.
  * Output format (shared with rocdec_spike): "frame <n> y=<crc> uv=<crc>". */
 #include <gst/gst.h>

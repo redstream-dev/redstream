@@ -39,14 +39,18 @@ Jetson-specific hardware blocks.
 | `nvinfer` | `rdsinfer` (MIGraphX) |
 | `nvtracker` | `rdstracker` |
 | `nvdsosd` | `rdsosd` |
+| `nvmultistreamtiler` | `rdsmultistreamtiler` |
 | `nvdsanalytics` | `rdsanalytics` |
+| `nveglglessink`, `nv3dsink` | `rdsvideosink` |
+| `nvdslogger` | `rdslogger` |
+| `nvv4l2h264enc`, `nvv4l2h265enc` | `rdsh264enc`, `rdsh265enc` |
 | `NvDsBatchMeta`, `NvDsObjectMeta`, … | `Rds*` + `rds/rds_compat.h` |
 | TensorRT `.engine` | MIGraphX `.mxr` (compiled from ONNX, cached) |
 
 ## Roadmap
 
 **M1: multi-stream detector**
-- File/RTSP sources → VA-API decode → `rdsstreammux` → `rdsinfer` (YOLO + custom bbox parser) → `rdstracker` → `rdsosd`.
+- File/RTSP sources → rocDecode decode (`rdsvideodec`) → `rdsstreammux` → `rdsinfer` (YOLO + custom bbox parser) → `rdstracker` → `rdsosd`.
 - Acceptance test: NVIDIA's `deepstream-test3` sample, ported with `#ifdef`s only, produces equivalent detections.
 
 **M2: production-style multi-model pipeline**

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
 // Spike 0a: rocDecode H.264 decode -> HIP device frame -> copy into an owned pitch-linear NV12 surface.
 // Prints "frame <n> y=<crc> uv=<crc>" (same format as ref_crc) unless --no-crc.
 // Usage: rocdec_spike file.h264 [--loops N] [--no-crc]

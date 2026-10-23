@@ -1,4 +1,5 @@
 /* Redstream source-compatibility header for applications written against DeepStream.
+ * Currently provides element factory remapping only; metadata, surface and event aliases follow.
  *
  *   #ifdef USE_REDSTREAM
  *   #include <rds/rds_compat.h>
