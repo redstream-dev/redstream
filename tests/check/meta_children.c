@@ -418,6 +418,93 @@ test_lock_recursive (void)
   rds_destroy_batch_meta (ctx.batch);
 }
 
+static void
+test_destroy_sweeps_orphans (void)
+{
+  RdsBatchMeta *b = rds_create_batch_meta (1);
+  RdsClassifierMeta *c = rds_acquire_classifier_meta_from_pool (b);
+  RdsLabelInfo *l = rds_acquire_label_info_meta_from_pool (b);
+  RdsObjectMeta *o = rds_acquire_obj_meta_from_pool (b);
+  RdsFrameMeta *f = rds_acquire_frame_meta_from_pool (b);       /* never added to the batch */
+  RdsUserMeta *u = new_user_meta (b, RDS_USER_META, 5);         /* never added anywhere */
+
+  reset_counters ();
+
+  /* Orphan classifier with a label that owns a long label. */
+  l->pResult_label = g_strnfill (200, 'y');
+  rds_add_label_info_meta_to_classifier (c, l);
+
+  /* Orphan object with display text and a mask. */
+  o->text_params.display_text = g_strdup ("orphan");
+  o->mask_params.data = g_new0 (gfloat, 4);
+  o->mask_params.size = 4 * sizeof (gfloat);
+
+  /* A frame that was never added, but has objects, display meta and user meta of its own. */
+  for (gint i = 0; i < 3; i++) {
+    RdsObjectMeta *fo = new_obj (b, f);
+
+    fo->text_params.display_text = g_strdup_printf ("in frame %d", i);
+  }
+  rds_add_user_meta_to_frame (f, new_user_meta (b, RDS_USER_META, 6));
+
+  (void) u;
+  rds_destroy_batch_meta (b);                                   /* ASan checks the strings, mask and data */
+  g_assert_cmpint (released_by_value[5], ==, 1);
+  g_assert_cmpint (released_by_value[6], ==, 1);
+  g_assert_cmpint (released, ==, 2);
+}
+
+static gint readd_calls;
+
+static void
+release_readd (gpointer data, G_GNUC_UNUSED gpointer user_data)
+{
+  RdsUserMeta *um = data;
+  RdsBatchMeta *b = um->base_meta.batch_meta;
+  RdsUserMeta *again = rds_acquire_user_meta_from_pool (b);
+
+  /* Misbehaving on purpose: every release adds a fresh meta that does the same. */
+  again->base_meta.release_func = release_readd;
+  rds_add_user_meta_to_batch (b, again);
+  readd_calls++;
+}
+
+static void
+test_destroy_loop_capped (void)
+{
+  RdsBatchMeta *b = rds_create_batch_meta (1);
+  RdsUserMeta *um = rds_acquire_user_meta_from_pool (b);
+
+  readd_calls = 0;
+  um->base_meta.release_func = release_readd;
+  rds_add_user_meta_to_batch (b, um);
+  rds_destroy_batch_meta (b);                                   /* must terminate */
+  g_assert_cmpint (readd_calls, >=, 16);
+  g_assert_cmpint (readd_calls, <, 64);
+}
+
+static void
+test_non_pool_meta_refused (void)
+{
+  RdsBatchMeta *b = rds_create_batch_meta (1);
+  RdsFrameMeta *f = new_frame (b);
+  RdsObjectMeta *o = new_obj (b, f);
+  /* A zeroed 16-byte prefix stands in for whatever precedes a meta the app allocated itself. */
+  guint8 *blk = g_malloc0 (16 + sizeof (RdsUserMeta));
+  RdsUserMeta *fake = (RdsUserMeta *) (blk + 16);
+
+  fake->base_meta.batch_meta = b;
+  fake->base_meta.meta_type = RDS_USER_META;
+  rds_add_user_meta_to_batch (b, fake);
+  rds_add_user_meta_to_frame (f, fake);
+  rds_add_user_meta_to_obj (o, fake);
+  g_assert_null (b->batch_user_meta_list);
+  g_assert_null (f->frame_user_meta_list);
+  g_assert_null (o->obj_user_meta_list);
+  rds_destroy_batch_meta (b);
+  g_free (blk);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -430,5 +517,8 @@ main (int argc, char **argv)
   g_test_add_func ("/meta/release-reentrant", test_release_reentrant);
   g_test_add_func ("/meta/user-meta-type", test_user_meta_type);
   g_test_add_func ("/meta/lock-recursive", test_lock_recursive);
+  g_test_add_func ("/meta/destroy-sweeps-orphans", test_destroy_sweeps_orphans);
+  g_test_add_func ("/meta/destroy-loop-capped", test_destroy_loop_capped);
+  g_test_add_func ("/meta/non-pool-meta-refused", test_non_pool_meta_refused);
   return g_test_run ();
 }

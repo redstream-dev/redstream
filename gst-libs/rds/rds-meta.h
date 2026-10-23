@@ -4,13 +4,14 @@
  *
  * Ownership: text_params.display_text, mask_params.data and pResult_label are g_malloc'd and freed on release;
  * font_params.font_name and classifier_type are not owned. A user meta's release_func frees user_meta_data.
- * A user meta's release_func may run while the batch's lists are being torn down: it must not add or remove metas
- * (the list being released is detached first, so this is safe today, but it is not part of the contract).
+ * A user meta's release_func may run while the batch is being torn down. Adding or removing metas from it is
+ * unsupported. It is tolerated for the batch-level lists (frames and batch user meta: destroy keeps releasing
+ * them, for at most 16 passes); adds to the frame or object being released are not supported and may leak.
  * Every add/remove takes the batch's recursive meta_mutex; hold rds_acquire_meta_lock() around traversals that
  * race with other threads.
  *
- * A meta can be in one list at a time: adding it again, or to another frame or batch, is refused with a
- * GST_WARNING. Removing releases the meta, so when removing during a traversal save l->next first:
+ * Metas must come from the rds_acquire_*_from_pool functions; a meta allocated any other way is refused. A meta
+ * can be in one list at a time: adding it again, or to another frame or batch, is refused with a GST_WARNING. Removing releases the meta, so when removing during a traversal save l->next first:
  *
  *   for (l = frame->obj_meta_list; l != NULL; l = next) {
  *     next = l->next;
@@ -174,6 +175,8 @@ typedef struct
   gint64 reserved[RDS_MAX_RESERVED_FIELDS];
 } RdsFrameMeta;
 
+/* Always created by rds_create_batch_meta and freed by rds_destroy_batch_meta: never embed it by value or
+ * allocate it yourself (private state follows it in memory). */
 struct _RdsBatchMeta
 {
   RdsBaseMeta base_meta;
@@ -193,8 +196,8 @@ struct _RdsBatchMeta
 };
 
 RDS_API RdsBatchMeta *rds_create_batch_meta (guint max_batch_size);
-/* Releases everything in the batch and frees the pools, including metas acquired but never added (their owned
- * members are not freed). NULL is ignored. */
+/* Releases everything in the batch, then every meta acquired from it but never added (with its owned members
+ * and children; user metas get their release_func), and frees the pools. NULL is ignored. */
 RDS_API void rds_destroy_batch_meta (RdsBatchMeta * batch_meta);
 RDS_API void rds_acquire_meta_lock (RdsBatchMeta * batch_meta);
 RDS_API void rds_release_meta_lock (RdsBatchMeta * batch_meta);
@@ -209,7 +212,8 @@ RDS_API void rds_remove_frame_meta_from_batch (RdsBatchMeta * batch_meta, RdsFra
 RDS_API RdsObjectMeta *rds_acquire_obj_meta_from_pool (RdsBatchMeta * batch_meta);
 /* parent may be NULL. A parent that is obj_meta itself or from another batch is dropped (parent = NULL) with a
  * GST_WARNING. Set the parent here: assigning obj_meta->parent directly after the add is unsupported, because
- * removals would not know to clear it and it could dangle. */
+ * removals would not know to clear it and it could dangle. Frames that were never added to the batch are not
+ * scanned either when a parent is removed (except the frame passed to the remove call). */
 RDS_API void rds_add_obj_meta_to_frame (RdsFrameMeta * frame_meta, RdsObjectMeta * obj_meta,
     RdsObjectMeta * obj_parent);
 /* Releases the object and everything hanging off it (classifiers, user meta, owned strings and mask). Objects

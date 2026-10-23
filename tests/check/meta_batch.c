@@ -337,6 +337,29 @@ test_parent_tracking (void)
   rds_destroy_batch_meta (b);
 }
 
+static void
+test_non_pool_frame_and_obj_refused (void)
+{
+  RdsBatchMeta *b = rds_create_batch_meta (1);
+  RdsFrameMeta *f = rds_acquire_frame_meta_from_pool (b);
+  guint8 *fblk = g_malloc0 (16 + sizeof (RdsFrameMeta));
+  guint8 *oblk = g_malloc0 (16 + sizeof (RdsObjectMeta));
+  RdsFrameMeta *fake_f = (RdsFrameMeta *) (fblk + 16);
+  RdsObjectMeta *fake_o = (RdsObjectMeta *) (oblk + 16);
+
+  fake_f->base_meta.batch_meta = b;
+  fake_o->base_meta.batch_meta = b;
+  rds_add_frame_meta_to_batch (b, fake_f);
+  g_assert_null (b->frame_meta_list);
+  rds_add_frame_meta_to_batch (b, f);
+  rds_add_obj_meta_to_frame (f, fake_o, NULL);
+  g_assert_null (f->obj_meta_list);
+  g_assert_cmpuint (f->num_obj_meta, ==, 0);
+  rds_destroy_batch_meta (b);
+  g_free (fblk);
+  g_free (oblk);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -354,5 +377,6 @@ main (int argc, char **argv)
   g_test_add_func ("/meta/remove-via-wrong-frame", test_remove_via_wrong_frame);
   g_test_add_func ("/meta/remove-during-traversal", test_remove_during_traversal);
   g_test_add_func ("/meta/parent-tracking", test_parent_tracking);
+  g_test_add_func ("/meta/non-pool-refused", test_non_pool_frame_and_obj_refused);
   return g_test_run ();
 }
