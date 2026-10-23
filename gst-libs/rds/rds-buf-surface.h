@@ -13,7 +13,8 @@ G_BEGIN_DECLS
 #define RDS_BUF_SURFACE_MAX_PLANES 4
 /* Row pitch and surface spacing alignment, in bytes (matches hipMallocPitch on RDNA2). */
 #define RDS_BUF_SURFACE_PITCH_ALIGN 256
-/* Largest supported width or height; keeps all size arithmetic within 32 bits. */
+/* Largest supported width or height. Computed plane sizes then fit in 32 bits; a larger `size` override is
+ * honoured, and batch totals are checked for overflow at create time. */
 #define RDS_BUF_SURFACE_MAX_DIM 16384
 
 /* Values follow DeepStream's documented order: configs pass them as integers (nvbuf-memory-type=N). */
@@ -85,10 +86,12 @@ typedef struct
   guint32 dataSize;                                 /* bytes, all planes */
   gpointer dataPtr;                                 /* device or host pointer, depending on memType */
   RdsBufSurfacePlaneParams planeParams;
-  RdsBufSurfaceMappedAddr mappedAddr;
+  RdsBufSurfaceMappedAddr mappedAddr;              /* output only: set by map, cleared by unmap */
   gpointer _reserved[4];
 } RdsBufSurfaceParams;
 
+/* A surface returned by rds_buf_surface_create owns its memory through _priv: never copy it by value (use
+ * rds_buf_surface_copy), and release it only with rds_buf_surface_destroy. */
 typedef struct
 {
   guint32 gpuId;
@@ -118,6 +121,12 @@ typedef struct
 RDS_API int rds_buf_surface_create (RdsBufSurface ** surf, guint32 batchSize,
     const RdsBufSurfaceCreateParams * params);
 RDS_API int rds_buf_surface_destroy (RdsBufSurface * surf);
+/* Points mappedAddr.addr[plane] at CPU-accessible memory; mapping copies no data.
+ * Host-accessible memory (system, pinned, unified) is mapped in place and the sync calls are no-ops. Device
+ * memory is mapped to a pinned staging mirror, so the required sequence is:
+ *   map -> sync_for_cpu -> read/write through mappedAddr -> sync_for_device -> unmap.
+ * sync_for_device writes back the whole plane (pitch * height bytes). If map fails partway through a
+ * multi-plane or multi-surface request, some planes may be mapped: call unmap with the same index and plane. */
 RDS_API int rds_buf_surface_map (RdsBufSurface * surf, int index, int plane, RdsBufSurfaceMemMapFlags type);
 RDS_API int rds_buf_surface_unmap (RdsBufSurface * surf, int index, int plane);
 RDS_API int rds_buf_surface_sync_for_cpu (RdsBufSurface * surf, int index, int plane);
