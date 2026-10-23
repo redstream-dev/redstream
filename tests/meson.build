@@ -11,11 +11,18 @@ test_deps = [rds_dep, gst_check_dep, hip_dep]
 # GPU-free tests (hosted CI runs `meson test --suite cpu`).
 cpu_tests = ['compat_remap', 'compat_header', 'compat_header_nomacros', 'buf_surface', 'memory', 'buffer_pool',
   'allocation', 'meta_batch', 'meta_children',
-  'meta_copy', 'event', 'compat_meta']
+  'meta_copy', 'event', 'compat_meta', 'compat_aliases']
 foreach t : cpu_tests
   test(t, executable(t, 'check' / (t + '.c'), dependencies : test_deps),
     suite : 'cpu', env : test_env, protocol : 'tap')
 endforeach
+
+# DeepStream apps are often C++: check that the compat header builds and works there too.
+if add_languages('cpp', required : false, native : false)
+  test('compat_cpp', executable('compat_cpp', 'check' / 'compat_cpp.cpp', dependencies : [rds_dep],
+      override_options : ['cpp_std=c++17']),
+    suite : 'cpu', env : test_env, protocol : 'tap')
+endif
 
 # Tests that need a ROCm device; each skips itself when none is visible.
 gpu_tests = ['gpu_smoke', 'buf_surface_hip', 'memory_hip', 'buffer_pool_hip']

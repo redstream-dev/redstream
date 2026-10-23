@@ -63,9 +63,14 @@ typedef RdsOSD_ArrowParams NvOSD_ArrowParams;
 typedef RdsOSD_CircleParams NvOSD_CircleParams;
 typedef RdsOSD_MaskParams NvOSD_MaskParams;
 typedef RdsOSD_Arrow_Head_Direction NvOSD_Arrow_Head_Direction;
+typedef RdsBbox_Coords NvBbox_Coords;
 #ifndef START_HEAD
 #define START_HEAD RDS_OSD_ARROW_START_HEAD
+#endif
+#ifndef END_HEAD
 #define END_HEAD RDS_OSD_ARROW_END_HEAD
+#endif
+#ifndef BOTH_HEAD
 #define BOTH_HEAD RDS_OSD_ARROW_BOTH_HEAD
 #endif
 
@@ -88,8 +93,7 @@ typedef RdsObjectMetaList NvDsObjectMetaList;
 typedef RdsClassifierMetaList NvDsClassifierMetaList;
 typedef RdsLabelInfoList NvDsLabelInfoList;
 typedef RdsUserMetaList NvDsUserMetaList;
-/* RdsDisplayMetaList has no alias: the public reference documents no NvDs name for it. */
-typedef RdsBbox_Coords NvBbox_Coords;
+typedef RdsDisplayMetaList NvDisplayMetaList;       /* sic: no "Ds" in DeepStream's name */
 typedef RdsComp_BboxInfo NvDsComp_BboxInfo;
 typedef RdsMeta NvDsMeta;
 
@@ -107,20 +111,31 @@ typedef RdsMeta NvDsMeta;
 #define NVDS_START_USER_META RDS_START_USER_META
 #define NVDS_FORCE32_META RDS_FORCE32_META
 
+/* Un-prefixed values: an earlier definition is kept only if it has the same value. */
 #ifndef MAX_LABEL_SIZE
 #define MAX_LABEL_SIZE RDS_MAX_LABEL_SIZE
+#elif MAX_LABEL_SIZE != RDS_MAX_LABEL_SIZE
+#error "MAX_LABEL_SIZE is already defined with a value Redstream does not use"
 #endif
 #ifndef MAX_ELEMENTS_IN_DISPLAY_META
 #define MAX_ELEMENTS_IN_DISPLAY_META RDS_MAX_ELEMENTS_IN_DISPLAY_META
+#elif MAX_ELEMENTS_IN_DISPLAY_META != RDS_MAX_ELEMENTS_IN_DISPLAY_META
+#error "MAX_ELEMENTS_IN_DISPLAY_META is already defined with a value Redstream does not use"
 #endif
 #ifndef MAX_USER_FIELDS
 #define MAX_USER_FIELDS RDS_MAX_USER_FIELDS
+#elif MAX_USER_FIELDS != RDS_MAX_USER_FIELDS
+#error "MAX_USER_FIELDS is already defined with a value Redstream does not use"
 #endif
 #ifndef MAX_RESERVED_FIELDS
 #define MAX_RESERVED_FIELDS RDS_MAX_RESERVED_FIELDS
+#elif MAX_RESERVED_FIELDS != RDS_MAX_RESERVED_FIELDS
+#error "MAX_RESERVED_FIELDS is already defined with a value Redstream does not use"
 #endif
 #ifndef UNTRACKED_OBJECT_ID
 #define UNTRACKED_OBJECT_ID RDS_UNTRACKED_OBJECT_ID
+#elif UNTRACKED_OBJECT_ID != RDS_UNTRACKED_OBJECT_ID
+#error "UNTRACKED_OBJECT_ID is already defined with a value Redstream does not use"
 #endif
 
 #define nvds_create_batch_meta rds_create_batch_meta
