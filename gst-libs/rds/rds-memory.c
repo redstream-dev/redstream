@@ -53,9 +53,23 @@ rds_allocator_free (G_GNUC_UNUSED GstAllocator * allocator, GstMemory * mem)
   g_free (m);
 }
 
+/* A resized memory no longer covers exactly one RdsBufSurface struct. */
+static gboolean
+check_whole (GstMemory * mem)
+{
+  if (mem->offset != 0 || mem->size != sizeof (RdsBufSurface)) {
+    GST_WARNING_OBJECT (mem->allocator, "RDS memory was resized (offset %" G_GSIZE_FORMAT ", size %"
+        G_GSIZE_FORMAT "), refusing", mem->offset, mem->size);
+    return FALSE;
+  }
+  return TRUE;
+}
+
 static gpointer
 rds_memory_map (GstMemory * mem, G_GNUC_UNUSED gsize maxsize, G_GNUC_UNUSED GstMapFlags flags)
 {
+  if (!check_whole (mem))
+    return NULL;
   return ((RdsMemory *) mem)->surface;
 }
 
@@ -82,6 +96,8 @@ rds_memory_copy (GstMemory * mem, gssize offset, gssize size)
     GST_WARNING_OBJECT (mem->allocator, "partial copies of RDS memory are not supported");
     return NULL;
   }
+  if (!check_whole (mem))
+    return NULL;
 
   copy = rds_allocator_alloc_surface (mem->allocator, src->batchSize, &params);
   if (copy == NULL)

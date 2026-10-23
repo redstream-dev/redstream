@@ -82,6 +82,60 @@ test_copy_is_deep (void)
 }
 
 static void
+test_write_map_copies_shared (void)
+{
+  GstAllocator *alloc = rds_allocator_new (0, RDS_BUF_MEM_SYSTEM);
+  GstBuffer *buf = gst_buffer_new ();
+  GstMapInfo info;
+  RdsBufSurface *a;
+
+  gst_buffer_append_memory (buf, rds_allocator_alloc_surface (alloc, 1, &nv12_640));
+  a = rds_buffer_get_surface (buf);
+  a->numFilled = 1;
+  rds_buf_surface_memset (a, 0, -1, 42);
+
+  /* The copy shares the memory, so a write map swaps a private deep copy into it. */
+  GstBuffer *copy = gst_buffer_copy (buf);
+  g_assert_true (rds_buffer_get_surface (copy) == a);
+  g_assert_true (gst_buffer_map (copy, &info, GST_MAP_WRITE));
+  RdsBufSurface *c = (RdsBufSurface *) info.data;
+  g_assert_true (c != a);
+  g_assert_true (c == rds_buffer_get_surface (copy));
+  g_assert_cmpuint (((guint8 *) c->surfaceList[0].dataPtr)[0], ==, 42);
+  rds_buf_surface_memset (c, 0, -1, 7);
+  gst_buffer_unmap (copy, &info);
+
+  g_assert_true (gst_buffer_map (buf, &info, GST_MAP_READ));
+  g_assert_true (info.data == (guint8 *) a);
+  g_assert_cmpuint (((guint8 *) a->surfaceList[0].dataPtr)[0], ==, 42);
+  gst_buffer_unmap (buf, &info);
+
+  gst_buffer_unref (copy);
+  gst_buffer_unref (buf);
+  gst_object_unref (alloc);
+}
+
+static void
+test_resized_refused (void)
+{
+  GstAllocator *alloc = rds_allocator_new (0, RDS_BUF_MEM_SYSTEM);
+  GstBuffer *buf = gst_buffer_new ();
+  GstMemory *mem;
+  GstMapInfo info;
+
+  gst_buffer_append_memory (buf, rds_allocator_alloc_surface (alloc, 1, &nv12_640));
+  gst_buffer_resize (buf, 8, -1);
+  mem = gst_buffer_peek_memory (buf, 0);
+  g_assert_true (rds_is_rds_memory (mem));
+  g_assert_cmpuint (mem->offset, ==, 8);
+  g_assert_false (gst_memory_map (mem, &info, GST_MAP_READ));
+  g_assert_null (gst_memory_copy (mem, 0, -1));
+
+  gst_buffer_unref (buf);
+  gst_object_unref (alloc);
+}
+
+static void
 test_caps_feature (void)
 {
   GstCaps *rds = gst_caps_from_string ("video/x-raw(memory:RDS), format=NV12, width=64, height=64");
@@ -122,6 +176,8 @@ main (int argc, char **argv)
   g_test_add_func ("/memory/map-returns-surface", test_map_returns_surface);
   g_test_add_func ("/memory/buffer-helpers", test_buffer_helpers);
   g_test_add_func ("/memory/copy-is-deep", test_copy_is_deep);
+  g_test_add_func ("/memory/write-map-copies-shared", test_write_map_copies_shared);
+  g_test_add_func ("/memory/resized-refused", test_resized_refused);
   g_test_add_func ("/memory/caps-feature", test_caps_feature);
   g_test_add_func ("/memory/format-mapping", test_format_mapping);
   return g_test_run ();
