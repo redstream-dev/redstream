@@ -75,6 +75,7 @@ test_round_trip (void)
     guint id = 0;
 
     g_assert_nonnull (ev);
+    /* Not a bare ==: GstEventType vs RdsEventType trips -Wenum-compare; cmpint widens both to integers. */
     g_assert_cmpint (GST_EVENT_TYPE (ev), ==, all_types[i]);
     g_assert_cmpuint ((guint) GST_EVENT_TYPE (ev) >> GST_EVENT_NUM_SHIFT, ==, 500 + i);
     g_assert_true (GST_EVENT_IS_DOWNSTREAM (ev));
@@ -194,6 +195,28 @@ dispatch (GstEvent * ev)
   }
 }
 
+/* The documented warning-free idiom: switch on the RdsEventType cast, with a default for stock types. */
+static const gchar *
+dispatch_rds (GstEvent * ev)
+{
+  switch ((RdsEventType) GST_EVENT_TYPE (ev)) {
+    case RDS_EVENT_PAD_ADDED:
+      return "pad-added";
+    case RDS_EVENT_PAD_DELETED:
+      return "pad-deleted";
+    case RDS_EVENT_STREAM_EOS:
+      return "stream-eos";
+    case RDS_EVENT_STREAM_SEGMENT:
+      return "stream-segment";
+    case RDS_EVENT_STREAM_RESET:
+      return "stream-reset";
+    case RDS_EVENT_STREAM_START:
+      return "stream-start";
+    default:
+      return "other";
+  }
+}
+
 static void
 test_switchable (void)
 {
@@ -206,10 +229,46 @@ test_switchable (void)
     GstEvent *ev = make_event (i, 1);
 
     g_assert_cmpstr (dispatch (ev), ==, expected[i]);
+    g_assert_cmpstr (dispatch_rds (ev), ==, expected[i]);
+    g_assert_true ((RdsEventType) GST_EVENT_TYPE (ev) == all_types[i]);
     gst_event_unref (ev);
   }
   g_assert_cmpstr (dispatch (eos), ==, "eos");
+  g_assert_cmpstr (dispatch_rds (eos), ==, "other");
   gst_event_unref (eos);
+}
+
+/* Our type but missing or wrongly typed fields: FALSE, outputs untouched. */
+static void
+test_malformed (void)
+{
+  GstEvent *no_segment = gst_event_new_custom ((GstEventType) RDS_EVENT_STREAM_SEGMENT,
+      gst_structure_new ("rds-stream-segment", "source-id", G_TYPE_UINT, 3, NULL));
+  GstEvent *no_source = gst_event_new_custom ((GstEventType) RDS_EVENT_PAD_ADDED,
+      gst_structure_new_empty ("rds-pad-added"));
+  GstEvent *bad_source = gst_event_new_custom ((GstEventType) RDS_EVENT_STREAM_EOS,
+      gst_structure_new ("rds-stream-eos", "source-id", G_TYPE_STRING, "3", NULL));
+  GstEvent *no_stream_id = gst_event_new_custom ((GstEventType) RDS_EVENT_STREAM_START,
+      gst_structure_new ("rds-stream-start", "source-id", G_TYPE_UINT, 3, NULL));
+  GstSegment *segment = (GstSegment *) 0x1;
+  gchar *stream_id = (gchar *) "untouched";
+  guint id = 42;
+
+  g_assert_false (rds_event_parse_stream_segment (no_segment, &id, &segment));
+  g_assert_cmpuint (id, ==, 42);
+  g_assert_true (segment == (GstSegment *) 0x1);
+  g_assert_false (rds_event_parse_pad_added (no_source, &id));
+  g_assert_cmpuint (id, ==, 42);
+  g_assert_false (rds_event_parse_stream_eos (bad_source, &id));
+  g_assert_cmpuint (id, ==, 42);
+  g_assert_false (rds_event_parse_stream_start (no_stream_id, &id, &stream_id));
+  g_assert_cmpuint (id, ==, 42);
+  g_assert_cmpstr (stream_id, ==, "untouched");
+
+  gst_event_unref (no_stream_id);
+  gst_event_unref (bad_source);
+  gst_event_unref (no_source);
+  gst_event_unref (no_segment);
 }
 
 /* Records, in arrival order at the harness sink pad, buffers (by offset) and our events. */
@@ -329,6 +388,7 @@ main (int argc, char **argv)
   g_test_add_func ("/event/round-trip", test_round_trip);
   g_test_add_func ("/event/wrong-type", test_wrong_type);
   g_test_add_func ("/event/switchable", test_switchable);
+  g_test_add_func ("/event/malformed", test_malformed);
   g_test_add_func ("/event/passes-elements", test_passes_elements);
   return g_test_run ();
 }
