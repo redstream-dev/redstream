@@ -1,4 +1,4 @@
-rds_headers = files('rds-prelude.h', 'rds-compat-remap.h')
+rds_headers = files('rds-prelude.h', 'rds-compat-remap.h', 'rds_compat.h')
 install_headers(rds_headers, subdir : 'redstream-' + api_version / 'rds')
 
 librds = library('gstrds-' + api_version,
