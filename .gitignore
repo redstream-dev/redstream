@@ -1,0 +1,8 @@
+.cache/
+build/
+*.mxr
+*.onnx
+*.engine
+*.mkv
+*.mp4
+.claude/settings.local.json

@@ -1,0 +1,45 @@
+# Dev image: ROCm 10.1 + MIGraphX + rocDecode/RPP + GStreamer 1.28 (va, hip, analytics) built from source.
+#
+#   docker build -f docker/Dockerfile.dev -t redstream:dev .
+#   docker run -it --rm --device=/dev/kfd --device=/dev/dri \
+#     --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+#     --security-opt seccomp=unconfined -v $HOME/Workspace:/workspace redstream:dev
+FROM rocm/dev-ubuntu-24.04:10.1.0-full
+
+ARG GST_VERSION=1.28.8
+# GPU arch(s) for the ROCm math libs MIGraphX depends on. Raphael iGPU (gfx1036) runs gfx1030 code
+# via HSA_OVERRIDE_GFX_VERSION=10.3.0.
+ARG GFX=gfx1030
+ENV DEBIAN_FRONTEND=noninteractive
+
+# MIGraphX lives in its own AMD repo; reuse the core repo's signing key.
+RUN echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://stable.repo.amd.com/rocm/migraphx/packages/ubuntu2404 stable main" \
+      > /etc/apt/sources.list.d/amd-migraphx.list \
+ && printf "/opt/rocm/core-10.1/lib\n/opt/rocm/extras-10/lib\n" > /etc/ld.so.conf.d/rocm.conf \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      amdrocm10-migraphx amdrocm10-migraphx-dev \
+      amdrocm-dnn10.1-${GFX} amdrocm-blas10.1-${GFX} \
+      amdrocm-decode-dev amdrocm-rpp-dev amdrocm-hipify \
+      build-essential cmake ninja-build flex bison git pkg-config python3-pip \
+      libglib2.0-dev liborc-0.4-dev zlib1g-dev libva-dev libdrm-dev mesa-va-drivers vainfo \
+      libpango1.0-dev libcairo2-dev libjson-glib-dev \
+ && ldconfig && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --break-system-packages "meson>=1.4,<2"
+
+# GStreamer monorepo, minimal feature set; hip/va/analytics are forced on so a missing dep fails the build.
+RUN git clone --depth 1 --branch ${GST_VERSION} https://gitlab.freedesktop.org/gstreamer/gstreamer.git /opt/src/gstreamer \
+ && cd /opt/src/gstreamer \
+ && meson setup build --prefix=/usr/local --buildtype=release \
+      -Dlibav=disabled -Dges=disabled -Ddevtools=disabled -Dpython=disabled -Drtsp_server=enabled \
+      -Dqt5=disabled -Dqt6=disabled -Dintrospection=disabled -Dtests=disabled -Dexamples=disabled \
+      -Dgst-examples=disabled -Dlibnice=disabled -Dwebrtc=disabled -Ddoc=disabled -Dgpl=disabled \
+      -Dgst-plugins-bad:hip=enabled -Dgst-plugins-bad:va=enabled \
+      -Dgst-plugins-bad:analyticsoverlay=enabled -Dgst-plugins-bad:tensordecoders=enabled \
+ && ninja -C build && ninja -C build install && ldconfig \
+ && rm -rf /opt/src/gstreamer/build
+
+ENV HSA_OVERRIDE_GFX_VERSION=10.3.0 \
+    LIBVA_DRIVER_NAME=radeonsi \
+    PATH=/opt/rocm/bin:/opt/rocm/extras-10/bin:$PATH
+WORKDIR /workspace
