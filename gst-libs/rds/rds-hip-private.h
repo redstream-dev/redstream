@@ -8,19 +8,13 @@
 #include <gst/gst.h>
 #include <hip/hip_runtime_api.h>
 
-static inline gboolean
-rds_hip_check (GstDebugCategory * cat, hipError_t err, const gchar * expr,
-    const gchar * file, const gchar * func, gint line)
-{
-  if (G_LIKELY (err == hipSuccess))
-    return TRUE;
-  gst_debug_log (cat, GST_LEVEL_ERROR, file, func, line, NULL, "%s failed: %s (%d)",
-      expr, hipGetErrorString (err), (gint) err);
-  return FALSE;
-}
-
-/* Evaluates a HIP call, logs failures to GST_CAT_DEFAULT, and yields TRUE on success. */
-#define RDS_HIP_CHECK(call) \
-  rds_hip_check (GST_CAT_DEFAULT, (call), #call, __FILE__, G_STRFUNC, __LINE__)
+/* Evaluates a HIP call, logs failures with GST_ERROR, and yields TRUE on success.
+ * It logs to GST_CAT_DEFAULT, so the file's ensure_debug_category () must have run first. */
+#define RDS_HIP_CHECK(call) G_GNUC_EXTENSION ({                          \
+    hipError_t _rds_err = (call);                                        \
+    if (G_UNLIKELY (_rds_err != hipSuccess))                             \
+      GST_ERROR ("%s failed: %s (%d)", #call,                            \
+          hipGetErrorString (_rds_err), (gint) _rds_err);                \
+    _rds_err == hipSuccess; })
 
 #endif /* RDS_HIP_PRIVATE_H */

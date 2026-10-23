@@ -1,20 +1,23 @@
 test_env = environment()
 test_env.set('LSAN_OPTIONS', 'suppressions=@0@:print_suppressions=0'.format(
   meson.current_source_dir() / 'lsan.supp'))
-test_env.set('UBSAN_OPTIONS', 'halt_on_error=1:print_stacktrace=1')
+test_env.set('UBSAN_OPTIONS', 'halt_on_error=1:abort_on_error=1:print_stacktrace=1')
+
+# gst_check_dep is for GstHarness-based tests in later tasks.
+test_deps = [rds_dep, gst_check_dep, hip_dep]
 
 # GPU-free tests (hosted CI runs `meson test --suite cpu`).
 cpu_tests = ['compat_remap', 'compat_header', 'compat_header_nomacros']
 foreach t : cpu_tests
-  test(t, executable(t, 'check' / t + '.c', dependencies : [rds_dep, gst_check_dep]),
+  test(t, executable(t, 'check' / (t + '.c'), dependencies : test_deps),
     suite : 'cpu', env : test_env, protocol : 'tap')
 endforeach
 
 # Tests that need a ROCm device; each skips itself when none is visible.
 gpu_tests = ['gpu_smoke']
 foreach t : gpu_tests
-  test(t, executable(t, 'check' / t + '.c', dependencies : [rds_dep, gst_check_dep, hip_dep]),
-    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false)
+  test(t, executable(t, 'check' / (t + '.c'), dependencies : test_deps),
+    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120)
 endforeach
 
 test('rds_test3_dry_run',
