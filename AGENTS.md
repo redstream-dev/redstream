@@ -105,7 +105,7 @@ gst/               plugins: rdsstreammux, rdsinfer, rdstracker, rdsosd, …
 compat/            nvds_compat.h and the custom-parser ABI header
 samples/           ported sample apps (M1: test3-equivalent)
 tests/             unit tests + pipeline tests against public media
-docs/plans/        design documents (YYYY-MM-DD-<topic>-design.md)
+docs/              user docs: porting.md, compat-matrix.md, benchmarks.md
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
 ```
 

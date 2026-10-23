@@ -89,7 +89,7 @@ On other GPUs, pass your gfx target and unset the override.
 ## Contributing
 
 The project is in its design phase, so issues and design discussion are the most useful contributions right now.
-Design documents live in `docs/plans/`. If you use AI coding agents, read [`AGENTS.md`](AGENTS.md) first.
+Design discussion happens in GitHub issues. If you use AI coding agents, read [`AGENTS.md`](AGENTS.md) first.
 
 This is a clean-room implementation: do not contribute code, headers or documentation copied from the
 NVIDIA DeepStream SDK.
