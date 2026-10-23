@@ -235,6 +235,63 @@ clear_parents (RdsBatchMeta * b, RdsFrameMeta * extra, RdsObjectMeta * gone, GHa
     clear_parents_in_frame (b, extra, gone, gone_set);
 }
 
+/* Lock held. Appends meta to *list when it belongs to b and is in no list yet; owner and what are for the log. */
+static gboolean
+attach_meta (RdsBatchMeta * b, GList ** list, gpointer meta, const gchar * what, gconstpointer owner)
+{
+  RdsBaseMeta *base = meta;
+
+  if (base->batch_meta != b) {
+    GST_WARNING ("%s meta %p belongs to batch %p, not to %p's batch %p; not added", what, meta, base->batch_meta,
+        owner, b);
+    return FALSE;
+  }
+  if (ELEM_HEADER (meta)->f.attached) {
+    GST_WARNING ("%s meta %p is already attached; not added to %p", what, meta, owner);
+    return FALSE;
+  }
+  ELEM_HEADER (meta)->f.attached = TRUE;
+  /* Append: insertion order is part of the contract. */
+  *list = g_list_append (*list, meta);
+  return TRUE;
+}
+
+/* Lock held. Unlinks meta from *list; the caller then releases it. */
+static gboolean
+detach_meta (GList ** list, gpointer meta, const gchar * what, gconstpointer owner)
+{
+  GList *link = g_list_find (*list, meta);
+
+  if (link == NULL) {
+    GST_WARNING ("%s meta %p is not in %p; not removed", what, meta, owner);
+    return FALSE;
+  }
+  *list = g_list_delete_link (*list, link);
+  return TRUE;
+}
+
+/* The batch an owner meta belongs to, or NULL (with a warning) for a released or foreign one. */
+static RdsBatchMeta *
+owner_batch (gconstpointer owner)
+{
+  RdsBatchMeta *b = ((const RdsBaseMeta *) owner)->batch_meta;
+
+  if (b == NULL)
+    GST_WARNING ("meta %p has no batch (released?); ignored", owner);
+  return b;
+}
+
+static gpointer
+acquire_from (RdsBatchMeta * b, RdsMetaPool * pool)
+{
+  gpointer meta;
+
+  g_rec_mutex_lock (&b->meta_mutex);
+  meta = pool_acquire (pool, b);
+  g_rec_mutex_unlock (&b->meta_mutex);
+  return meta;
+}
+
 RdsBatchMeta *
 rds_create_batch_meta (guint max_batch_size)
 {
@@ -269,13 +326,16 @@ rds_destroy_batch_meta (RdsBatchMeta * batch_meta)
     return;
 
   g_rec_mutex_lock (&batch_meta->meta_mutex);
-  frames = batch_meta->frame_meta_list;
-  batch_meta->frame_meta_list = NULL;
-  batch_meta->num_frames_in_batch = 0;
-  for (GList * l = frames; l != NULL; l = l->next)
-    release_frame (batch_meta, l->data);
-  g_list_free (frames);
-  release_user_list (batch_meta, &batch_meta->batch_user_meta_list);
+  /* Loop: a release_func that adds to the batch's lists (unsupported, but it happens) must not leak. */
+  while (batch_meta->frame_meta_list != NULL || batch_meta->batch_user_meta_list != NULL) {
+    frames = batch_meta->frame_meta_list;
+    batch_meta->frame_meta_list = NULL;
+    batch_meta->num_frames_in_batch = 0;
+    for (GList * l = frames; l != NULL; l = l->next)
+      release_frame (batch_meta, l->data);
+    g_list_free (frames);
+    release_user_list (batch_meta, &batch_meta->batch_user_meta_list);
+  }
   g_rec_mutex_unlock (&batch_meta->meta_mutex);
 
   pool_free (batch_meta->frame_meta_pool);
@@ -446,4 +506,226 @@ rds_remove_obj_meta_from_frame (RdsFrameMeta * frame_meta, RdsObjectMeta * obj_m
   clear_parents (b, frame_meta, obj_meta, NULL);
   release_obj (b, obj_meta);
   g_rec_mutex_unlock (&b->meta_mutex);
+}
+
+RdsClassifierMeta *
+rds_acquire_classifier_meta_from_pool (RdsBatchMeta * batch_meta)
+{
+  g_return_val_if_fail (batch_meta != NULL, NULL);
+  return acquire_from (batch_meta, batch_meta->classifier_meta_pool);
+}
+
+void
+rds_add_classifier_meta_to_object (RdsObjectMeta * obj_meta, RdsClassifierMeta * classifier_meta)
+{
+  RdsBatchMeta *b;
+
+  g_return_if_fail (obj_meta != NULL);
+  g_return_if_fail (classifier_meta != NULL);
+  if ((b = owner_batch (obj_meta)) == NULL)
+    return;
+  g_rec_mutex_lock (&b->meta_mutex);
+  attach_meta (b, &obj_meta->classifier_meta_list, classifier_meta, "classifier", obj_meta);
+  g_rec_mutex_unlock (&b->meta_mutex);
+}
+
+void
+rds_remove_classifier_meta_from_obj (RdsObjectMeta * obj_meta, RdsClassifierMeta * classifier_meta)
+{
+  RdsBatchMeta *b;
+
+  g_return_if_fail (obj_meta != NULL);
+  g_return_if_fail (classifier_meta != NULL);
+  if ((b = owner_batch (obj_meta)) == NULL)
+    return;
+  g_rec_mutex_lock (&b->meta_mutex);
+  if (detach_meta (&obj_meta->classifier_meta_list, classifier_meta, "classifier", obj_meta))
+    release_classifier (b, classifier_meta);
+  g_rec_mutex_unlock (&b->meta_mutex);
+}
+
+RdsLabelInfo *
+rds_acquire_label_info_meta_from_pool (RdsBatchMeta * batch_meta)
+{
+  g_return_val_if_fail (batch_meta != NULL, NULL);
+  return acquire_from (batch_meta, batch_meta->label_info_meta_pool);
+}
+
+void
+rds_add_label_info_meta_to_classifier (RdsClassifierMeta * classifier_meta, RdsLabelInfo * label_info_meta)
+{
+  RdsBatchMeta *b;
+
+  g_return_if_fail (classifier_meta != NULL);
+  g_return_if_fail (label_info_meta != NULL);
+  if ((b = owner_batch (classifier_meta)) == NULL)
+    return;
+  g_rec_mutex_lock (&b->meta_mutex);
+  if (attach_meta (b, &classifier_meta->label_info_list, label_info_meta, "label info", classifier_meta))
+    classifier_meta->num_labels++;
+  g_rec_mutex_unlock (&b->meta_mutex);
+}
+
+void
+rds_remove_label_info_meta_from_classifier (RdsClassifierMeta * classifier_meta, RdsLabelInfo * label_info_meta)
+{
+  RdsBatchMeta *b;
+
+  g_return_if_fail (classifier_meta != NULL);
+  g_return_if_fail (label_info_meta != NULL);
+  if ((b = owner_batch (classifier_meta)) == NULL)
+    return;
+  g_rec_mutex_lock (&b->meta_mutex);
+  if (detach_meta (&classifier_meta->label_info_list, label_info_meta, "label info", classifier_meta)) {
+    classifier_meta->num_labels--;
+    release_label (b, label_info_meta);
+  }
+  g_rec_mutex_unlock (&b->meta_mutex);
+}
+
+RdsDisplayMeta *
+rds_acquire_display_meta_from_pool (RdsBatchMeta * batch_meta)
+{
+  g_return_val_if_fail (batch_meta != NULL, NULL);
+  return acquire_from (batch_meta, batch_meta->display_meta_pool);
+}
+
+void
+rds_add_display_meta_to_frame (RdsFrameMeta * frame_meta, RdsDisplayMeta * display_meta)
+{
+  RdsBatchMeta *b;
+
+  g_return_if_fail (frame_meta != NULL);
+  g_return_if_fail (display_meta != NULL);
+  if ((b = owner_batch (frame_meta)) == NULL)
+    return;
+  g_rec_mutex_lock (&b->meta_mutex);
+  attach_meta (b, &frame_meta->display_meta_list, display_meta, "display", frame_meta);
+  g_rec_mutex_unlock (&b->meta_mutex);
+}
+
+void
+rds_remove_display_meta_from_frame (RdsFrameMeta * frame_meta, RdsDisplayMeta * display_meta)
+{
+  RdsBatchMeta *b;
+
+  g_return_if_fail (frame_meta != NULL);
+  g_return_if_fail (display_meta != NULL);
+  if ((b = owner_batch (frame_meta)) == NULL)
+    return;
+  g_rec_mutex_lock (&b->meta_mutex);
+  if (detach_meta (&frame_meta->display_meta_list, display_meta, "display", frame_meta))
+    release_display (b, display_meta);
+  g_rec_mutex_unlock (&b->meta_mutex);
+}
+
+RdsUserMeta *
+rds_acquire_user_meta_from_pool (RdsBatchMeta * batch_meta)
+{
+  g_return_val_if_fail (batch_meta != NULL, NULL);
+  return acquire_from (batch_meta, batch_meta->user_meta_pool);
+}
+
+/* owner is the batch, frame or object whose user list is *list. */
+static void
+add_user_meta (gconstpointer owner, GList ** list, RdsUserMeta * user_meta)
+{
+  RdsBatchMeta *b = owner_batch (owner);
+
+  if (b == NULL)
+    return;
+  g_rec_mutex_lock (&b->meta_mutex);
+  attach_meta (b, list, user_meta, "user", owner);
+  g_rec_mutex_unlock (&b->meta_mutex);
+}
+
+static void
+remove_user_meta (gconstpointer owner, GList ** list, RdsUserMeta * user_meta)
+{
+  RdsBatchMeta *b = owner_batch (owner);
+
+  if (b == NULL)
+    return;
+  g_rec_mutex_lock (&b->meta_mutex);
+  if (detach_meta (list, user_meta, "user", owner))
+    release_user (b, user_meta);
+  g_rec_mutex_unlock (&b->meta_mutex);
+}
+
+void
+rds_add_user_meta_to_batch (RdsBatchMeta * batch_meta, RdsUserMeta * user_meta)
+{
+  g_return_if_fail (batch_meta != NULL);
+  g_return_if_fail (user_meta != NULL);
+  add_user_meta (batch_meta, &batch_meta->batch_user_meta_list, user_meta);
+}
+
+void
+rds_add_user_meta_to_frame (RdsFrameMeta * frame_meta, RdsUserMeta * user_meta)
+{
+  g_return_if_fail (frame_meta != NULL);
+  g_return_if_fail (user_meta != NULL);
+  add_user_meta (frame_meta, &frame_meta->frame_user_meta_list, user_meta);
+}
+
+void
+rds_add_user_meta_to_obj (RdsObjectMeta * obj_meta, RdsUserMeta * user_meta)
+{
+  g_return_if_fail (obj_meta != NULL);
+  g_return_if_fail (user_meta != NULL);
+  add_user_meta (obj_meta, &obj_meta->obj_user_meta_list, user_meta);
+}
+
+void
+rds_remove_user_meta_from_batch (RdsBatchMeta * batch_meta, RdsUserMeta * user_meta)
+{
+  g_return_if_fail (batch_meta != NULL);
+  g_return_if_fail (user_meta != NULL);
+  remove_user_meta (batch_meta, &batch_meta->batch_user_meta_list, user_meta);
+}
+
+void
+rds_remove_user_meta_from_frame (RdsFrameMeta * frame_meta, RdsUserMeta * user_meta)
+{
+  g_return_if_fail (frame_meta != NULL);
+  g_return_if_fail (user_meta != NULL);
+  remove_user_meta (frame_meta, &frame_meta->frame_user_meta_list, user_meta);
+}
+
+void
+rds_remove_user_meta_from_object (RdsObjectMeta * obj_meta, RdsUserMeta * user_meta)
+{
+  g_return_if_fail (obj_meta != NULL);
+  g_return_if_fail (user_meta != NULL);
+  remove_user_meta (obj_meta, &obj_meta->obj_user_meta_list, user_meta);
+}
+
+/* Process-lifetime table: interned descriptor -> type. Never freed (LSan sees it as reachable). */
+G_LOCK_DEFINE_STATIC (user_meta_types);
+static GHashTable *user_meta_types;
+static gint next_user_meta_type = RDS_START_USER_META;
+
+RdsMetaType
+rds_get_user_meta_type (const gchar * meta_descriptor)
+{
+  const gchar *key;
+  gpointer value;
+  RdsMetaType type;
+
+  g_return_val_if_fail (meta_descriptor != NULL, RDS_INVALID_META);
+
+  key = g_intern_string (meta_descriptor);
+  G_LOCK (user_meta_types);
+  if (user_meta_types == NULL)
+    user_meta_types = g_hash_table_new (g_direct_hash, g_direct_equal);
+  if (g_hash_table_lookup_extended (user_meta_types, key, NULL, &value)) {
+    type = (RdsMetaType) GPOINTER_TO_INT (value);
+  } else {
+    type = (RdsMetaType) next_user_meta_type++;
+    g_hash_table_insert (user_meta_types, (gpointer) key, GINT_TO_POINTER (type));
+    ensure_debug_category ();
+    GST_DEBUG ("user meta type %d for \"%s\"", type, key);
+  }
+  G_UNLOCK (user_meta_types);
+  return type;
 }

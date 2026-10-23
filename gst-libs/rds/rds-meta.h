@@ -216,6 +216,39 @@ RDS_API void rds_add_obj_meta_to_frame (RdsFrameMeta * frame_meta, RdsObjectMeta
  * whose parent it was get parent = NULL: in this frame and in every frame of the batch. */
 RDS_API void rds_remove_obj_meta_from_frame (RdsFrameMeta * frame_meta, RdsObjectMeta * obj_meta);
 
+/* Classifier, label, display and user meta follow the same rules as objects: the meta must come from the owner's
+ * batch and be in no other list, and removing releases it with everything hanging off it. */
+RDS_API RdsClassifierMeta *rds_acquire_classifier_meta_from_pool (RdsBatchMeta * batch_meta);
+RDS_API void rds_add_classifier_meta_to_object (RdsObjectMeta * obj_meta, RdsClassifierMeta * classifier_meta);
+RDS_API void rds_remove_classifier_meta_from_obj (RdsObjectMeta * obj_meta,
+    RdsClassifierMeta * classifier_meta);
+
+/* Adding and removing labels updates classifier_meta->num_labels. */
+RDS_API RdsLabelInfo *rds_acquire_label_info_meta_from_pool (RdsBatchMeta * batch_meta);
+RDS_API void rds_add_label_info_meta_to_classifier (RdsClassifierMeta * classifier_meta,
+    RdsLabelInfo * label_info_meta);
+RDS_API void rds_remove_label_info_meta_from_classifier (RdsClassifierMeta * classifier_meta,
+    RdsLabelInfo * label_info_meta);
+
+/* Releasing a display meta frees every non-NULL text_params[i].display_text, whatever num_labels says. */
+RDS_API RdsDisplayMeta *rds_acquire_display_meta_from_pool (RdsBatchMeta * batch_meta);
+RDS_API void rds_add_display_meta_to_frame (RdsFrameMeta * frame_meta, RdsDisplayMeta * display_meta);
+RDS_API void rds_remove_display_meta_from_frame (RdsFrameMeta * frame_meta, RdsDisplayMeta * display_meta);
+
+/* The caller sets base_meta.meta_type (usually from rds_get_user_meta_type), user_meta_data, and
+ * base_meta.release_func (and copy_func, see rds_batch_meta_copy) before adding. */
+RDS_API RdsUserMeta *rds_acquire_user_meta_from_pool (RdsBatchMeta * batch_meta);
+RDS_API void rds_add_user_meta_to_batch (RdsBatchMeta * batch_meta, RdsUserMeta * user_meta);
+RDS_API void rds_add_user_meta_to_frame (RdsFrameMeta * frame_meta, RdsUserMeta * user_meta);
+RDS_API void rds_add_user_meta_to_obj (RdsObjectMeta * obj_meta, RdsUserMeta * user_meta);
+RDS_API void rds_remove_user_meta_from_batch (RdsBatchMeta * batch_meta, RdsUserMeta * user_meta);
+RDS_API void rds_remove_user_meta_from_frame (RdsFrameMeta * frame_meta, RdsUserMeta * user_meta);
+RDS_API void rds_remove_user_meta_from_object (RdsObjectMeta * obj_meta, RdsUserMeta * user_meta);
+
+/* Process-wide: the same descriptor (e.g. "EXAMPLE.MYAPP.USER_META") always yields the same type,
+ * >= RDS_START_USER_META. Thread-safe. */
+RDS_API RdsMetaType rds_get_user_meta_type (const gchar * meta_descriptor);
+
 G_END_DECLS
 
 #endif /* RDS_META_H */
