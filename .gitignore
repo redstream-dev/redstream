@@ -6,3 +6,4 @@ build/
 *.mkv
 *.mp4
 .claude/settings.local.json
+*.h264
