@@ -2,7 +2,7 @@
 
 **GStreamer video and audio analytics on AMD GPUs: an open-source, ROCm-based functional equivalent of NVIDIA DeepStream.**
 
-> Status: **pre-alpha / design phase.** APIs and element names will change.
+> Status: **pre-alpha.** Feasibility spikes are done and the project skeleton builds; no elements yet. APIs and element names will change.
 
 ## Why
 
@@ -33,8 +33,8 @@ Jetson-specific hardware blocks.
 
 | DeepStream | Redstream |
 |---|---|
-| `nvv4l2decoder`, `nvurisrcbin` | upstream `vah264dec` / `vah265dec`, `rdsurisrcbin` |
-| `nvvideoconvert` | upstream `hipconvertscale` |
+| `nvv4l2decoder`, `nvurisrcbin` | `rdsvideodec` (rocDecode), `rdsurisrcbin` |
+| `nvvideoconvert` | `rdsvideoconvert` |
 | `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` |
 | `nvinfer` | `rdsinfer` (MIGraphX) |
 | `nvtracker` | `rdstracker` |
@@ -81,6 +81,13 @@ gst-inspect-1.0 hip
 gst-launch-1.0 filesrc location=sample.mkv ! matroskademux ! h264parse ! vah264dec \
   ! hipupload ! hipconvertscale ! "video/x-raw(memory:HIPMemory),format=RGBA,width=640,height=640" \
   ! fakesink sync=false
+```
+
+Build and run the tests (inside the container):
+
+```bash
+meson setup build && meson test -C build --print-errorlogs
+build/samples/rds-test3/rds-test3 --dry-run file:///a.mp4   # shows the DeepStream → Redstream element mapping
 ```
 
 The image targets RDNA2 APUs by default (`HSA_OVERRIDE_GFX_VERSION=10.3.0`, `--build-arg GFX=gfx1030`).

@@ -10,7 +10,7 @@ DeepStream on AMD GPUs (ROCm)**. Porting an existing DeepStream application shou
 mechanical changes: element factory names behind an `#ifdef`, the same config files, and the same
 metadata-traversal code via a compatibility header.
 
-Status: **pre-alpha, design phase.** Nothing here is stable.
+Status: **pre-alpha.** Phase 0 spikes are done; the walking skeleton (build, compat remap, sample) is in place. Nothing here is stable.
 
 ## Architecture principles
 
@@ -31,8 +31,10 @@ Status: **pre-alpha, design phase.** Nothing here is stable.
 
 | DeepStream | Redstream | Notes |
 |---|---|---|
-| `nvurisrcbin` / `nvv4l2decoder` | `rdsurisrcbin` / upstream `vah264dec`, `vah265dec` | RTSP reconnect lives in the bin |
-| `nvvideoconvert` | upstream `hipconvertscale` | |
+| `nvurisrcbin` | `rdsurisrcbin` | RTSP reconnect lives in the bin |
+| `nvv4l2decoder` | `rdsvideodec` | rocDecode-backed: stock VA output is tiled on AMD, so it is not used for analytics |
+| `nvvideoconvert` | `rdsvideoconvert` | convert, scale and crop on `memory:RDS`; copies stock VA input via a linear path |
+| `nvmultistreamtiler` | `rdsmultistreamtiler` | |
 | `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` | reads new-mux config file |
 | `nvinfer` | `rdsinfer` | primary + secondary, custom parser ABI, tensor meta |
 | `nvtracker` | `rdstracker` | IOU/SORT-class first |
@@ -85,7 +87,14 @@ Known gotchas:
 - `analyticscombiner` / `analyticssplitter` are in gst-plugins-rs and are not built in the image yet.
 - On machines with an NVIDIA GPU as well, VA-API may log `pci id for fd N: 10de:...`. This is harmless; the
   AMD render node is still picked.
-- MIGraphX compilation is slow on small GPUs (minutes). Always cache compiled programs.
+- MIGraphX compilation is slow on small GPUs (minutes; FP16 even slower). Always cache compiled programs (`.mxr`).
+- Build HIP code with the GPU attached, or pass `--offload-arch` explicitly. Otherwise hipcc targets the wrong arch
+  and kernels fail with "device kernel image is invalid".
+- rocDecode must be fed whole NAL units or access units (`h264parse ! ...,alignment=au`). Split NAL units decode
+  incorrectly.
+- Stock `vah26xdec` exports tiled NV12 DMABufs (AMD modifier `0x0200000000401b03`). Never read them as linear.
+- Run docker with `--user $(id -u):$(id -g)` so build outputs aren't root-owned. From zsh, wrap `$RUN`-style
+  variables in `bash -c` (zsh doesn't word-split them).
 
 Useful checks:
 
@@ -96,18 +105,34 @@ gst-inspect-1.0 hip
 migraphx-driver perf model.onnx --input-dim @images 1 3 640 640 --fp16
 ```
 
-## Repository layout (planned)
+## Repository layout
 
 ```
-docker/            dev and CI images
-gst-libs/rds/    core library: batched surfaces, metadata, config parsers, compat headers
-gst/               plugins: rdsstreammux, rdsinfer, rdstracker, rdsosd, …
-compat/            nvds_compat.h and the custom-parser ABI header
-samples/           ported sample apps (M1: test3-equivalent)
-tests/             unit tests + pipeline tests against public media
-docs/              user docs: porting.md, compat-matrix.md, benchmarks.md
+docker/            dev image (Dockerfile.dev)
+gst-libs/rds/      libgstrds-1.0: compat layer today; surfaces, metadata and config parsers next
+samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
+tests/check/       GLib unit tests       tests/samples/  sample-level tests
+tests/media/       make-test-media.sh: generated H.264 clips (into git-ignored .cache/)
+spikes/            Phase 0 experiments (rocdec-hip, migraphx-devptr); reference code, not built by meson
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
 ```
+
+Planned next: `gst/` (plugins), `docs/` (porting.md, compat-matrix.md, benchmarks.md).
+
+## Build and test
+
+Inside the dev container:
+
+```bash
+meson setup build          # once; then `meson setup build --reconfigure` after meson.build changes
+meson test -C build --print-errorlogs
+tests/media/make-test-media.sh   # generates .cache/media/*.h264 for pipeline tests and spikes
+```
+
+- Warnings are errors (`warning_level=2`, `werror`).
+- Library symbols are hidden by default. Mark public API with `RDS_API` (from `rds/rds-prelude.h`).
+- Put new tests next to the existing ones and register them in `tests/meson.build`.
+- Use TDD: write the failing test first.
 
 ## Agent skills
 

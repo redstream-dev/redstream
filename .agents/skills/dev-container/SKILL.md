@@ -20,6 +20,15 @@ $RUN bash -c 'rocminfo | grep -E "^\s+Name:\s+gfx"'          # non-interactive o
 ```
 
 Use `-it` only for interactive shells; agents should use one-off `bash -c` commands.
+Add `--user $(id -u):$(id -g) -e HOME=/tmp` so outputs aren't root-owned. From zsh, run the whole thing via
+`bash -c '...'`, because zsh doesn't word-split `$RUN`.
+
+## Build and test
+
+```bash
+$RUN bash -c 'meson setup build --reconfigure 2>/dev/null || meson setup build; meson test -C build --print-errorlogs'
+$RUN tests/media/make-test-media.sh          # .cache/media/{ball-720p,smpte-1366x768,ball-1080p}.h264
+```
 
 ## Smoke tests
 
@@ -41,4 +50,6 @@ $RUN migraphx-driver perf model.onnx --input-dim @images 1 3 640 640 --fp16 --it
 | MIGraphX parse error showing `{1, 3, 1, 1}` input | model has dynamic dims → `--input-dim @<input> N C H W` |
 | MIGraphX "hangs" for minutes | it is compiling/tuning; normal on small GPUs. Run long jobs in the background and cache `.mxr` |
 | `pci id for fd N: 10de:...` spam | harmless, VA probing the NVIDIA card on mixed-GPU hosts |
+| `device kernel image is invalid` | HIP binary was built without the GPU attached → build inside a GPU container or pass `--offload-arch=gfx1030` |
+| rocDecode wrong frames / `ROCDEC_RUNTIME_ERROR` mid-stream | feed whole NAL units or access units, not byte chunks |
 | VA plugin has no `vah264dec` on the host (Fedora) | host Mesa lacks patented codecs → `mesa-va-drivers-freeworld`; the container is fine |
