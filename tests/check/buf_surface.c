@@ -98,6 +98,7 @@ test_rejects (void)
     .layout = RDS_BUF_LAYOUT_PITCH, .memType = RDS_BUF_MEM_SYSTEM,
   };
   RdsBufSurface *s = (RdsBufSurface *) 0x1;
+  RdsBufSurface hand = { .batchSize = 1 };
   RdsBufSurfaceCreateParams bad;
 
 #define EXPECT_REJECT(batch, params) G_STMT_START { \
@@ -129,7 +130,6 @@ test_rejects (void)
 #undef EXPECT_REJECT
 
   /* A hand-built surface was not allocated by us, so destroy refuses it. */
-  RdsBufSurface hand = { .batchSize = 1 };
   g_assert_cmpint (rds_buf_surface_destroy (&hand), ==, -1);
 }
 
@@ -214,6 +214,7 @@ test_system_copy (void)
 {
   RdsBufSurface *src = create_sys (RDS_BUF_COLOR_FORMAT_NV12, 100, 50, 2);
   RdsBufSurface *dst = create_sys (RDS_BUF_COLOR_FORMAT_NV12, 100, 50, 2);
+  RdsBufSurface *other = create_sys (RDS_BUF_COLOR_FORMAT_NV12, 102, 50, 2);
   RdsBufSurfaceParams *d0 = &dst->surfaceList[0];
 
   fill_pattern (src, 0);
@@ -237,7 +238,6 @@ test_system_copy (void)
   g_assert_cmpuint (((guint8 *) dst->surfaceList[1].dataPtr)[0], ==, 0xaa);
 
   /* Mismatched geometry is refused. */
-  RdsBufSurface *other = create_sys (RDS_BUF_COLOR_FORMAT_NV12, 102, 50, 2);
   g_assert_cmpint (rds_buf_surface_copy (src, other), ==, -1);
   g_assert_cmpint (rds_buf_surface_destroy (other), ==, 0);
 
@@ -297,9 +297,11 @@ test_copy_rejects (void)
   g_assert_cmpint (rds_buf_surface_copy (src, small), ==, -1);
   g_assert_cmpuint (small->numFilled, ==, 0);
 
-  /* Copying a surface onto itself is a no-op. */
+  /* Copying a surface onto itself is a no-op, but numFilled is still validated. */
   g_assert_cmpint (rds_buf_surface_copy (src, src), ==, 0);
   g_assert_cmpuint (src->numFilled, ==, 2);
+  src->numFilled = 3;
+  g_assert_cmpint (rds_buf_surface_copy (src, src), ==, -1);
 
   /* A hand-built destination whose plane 1 pitch is smaller than a row of pixels is refused, untouched. */
   src->numFilled = 1;
@@ -312,6 +314,17 @@ test_copy_rejects (void)
   hand_params.planeParams.pitch[1] = 63;
   memset (hand_data, 0, hand_params.dataSize);
   g_assert_cmpint (rds_buf_surface_copy (src, &hand), ==, -1);
+  g_assert_cmpuint (((guint8 *) hand_data)[0], ==, 0);
+
+  /* A hand-built surface with a Jetson-only memory type is refused by copy and memset, without touching HIP. */
+  hand_params.planeParams.pitch[1] = src->surfaceList[0].planeParams.pitch[1];
+  hand.memType = RDS_BUF_MEM_SURFACE_ARRAY;
+  g_assert_cmpint (rds_buf_surface_copy (src, &hand), ==, -1);
+  g_assert_cmpint (rds_buf_surface_copy (&hand, src), ==, -1);
+  g_assert_cmpint (rds_buf_surface_memset (&hand, 0, -1, 1), ==, -1);
+  hand.memType = RDS_BUF_MEM_HANDLE;
+  g_assert_cmpint (rds_buf_surface_copy (src, &hand), ==, -1);
+  g_assert_cmpint (rds_buf_surface_memset (&hand, 0, -1, 1), ==, -1);
   g_assert_cmpuint (((guint8 *) hand_data)[0], ==, 0);
   g_free (hand_data);
 

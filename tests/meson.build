@@ -16,7 +16,7 @@ foreach t : cpu_tests
 endforeach
 
 # Tests that need a ROCm device; each skips itself when none is visible.
-gpu_tests = ['gpu_smoke']
+gpu_tests = ['gpu_smoke', 'buf_surface_hip']
 foreach t : gpu_tests
   test(t, executable(t, 'check' / (t + '.c'), dependencies : test_deps),
     suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120)

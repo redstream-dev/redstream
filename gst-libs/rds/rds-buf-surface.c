@@ -92,6 +92,16 @@ is_supported_mem_type (RdsBufSurfaceMemType t)
   }
 }
 
+/* Hand-built surfaces can carry any memType; refuse the unsupported ones before touching memory or HIP. */
+static gboolean
+check_mem_type (const RdsBufSurface * surf)
+{
+  if (is_supported_mem_type (surf->memType))
+    return TRUE;
+  GST_ERROR ("surface %p has unsupported memory type %d", surf, surf->memType);
+  return FALSE;
+}
+
 /* Makes @gpu the current HIP device and stores the previous one in @prev. Only for HIP memory. */
 static gboolean
 device_enter (guint32 gpu, int *prev)
@@ -393,6 +403,8 @@ rds_buf_surface_map (RdsBufSurface * surf, int index, int plane, RdsBufSurfaceMe
     GST_ERROR ("invalid map flags %d", type);
     return -1;
   }
+  if (!check_mem_type (surf))
+    return -1;
   return for_each_plane (surf, index, plane, map_plane, NULL);
 }
 
@@ -458,6 +470,8 @@ sync_surface (RdsBufSurface * surf, int index, int plane, PlaneFunc fn)
 {
   int prev_dev, ret;
 
+  if (!check_mem_type (surf))
+    return -1;
   if (is_host_accessible (surf->memType))
     return for_each_plane (surf, index, plane, sync_noop, NULL);
 
@@ -508,6 +522,8 @@ rds_buf_surface_memset (RdsBufSurface * surf, int index, int plane, guint8 value
   g_return_val_if_fail (surf != NULL, -1);
   ensure_debug_category ();
 
+  if (!check_mem_type (surf))
+    return -1;
   if (is_cpu_only (surf->memType))
     return for_each_plane (surf, index, plane, memset_plane, GUINT_TO_POINTER (value));
 
@@ -583,13 +599,15 @@ rds_buf_surface_copy (const RdsBufSurface * src, RdsBufSurface * dst)
   g_return_val_if_fail (dst != NULL, -1);
   ensure_debug_category ();
 
-  if (src == dst)
-    return 0;
+  if (!check_mem_type (src) || !check_mem_type (dst))
+    return -1;
   if (src->numFilled > src->batchSize || src->numFilled > dst->batchSize) {
     GST_ERROR ("cannot copy %u filled surfaces (source batch %u, destination batch %u)",
         src->numFilled, src->batchSize, dst->batchSize);
     return -1;
   }
+  if (src == dst)
+    return 0;
   if (src->numFilled > 0 && (src->surfaceList == NULL || dst->surfaceList == NULL)) {
     GST_ERROR ("surface has no surface list");
     return -1;
@@ -600,7 +618,7 @@ rds_buf_surface_copy (const RdsBufSurface * src, RdsBufSurface * dst)
   }
 
   if (is_cpu_only (src->memType) && is_cpu_only (dst->memType)) {
-    copy_planes (src, dst, TRUE);
+    (void) copy_planes (src, dst, TRUE);       /* memcpy cannot fail */
   } else {
     /* Run on the GPU that owns the destination, or the source's when the destination is host memory. */
     gpu = is_cpu_only (dst->memType) ? src->gpuId : dst->gpuId;
