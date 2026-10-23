@@ -103,7 +103,8 @@ test_round_trip (gconstpointer data)
   fill_pattern (src, 0);
   fill_pattern (src, 1);
   src->numFilled = 2;
-  /* Pageable system memory on one side and HIP memory on the other: hipMemcpy2D with hipMemcpyDefault. */
+  /* System to device, default or unified memory goes through hipMemcpy2D (hipMemcpyDefault) with pageable
+   * memory on one side; system to pinned is a plain memcpy. */
   g_assert_cmpint (rds_buf_surface_copy (src, mid), ==, 0);
   g_assert_cmpuint (mid->numFilled, ==, 2);
   g_assert_cmpint (rds_buf_surface_copy (mid, back), ==, 0);
@@ -156,8 +157,10 @@ test_map_sync (gconstpointer data)
   g_assert_cmpint (rds_buf_surface_destroy (s), ==, 0);
 }
 
-/* A copy between HIP surfaces has finished when it returns: read the result straight away, either through a
- * second copy to system memory or directly from host-accessible memory, with no sync in between. */
+/* Contract and regression test, not a discriminating one: a copy between HIP surfaces has finished when it
+ * returns, so the result is read straight away, through a second copy to system memory or directly from
+ * host-accessible memory, with no sync in between. On ROCm, hipMemcpy2D and hipMemset already block the host,
+ * so this passes even without the library's own stream syncs; it guards against a future async path. */
 static void
 test_copy_ready (gconstpointer data)
 {
@@ -243,6 +246,35 @@ test_device_select (gconstpointer data)
   g_assert_cmpint (current_device (), ==, before);
   g_assert_cmpint (rds_buf_surface_destroy (s), ==, 0);
   g_assert_cmpint (current_device (), ==, before);
+
+  if (n < 2) {
+    g_test_message ("single GPU: restoring a different current device is not exercised");
+    return;
+  }
+  /* Operate on a gpuId-0 surface while device 1 is current: every call must leave device 1 current. */
+  {
+    RdsBufSurface *sys = NULL;
+    RdsBufSurfaceCreateParams sp = p;
+
+    p.gpuId = 0;
+    sp.memType = RDS_BUF_MEM_SYSTEM;
+    g_assert_cmpint (hipSetDevice (1), ==, hipSuccess);
+    g_assert_cmpint (rds_buf_surface_create (&s, 1, &p), ==, 0);
+    g_assert_cmpint (rds_buf_surface_create (&sys, 1, &sp), ==, 0);
+    g_assert_cmpint (current_device (), ==, 1);
+    g_assert_cmpint (rds_buf_surface_memset (s, 0, -1, 5), ==, 0);
+    g_assert_cmpint (rds_buf_surface_map (s, 0, -1, RDS_BUF_MAP_READ), ==, 0);
+    g_assert_cmpint (rds_buf_surface_sync_for_cpu (s, 0, -1), ==, 0);
+    g_assert_cmpint (rds_buf_surface_unmap (s, 0, -1), ==, 0);
+    s->numFilled = 1;
+    g_assert_cmpint (rds_buf_surface_copy (s, sys), ==, 0);
+    g_assert_cmpuint (((guint8 *) sys->surfaceList[0].dataPtr)[0], ==, 5);
+    g_assert_cmpint (current_device (), ==, 1);
+    g_assert_cmpint (rds_buf_surface_destroy (s), ==, 0);
+    g_assert_cmpint (rds_buf_surface_destroy (sys), ==, 0);
+    g_assert_cmpint (current_device (), ==, 1);
+    g_assert_cmpint (hipSetDevice (before), ==, hipSuccess);
+  }
 }
 
 static void
@@ -263,13 +295,42 @@ test_sync_unmapped (void)
   g_assert_cmpint (rds_buf_surface_destroy (s), ==, 0);
 }
 
+/* Resident set size of this process in KiB. Pinned hipHostMalloc memory is counted here, not in VmPin or VmLck
+ * (checked with ROCm 10.1: a 64 MiB hipHostMalloc raises VmRSS by 64 MiB and leaves VmPin/VmLck at 0). */
+static gsize
+vm_rss_kib (void)
+{
+  gchar *status = NULL;
+  const gchar *line;
+  gsize kib = 0;
+
+  g_assert_true (g_file_get_contents ("/proc/self/status", &status, NULL, NULL));
+  line = strstr (status, "\nVmRSS:");
+  g_assert_nonnull (line);
+  kib = g_ascii_strtoull (line + strlen ("\nVmRSS:"), NULL, 10);
+  g_free (status);
+  g_assert_cmpuint (kib, >, 0);
+  return kib;
+}
+
 static void
 test_no_leak (void)
 {
   size_t free_before = 0, free_after = 0, total = 0;
+  gsize rss_before, rss_after;
 
   RDS_TEST_REQUIRE_GPU ();
+  /* One warm-up cycle so lazy HIP runtime allocations don't count. */
+  {
+    RdsBufSurface *s = create (RDS_BUF_MEM_DEFAULT, 1920, 1080, 4);
+
+    g_assert_cmpint (rds_buf_surface_map (s, -1, -1, RDS_BUF_MAP_READ), ==, 0);
+    g_assert_cmpint (rds_buf_surface_destroy (s), ==, 0);
+  }
+  /* Assumes no other KFD user allocates during the test (the gpu suite does not run in parallel). Device memory
+   * shows in hipMemGetInfo; the pinned staging mirrors (12 MiB each, 50 maps below) show only in VmRSS. */
   g_assert_cmpint (hipMemGetInfo (&free_before, &total), ==, hipSuccess);
+  rss_before = vm_rss_kib ();
   for (guint i = 0; i < 500; i++) {
     RdsBufSurface *s = create (RDS_BUF_MEM_DEFAULT, 1920, 1080, 4);
 
@@ -278,7 +339,9 @@ test_no_leak (void)
     g_assert_cmpint (rds_buf_surface_destroy (s), ==, 0);
   }
   g_assert_cmpint (hipMemGetInfo (&free_after, &total), ==, hipSuccess);
+  rss_after = vm_rss_kib ();
   g_assert_cmpuint (free_after + 4 * 1024 * 1024, >=, free_before);
+  g_assert_cmpuint (rss_after, <=, rss_before + 64 * 1024);
 }
 
 static const struct
