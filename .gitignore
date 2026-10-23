@@ -9,3 +9,4 @@ build/
 *.h264
 spikes/rocdec-hip/ref_crc
 spikes/rocdec-hip/rocdec_spike
+spikes/migraphx-devptr/mgx_spike
