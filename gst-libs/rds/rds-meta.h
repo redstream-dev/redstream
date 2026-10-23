@@ -4,8 +4,19 @@
  *
  * Ownership: text_params.display_text, mask_params.data and pResult_label are g_malloc'd and freed on release;
  * font_params.font_name and classifier_type are not owned. A user meta's release_func frees user_meta_data.
+ * A user meta's release_func may run while the batch's lists are being torn down: it must not add or remove metas
+ * (the list being released is detached first, so this is safe today, but it is not part of the contract).
  * Every add/remove takes the batch's recursive meta_mutex; hold rds_acquire_meta_lock() around traversals that
  * race with other threads.
+ *
+ * A meta can be in one list at a time: adding it again, or to another frame or batch, is refused with a
+ * GST_WARNING. Removing releases the meta, so when removing during a traversal save l->next first:
+ *
+ *   for (l = frame->obj_meta_list; l != NULL; l = next) {
+ *     next = l->next;
+ *     if (drop (l->data))
+ *       rds_remove_obj_meta_from_frame (frame, l->data);
+ *   }
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_META_H
 #define RDS_META_H
@@ -189,13 +200,16 @@ RDS_API void rds_acquire_meta_lock (RdsBatchMeta * batch_meta);
 RDS_API void rds_release_meta_lock (RdsBatchMeta * batch_meta);
 
 RDS_API RdsFrameMeta *rds_acquire_frame_meta_from_pool (RdsBatchMeta * batch_meta);
+/* Adding more than max_frames_in_batch frames is allowed (logged at debug level). */
 RDS_API void rds_add_frame_meta_to_batch (RdsBatchMeta * batch_meta, RdsFrameMeta * frame_meta);
 /* Releases the frame with its objects, display and user meta. Objects in other frames whose parent was one of
  * them get parent = NULL. */
 RDS_API void rds_remove_frame_meta_from_batch (RdsBatchMeta * batch_meta, RdsFrameMeta * frame_meta);
 
 RDS_API RdsObjectMeta *rds_acquire_obj_meta_from_pool (RdsBatchMeta * batch_meta);
-/* parent may be NULL. */
+/* parent may be NULL. A parent that is obj_meta itself or from another batch is dropped (parent = NULL) with a
+ * GST_WARNING. Set the parent here: assigning obj_meta->parent directly after the add is unsupported, because
+ * removals would not know to clear it and it could dangle. */
 RDS_API void rds_add_obj_meta_to_frame (RdsFrameMeta * frame_meta, RdsObjectMeta * obj_meta,
     RdsObjectMeta * obj_parent);
 /* Releases the object and everything hanging off it (classifiers, user meta, owned strings and mask). Objects

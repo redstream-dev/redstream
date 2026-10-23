@@ -20,14 +20,41 @@ ensure_debug_category (void)
   }
 }
 
-/* Every element starts with an RdsBaseMeta. The pool owns all elements it ever allocated (all), so metas acquired
- * but never added are still freed with the batch; free holds the released ones, zeroed and ready for reuse.
- * Pools are only touched under the batch's meta_mutex. */
+/* Hidden per-element header, allocated just before every pooled meta. 16 bytes keep the meta itself aligned as
+ * g_malloc would. */
+typedef union
+{
+  struct
+  {
+    gboolean attached;          /* in a list: refuses double adds and adds to a second list */
+    gboolean parented;          /* an object added with a parent: counted in n_parented */
+  } f;
+  guint8 pad[16];
+} RdsMetaElemHeader;
+
+G_STATIC_ASSERT (sizeof (RdsMetaElemHeader) % 16 == 0);
+
+#define ELEM_HEADER(elem) (((RdsMetaElemHeader *) (elem)) - 1)
+
+/* Private batch: the public struct comes first, so RdsBatchMeta * casts to it. */
+typedef struct
+{
+  RdsBatchMeta pub;
+  /* Attached objects added with a non-NULL parent that is still set. While it is 0, removals skip the
+   * batch-wide parent scan. */
+  guint n_parented;
+} RdsBatchMetaPriv;
+
+#define BATCH_PRIV(b) ((RdsBatchMetaPriv *) (b))
+
+/* Every element starts with an RdsBaseMeta, after its hidden header. The pool owns all elements it ever allocated
+ * (all), so metas acquired but never added are still freed with the batch; free holds the released ones, zeroed
+ * and ready for reuse. Both arrays hold header pointers. Pools are only touched under the batch's meta_mutex. */
 struct _RdsMetaPool
 {
   RdsMetaType meta_type;
   gsize element_size;
-  GPtrArray *all;               /* owns the elements */
+  GPtrArray *all;               /* owns the allocations */
   GPtrArray *free;              /* subset of all */
 };
 
@@ -41,10 +68,10 @@ pool_new (RdsMetaType meta_type, gsize element_size, guint prealloc)
   pool->all = g_ptr_array_new_full (prealloc, g_free);
   pool->free = g_ptr_array_sized_new (prealloc);
   for (guint i = 0; i < prealloc; i++) {
-    gpointer elem = g_malloc0 (element_size);
+    gpointer hdr = g_malloc0 (sizeof (RdsMetaElemHeader) + element_size);
 
-    g_ptr_array_add (pool->all, elem);
-    g_ptr_array_add (pool->free, elem);
+    g_ptr_array_add (pool->all, hdr);
+    g_ptr_array_add (pool->free, hdr);
   }
   return pool;
 }
@@ -52,14 +79,16 @@ pool_new (RdsMetaType meta_type, gsize element_size, guint prealloc)
 static gpointer
 pool_acquire (RdsMetaPool * pool, RdsBatchMeta * batch_meta)
 {
+  RdsMetaElemHeader *hdr;
   RdsBaseMeta *base;
 
   if (pool->free->len > 0) {
-    base = g_ptr_array_steal_index_fast (pool->free, pool->free->len - 1);
+    hdr = g_ptr_array_steal_index_fast (pool->free, pool->free->len - 1);
   } else {
-    base = g_malloc0 (pool->element_size);
-    g_ptr_array_add (pool->all, base);
+    hdr = g_malloc0 (sizeof (RdsMetaElemHeader) + pool->element_size);
+    g_ptr_array_add (pool->all, hdr);
   }
+  base = (RdsBaseMeta *) (hdr + 1);
   base->batch_meta = batch_meta;
   base->meta_type = pool->meta_type;
   return base;
@@ -69,8 +98,10 @@ pool_acquire (RdsMetaPool * pool, RdsBatchMeta * batch_meta)
 static void
 pool_release (RdsMetaPool * pool, gpointer elem)
 {
-  memset (elem, 0, pool->element_size);
-  g_ptr_array_add (pool->free, elem);
+  RdsMetaElemHeader *hdr = ELEM_HEADER (elem);
+
+  memset (hdr, 0, sizeof (RdsMetaElemHeader) + pool->element_size);
+  g_ptr_array_add (pool->free, hdr);
 }
 
 static void
@@ -82,7 +113,8 @@ pool_free (RdsMetaPool * pool)
 }
 
 /* Release helpers: free owned members and children, then return the element to its pool. Callers unlink first
- * and hold the lock. */
+ * and hold the lock. Each list is detached from its owner before it is walked, so a release_func that calls back
+ * into the API cannot change the list being iterated. */
 
 static void
 release_label (RdsBatchMeta * b, RdsLabelInfo * label)
@@ -94,9 +126,12 @@ release_label (RdsBatchMeta * b, RdsLabelInfo * label)
 static void
 release_classifier (RdsBatchMeta * b, RdsClassifierMeta * classifier)
 {
-  for (GList * l = classifier->label_info_list; l != NULL; l = l->next)
+  GList *labels = classifier->label_info_list;
+
+  classifier->label_info_list = NULL;
+  for (GList * l = labels; l != NULL; l = l->next)
     release_label (b, l->data);
-  g_list_free (classifier->label_info_list);
+  g_list_free (labels);
   pool_release (b->classifier_meta_pool, classifier);
 }
 
@@ -108,9 +143,13 @@ release_user (RdsBatchMeta * b, RdsUserMeta * user)
   pool_release (b->user_meta_pool, user);
 }
 
+/* Takes the list from *list_field (detaching it) and releases its user metas. */
 static void
-release_user_list (RdsBatchMeta * b, GList * list)
+release_user_list (RdsBatchMeta * b, GList ** list_field)
 {
+  GList *list = *list_field;
+
+  *list_field = NULL;
   for (GList * l = list; l != NULL; l = l->next)
     release_user (b, l->data);
   g_list_free (list);
@@ -128,10 +167,15 @@ release_display (RdsBatchMeta * b, RdsDisplayMeta * display)
 static void
 release_obj (RdsBatchMeta * b, RdsObjectMeta * obj)
 {
-  for (GList * l = obj->classifier_meta_list; l != NULL; l = l->next)
+  GList *classifiers = obj->classifier_meta_list;
+
+  if (ELEM_HEADER (obj)->f.parented)
+    BATCH_PRIV (b)->n_parented--;
+  obj->classifier_meta_list = NULL;
+  for (GList * l = classifiers; l != NULL; l = l->next)
     release_classifier (b, l->data);
-  g_list_free (obj->classifier_meta_list);
-  release_user_list (b, obj->obj_user_meta_list);
+  g_list_free (classifiers);
+  release_user_list (b, &obj->obj_user_meta_list);
   g_free (obj->text_params.display_text);
   g_free (obj->mask_params.data);
   pool_release (b->obj_meta_pool, obj);
@@ -140,27 +184,36 @@ release_obj (RdsBatchMeta * b, RdsObjectMeta * obj)
 static void
 release_frame (RdsBatchMeta * b, RdsFrameMeta * frame)
 {
-  for (GList * l = frame->obj_meta_list; l != NULL; l = l->next)
+  GList *objs = frame->obj_meta_list, *displays = frame->display_meta_list;
+
+  frame->obj_meta_list = NULL;
+  frame->display_meta_list = NULL;
+  for (GList * l = objs; l != NULL; l = l->next)
     release_obj (b, l->data);
-  g_list_free (frame->obj_meta_list);
-  for (GList * l = frame->display_meta_list; l != NULL; l = l->next)
+  g_list_free (objs);
+  for (GList * l = displays; l != NULL; l = l->next)
     release_display (b, l->data);
-  g_list_free (frame->display_meta_list);
-  release_user_list (b, frame->frame_user_meta_list);
+  g_list_free (displays);
+  release_user_list (b, &frame->frame_user_meta_list);
   pool_release (b->frame_meta_pool, frame);
 }
 
 /* Sets parent = NULL on every object in frame whose parent is gone (in the set, or equal to gone). */
 static void
-clear_parents_in_frame (RdsFrameMeta * frame, RdsObjectMeta * gone, GHashTable * gone_set)
+clear_parents_in_frame (RdsBatchMeta * b, RdsFrameMeta * frame, RdsObjectMeta * gone, GHashTable * gone_set)
 {
   for (GList * l = frame->obj_meta_list; l != NULL; l = l->next) {
     RdsObjectMeta *o = l->data;
 
     if (o->parent == NULL)
       continue;
-    if (o->parent == gone || (gone_set != NULL && g_hash_table_contains (gone_set, o->parent)))
+    if (o->parent == gone || (gone_set != NULL && g_hash_table_contains (gone_set, o->parent))) {
       o->parent = NULL;
+      if (ELEM_HEADER (o)->f.parented) {
+        ELEM_HEADER (o)->f.parented = FALSE;
+        BATCH_PRIV (b)->n_parented--;
+      }
+    }
   }
 }
 
@@ -169,20 +222,23 @@ clear_parents (RdsBatchMeta * b, RdsFrameMeta * extra, RdsObjectMeta * gone, GHa
 {
   gboolean extra_seen = FALSE;
 
+  /* Parents are only set through rds_add_obj_meta_to_frame (documented), so no counted object means no
+   * object can point at the removed one(s). */
+  if (BATCH_PRIV (b)->n_parented == 0)
+    return;
   for (GList * l = b->frame_meta_list; l != NULL; l = l->next) {
-    clear_parents_in_frame (l->data, gone, gone_set);
+    clear_parents_in_frame (b, l->data, gone, gone_set);
     extra_seen |= (l->data == (gpointer) extra);
   }
   /* The frame may not have been added to the batch (yet). */
   if (extra != NULL && !extra_seen)
-    clear_parents_in_frame (extra, gone, gone_set);
+    clear_parents_in_frame (b, extra, gone, gone_set);
 }
 
 RdsBatchMeta *
 rds_create_batch_meta (guint max_batch_size)
 {
-  RdsBatchMeta *self = g_new0 (RdsBatchMeta, 1);
-  guint n = max_batch_size;
+  RdsBatchMeta *self = &g_new0 (RdsBatchMetaPriv, 1)->pub;
 
   ensure_debug_category ();
   self->base_meta.batch_meta = self;
@@ -190,13 +246,15 @@ rds_create_batch_meta (guint max_batch_size)
   self->max_frames_in_batch = max_batch_size;
   g_rec_mutex_init (&self->meta_mutex);
 
-  /* Initial sizes only: pools grow on demand (D8). */
-  self->frame_meta_pool = pool_new (RDS_FRAME_META, sizeof (RdsFrameMeta), n);
-  self->obj_meta_pool = pool_new (RDS_OBJ_META, sizeof (RdsObjectMeta), n * 32);
-  self->classifier_meta_pool = pool_new (RDS_CLASSIFIER_META, sizeof (RdsClassifierMeta), n * 32);
-  self->label_info_meta_pool = pool_new (RDS_LABEL_INFO_META, sizeof (RdsLabelInfo), n * 32);
-  self->display_meta_pool = pool_new (RDS_DISPLAY_META, sizeof (RdsDisplayMeta), n * 4);
-  self->user_meta_pool = pool_new (RDS_USER_META, sizeof (RdsUserMeta), n * 32);
+  /* Pools grow on demand (D8). Only frames are preallocated, one per batch slot: the other pools start empty,
+   * since batches are often created and destroyed per buffer (a deep copy per make_writable) and most of them
+   * never use every pool. */
+  self->frame_meta_pool = pool_new (RDS_FRAME_META, sizeof (RdsFrameMeta), max_batch_size);
+  self->obj_meta_pool = pool_new (RDS_OBJ_META, sizeof (RdsObjectMeta), 0);
+  self->classifier_meta_pool = pool_new (RDS_CLASSIFIER_META, sizeof (RdsClassifierMeta), 0);
+  self->label_info_meta_pool = pool_new (RDS_LABEL_INFO_META, sizeof (RdsLabelInfo), 0);
+  self->display_meta_pool = pool_new (RDS_DISPLAY_META, sizeof (RdsDisplayMeta), 0);
+  self->user_meta_pool = pool_new (RDS_USER_META, sizeof (RdsUserMeta), 0);
 
   GST_DEBUG ("created batch meta %p, max %u frames", self, max_batch_size);
   return self;
@@ -205,17 +263,19 @@ rds_create_batch_meta (guint max_batch_size)
 void
 rds_destroy_batch_meta (RdsBatchMeta * batch_meta)
 {
+  GList *frames;
+
   if (batch_meta == NULL)
     return;
 
   g_rec_mutex_lock (&batch_meta->meta_mutex);
-  for (GList * l = batch_meta->frame_meta_list; l != NULL; l = l->next)
-    release_frame (batch_meta, l->data);
-  g_list_free (batch_meta->frame_meta_list);
+  frames = batch_meta->frame_meta_list;
   batch_meta->frame_meta_list = NULL;
   batch_meta->num_frames_in_batch = 0;
-  release_user_list (batch_meta, batch_meta->batch_user_meta_list);
-  batch_meta->batch_user_meta_list = NULL;
+  for (GList * l = frames; l != NULL; l = l->next)
+    release_frame (batch_meta, l->data);
+  g_list_free (frames);
+  release_user_list (batch_meta, &batch_meta->batch_user_meta_list);
   g_rec_mutex_unlock (&batch_meta->meta_mutex);
 
   pool_free (batch_meta->frame_meta_pool);
@@ -266,6 +326,15 @@ rds_add_frame_meta_to_batch (RdsBatchMeta * batch_meta, RdsFrameMeta * frame_met
     return;
   }
   g_rec_mutex_lock (&batch_meta->meta_mutex);
+  if (ELEM_HEADER (frame_meta)->f.attached) {
+    GST_WARNING ("frame meta %p is already in a batch; not added again", frame_meta);
+    g_rec_mutex_unlock (&batch_meta->meta_mutex);
+    return;
+  }
+  if (batch_meta->num_frames_in_batch >= batch_meta->max_frames_in_batch)
+    GST_DEBUG ("batch %p: adding frame %u exceeds max_frames_in_batch %u", batch_meta,
+        batch_meta->num_frames_in_batch + 1, batch_meta->max_frames_in_batch);
+  ELEM_HEADER (frame_meta)->f.attached = TRUE;
   /* Append: insertion order is part of the contract. */
   batch_meta->frame_meta_list = g_list_append (batch_meta->frame_meta_list, frame_meta);
   batch_meta->num_frames_in_batch++;
@@ -329,8 +398,23 @@ rds_add_obj_meta_to_frame (RdsFrameMeta * frame_meta, RdsObjectMeta * obj_meta, 
         frame_meta);
     return;
   }
+  if (obj_parent != NULL && (obj_parent == obj_meta || obj_parent->base_meta.batch_meta != b)) {
+    GST_WARNING ("object meta %p: invalid parent %p (itself or from another batch); parent dropped", obj_meta,
+        obj_parent);
+    obj_parent = NULL;
+  }
   g_rec_mutex_lock (&b->meta_mutex);
+  if (ELEM_HEADER (obj_meta)->f.attached) {
+    GST_WARNING ("object meta %p is already in a frame; not added again", obj_meta);
+    g_rec_mutex_unlock (&b->meta_mutex);
+    return;
+  }
+  ELEM_HEADER (obj_meta)->f.attached = TRUE;
   obj_meta->parent = obj_parent;
+  if (obj_parent != NULL) {
+    ELEM_HEADER (obj_meta)->f.parented = TRUE;
+    BATCH_PRIV (b)->n_parented++;
+  }
   frame_meta->obj_meta_list = g_list_append (frame_meta->obj_meta_list, obj_meta);
   frame_meta->num_obj_meta++;
   g_rec_mutex_unlock (&b->meta_mutex);
