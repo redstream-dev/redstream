@@ -2,7 +2,9 @@
 
 **GStreamer video and audio analytics on AMD GPUs: an open-source, ROCm-based functional equivalent of NVIDIA DeepStream.**
 
-> Status: **pre-alpha.** Feasibility spikes are done and the project skeleton builds; no elements yet. APIs and element names will change.
+> Status: **pre-alpha.** Feasibility spikes are done and the core library `libgstrds` is in place: batched GPU
+> surfaces (`memory:RDS`), buffer pools, DeepStream-shaped metadata and stream events, plus the compat header
+> (see [`docs/compat-matrix.md`](docs/compat-matrix.md)). No elements yet. APIs and element names will change.
 
 ## Why
 
