@@ -7,3 +7,5 @@ build/
 *.mp4
 .claude/settings.local.json
 *.h264
+spikes/rocdec-hip/ref_crc
+spikes/rocdec-hip/rocdec_spike
