@@ -63,11 +63,10 @@ rds_compat_map_factory_name (const gchar * factory_name)
 }
 
 static gboolean
-rewrite_token (const GMatchInfo * info, GString * result, gpointer user_data)
+rewrite_token (const GMatchInfo * info, GString * result, G_GNUC_UNUSED gpointer user_data)
 {
   gchar *token = g_match_info_fetch (info, 1);
 
-  (void) user_data;
   g_string_append (result, rds_compat_map_factory_name (token));
   g_free (token);
   return FALSE;
@@ -87,6 +86,7 @@ rds_compat_rewrite_launch (const gchar * description)
   /* Only whole tokens are rewritten: "nvinfer" becomes "rdsinfer", "config-file-path=nvinfer.txt" is untouched. */
   if (g_once_init_enter (&initialized)) {
     token_re = g_regex_new ("(?<=^|[\\s!])(nv[A-Za-z0-9_]+)(?=$|[\\s!])", G_REGEX_OPTIMIZE, 0, NULL);
+    g_assert (token_re != NULL);
     g_once_init_leave (&initialized, 1);
   }
   return g_regex_replace_eval (token_re, description, -1, 0, 0, rewrite_token, NULL, NULL);
