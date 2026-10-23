@@ -1,0 +1,3 @@
+leak:libhsa-runtime64.so
+leak:libamdhip64.so
+leak:libdrm_amdgpu.so

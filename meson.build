@@ -7,6 +7,15 @@ project('redstream', 'c',
 api_version = '1.0'
 cc = meson.get_compiler('c')
 gst_dep = dependency('gstreamer-1.0', version : '>= 1.28')
+gst_video_dep = dependency('gstreamer-video-1.0', version : '>= 1.28')
+gst_check_dep = dependency('gstreamer-check-1.0', version : '>= 1.28')
+
+# The ROCm image ships no hip.pc; locate the HIP runtime directly.
+rocm_path = get_option('rocm_path')
+hip_dep = declare_dependency(
+  compile_args : ['-D__HIP_PLATFORM_AMD__'],
+  include_directories : include_directories(rocm_path / 'include', is_system : true),
+  dependencies : cc.find_library('amdhip64', dirs : [rocm_path / 'lib']))
 
 subdir('gst-libs/rds')
 subdir('samples')

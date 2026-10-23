@@ -1,0 +1,2 @@
+option('rocm_path', type : 'string', value : '/opt/rocm',
+  description : 'ROCm prefix holding include/hip and lib/libamdhip64.so')

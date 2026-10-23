@@ -1,5 +1,6 @@
 .cache/
 build/
+build-asan/
 *.mxr
 *.onnx
 *.engine
