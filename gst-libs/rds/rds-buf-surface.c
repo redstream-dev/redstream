@@ -1,6 +1,7 @@
 /* Redstream: RdsBufSurface allocation, CPU mapping and copies.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-buf-surface.h"
+#include "rds-buf-surface-private.h"
 #include "rds-hip-private.h"
 
 #include <stdlib.h>
@@ -77,8 +78,8 @@ is_cpu_only (RdsBufSurfaceMemType t)
   return t == RDS_BUF_MEM_SYSTEM || t == RDS_BUF_MEM_HIP_PINNED;
 }
 
-static gboolean
-is_supported_mem_type (RdsBufSurfaceMemType t)
+gboolean
+rds_buf_mem_type_is_supported (RdsBufSurfaceMemType t)
 {
   switch (t) {
     case RDS_BUF_MEM_DEFAULT:
@@ -96,7 +97,7 @@ is_supported_mem_type (RdsBufSurfaceMemType t)
 static gboolean
 check_mem_type (const RdsBufSurface * surf)
 {
-  if (is_supported_mem_type (surf->memType))
+  if (rds_buf_mem_type_is_supported (surf->memType))
     return TRUE;
   GST_ERROR ("surface %p has unsupported memory type %d", surf, surf->memType);
   return FALSE;
@@ -266,7 +267,7 @@ rds_buf_surface_create (RdsBufSurface ** surf, guint32 batchSize, const RdsBufSu
     GST_ERROR ("unsupported layout %d (only pitch-linear)", params->layout);
     return -1;
   }
-  if (!is_supported_mem_type (params->memType)) {
+  if (!rds_buf_mem_type_is_supported (params->memType)) {
     GST_ERROR ("unsupported memory type %d", params->memType);
     return -1;
   }

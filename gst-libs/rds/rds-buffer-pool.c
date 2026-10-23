@@ -1,6 +1,7 @@
 /* Redstream: buffer pool of memory:RDS buffers.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-buffer-pool.h"
+#include "rds-buf-surface-private.h"
 
 GST_DEBUG_CATEGORY_STATIC (rds_buffer_pool_debug);
 #define GST_CAT_DEFAULT rds_buffer_pool_debug
@@ -61,9 +62,23 @@ rds_buffer_pool_set_config (GstBufferPool * pool, GstStructure * config)
     return FALSE;
   }
 
-  rds_buffer_pool_config_get_surface_params (config, &batch_size, &mem_type, &gpu_id);
+  if (GST_VIDEO_INFO_WIDTH (&info) < 1 || GST_VIDEO_INFO_WIDTH (&info) > RDS_BUF_SURFACE_MAX_DIM
+      || GST_VIDEO_INFO_HEIGHT (&info) < 1 || GST_VIDEO_INFO_HEIGHT (&info) > RDS_BUF_SURFACE_MAX_DIM) {
+    GST_WARNING_OBJECT (self, "size %dx%d out of range (1..%u)", GST_VIDEO_INFO_WIDTH (&info),
+        GST_VIDEO_INFO_HEIGHT (&info), RDS_BUF_SURFACE_MAX_DIM);
+    return FALSE;
+  }
+
+  if (!rds_buffer_pool_config_get_surface_params (config, &batch_size, &mem_type, &gpu_id)
+      && (gst_structure_has_field (config, CONFIG_BATCH_SIZE) || gst_structure_has_field (config, CONFIG_MEM_TYPE)
+          || gst_structure_has_field (config, CONFIG_GPU_ID)))
+    GST_DEBUG_OBJECT (self, "config sets only some surface parameters (or with wrong types); using the defaults");
   if (batch_size == 0) {
     GST_WARNING_OBJECT (self, "batch size must be at least 1");
+    return FALSE;
+  }
+  if (!rds_buf_mem_type_is_supported (mem_type)) {
+    GST_WARNING_OBJECT (self, "unsupported memory type %d", mem_type);
     return FALSE;
   }
 
@@ -135,6 +150,9 @@ rds_buffer_pool_reset_buffer (GstBufferPool * pool, GstBuffer * buffer)
 
   GST_BUFFER_POOL_CLASS (rds_buffer_pool_parent_class)->reset_buffer (pool, buffer);
 
+  /* A surface still shared with another buffer is not ours to reset; the base class then drops this buffer. */
+  if (!gst_buffer_is_all_memory_writable (buffer))
+    return;
   surf = rds_buffer_get_surface (buffer);
   if (surf != NULL)
     surf->numFilled = initial_num_filled (self);

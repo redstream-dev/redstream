@@ -11,8 +11,13 @@ G_BEGIN_DECLS
 RDS_API G_DECLARE_FINAL_TYPE (RdsBufferPool, rds_buffer_pool, RDS, BUFFER_POOL, GstBufferPool)
 
 /* Returns a new reference. Configure with gst_buffer_pool_config_set_params() (video caps; the size is
- * overridden to sizeof (RdsBufSurface)) and rds_buffer_pool_config_set_surface_params(). Supports
- * GST_BUFFER_POOL_OPTION_VIDEO_META (added to batch-size-1 buffers only). */
+ * overridden to sizeof (RdsBufSurface)) and rds_buffer_pool_config_set_surface_params(). set_config rejects
+ * missing caps, unsupported formats, sizes outside 1..RDS_BUF_SURFACE_MAX_DIM, batch size 0 and unsupported
+ * memory types; an invalid GPU id only fails at allocation. After a rejected set_config the pool keeps its
+ * previous valid configuration (GstBufferPool behaviour).
+ * Supports GST_BUFFER_POOL_OPTION_VIDEO_META (added to batch-size-1 buffers only). Its offsets and strides
+ * describe the planes of the surface (possibly device memory), not the mapped data: mapping an RDS buffer yields
+ * the RdsBufSurface struct, so never gst_video_frame_map() these buffers. */
 RDS_API GstBufferPool *rds_buffer_pool_new (void);
 
 /* Defaults when unset: batch_size 1, RDS_BUF_MEM_DEFAULT, GPU 0. */
