@@ -300,6 +300,42 @@ acquire_from (RdsBatchMeta * b, RdsMetaPool * pool)
 typedef void (*ReleaseFunc) (RdsBatchMeta * b, gpointer meta);
 
 static void
+sweep_release_frame (RdsBatchMeta * b, gpointer meta)
+{
+  rds_meta_release_frame (b, meta);
+}
+
+static void
+sweep_release_obj (RdsBatchMeta * b, gpointer meta)
+{
+  rds_meta_release_obj (b, meta);
+}
+
+static void
+sweep_release_classifier (RdsBatchMeta * b, gpointer meta)
+{
+  rds_meta_release_classifier (b, meta);
+}
+
+static void
+sweep_release_label (RdsBatchMeta * b, gpointer meta)
+{
+  rds_meta_release_label (b, meta);
+}
+
+static void
+sweep_release_display (RdsBatchMeta * b, gpointer meta)
+{
+  rds_meta_release_display (b, meta);
+}
+
+static void
+sweep_release_user (RdsBatchMeta * b, gpointer meta)
+{
+  rds_meta_release_user (b, meta);
+}
+
+static void
 sweep_pool (RdsBatchMeta * b, RdsMetaPool * pool, ReleaseFunc release)
 {
   guint n = pool->all->len;
@@ -369,12 +405,12 @@ rds_destroy_batch_meta (RdsBatchMeta * batch_meta)
   g_clear_pointer (&batch_meta->batch_user_meta_list, g_list_free);
 
   /* Sweep, parents before children, so a meta that still has an owner is released through it. */
-  sweep_pool (batch_meta, batch_meta->frame_meta_pool, (ReleaseFunc) rds_meta_release_frame);
-  sweep_pool (batch_meta, batch_meta->obj_meta_pool, (ReleaseFunc) rds_meta_release_obj);
-  sweep_pool (batch_meta, batch_meta->classifier_meta_pool, (ReleaseFunc) rds_meta_release_classifier);
-  sweep_pool (batch_meta, batch_meta->label_info_meta_pool, (ReleaseFunc) rds_meta_release_label);
-  sweep_pool (batch_meta, batch_meta->display_meta_pool, (ReleaseFunc) rds_meta_release_display);
-  sweep_pool (batch_meta, batch_meta->user_meta_pool, (ReleaseFunc) rds_meta_release_user);
+  sweep_pool (batch_meta, batch_meta->frame_meta_pool, sweep_release_frame);
+  sweep_pool (batch_meta, batch_meta->obj_meta_pool, sweep_release_obj);
+  sweep_pool (batch_meta, batch_meta->classifier_meta_pool, sweep_release_classifier);
+  sweep_pool (batch_meta, batch_meta->label_info_meta_pool, sweep_release_label);
+  sweep_pool (batch_meta, batch_meta->display_meta_pool, sweep_release_display);
+  sweep_pool (batch_meta, batch_meta->user_meta_pool, sweep_release_user);
   /* Links a release_func added during the sweep; their metas are freed with the pools. */
   g_clear_pointer (&batch_meta->frame_meta_list, g_list_free);
   g_clear_pointer (&batch_meta->batch_user_meta_list, g_list_free);

@@ -115,12 +115,12 @@ copy_display (RdsDisplayMeta * src, RdsBatchMeta * dst)
   return d;
 }
 
-/* Both locks held. Returns a complete frame in dst that is not yet added to dst's frame list. */
+/* Both locks held. Returns a complete frame in dst that is not yet added to dst's frame list. Objects get no
+ * parent; each source object -> copy pair is recorded in map, for remap_parents. */
 static RdsFrameMeta *
-copy_frame (RdsFrameMeta * src, RdsBatchMeta * dst)
+copy_frame (RdsFrameMeta * src, RdsBatchMeta * dst, GHashTable * map)
 {
   RdsFrameMeta *f = rds_meta_pool_acquire (dst->frame_meta_pool, dst);
-  GHashTable *map = g_hash_table_new (g_direct_hash, g_direct_equal);
 
   COPY_KEEP_BASE (f, src);
   f->obj_meta_list = NULL;
@@ -128,7 +128,7 @@ copy_frame (RdsFrameMeta * src, RdsBatchMeta * dst)
   f->frame_user_meta_list = NULL;
   f->num_obj_meta = 0;
 
-  /* Pass 1: every object, in order, without parents. */
+  /* Every object, in order, without parents. */
   for (GList * l = src->obj_meta_list; l != NULL; l = l->next) {
     RdsObjectMeta *o = copy_obj (l->data, dst);
 
@@ -139,18 +139,6 @@ copy_frame (RdsFrameMeta * src, RdsBatchMeta * dst)
       rds_meta_release_obj (dst, o);
     }
   }
-  /* Pass 2: parents within the frame, through the internal path so n_parented stays right. A parent elsewhere
-   * (another frame, or not in any list) becomes NULL. */
-  for (GList * l = src->obj_meta_list; l != NULL; l = l->next) {
-    RdsObjectMeta *so = l->data;
-    RdsObjectMeta *o = g_hash_table_lookup (map, so);
-    RdsObjectMeta *parent = so->parent != NULL ? g_hash_table_lookup (map, so->parent) : NULL;
-
-    if (o != NULL && parent != NULL)
-      rds_meta_set_parent (dst, o, parent);
-  }
-  g_hash_table_unref (map);
-
   for (GList * l = src->display_meta_list; l != NULL; l = l->next) {
     RdsDisplayMeta *d = copy_display (l->data, dst);
 
@@ -159,6 +147,22 @@ copy_frame (RdsFrameMeta * src, RdsBatchMeta * dst)
   }
   copy_user_list (src->frame_user_meta_list, dst, &f->frame_user_meta_list, f);
   return f;
+}
+
+/* dst's lock held. Second pass, once every object the map covers exists: links each copy of src_objs to the copy
+ * of its source parent, through the internal path so n_parented stays right. A parent the map does not cover
+ * (a frame that was not copied, or an object in no list) becomes NULL. */
+static void
+remap_parents (RdsBatchMeta * dst, GList * src_objs, GHashTable * map)
+{
+  for (GList * l = src_objs; l != NULL; l = l->next) {
+    RdsObjectMeta *so = l->data;
+    RdsObjectMeta *o = g_hash_table_lookup (map, so);
+    RdsObjectMeta *parent = so->parent != NULL ? g_hash_table_lookup (map, so->parent) : NULL;
+
+    if (o != NULL && parent != NULL)
+      rds_meta_set_parent (dst, o, parent);
+  }
 }
 
 /* dst's lock held. Adds the copied frame, or releases it (with everything under it) if that fails. */
@@ -178,6 +182,7 @@ rds_copy_frame_meta_to_batch (RdsFrameMeta * src, RdsBatchMeta * dst)
 {
   RdsBatchMeta *sb;
   RdsFrameMeta *f;
+  GHashTable *map;
 
   g_return_val_if_fail (src != NULL, NULL);
   g_return_val_if_fail (dst != NULL, NULL);
@@ -189,7 +194,11 @@ rds_copy_frame_meta_to_batch (RdsFrameMeta * src, RdsBatchMeta * dst)
   }
   g_rec_mutex_lock (&sb->meta_mutex);
   g_rec_mutex_lock (&dst->meta_mutex);
-  f = copy_frame (src, dst);
+  /* A local map: parents in other frames of src's batch become NULL. */
+  map = g_hash_table_new (g_direct_hash, g_direct_equal);
+  f = copy_frame (src, dst, map);
+  remap_parents (dst, src->obj_meta_list, map);
+  g_hash_table_unref (map);
   if (!add_copied_frame (dst, f))
     f = NULL;
   g_rec_mutex_unlock (&dst->meta_mutex);
@@ -201,25 +210,34 @@ RdsBatchMeta *
 rds_batch_meta_copy (RdsBatchMeta * src)
 {
   RdsBatchMeta *dst;
+  GHashTable *map;
   gboolean ok = TRUE;
 
   g_return_val_if_fail (src != NULL, NULL);
 
+  g_rec_mutex_lock (&src->meta_mutex);
   dst = rds_create_batch_meta (src->max_frames_in_batch);
   memcpy (dst->misc_batch_info, src->misc_batch_info, sizeof dst->misc_batch_info);
   memcpy (dst->reserved, src->reserved, sizeof dst->reserved);
-
-  g_rec_mutex_lock (&src->meta_mutex);
   g_rec_mutex_lock (&dst->meta_mutex);
+
+  /* One map for the whole batch, and the parent pass after every frame exists, so a parent in another frame
+   * (earlier or later) is remapped too. */
+  map = g_hash_table_new (g_direct_hash, g_direct_equal);
   for (GList * l = src->frame_meta_list; l != NULL && ok; l = l->next)
-    ok = add_copied_frame (dst, copy_frame (l->data, dst));
-  if (ok)
+    ok = add_copied_frame (dst, copy_frame (l->data, dst, map));
+  if (ok) {
+    for (GList * l = src->frame_meta_list; l != NULL; l = l->next)
+      remap_parents (dst, ((RdsFrameMeta *) l->data)->obj_meta_list, map);
     copy_user_list (src->batch_user_meta_list, dst, &dst->batch_user_meta_list, dst);
+  }
+  g_hash_table_unref (map);
   g_rec_mutex_unlock (&dst->meta_mutex);
   g_rec_mutex_unlock (&src->meta_mutex);
 
   if (!ok) {
-    /* A partial copy is worse than none: callers would silently lose frames. */
+    /* Defensive: adding a freshly copied frame cannot fail today. If it ever does, a partial copy is worse than
+     * none (callers would silently lose frames), so it is discarded without leaking. */
     GST_WARNING ("copy of batch %p failed; discarding the partial copy", src);
     rds_destroy_batch_meta (dst);
     return NULL;

@@ -53,6 +53,11 @@ rds_meta_transform (GstBuffer * dest, GstMeta * meta, G_GNUC_UNUSED GstBuffer * 
   if (!GST_META_TRANSFORM_IS_COPY (type) || m->meta_type != RDS_BATCH_GST_META || m->meta_data == NULL)
     return FALSE;
 
+  /* gst_buffer_copy_into onto a buffer that already carries a batch: keep dest's, so it still has exactly one. */
+  if (gst_buffer_get_rds_batch_meta (dest) != NULL) {
+    GST_DEBUG ("buffer %p already has a batch meta; not copying %p onto it", dest, m->meta_data);
+    return TRUE;
+  }
   copy = rds_batch_meta_copy (m->meta_data);
   if (copy == NULL)
     return FALSE;

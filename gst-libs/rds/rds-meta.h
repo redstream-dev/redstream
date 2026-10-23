@@ -63,7 +63,9 @@ typedef enum
 typedef struct _RdsBatchMeta RdsBatchMeta;
 typedef struct _RdsMetaPool RdsMetaPool;            /* opaque */
 
-/* For user meta: data is the RdsUserMeta, user_data is its base_meta.uContext. copy returns new user_meta_data. */
+/* For user meta: data is the RdsUserMeta, user_data is its base_meta.uContext. copy returns the new
+ * user_meta_data (NULL gives a copied user meta with NULL data). copy runs with both batches' locks held: it must
+ * not block on locks the pipeline may hold while it waits for metadata. */
 typedef gpointer (*RdsMetaCopyFunc) (gpointer data, gpointer user_data);
 typedef void (*RdsMetaReleaseFunc) (gpointer data, gpointer user_data);
 
@@ -254,12 +256,15 @@ RDS_API void rds_remove_user_meta_from_object (RdsObjectMeta * obj_meta, RdsUser
 RDS_API RdsMetaType rds_get_user_meta_type (const gchar * meta_descriptor);
 
 /* Deep copy through the destination's pools: strings, masks, classifiers, labels and display meta are duplicated,
- * object parent pointers are remapped within the frame (NULL if the parent is elsewhere), and user meta is copied
- * with its copy_func (user meta without one is skipped, with a one-time warning). Takes src's lock, then the
- * destination's. Returns NULL if src is NULL. */
+ * object parent pointers are remapped to the copies, also across frames (NULL if the parent is in no list), and
+ * user meta is copied with its copy_func (user meta without one is skipped, with a one-time warning). For
+ * metas other than user meta, base_meta.uContext, copy_func and release_func are not carried over. Takes src's
+ * lock, then the destination's. Returns NULL if src is NULL. */
 RDS_API RdsBatchMeta *rds_batch_meta_copy (RdsBatchMeta * src);
-/* Deep-copies one frame into dst and appends it there (rdsstreamdemux's per-source subset). Returns the copy, or
- * NULL if src does not belong to a batch. Locks src's batch, then dst: never call it with dst's lock held unless
+/* Deep-copies one frame into dst and appends it there (rdsstreamdemux's per-source subset). Parents are remapped
+ * within the frame only: a parent in another frame, or in no list, becomes NULL. Scalar fields, including
+ * batch_id and pad_index, are kept from the source; the caller sets batch_id for its position in dst. Same
+ * copy rules as rds_batch_meta_copy otherwise. Returns the copy, or NULL if src does not belong to a batch. Locks src's batch, then dst: never call it with dst's lock held unless
  * you also hold src's. */
 RDS_API RdsFrameMeta *rds_copy_frame_meta_to_batch (RdsFrameMeta * src, RdsBatchMeta * dst);
 

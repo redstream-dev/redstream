@@ -221,6 +221,7 @@ assert_frame0_copied (RdsFrameMeta * sf, RdsFrameMeta * cf, RdsBatchMeta * copy)
   /* Frame user meta. */
   g_assert_cmpuint (g_list_length (cf->frame_user_meta_list), ==, 1);
   g_assert_cmpint (user_value (cf->frame_user_meta_list), ==, 2);
+  g_assert_true (((RdsUserMeta *) cf->frame_user_meta_list->data)->base_meta.batch_meta == copy);
 }
 
 static void
@@ -245,16 +246,17 @@ test_copy_batch (void)
   cf1 = frame_at (copy, 1);
   assert_frame0_copied (sf0, cf0, copy);
 
-  /* Frame 1: the cross-frame parent becomes NULL; the uncopyable user meta is skipped. */
+  /* Frame 1: the cross-frame parent is remapped to the copy's car; the uncopyable user meta is skipped. */
   g_assert_cmpuint (cf1->source_id, ==, 3);
   g_assert_cmpuint (cf1->num_obj_meta, ==, 1);
-  g_assert_null (obj_at (cf1, 0)->parent);
+  g_assert_true (obj_at (cf1, 0)->parent == obj_at (cf0, 0));
   g_assert_null (obj_at (cf1, 0)->obj_user_meta_list);
   g_assert_nonnull (obj_at (frame_at (src, 1), 0)->obj_user_meta_list);
 
   /* Batch user meta. */
   g_assert_cmpuint (g_list_length (copy->batch_user_meta_list), ==, 1);
   g_assert_cmpint (user_value (copy->batch_user_meta_list), ==, 3);
+  g_assert_true (((RdsUserMeta *) copy->batch_user_meta_list->data)->base_meta.batch_meta == copy);
   g_assert_cmpint (copied, ==, 3);
 
   /* Edits to the copy leave the source alone. */
@@ -266,6 +268,7 @@ test_copy_batch (void)
   /* The remapped parent link is a real one: removing the copy's car clears the copy's plate. */
   rds_remove_obj_meta_from_frame (cf0, ccar);
   g_assert_null (cplate->parent);
+  g_assert_null (obj_at (cf1, 0)->parent);
   rds_remove_obj_meta_from_frame (cf0, cplate);
   g_assert_cmpuint (cf0->num_obj_meta, ==, 0);
 
@@ -297,6 +300,14 @@ test_copy_frame_subset (void)
   g_assert_true (dst->frame_meta_list->data == f);
   assert_frame0_copied (frame_at (src, 0), f, dst);
   g_assert_cmpint (copied, ==, 2);
+
+  /* Frame 1 alone: its parent is in a frame that was not copied, so it becomes NULL. */
+  f = rds_copy_frame_meta_to_batch (frame_at (src, 1), dst);
+  g_assert_nonnull (f);
+  g_assert_cmpuint (dst->num_frames_in_batch, ==, 2);
+  g_assert_cmpuint (f->source_id, ==, 3);
+  g_assert_cmpuint (f->num_obj_meta, ==, 1);
+  g_assert_null (obj_at (f, 0)->parent);
 
   rds_destroy_batch_meta (dst);
   rds_destroy_batch_meta (src);
@@ -349,12 +360,16 @@ check_survives (const gchar * element)
   GstBuffer *in = gst_buffer_new (), *out;
   RdsBatchMeta *b;
 
+  RdsBatchMeta *orig = build_batch ();
+  gint copied_before = copied;
+
   gst_harness_set_src_caps_str (h, "application/x-rds-test");
-  rds_buffer_add_batch_meta (in, build_batch ());
+  rds_buffer_add_batch_meta (in, orig);
   out = gst_harness_push_and_pull (h, in);
   g_assert_nonnull (out);
   b = gst_buffer_get_rds_batch_meta (out);
-  g_assert_nonnull (b);
+  g_assert_true (b == orig);                        /* passed through, not copied */
+  g_assert_cmpint (copied, ==, copied_before);
   g_assert_cmpuint (b->num_frames_in_batch, ==, 2);
   gst_buffer_unref (out);
   gst_harness_teardown (h);
@@ -366,6 +381,70 @@ test_survives_elements (void)
   reset_counters ();
   check_survives ("queue");
   check_survives ("identity");
+  g_assert_cmpint (copied, ==, 0);
+  g_assert_cmpint (released, ==, created + copied);
+}
+
+/* A child whose parent is in a later frame, and one whose parent is in no list. */
+static void
+test_copy_parent_in_later_frame (void)
+{
+  RdsBatchMeta *src = rds_create_batch_meta (2), *copy;
+  RdsFrameMeta *f0 = rds_acquire_frame_meta_from_pool (src);
+  RdsFrameMeta *f1 = rds_acquire_frame_meta_from_pool (src);
+  RdsObjectMeta *child = rds_acquire_obj_meta_from_pool (src);
+  RdsObjectMeta *parent = rds_acquire_obj_meta_from_pool (src);
+  RdsObjectMeta *loose = rds_acquire_obj_meta_from_pool (src);          /* never added */
+  RdsObjectMeta *orphan = rds_acquire_obj_meta_from_pool (src);
+  RdsObjectMeta *cchild, *cparent;
+
+  rds_add_frame_meta_to_batch (src, f0);
+  rds_add_frame_meta_to_batch (src, f1);
+  rds_add_obj_meta_to_frame (f1, parent, NULL);
+  rds_add_obj_meta_to_frame (f0, child, parent);
+  rds_add_obj_meta_to_frame (f0, orphan, loose);
+
+  copy = rds_batch_meta_copy (src);
+  cchild = obj_at (frame_at (copy, 0), 0);
+  cparent = obj_at (frame_at (copy, 1), 0);
+  g_assert_true (cchild != child);
+  g_assert_true (cchild->parent == cparent);
+  g_assert_null (obj_at (frame_at (copy, 0), 1)->parent);
+
+  /* A real link: removing the copied parent clears the copied child. */
+  rds_remove_obj_meta_from_frame (frame_at (copy, 1), cparent);
+  g_assert_null (cchild->parent);
+  g_assert_true (child->parent == parent);
+
+  rds_destroy_batch_meta (copy);
+  rds_destroy_batch_meta (src);
+}
+
+/* dest already has a batch meta: it wins, nothing is copied. */
+static void
+test_copy_into_existing (void)
+{
+  GstBuffer *src_buf = gst_buffer_new (), *dest = gst_buffer_new ();
+  RdsBatchMeta *dest_batch;
+  gpointer state = NULL;
+  guint n = 0;
+  gint copied_before;
+
+  reset_counters ();
+  rds_buffer_add_batch_meta (src_buf, build_batch ());
+  dest_batch = rds_create_batch_meta (1);
+  rds_buffer_add_batch_meta (dest, dest_batch);
+  copied_before = copied;
+
+  g_assert_true (gst_buffer_copy_into (dest, src_buf, GST_BUFFER_COPY_METADATA, 0, -1));
+  while (gst_buffer_iterate_meta_filtered (dest, &state, RDS_META_API_TYPE) != NULL)
+    n++;
+  g_assert_cmpuint (n, ==, 1);
+  g_assert_true (gst_buffer_get_rds_batch_meta (dest) == dest_batch);
+  g_assert_cmpint (copied, ==, copied_before);
+
+  gst_buffer_unref (dest);
+  gst_buffer_unref (src_buf);
   g_assert_cmpint (released, ==, created + copied);
 }
 
@@ -378,5 +457,7 @@ main (int argc, char **argv)
   g_test_add_func ("/meta-copy/frame-subset", test_copy_frame_subset);
   g_test_add_func ("/meta-copy/gst-buffer", test_copy_gst_buffer);
   g_test_add_func ("/meta-copy/survives-elements", test_survives_elements);
+  g_test_add_func ("/meta-copy/parent-in-later-frame", test_copy_parent_in_later_frame);
+  g_test_add_func ("/meta-copy/copy-into-existing", test_copy_into_existing);
   return g_test_run ();
 }
