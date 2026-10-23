@@ -1,6 +1,6 @@
 rds_headers = files('rds-prelude.h', 'rds-compat-remap.h', 'rds_compat.h', 'rds-buf-surface.h',
   'rds-memory.h', 'rds-buffer-pool.h', 'rds-osd-types.h', 'rds-meta.h',
-  'rds-gst-meta.h', 'rds-event.h')
+  'rds-gst-meta.h', 'rds-event.h', 'rds.h', 'rds-compat-aliases.h')
 install_headers(rds_headers, subdir : 'redstream-' + api_version / 'rds')
 
 # HIP is linked privately; public headers never include it. gst-video is public (GstVideoFormat).

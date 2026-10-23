@@ -1,0 +1,176 @@
+/* Redstream: DeepStream name aliases (types, functions, enumerators, constants) for source compatibility.
+ * Every name below is taken from NVIDIA's public DeepStream API reference; provenance is recorded in
+ * docs/compat-matrix.md. Included by rds/rds_compat.h; not meant to be included directly.
+ * SPDX-License-Identifier: LGPL-2.1-or-later */
+#ifndef RDS_COMPAT_ALIASES_H
+#define RDS_COMPAT_ALIASES_H
+
+#include <rds/rds.h>
+
+/* ---- NvBufSurface ---- */
+typedef RdsBufSurface NvBufSurface;
+typedef RdsBufSurfaceParams NvBufSurfaceParams;
+typedef RdsBufSurfacePlaneParams NvBufSurfacePlaneParams;
+typedef RdsBufSurfaceMappedAddr NvBufSurfaceMappedAddr;
+typedef RdsBufSurfaceCreateParams NvBufSurfaceCreateParams;
+typedef RdsBufSurfaceMemType NvBufSurfaceMemType;
+typedef RdsBufSurfaceColorFormat NvBufSurfaceColorFormat;
+typedef RdsBufSurfaceLayout NvBufSurfaceLayout;
+typedef RdsBufSurfaceMemMapFlags NvBufSurfaceMemMapFlags;
+
+#define NVBUF_MEM_DEFAULT RDS_BUF_MEM_DEFAULT
+#define NVBUF_MEM_CUDA_PINNED RDS_BUF_MEM_HIP_PINNED
+#define NVBUF_MEM_CUDA_DEVICE RDS_BUF_MEM_HIP_DEVICE
+#define NVBUF_MEM_CUDA_UNIFIED RDS_BUF_MEM_HIP_UNIFIED
+#define NVBUF_MEM_SURFACE_ARRAY RDS_BUF_MEM_SURFACE_ARRAY
+#define NVBUF_MEM_HANDLE RDS_BUF_MEM_HANDLE
+#define NVBUF_MEM_SYSTEM RDS_BUF_MEM_SYSTEM
+
+#define NVBUF_COLOR_FORMAT_INVALID RDS_BUF_COLOR_FORMAT_INVALID
+#define NVBUF_COLOR_FORMAT_GRAY8 RDS_BUF_COLOR_FORMAT_GRAY8
+#define NVBUF_COLOR_FORMAT_YUV420 RDS_BUF_COLOR_FORMAT_YUV420
+#define NVBUF_COLOR_FORMAT_NV12 RDS_BUF_COLOR_FORMAT_NV12
+#define NVBUF_COLOR_FORMAT_RGBA RDS_BUF_COLOR_FORMAT_RGBA
+#define NVBUF_COLOR_FORMAT_BGRA RDS_BUF_COLOR_FORMAT_BGRA
+#define NVBUF_COLOR_FORMAT_RGBx RDS_BUF_COLOR_FORMAT_RGBx
+#define NVBUF_COLOR_FORMAT_BGRx RDS_BUF_COLOR_FORMAT_BGRx
+#define NVBUF_COLOR_FORMAT_RGB RDS_BUF_COLOR_FORMAT_RGB
+#define NVBUF_COLOR_FORMAT_BGR RDS_BUF_COLOR_FORMAT_BGR
+#define NVBUF_COLOR_FORMAT_LAST RDS_BUF_COLOR_FORMAT_LAST
+
+#define NVBUF_LAYOUT_PITCH RDS_BUF_LAYOUT_PITCH
+#define NVBUF_LAYOUT_BLOCK_LINEAR RDS_BUF_LAYOUT_BLOCK_LINEAR
+#define NVBUF_MAP_READ RDS_BUF_MAP_READ
+#define NVBUF_MAP_WRITE RDS_BUF_MAP_WRITE
+#define NVBUF_MAP_READ_WRITE RDS_BUF_MAP_READ_WRITE
+
+#define NvBufSurfaceCreate rds_buf_surface_create
+#define NvBufSurfaceDestroy rds_buf_surface_destroy
+#define NvBufSurfaceMap rds_buf_surface_map
+#define NvBufSurfaceUnMap rds_buf_surface_unmap
+#define NvBufSurfaceSyncForCpu rds_buf_surface_sync_for_cpu
+#define NvBufSurfaceSyncForDevice rds_buf_surface_sync_for_device
+#define NvBufSurfaceCopy rds_buf_surface_copy
+#define NvBufSurfaceMemSet rds_buf_surface_memset
+
+/* ---- OSD parameter structs ---- */
+typedef RdsOSD_ColorParams NvOSD_ColorParams;
+typedef RdsOSD_FontParams NvOSD_FontParams;
+typedef RdsOSD_TextParams NvOSD_TextParams;
+typedef RdsOSD_RectParams NvOSD_RectParams;
+typedef RdsOSD_LineParams NvOSD_LineParams;
+typedef RdsOSD_ArrowParams NvOSD_ArrowParams;
+typedef RdsOSD_CircleParams NvOSD_CircleParams;
+typedef RdsOSD_MaskParams NvOSD_MaskParams;
+typedef RdsOSD_Arrow_Head_Direction NvOSD_Arrow_Head_Direction;
+#ifndef START_HEAD
+#define START_HEAD RDS_OSD_ARROW_START_HEAD
+#define END_HEAD RDS_OSD_ARROW_END_HEAD
+#define BOTH_HEAD RDS_OSD_ARROW_BOTH_HEAD
+#endif
+
+/* ---- Metadata ---- */
+typedef RdsBaseMeta NvDsBaseMeta;
+typedef RdsBatchMeta NvDsBatchMeta;
+typedef RdsFrameMeta NvDsFrameMeta;
+typedef RdsObjectMeta NvDsObjectMeta;
+typedef RdsClassifierMeta NvDsClassifierMeta;
+typedef RdsLabelInfo NvDsLabelInfo;
+typedef RdsDisplayMeta NvDsDisplayMeta;
+typedef RdsUserMeta NvDsUserMeta;
+typedef RdsMetaPool NvDsMetaPool;
+typedef RdsMetaType NvDsMetaType;
+typedef RdsMetaCopyFunc NvDsMetaCopyFunc;
+typedef RdsMetaReleaseFunc NvDsMetaReleaseFunc;
+typedef RdsMetaList NvDsMetaList;
+typedef RdsFrameMetaList NvDsFrameMetaList;
+typedef RdsObjectMetaList NvDsObjectMetaList;
+typedef RdsClassifierMetaList NvDsClassifierMetaList;
+typedef RdsLabelInfoList NvDsLabelInfoList;
+typedef RdsUserMetaList NvDsUserMetaList;
+/* RdsDisplayMetaList has no alias: the public reference documents no NvDs name for it. */
+typedef RdsBbox_Coords NvBbox_Coords;
+typedef RdsComp_BboxInfo NvDsComp_BboxInfo;
+typedef RdsMeta NvDsMeta;
+
+#define NVDS_INVALID_META RDS_INVALID_META
+#define NVDS_BATCH_META RDS_BATCH_META
+#define NVDS_FRAME_META RDS_FRAME_META
+#define NVDS_OBJ_META RDS_OBJ_META
+#define NVDS_DISPLAY_META RDS_DISPLAY_META
+#define NVDS_CLASSIFIER_META RDS_CLASSIFIER_META
+#define NVDS_LABEL_INFO_META RDS_LABEL_INFO_META
+#define NVDS_USER_META RDS_USER_META
+#define NVDS_RESERVED_META RDS_RESERVED_META
+#define NVDS_GST_CUSTOM_META RDS_GST_CUSTOM_META
+#define NVDS_BATCH_GST_META RDS_BATCH_GST_META
+#define NVDS_START_USER_META RDS_START_USER_META
+#define NVDS_FORCE32_META RDS_FORCE32_META
+
+#ifndef MAX_LABEL_SIZE
+#define MAX_LABEL_SIZE RDS_MAX_LABEL_SIZE
+#endif
+#ifndef MAX_ELEMENTS_IN_DISPLAY_META
+#define MAX_ELEMENTS_IN_DISPLAY_META RDS_MAX_ELEMENTS_IN_DISPLAY_META
+#endif
+#ifndef MAX_USER_FIELDS
+#define MAX_USER_FIELDS RDS_MAX_USER_FIELDS
+#endif
+#ifndef MAX_RESERVED_FIELDS
+#define MAX_RESERVED_FIELDS RDS_MAX_RESERVED_FIELDS
+#endif
+#ifndef UNTRACKED_OBJECT_ID
+#define UNTRACKED_OBJECT_ID RDS_UNTRACKED_OBJECT_ID
+#endif
+
+#define nvds_create_batch_meta rds_create_batch_meta
+#define nvds_destroy_batch_meta rds_destroy_batch_meta
+#define nvds_acquire_meta_lock rds_acquire_meta_lock
+#define nvds_release_meta_lock rds_release_meta_lock
+#define nvds_acquire_frame_meta_from_pool rds_acquire_frame_meta_from_pool
+#define nvds_add_frame_meta_to_batch rds_add_frame_meta_to_batch
+#define nvds_remove_frame_meta_from_batch rds_remove_frame_meta_from_batch
+#define nvds_acquire_obj_meta_from_pool rds_acquire_obj_meta_from_pool
+#define nvds_add_obj_meta_to_frame rds_add_obj_meta_to_frame
+#define nvds_remove_obj_meta_from_frame rds_remove_obj_meta_from_frame
+#define nvds_acquire_classifier_meta_from_pool rds_acquire_classifier_meta_from_pool
+#define nvds_add_classifier_meta_to_object rds_add_classifier_meta_to_object
+#define nvds_remove_classifier_meta_from_obj rds_remove_classifier_meta_from_obj
+#define nvds_acquire_label_info_meta_from_pool rds_acquire_label_info_meta_from_pool
+#define nvds_add_label_info_meta_to_classifier rds_add_label_info_meta_to_classifier
+#define nvds_remove_label_info_meta_from_classifier rds_remove_label_info_meta_from_classifier
+#define nvds_acquire_display_meta_from_pool rds_acquire_display_meta_from_pool
+#define nvds_add_display_meta_to_frame rds_add_display_meta_to_frame
+#define nvds_remove_display_meta_from_frame rds_remove_display_meta_from_frame
+#define nvds_acquire_user_meta_from_pool rds_acquire_user_meta_from_pool
+#define nvds_add_user_meta_to_batch rds_add_user_meta_to_batch
+#define nvds_add_user_meta_to_frame rds_add_user_meta_to_frame
+#define nvds_add_user_meta_to_obj rds_add_user_meta_to_obj
+#define nvds_remove_user_meta_from_batch rds_remove_user_meta_from_batch
+#define nvds_remove_user_meta_from_frame rds_remove_user_meta_from_frame
+#define nvds_remove_user_meta_from_object rds_remove_user_meta_from_object
+#define nvds_get_user_meta_type rds_get_user_meta_type
+#define gst_buffer_get_nvds_batch_meta gst_buffer_get_rds_batch_meta
+
+/* ---- Stream events (gst-nvevent) ---- */
+typedef RdsEventType GstNvEventType;
+#define GST_NVEVENT_PAD_ADDED RDS_EVENT_PAD_ADDED
+#define GST_NVEVENT_PAD_DELETED RDS_EVENT_PAD_DELETED
+#define GST_NVEVENT_STREAM_EOS RDS_EVENT_STREAM_EOS
+#define GST_NVEVENT_STREAM_SEGMENT RDS_EVENT_STREAM_SEGMENT
+#define GST_NVEVENT_STREAM_RESET RDS_EVENT_STREAM_RESET
+#define GST_NVEVENT_STREAM_START RDS_EVENT_STREAM_START
+#define gst_nvevent_new_pad_added rds_event_new_pad_added
+#define gst_nvevent_new_pad_deleted rds_event_new_pad_deleted
+#define gst_nvevent_new_stream_eos rds_event_new_stream_eos
+#define gst_nvevent_new_stream_segment rds_event_new_stream_segment
+#define gst_nvevent_new_stream_reset rds_event_new_stream_reset
+#define gst_nvevent_new_stream_start rds_event_new_stream_start
+#define gst_nvevent_parse_pad_added rds_event_parse_pad_added
+#define gst_nvevent_parse_pad_deleted rds_event_parse_pad_deleted
+#define gst_nvevent_parse_stream_eos rds_event_parse_stream_eos
+#define gst_nvevent_parse_stream_segment rds_event_parse_stream_segment
+#define gst_nvevent_parse_stream_reset rds_event_parse_stream_reset
+#define gst_nvevent_parse_stream_start rds_event_parse_stream_start
+
+#endif /* RDS_COMPAT_ALIASES_H */
