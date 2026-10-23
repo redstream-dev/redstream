@@ -10,7 +10,8 @@ DeepStream on AMD GPUs (ROCm)**. Porting an existing DeepStream application shou
 mechanical changes: element factory names behind an `#ifdef`, the same config files, and the same
 metadata-traversal code via a compatibility header.
 
-Status: **pre-alpha.** Phase 0 spikes are done; the walking skeleton (build, compat remap, sample) is in place. Nothing here is stable.
+Status: **pre-alpha.** Phase 0 spikes and the walking skeleton are done; the libgstrds core is in place (surfaces,
+`memory:RDS`, pools, metadata, events). No elements yet. Nothing here is stable.
 
 ## Architecture principles
 
@@ -100,6 +101,9 @@ Known gotchas:
 - Stock `vah26xdec` exports tiled NV12 DMABufs (AMD modifier `0x0200000000401b03`). Never read them as linear.
 - Run docker with `--user $(id -u):$(id -g)` so build outputs aren't root-owned. From zsh, wrap `$RUN`-style
   variables in `bash -c` (zsh doesn't word-split them).
+- Include GLib/GStreamer **before** HIP: HIP defines `__noinline__` as a macro, which breaks `gmacros.h`. Public
+  headers never include HIP (device pointers are `gpointer`); only `rds-hip-private.h` does.
+- `hipHostMalloc` (pinned) memory shows up in the process's VmRSS, not in `hipMemGetInfo`.
 
 Useful checks:
 
@@ -114,15 +118,24 @@ migraphx-driver perf model.onnx --input-dim @images 1 3 640 640 --fp16
 
 ```
 docker/            dev image (Dockerfile.dev)
-gst-libs/rds/      libgstrds-1.0: compat layer today; surfaces, metadata and config parsers next
+gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
+  rds-buf-surface    RdsBufSurface: system/device/pinned/unified memory, pinned staging mirror for CPU access
+  rds-memory         memory:RDS allocator (map returns the RdsBufSurface)
+  rds-buffer-pool    RdsBufferPool, rds_propose_allocation / rds_decide_allocation
+  rds-meta*, rds-osd-types  batch/frame/object/user/display meta, pools, deep copy
+  rds-gst-meta       RdsMeta GstMeta on buffers (gst_buffer_get_rds_batch_meta)
+  rds-event          stream events (pad added/deleted, stream start/EOS/segment/reset)
+  rds_compat.h       DeepStream compat header (+ rds-compat-aliases.h, rds-compat-remap.c)
+  *-private.h        internal headers, not installed (rds-hip-private.h is the only HIP include)
+docs/              compat-matrix.md: what the compat header maps, with status and sources
 samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
-tests/check/       GLib unit tests       tests/samples/  sample-level tests
+tests/check/       GLib unit tests (suites cpu/gpu)       tests/samples/  sample-level tests
 tests/media/       make-test-media.sh: generated H.264 clips (into git-ignored .cache/)
 spikes/            Phase 0 experiments (rocdec-hip, migraphx-devptr); reference code, not built by meson
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
 ```
 
-Planned next: `gst/` (plugins), `docs/` (porting.md, compat-matrix.md, benchmarks.md).
+Planned next: `gst/` (plugins), `docs/porting.md`, `docs/benchmarks.md`.
 
 ## Build and test
 
@@ -131,12 +144,24 @@ Inside the dev container:
 ```bash
 meson setup build          # once; then `meson setup build --reconfigure` after meson.build changes
 meson test -C build --print-errorlogs
+meson test -C build --suite cpu  # GPU-free subset (gpu tests also skip themselves without a device);
+                                 # building still needs the ROCm headers and libamdhip64
 tests/media/make-test-media.sh   # generates .cache/media/*.h264 for pipeline tests and spikes
+
+# ASan + UBSan build; tests/lsan.supp hides HIP runtime leaks
+meson setup build-asan -Db_sanitize=address,undefined -Db_lundef=false
+meson test -C build-asan --print-errorlogs
 ```
 
 - Warnings are errors (`warning_level=2`, `werror`).
 - Library symbols are hidden by default. Mark public API with `RDS_API` (from `rds/rds-prelude.h`).
-- Put new tests next to the existing ones and register them in `tests/meson.build`.
+- Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
+- **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never
+  waits on a stream. Library copies and memsets are synchronous.
+- `memory:RDS` is not `NO_SHARE`: shallow buffer copies share the surface. Pixel writers must own the memory
+  exclusively (a WRITE map of shared memory gets a private deep copy).
+- Dispatch our stream events on the cast type: `switch ((RdsEventType) GST_EVENT_TYPE (ev))`. An uncast switch
+  triggers `-Wswitch`, as on DeepStream.
 - Use TDD: write the failing test first.
 
 ## Agent skills

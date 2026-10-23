@@ -28,6 +28,13 @@ Add `--user $(id -u):$(id -g) -e HOME=/tmp` so outputs aren't root-owned. From z
 ```bash
 $RUN bash -c 'meson setup build --reconfigure 2>/dev/null || meson setup build; meson test -C build --print-errorlogs'
 $RUN tests/media/make-test-media.sh          # .cache/media/{ball-720p,smpte-1366x768,ball-1080p}.h264
+
+# ASan + UBSan (tests/lsan.supp, applied by meson test, hides HIP runtime leaks)
+$RUN bash -c 'meson setup build-asan --reconfigure -Db_sanitize=address,undefined -Db_lundef=false 2>/dev/null \
+  || meson setup build-asan -Db_sanitize=address,undefined -Db_lundef=false; meson test -C build-asan --print-errorlogs'
+
+# No GPU: drop the --device/--group-add flags. gpu-suite tests SKIP; or run only the cpu suite
+docker run --rm --user $(id -u):$(id -g) -e HOME=/tmp -v $PWD:/src -w /src redstream:dev meson test -C build --suite cpu
 ```
 
 ## Smoke tests

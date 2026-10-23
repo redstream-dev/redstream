@@ -1,5 +1,6 @@
 /* Redstream source-compatibility header for applications written against DeepStream.
- * Currently provides element factory remapping only; metadata, surface and event aliases follow.
+ * Provides element factory remapping, plus surface, metadata and event aliases (NvBufSurface*, NvDs*,
+ * NvOSD_*, gst_nvevent_*) over the Redstream API; see docs/compat-matrix.md for what is covered.
  *
  *   #ifdef USE_REDSTREAM
  *   #include <rds/rds_compat.h>
@@ -8,13 +9,15 @@
  *   #endif
  *
  * Define RDS_COMPAT_NO_MACROS before including to keep the GStreamer functions unredirected
- * and call the rds_compat_* functions explicitly instead.
+ * and call the rds_compat_* functions explicitly instead. The DeepStream aliases stay available.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_COMPAT_H
 #define RDS_COMPAT_H
 
 #include <gst/gst.h>
 #include <rds/rds-compat-remap.h>
+#include <rds/rds.h>
+#include <rds/rds-compat-aliases.h>
 
 #ifndef RDS_COMPAT_NO_MACROS
 /* Object-like macros with identical signatures, so taking the function's address keeps working. */
