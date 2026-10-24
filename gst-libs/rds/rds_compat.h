@@ -1,6 +1,7 @@
 /* Redstream source-compatibility header for applications written against DeepStream.
- * Provides element factory remapping, plus surface, metadata and event aliases (NvBufSurface*, NvDs*,
- * NvOSD_*, gst_nvevent_*) over the Redstream API; see docs/compat-matrix.md for what is covered.
+ * Provides element factory remapping, plus surface, transform, metadata and event aliases (NvBufSurface*,
+ * NvBufSurfTransform*, NvDs*, NvOSD_*, gst_nvevent_*) over the Redstream API; see docs/compat-matrix.md for what
+ * is covered.
  *
  *   #ifdef USE_REDSTREAM
  *   #include <rds/rds_compat.h>

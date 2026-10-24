@@ -42,11 +42,55 @@ test_cpp_aliases (void)
   g_assert_cmpint (head, ==, RDS_OSD_ARROW_BOTH_HEAD);
 }
 
+/* A DeepStream-style transform call compiled as C++. The source batch is empty (numFilled = 0), so the call fails
+ * validation and never reaches the GPU: this test needs no device. */
+static void
+test_cpp_transform (void)
+{
+  NvBufSurfaceCreateParams create_params = {};
+  NvBufSurface *src = nullptr, *dst = nullptr;
+  NvBufSurfTransformConfigParams config = {};
+  NvBufSurfTransformConfigParams got = {};
+  NvBufSurfTransformParams transform_params = {};
+  NvBufSurfTransformRect src_rect = { 0, 0, 32, 16 };
+
+  config.compute_mode = NvBufSurfTransformCompute_GPU;
+  config.gpu_id = 0;
+  config.cuda_stream = nullptr;
+  g_assert_cmpint (NvBufSurfTransformSetSessionParams (&config), ==, NvBufSurfTransformError_Success);
+  g_assert_cmpint (NvBufSurfTransformGetSessionParams (&got), ==, NvBufSurfTransformError_Success);
+  g_assert_cmpint (got.compute_mode, ==, NvBufSurfTransformCompute_GPU);
+
+  create_params.width = 64;
+  create_params.height = 32;
+  create_params.colorFormat = NVBUF_COLOR_FORMAT_NV12;
+  create_params.layout = NVBUF_LAYOUT_PITCH;
+  create_params.memType = NVBUF_MEM_SYSTEM;
+  g_assert_cmpint (NvBufSurfaceCreate (&src, 1, &create_params), ==, 0);
+  create_params.colorFormat = NVBUF_COLOR_FORMAT_RGBA;
+  g_assert_cmpint (NvBufSurfaceCreate (&dst, 1, &create_params), ==, 0);
+  src->numFilled = 0;
+
+  transform_params.transform_flag = NVBUFSURF_TRANSFORM_CROP_SRC | NVBUFSURF_TRANSFORM_FILTER;
+  transform_params.transform_flip = NvBufSurfTransform_None;
+  transform_params.transform_filter = NvBufSurfTransformInter_Bilinear;
+  transform_params.src_rect = &src_rect;
+
+  NvBufSurfTransform_Error err = NvBufSurfTransform (src, dst, &transform_params);
+  g_assert_cmpint (err, ==, NvBufSurfTransformError_Invalid_Params);
+  g_assert_cmpuint (dst->numFilled, ==, 0);
+
+  g_assert_cmpint (NvBufSurfaceDestroy (src), ==, 0);
+  g_assert_cmpint (NvBufSurfaceDestroy (dst), ==, 0);
+  g_assert_cmpint (NvBufSurfTransformSetDefaultSession (), ==, NvBufSurfTransformError_Success);
+}
+
 int
 main (int argc, char **argv)
 {
   gst_init (&argc, &argv);
   g_test_init (&argc, &argv, NULL);
   g_test_add_func ("/compat-cpp/aliases", test_cpp_aliases);
+  g_test_add_func ("/compat-cpp/transform", test_cpp_transform);
   return g_test_run ();
 }

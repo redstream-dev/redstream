@@ -47,6 +47,49 @@ test_types (void)
   { RdsComp_BboxInfo *r = NULL; NvDsComp_BboxInfo *n = r; g_assert_null (n); }
   { RdsMeta *r = NULL; NvDsMeta *n = r; g_assert_null (n); }
   { RdsEventType *r = NULL; GstNvEventType *n = r; g_assert_null (n); }
+  { RdsBufSurfTransform_Compute *r = NULL; NvBufSurfTransform_Compute *n = r; g_assert_null (n); }
+  { RdsBufSurfTransform_Flip *r = NULL; NvBufSurfTransform_Flip *n = r; g_assert_null (n); }
+  { RdsBufSurfTransform_Inter *r = NULL; NvBufSurfTransform_Inter *n = r; g_assert_null (n); }
+  { RdsBufSurfTransform_Error *r = NULL; NvBufSurfTransform_Error *n = r; g_assert_null (n); }
+  { RdsBufSurfTransform_Transform_Flag *r = NULL; NvBufSurfTransform_Transform_Flag *n = r; g_assert_null (n); }
+  { RdsBufSurfTransformRect *r = NULL; NvBufSurfTransformRect *n = r; g_assert_null (n); }
+  { RdsBufSurfTransformParams *r = NULL; NvBufSurfTransformParams *n = r; g_assert_null (n); }
+  { RdsBufSurfTransformConfigParams *r = NULL; NvBufSurfTransformConfigParams *n = r; g_assert_null (n); }
+}
+
+/* The transform structs keep DeepStream's field names and the documented field types, so designated initializers
+ * and member assignments in ported code compile unchanged. */
+static void
+test_transform_structs (void)
+{
+  NvBufSurfTransformRect rect = { .top = 1, .left = 2, .width = 3, .height = 4 };
+  NvBufSurfTransformParams params = {
+    .transform_flag = NVBUFSURF_TRANSFORM_CROP_SRC | NVBUFSURF_TRANSFORM_FILTER,
+    .transform_flip = NvBufSurfTransform_None,
+    .transform_filter = NvBufSurfTransformInter_Bilinear,
+    .src_rect = &rect,
+    .dst_rect = NULL,
+  };
+  NvBufSurfTransformConfigParams config = {
+    .compute_mode = NvBufSurfTransformCompute_GPU,
+    .gpu_id = 0,
+    .cuda_stream = NULL,
+  };
+
+  g_assert_cmpuint (sizeof (NvBufSurfTransformRect), ==, sizeof (RdsBufSurfTransformRect));
+  g_assert_cmpuint (sizeof (NvBufSurfTransformParams), ==, sizeof (RdsBufSurfTransformParams));
+  g_assert_cmpuint (sizeof (NvBufSurfTransformConfigParams), ==, sizeof (RdsBufSurfTransformConfigParams));
+  /* four uint32_t in the documented order */
+  g_assert_cmpuint (sizeof (NvBufSurfTransformRect), ==, 4 * sizeof (guint32));
+  g_assert_cmpuint (G_STRUCT_OFFSET (NvBufSurfTransformRect, top), ==, 0);
+  g_assert_cmpuint (G_STRUCT_OFFSET (NvBufSurfTransformRect, left), ==, 4);
+  g_assert_cmpuint (G_STRUCT_OFFSET (NvBufSurfTransformRect, width), ==, 8);
+  g_assert_cmpuint (G_STRUCT_OFFSET (NvBufSurfTransformRect, height), ==, 12);
+  g_assert_cmpuint (sizeof (params.transform_flag), ==, sizeof (guint32));
+  g_assert_cmpuint (sizeof (config.gpu_id), ==, sizeof (gint32));
+  g_assert_cmpuint (sizeof (config.cuda_stream), ==, sizeof (gpointer));
+  g_assert_true (params.src_rect->left == 2 && params.dst_rect == NULL);
+  g_assert_cmpint (config.compute_mode, ==, RdsBufSurfTransformCompute_GPU);
 }
 
 static void
@@ -101,6 +144,10 @@ test_functions (void)
     (gpointer) gst_nvevent_parse_stream_segment,
     (gpointer) gst_nvevent_parse_stream_reset,
     (gpointer) gst_nvevent_parse_stream_start,
+    (gpointer) NvBufSurfTransform,
+    (gpointer) NvBufSurfTransformSetSessionParams,
+    (gpointer) NvBufSurfTransformGetSessionParams,
+    (gpointer) NvBufSurfTransformSetDefaultSession,
   };
   gpointer rds[] = {
     (gpointer) rds_buf_surface_create,
@@ -151,7 +198,22 @@ test_functions (void)
     (gpointer) rds_event_parse_stream_segment,
     (gpointer) rds_event_parse_stream_reset,
     (gpointer) rds_event_parse_stream_start,
+    (gpointer) rds_buf_surf_transform,
+    (gpointer) rds_buf_surf_transform_set_session_params,
+    (gpointer) rds_buf_surf_transform_get_session_params,
+    (gpointer) rds_buf_surf_transform_set_default_session,
   };
+  /* The transform functions have DeepStream's exact prototypes: pointers declared with them accept our functions. */
+  NvBufSurfTransform_Error (*transform) (NvBufSurface *, NvBufSurface *, NvBufSurfTransformParams *) =
+      NvBufSurfTransform;
+  NvBufSurfTransform_Error (*set_session) (NvBufSurfTransformConfigParams *) = NvBufSurfTransformSetSessionParams;
+  NvBufSurfTransform_Error (*get_session) (NvBufSurfTransformConfigParams *) = NvBufSurfTransformGetSessionParams;
+  NvBufSurfTransform_Error (*set_default) (void) = NvBufSurfTransformSetDefaultSession;
+
+  g_assert_true ((gpointer) transform == (gpointer) rds_buf_surf_transform);
+  g_assert_true ((gpointer) set_session == (gpointer) rds_buf_surf_transform_set_session_params);
+  g_assert_true ((gpointer) get_session == (gpointer) rds_buf_surf_transform_get_session_params);
+  g_assert_true ((gpointer) set_default == (gpointer) rds_buf_surf_transform_set_default_session);
 
   g_assert_cmpuint (G_N_ELEMENTS (nv), ==, G_N_ELEMENTS (rds));
   for (gsize i = 0; i < G_N_ELEMENTS (nv); i++)
@@ -211,6 +273,36 @@ test_constants (void)
   g_assert_true ((gint64) GST_NVEVENT_STREAM_SEGMENT == (gint64) RDS_EVENT_STREAM_SEGMENT);
   g_assert_true ((gint64) GST_NVEVENT_STREAM_RESET == (gint64) RDS_EVENT_STREAM_RESET);
   g_assert_true ((gint64) GST_NVEVENT_STREAM_START == (gint64) RDS_EVENT_STREAM_START);
+  g_assert_true ((gint64) NvBufSurfTransformCompute_Default == (gint64) RdsBufSurfTransformCompute_Default);
+  g_assert_true ((gint64) NvBufSurfTransformCompute_GPU == (gint64) RdsBufSurfTransformCompute_GPU);
+  g_assert_true ((gint64) NvBufSurfTransformCompute_VIC == (gint64) RdsBufSurfTransformCompute_VIC);
+  g_assert_true ((gint64) NvBufSurfTransform_None == (gint64) RdsBufSurfTransform_None);
+  g_assert_true ((gint64) NvBufSurfTransform_Rotate90 == (gint64) RdsBufSurfTransform_Rotate90);
+  g_assert_true ((gint64) NvBufSurfTransform_Rotate180 == (gint64) RdsBufSurfTransform_Rotate180);
+  g_assert_true ((gint64) NvBufSurfTransform_Rotate270 == (gint64) RdsBufSurfTransform_Rotate270);
+  g_assert_true ((gint64) NvBufSurfTransform_FlipX == (gint64) RdsBufSurfTransform_FlipX);
+  g_assert_true ((gint64) NvBufSurfTransform_FlipY == (gint64) RdsBufSurfTransform_FlipY);
+  g_assert_true ((gint64) NvBufSurfTransform_Transpose == (gint64) RdsBufSurfTransform_Transpose);
+  g_assert_true ((gint64) NvBufSurfTransform_InvTranspose == (gint64) RdsBufSurfTransform_InvTranspose);
+  g_assert_true ((gint64) NvBufSurfTransformInter_Nearest == (gint64) RdsBufSurfTransformInter_Nearest);
+  g_assert_true ((gint64) NvBufSurfTransformInter_Bilinear == (gint64) RdsBufSurfTransformInter_Bilinear);
+  g_assert_true ((gint64) NvBufSurfTransformInter_Algo1 == (gint64) RdsBufSurfTransformInter_Algo1);
+  g_assert_true ((gint64) NvBufSurfTransformInter_Algo2 == (gint64) RdsBufSurfTransformInter_Algo2);
+  g_assert_true ((gint64) NvBufSurfTransformInter_Algo3 == (gint64) RdsBufSurfTransformInter_Algo3);
+  g_assert_true ((gint64) NvBufSurfTransformInter_Algo4 == (gint64) RdsBufSurfTransformInter_Algo4);
+  g_assert_true ((gint64) NvBufSurfTransformInter_Default == (gint64) RdsBufSurfTransformInter_Default);
+  g_assert_true ((gint64) NvBufSurfTransformError_ROI_Error == (gint64) RdsBufSurfTransformError_ROI_Error);
+  g_assert_true ((gint64) NvBufSurfTransformError_Invalid_Params == (gint64) RdsBufSurfTransformError_Invalid_Params);
+  g_assert_true ((gint64) NvBufSurfTransformError_Execution_Error
+      == (gint64) RdsBufSurfTransformError_Execution_Error);
+  g_assert_true ((gint64) NvBufSurfTransformError_Unsupported == (gint64) RdsBufSurfTransformError_Unsupported);
+  g_assert_true ((gint64) NvBufSurfTransformError_Success == (gint64) RdsBufSurfTransformError_Success);
+  g_assert_true ((gint64) NVBUFSURF_TRANSFORM_CROP_SRC == (gint64) RDS_BUFSURF_TRANSFORM_CROP_SRC);
+  g_assert_true ((gint64) NVBUFSURF_TRANSFORM_CROP_DST == (gint64) RDS_BUFSURF_TRANSFORM_CROP_DST);
+  g_assert_true ((gint64) NVBUFSURF_TRANSFORM_FILTER == (gint64) RDS_BUFSURF_TRANSFORM_FILTER);
+  g_assert_true ((gint64) NVBUFSURF_TRANSFORM_FLIP == (gint64) RDS_BUFSURF_TRANSFORM_FLIP);
+  g_assert_true ((gint64) NVBUFSURF_TRANSFORM_NORMALIZE == (gint64) RDS_BUFSURF_TRANSFORM_NORMALIZE);
+  g_assert_true ((gint64) NVBUFSURF_TRANSFORM_ALLOW_ODD_CROP == (gint64) RDS_BUFSURF_TRANSFORM_ALLOW_ODD_CROP);
 
   /* Values DeepStream's public reference documents and configs or apps rely on. */
   g_assert_cmpint (NVBUF_MEM_DEFAULT, ==, 0);
@@ -226,6 +318,35 @@ test_constants (void)
   g_assert_cmpint (MAX_RESERVED_FIELDS, ==, 4);
   g_assert_true (UNTRACKED_OBJECT_ID == G_GUINT64_CONSTANT (0xFFFFFFFFFFFFFFFF));
   g_assert_cmpint (NVDS_START_USER_META, ==, NVDS_GST_CUSTOM_META + 4096 + 1);
+  g_assert_cmpint (NvBufSurfTransformCompute_Default, ==, 0);
+  g_assert_cmpint (NvBufSurfTransformCompute_GPU, ==, 1);
+  g_assert_cmpint (NvBufSurfTransformCompute_VIC, ==, 2);
+  g_assert_cmpint (NvBufSurfTransform_None, ==, 0);
+  g_assert_cmpint (NvBufSurfTransform_Rotate90, ==, 1);
+  g_assert_cmpint (NvBufSurfTransform_Rotate180, ==, 2);
+  g_assert_cmpint (NvBufSurfTransform_Rotate270, ==, 3);
+  g_assert_cmpint (NvBufSurfTransform_FlipX, ==, 4);
+  g_assert_cmpint (NvBufSurfTransform_FlipY, ==, 5);
+  g_assert_cmpint (NvBufSurfTransform_Transpose, ==, 6);
+  g_assert_cmpint (NvBufSurfTransform_InvTranspose, ==, 7);
+  g_assert_cmpint (NvBufSurfTransformInter_Nearest, ==, 0);
+  g_assert_cmpint (NvBufSurfTransformInter_Bilinear, ==, 1);
+  g_assert_cmpint (NvBufSurfTransformInter_Algo1, ==, 2);
+  g_assert_cmpint (NvBufSurfTransformInter_Algo2, ==, 3);
+  g_assert_cmpint (NvBufSurfTransformInter_Algo3, ==, 4);
+  g_assert_cmpint (NvBufSurfTransformInter_Algo4, ==, 5);
+  g_assert_cmpint (NvBufSurfTransformInter_Default, ==, 6);
+  g_assert_cmpint (NvBufSurfTransformError_ROI_Error, ==, -4);
+  g_assert_cmpint (NvBufSurfTransformError_Invalid_Params, ==, -3);
+  g_assert_cmpint (NvBufSurfTransformError_Execution_Error, ==, -2);
+  g_assert_cmpint (NvBufSurfTransformError_Unsupported, ==, -1);
+  g_assert_cmpint (NvBufSurfTransformError_Success, ==, 0);
+  g_assert_cmpint (NVBUFSURF_TRANSFORM_CROP_SRC, ==, 1);
+  g_assert_cmpint (NVBUFSURF_TRANSFORM_CROP_DST, ==, 2);
+  g_assert_cmpint (NVBUFSURF_TRANSFORM_FILTER, ==, 4);
+  g_assert_cmpint (NVBUFSURF_TRANSFORM_FLIP, ==, 8);
+  g_assert_cmpint (NVBUFSURF_TRANSFORM_NORMALIZE, ==, 16);
+  g_assert_cmpint (NVBUFSURF_TRANSFORM_ALLOW_ODD_CROP, ==, 32);
 }
 
 int
@@ -235,5 +356,6 @@ main (int argc, char **argv)
   g_test_add_func ("/compat-aliases/types", test_types);
   g_test_add_func ("/compat-aliases/functions", test_functions);
   g_test_add_func ("/compat-aliases/constants", test_constants);
+  g_test_add_func ("/compat-aliases/transform-structs", test_transform_structs);
   return g_test_run ();
 }
