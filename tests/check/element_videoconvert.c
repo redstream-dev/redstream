@@ -226,6 +226,144 @@ test_wrap_surface (void)
   }
 }
 
+
+/* ---- cpu: caps transform and fixation, through the class vfuncs ---- */
+
+static GstCaps *
+transform_caps (GstElement * e, const gchar * in)
+{
+  GstBaseTransformClass *klass = GST_BASE_TRANSFORM_GET_CLASS (e);
+  GstCaps *caps = gst_caps_from_string (in);
+  GstCaps *ret = klass->transform_caps (GST_BASE_TRANSFORM (e), GST_PAD_SINK, caps, NULL);
+
+  gst_caps_unref (caps);
+  return ret;
+}
+
+/* What the base class does: transform, keep what the src template and downstream allow, fixate. */
+static GstCaps *
+negotiate (GstElement * e, const gchar * in, const gchar * downstream)
+{
+  GstBaseTransformClass *klass = GST_BASE_TRANSFORM_GET_CLASS (e);
+  GstCaps *caps = gst_caps_from_string (in), *peer = gst_caps_from_string (downstream);
+  GstCaps *templ = gst_pad_get_pad_template_caps (GST_BASE_TRANSFORM_SRC_PAD (e));
+  GstCaps *other = transform_caps (e, in), *tmp;
+
+  tmp = gst_caps_intersect_full (peer, templ, GST_CAPS_INTERSECT_FIRST);
+  gst_caps_replace (&peer, tmp);
+  gst_caps_unref (tmp);
+  tmp = gst_caps_intersect_full (peer, other, GST_CAPS_INTERSECT_FIRST);
+  gst_caps_unref (other);
+  other = klass->fixate_caps (GST_BASE_TRANSFORM (e), GST_PAD_SINK, caps, tmp);
+  g_assert_true (gst_caps_is_fixed (other));
+  gst_caps_unref (templ);
+  gst_caps_unref (peer);
+  gst_caps_unref (caps);
+  return other;
+}
+
+static void
+assert_caps_str (GstCaps * caps, const gchar * expected)
+{
+  GstCaps *exp = gst_caps_from_string (expected);
+
+  if (!gst_caps_is_equal (caps, exp)) {
+    gchar *got = gst_caps_to_string (caps);
+    g_error ("got %s, expected %s", got, expected);
+  }
+  gst_caps_unref (exp);
+}
+
+#define SYS_IN "video/x-raw,format=NV12,width=320,height=240,framerate=30/1,pixel-aspect-ratio=1/1," \
+  "colorimetry=bt601,chroma-site=jpeg,interlace-mode=progressive"
+#define RDS_IN "video/x-raw(memory:RDS),format=NV12,width=320,height=240,framerate=30/1," \
+  "pixel-aspect-ratio=1/1,colorimetry=bt601,chroma-site=jpeg"
+
+static void
+test_transform_caps (void)
+{
+  GstElement *e = gst_element_factory_make ("rdsvideoconvert", NULL);
+  GstCaps *caps;
+
+  /* each input's own memory first, then the other; format, size and colour fields are free */
+  caps = transform_caps (e, SYS_IN);
+  g_assert_cmpuint (gst_caps_get_size (caps), ==, 2);
+  g_assert_true (gst_caps_features_is_equal (gst_caps_get_features (caps, 0),
+          GST_CAPS_FEATURES_MEMORY_SYSTEM_MEMORY));
+  g_assert_true (gst_caps_features_contains (gst_caps_get_features (caps, 1), RDS_CAPS_FEATURE_MEMORY_RDS));
+  for (guint i = 0; i < 2; i++) {
+    GstStructure *st = gst_caps_get_structure (caps, i);
+    g_assert_false (gst_structure_has_field (st, "format"));
+    g_assert_false (gst_structure_has_field (st, "width"));
+    g_assert_false (gst_structure_has_field (st, "pixel-aspect-ratio"));
+    g_assert_false (gst_structure_has_field (st, "colorimetry"));
+    g_assert_true (gst_structure_has_field (st, "framerate"));
+  }
+  gst_caps_unref (caps);
+
+  caps = transform_caps (e, RDS_IN);
+  g_assert_cmpuint (gst_caps_get_size (caps), ==, 2);
+  g_assert_true (gst_caps_features_contains (gst_caps_get_features (caps, 0), RDS_CAPS_FEATURE_MEMORY_RDS));
+  g_assert_true (gst_caps_features_is_equal (gst_caps_get_features (caps, 1),
+          GST_CAPS_FEATURES_MEMORY_SYSTEM_MEMORY));
+  gst_caps_unref (caps);
+  gst_object_unref (e);
+}
+
+static void
+test_fixate (void)
+{
+  GstElement *e = gst_element_factory_make ("rdsvideoconvert", NULL);
+  GstCaps *caps;
+
+  /* downstream allows the input caps: exactly those (passthrough), in the input's memory */
+  caps = negotiate (e, SYS_IN, "video/x-raw,format=NV12");
+  assert_caps_str (caps, SYS_IN);
+  gst_caps_unref (caps);
+  caps = negotiate (e, SYS_IN, "video/x-raw(ANY)");
+  assert_caps_str (caps, SYS_IN);
+  gst_caps_unref (caps);
+  caps = negotiate (e, RDS_IN, "video/x-raw(memory:RDS)");
+  assert_caps_str (caps, RDS_IN);
+  gst_caps_unref (caps);
+
+  /* format only: the input size and PAR; YUV colorimetry does not carry over to RGB */
+  caps = negotiate (e, SYS_IN, "video/x-raw,format=RGBA");
+  assert_caps_str (caps, "video/x-raw,format=RGBA,width=320,height=240,framerate=30/1,pixel-aspect-ratio=1/1,"
+      "interlace-mode=progressive");
+  gst_caps_unref (caps);
+
+  /* another 4:2:0 format keeps colorimetry and siting */
+  caps = negotiate (e, RDS_IN, "video/x-raw(memory:RDS),format=I420");
+  assert_caps_str (caps, "video/x-raw(memory:RDS),format=I420,width=320,height=240,framerate=30/1,"
+      "pixel-aspect-ratio=1/1,colorimetry=bt601,chroma-site=jpeg");
+  gst_caps_unref (caps);
+
+  /* size only: the input format, with its colour fields */
+  caps = negotiate (e, SYS_IN, "video/x-raw,width=160,height=120");
+  assert_caps_str (caps, "video/x-raw,format=NV12,width=160,height=120,framerate=30/1,pixel-aspect-ratio=1/1,"
+      "colorimetry=bt601,chroma-site=jpeg,interlace-mode=progressive");
+  gst_caps_unref (caps);
+
+  /* downstream asks for another PAR: nearest allowed */
+  caps = negotiate (e, SYS_IN, "video/x-raw,width=160,height=120,pixel-aspect-ratio={4/3,10/11}");
+  g_assert_true (gst_structure_has_field (gst_caps_get_structure (caps, 0), "pixel-aspect-ratio"));
+  {
+    gint n, d;
+    g_assert_true (gst_structure_get_fraction (gst_caps_get_structure (caps, 0), "pixel-aspect-ratio", &n, &d));
+    g_assert_cmpint (n, ==, 10);
+    g_assert_cmpint (d, ==, 11);
+  }
+  gst_caps_unref (caps);
+
+  /* no PAR on the input: none added */
+  caps = negotiate (e, "video/x-raw,format=NV12,width=320,height=240,framerate=30/1", "video/x-raw,format=RGBA");
+  assert_caps_str (caps, "video/x-raw,format=RGBA,width=320,height=240,framerate=30/1");
+  gst_caps_unref (caps);
+
+  gst_object_unref (e);
+}
+
 /* ---- gpu helpers ---- */
 
 static GstBufferPool *
@@ -494,6 +632,296 @@ test_batch_meta_kept (void)
   gst_object_unref (pool);
 }
 
+static void
+test_passthrough_full_caps (void)
+{
+  GstHarness *h;
+  GstBufferPool *pool;
+  GstBuffer *in = NULL, *out;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = make_harness (RDS_IN, "video/x-raw(memory:RDS),format=NV12");
+  pool = make_pool (RDS_IN, 1);
+  g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &in, NULL), ==, GST_FLOW_OK);
+  fill_buffer (in, 31);
+  out = gst_harness_push_and_pull (h, gst_buffer_ref (in));
+  g_assert_true (out == in);
+  g_assert_true (gst_base_transform_is_passthrough (GST_BASE_TRANSFORM (h->element)));
+  gst_buffer_unref (out);
+  gst_buffer_unref (in);
+  gst_harness_teardown (h);
+  gst_buffer_pool_set_active (pool, FALSE);
+  gst_object_unref (pool);
+}
+
+/* Runs @desc (with an element named conv) to EOS; returns the converter (a new reference) and its src caps. */
+static GstElement *
+run_pipeline (const gchar * desc, GstCaps ** src_caps)
+{
+  GError *err = NULL;
+  GstElement *pipe = gst_parse_launch (desc, &err), *conv;
+  GstBus *bus;
+  GstMessage *msg;
+
+  g_assert_no_error (err);
+  conv = gst_bin_get_by_name (GST_BIN (pipe), "conv");
+  g_assert_nonnull (conv);
+  bus = gst_element_get_bus (pipe);
+  g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  msg = gst_bus_timed_pop_filtered (bus, 10 * GST_SECOND, GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+  g_assert_nonnull (msg);
+  g_assert_cmpint (GST_MESSAGE_TYPE (msg), ==, GST_MESSAGE_EOS);
+  gst_message_unref (msg);
+  *src_caps = gst_pad_get_current_caps (GST_BASE_TRANSFORM_SRC_PAD (conv));
+  g_assert_nonnull (*src_caps);
+  /* read while the pipeline is still running */
+  g_object_set_data (G_OBJECT (conv), "was-passthrough",
+      GINT_TO_POINTER (gst_base_transform_is_passthrough (GST_BASE_TRANSFORM (conv))));
+  gst_element_set_state (pipe, GST_STATE_NULL);
+  gst_object_unref (bus);
+  gst_object_unref (pipe);
+  return conv;
+}
+
+static void
+test_pipeline_passthrough (void)
+{
+  GstElement *conv;
+  GstCaps *caps;
+
+  RDS_TEST_REQUIRE_GPU ();
+  /* system NV12 in, NV12 asked downstream: passthrough with the full upstream caps */
+  conv = run_pipeline ("videotestsrc num-buffers=3 ! video/x-raw,format=NV12,width=320,height=240 "
+      "! rdsvideoconvert name=conv ! video/x-raw,format=NV12 ! fakesink", &caps);
+  g_assert_true (GPOINTER_TO_INT (g_object_get_data (G_OBJECT (conv), "was-passthrough")));
+  g_assert_true (gst_caps_features_is_equal (gst_caps_get_features (caps, 0),
+          GST_CAPS_FEATURES_MEMORY_SYSTEM_MEMORY));
+  gst_caps_unref (caps);
+  gst_object_unref (conv);
+
+  /* downstream accepts anything: the input's own (system) memory wins, again passthrough */
+  conv = run_pipeline ("videotestsrc num-buffers=3 ! video/x-raw,format=NV12,width=320,height=240 "
+      "! rdsvideoconvert name=conv ! fakesink", &caps);
+  g_assert_true (GPOINTER_TO_INT (g_object_get_data (G_OBJECT (conv), "was-passthrough")));
+  g_assert_true (gst_caps_features_is_equal (gst_caps_get_features (caps, 0),
+          GST_CAPS_FEATURES_MEMORY_SYSTEM_MEMORY));
+  gst_caps_unref (caps);
+  gst_object_unref (conv);
+}
+
+static void
+test_passthrough_toggle (void)
+{
+  GstHarness *h;
+  GstBufferPool *pool;
+  GstEvent *ev;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = make_harness (NV12_320, NV12_320);
+  pool = make_pool (NV12_320, 1);
+  for (guint step = 0; step < 3; step++) {
+    GstBuffer *in = NULL, *out;
+    gboolean disabled = step == 1;
+
+    if (step > 0) {
+      while ((ev = gst_harness_try_pull_upstream_event (h)) != NULL)
+        gst_event_unref (ev);
+      g_object_set (h->element, "disable-passthrough", disabled, NULL);
+      /* upstream is asked to renegotiate allocation */
+      while ((ev = gst_harness_try_pull_upstream_event (h)) != NULL
+          && GST_EVENT_TYPE (ev) != GST_EVENT_RECONFIGURE)
+        gst_event_unref (ev);
+      g_assert_nonnull (ev);
+      gst_event_unref (ev);
+    }
+    g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &in, NULL), ==, GST_FLOW_OK);
+    fill_buffer (in, 40 + step);
+    out = gst_harness_push_and_pull (h, gst_buffer_ref (in));
+    g_assert_nonnull (out);
+    g_assert_cmpint (gst_base_transform_is_passthrough (GST_BASE_TRANSFORM (h->element)), ==, !disabled);
+    if (disabled) {
+      HostImage hin, hout;
+
+      g_assert_true (out != in);
+      snapshot_buffer (in, &hin);
+      snapshot_buffer (out, &hout);
+      g_assert_cmpuint (max_diff (&hin, &hout, TRUE), ==, 0);
+      host_image_clear (&hout);
+      host_image_clear (&hin);
+    } else {
+      g_assert_true (out == in);
+    }
+    gst_buffer_unref (out);
+    gst_buffer_unref (in);
+  }
+  gst_harness_teardown (h);
+  gst_buffer_pool_set_active (pool, FALSE);
+  gst_object_unref (pool);
+}
+
+static void
+test_crop_meta (void)
+{
+  GstHarness *h;
+  GstBufferPool *pool;
+  GstBuffer *in = NULL, *out;
+  GstVideoCropMeta *crop;
+  HostImage hin, hout, href;
+  RefRect s = { 10, 20, 100, 50 }, d = { 0, 0, 160, 120 };
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = make_harness (NV12_320, RGBA_160);
+  pool = make_pool (NV12_320, 1);
+  g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &in, NULL), ==, GST_FLOW_OK);
+  fill_buffer (in, 51);
+  crop = gst_buffer_add_video_crop_meta (in);
+  crop->x = 10;
+  crop->y = 20;
+  crop->width = 100;
+  crop->height = 50;
+  snapshot_buffer (in, &hin);
+
+  out = gst_harness_push_and_pull (h, in);
+  g_assert_nonnull (out);
+  g_assert_null (gst_buffer_get_video_crop_meta (out));
+  snapshot_buffer (out, &hout);
+  href = hout;
+  href.im.plane[0] = g_malloc0 ((gsize) hout.im.pitch[0] * hout.rows[0]);
+  ref_transform (&hin.im, &href.im, s, d, FALSE);
+  g_assert_cmpuint (max_diff (&hout, &href, TRUE), <=, 1);
+
+  host_image_clear (&href);
+  host_image_clear (&hout);
+  host_image_clear (&hin);
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+  gst_buffer_pool_set_active (pool, FALSE);
+  gst_object_unref (pool);
+}
+
+static void
+test_caps_query (void)
+{
+  GstHarness *h;
+  GstCaps *caps;
+  gboolean rds = FALSE, sys = FALSE;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = gst_harness_new ("rdsvideoconvert");
+  gst_harness_set_src_caps_str (h, SYS_IN);
+  caps = gst_pad_query_caps (GST_BASE_TRANSFORM_SRC_PAD (h->element), NULL);
+  for (guint i = 0; i < gst_caps_get_size (caps); i++) {
+    GstCapsFeatures *f = gst_caps_get_features (caps, i);
+    rds |= gst_caps_features_contains (f, RDS_CAPS_FEATURE_MEMORY_RDS);
+    sys |= gst_caps_features_is_equal (f, GST_CAPS_FEATURES_MEMORY_SYSTEM_MEMORY);
+  }
+  g_assert_true (rds);
+  g_assert_true (sys);
+  g_assert_true (gst_caps_features_is_equal (gst_caps_get_features (caps, 0),
+          GST_CAPS_FEATURES_MEMORY_SYSTEM_MEMORY));
+  gst_caps_unref (caps);
+  gst_harness_teardown (h);
+}
+
+static void
+test_propose_allocation (void)
+{
+  GstHarness *h;
+  GstBufferPool *pool, *proposed = NULL;
+  GstBuffer *in = NULL, *out;
+  GstCaps *caps = gst_caps_from_string (NV12_320);
+  GstQuery *query;
+  GstStructure *config;
+  guint min = 0, batch = 0, gpu = 99;
+  RdsBufSurfaceMemType mt = RDS_BUF_MEM_SYSTEM;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = make_harness (NV12_320, RGBA_160);
+  pool = make_pool (NV12_320, 1);
+  g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &in, NULL), ==, GST_FLOW_OK);
+  fill_buffer (in, 61);
+  out = gst_harness_push_and_pull (h, in);      /* negotiated, not passthrough */
+  gst_buffer_unref (out);
+
+  query = gst_query_new_allocation (caps, TRUE);
+  g_assert_true (gst_pad_peer_query (h->srcpad, query));
+  g_assert_cmpuint (gst_query_get_n_allocation_pools (query), >=, 1);
+  gst_query_parse_nth_allocation_pool (query, 0, &proposed, NULL, &min, NULL);
+  g_assert_true (RDS_IS_BUFFER_POOL (proposed));
+  g_assert_cmpuint (min, ==, 2);
+  config = gst_buffer_pool_get_config (proposed);
+  g_assert_true (rds_buffer_pool_config_get_surface_params (config, &batch, &mt, &gpu));
+  g_assert_cmpuint (batch, ==, 1);
+  g_assert_cmpint (mt, ==, RDS_BUF_MEM_DEFAULT);
+  g_assert_cmpuint (gpu, ==, 0);
+  gst_structure_free (config);
+  g_assert_true (gst_query_find_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL));
+
+  gst_object_unref (proposed);
+  gst_query_unref (query);
+  gst_caps_unref (caps);
+  gst_harness_teardown (h);
+  gst_buffer_pool_set_active (pool, FALSE);
+  gst_object_unref (pool);
+}
+
+static void
+test_decide_allocation (void)
+{
+  GstElement *e = gst_element_factory_make ("rdsvideoconvert", NULL);
+  GstHarness *h;
+  GstBufferPool *pool, *outpool;
+  GstBuffer *in = NULL, *out;
+  GstStructure *config;
+  guint min = 0, batch = 0, gpu = 99, v = 0;
+  RdsBufSurfaceMemType mt = RDS_BUF_MEM_SYSTEM;
+
+  RDS_TEST_REQUIRE_GPU ();
+  g_object_set (e, "nvbuf-memory-type", 3, "output-buffers", 6, NULL);
+  h = gst_harness_new_with_element (e, "sink", "src");
+  gst_harness_set_src_caps_str (h, NV12_320);
+  gst_harness_set_sink_caps_str (h, RGBA_160);
+  pool = make_pool (NV12_320, 1);
+  g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &in, NULL), ==, GST_FLOW_OK);
+  fill_buffer (in, 71);
+  out = gst_harness_push_and_pull (h, in);
+  g_assert_nonnull (out);
+  g_assert_cmpint (rds_buffer_get_surface (out)->memType, ==, RDS_BUF_MEM_HIP_UNIFIED);
+  gst_buffer_unref (out);
+
+  outpool = gst_base_transform_get_buffer_pool (GST_BASE_TRANSFORM (e));
+  g_assert_true (RDS_IS_BUFFER_POOL (outpool));
+  config = gst_buffer_pool_get_config (outpool);
+  g_assert_true (gst_buffer_pool_config_get_params (config, NULL, NULL, &min, NULL));
+  g_assert_cmpuint (min, ==, 6);
+  g_assert_true (rds_buffer_pool_config_get_surface_params (config, &batch, &mt, &gpu));
+  g_assert_cmpuint (batch, ==, 1);
+  g_assert_cmpint (mt, ==, RDS_BUF_MEM_HIP_UNIFIED);
+  g_assert_cmpuint (gpu, ==, 0);
+  gst_structure_free (config);
+  gst_object_unref (outpool);
+
+  /* allocation settings are fixed while streaming */
+  g_test_expect_message ("rdsvideo", G_LOG_LEVEL_WARNING, "*output-buffers*");
+  g_object_set (e, "output-buffers", 9, NULL);
+  g_test_expect_message ("rdsvideo", G_LOG_LEVEL_WARNING, "*nvbuf-memory-type*");
+  g_object_set (e, "nvbuf-memory-type", 2, NULL);
+  g_test_expect_message ("rdsvideo", G_LOG_LEVEL_WARNING, "*gpu-id*");
+  g_object_set (e, "gpu-id", 1, NULL);
+  g_test_assert_expected_messages ();
+  g_object_get (e, "output-buffers", &v, NULL);
+  g_assert_cmpuint (v, ==, 6);
+  g_object_get (e, "nvbuf-memory-type", &v, NULL);
+  g_assert_cmpuint (v, ==, 3);
+  g_object_get (e, "gpu-id", &v, NULL);
+  g_assert_cmpuint (v, ==, 0);
+
+  gst_harness_teardown (h);
+  gst_object_unref (e);
+  gst_buffer_pool_set_active (pool, FALSE);
+  gst_object_unref (pool);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -503,10 +931,19 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/videoconvert/properties", test_properties);
   g_test_add_func ("/cpu/videoconvert/parse-rect", test_parse_rect);
   g_test_add_func ("/cpu/videoconvert/wrap-surface", test_wrap_surface);
+  g_test_add_func ("/cpu/videoconvert/transform-caps", test_transform_caps);
+  g_test_add_func ("/cpu/videoconvert/fixate", test_fixate);
   g_test_add_func ("/gpu/videoconvert/convert-scale", test_convert_scale);
   g_test_add_func ("/gpu/videoconvert/session-per-call", test_session_per_call);
   g_test_add_func ("/gpu/videoconvert/passthrough", test_passthrough);
   g_test_add_func ("/gpu/videoconvert/batch-rejected", test_batch_rejected);
   g_test_add_func ("/gpu/videoconvert/batch-meta-kept", test_batch_meta_kept);
+  g_test_add_func ("/gpu/videoconvert/passthrough-full-caps", test_passthrough_full_caps);
+  g_test_add_func ("/gpu/videoconvert/pipeline-passthrough", test_pipeline_passthrough);
+  g_test_add_func ("/gpu/videoconvert/passthrough-toggle", test_passthrough_toggle);
+  g_test_add_func ("/gpu/videoconvert/crop-meta", test_crop_meta);
+  g_test_add_func ("/gpu/videoconvert/caps-query", test_caps_query);
+  g_test_add_func ("/gpu/videoconvert/propose-allocation", test_propose_allocation);
+  g_test_add_func ("/gpu/videoconvert/decide-allocation", test_decide_allocation);
   return g_test_run ();
 }

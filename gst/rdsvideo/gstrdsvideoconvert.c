@@ -44,6 +44,7 @@ struct _GstRdsVideoConvert
   guint stream_gpu;             /* the GPU the stream (and every transform) runs on */
   GstVideoInfo in_info;
   GstVideoInfo out_info;
+  gboolean caps_equal;          /* negotiated input and output caps are equal (object lock) */
 };
 
 #define RDS_VIDEO_CONVERT_FORMATS "{ NV12, I420, RGBA, BGRA, RGBx, BGRx, RGB, BGR, GRAY8 }"
@@ -106,20 +107,25 @@ static GstCaps *
 gst_rds_video_convert_transform_caps (GstBaseTransform * trans, GstPadDirection direction, GstCaps * caps,
     GstCaps * filter)
 {
-  GstCaps *rds = gst_caps_new_empty (), *sys = gst_caps_new_empty (), *ret;
+  GstCaps *own = gst_caps_new_empty (), *other = gst_caps_new_empty (), *ret;
 
-  /* Any format and size, in either memory: drop what we convert, keep the rest (framerate). */
+  /* Any format and size, in either memory: drop what we convert, keep the rest (framerate). Each structure's own
+   * memory comes first, as in videoconvertscale, so passthrough and downstream's order win. */
   for (guint i = 0; i < gst_caps_get_size (caps); i++) {
     GstStructure *s = gst_structure_copy (gst_caps_get_structure (caps, i));
+    GstCapsFeatures *f = gst_caps_get_features (caps, i);
+    gboolean is_rds = f != NULL && !gst_caps_features_is_any (f)
+        && gst_caps_features_contains (f, RDS_CAPS_FEATURE_MEMORY_RDS);
+    GstCaps **rds = is_rds ? &own : &other, **sys = is_rds ? &other : &own;
 
     gst_structure_remove_fields (s, "format", "width", "height", "pixel-aspect-ratio", "colorimetry",
         "chroma-site", NULL);
-    rds = gst_caps_merge_structure_full (rds, gst_structure_copy (s),
+    *rds = gst_caps_merge_structure_full (*rds, gst_structure_copy (s),
         gst_caps_features_new_single_static_str (RDS_CAPS_FEATURE_MEMORY_RDS));
-    sys = gst_caps_merge_structure_full (sys, s,
+    *sys = gst_caps_merge_structure_full (*sys, s,
         gst_caps_features_new_single_static_str (GST_CAPS_FEATURE_MEMORY_SYSTEM_MEMORY));
   }
-  ret = gst_caps_merge (rds, sys);
+  ret = gst_caps_merge (own, other);
 
   if (filter != NULL) {
     GstCaps *tmp = gst_caps_intersect_full (filter, ret, GST_CAPS_INTERSECT_FIRST);
@@ -131,16 +137,54 @@ gst_rds_video_convert_transform_caps (GstBaseTransform * trans, GstPadDirection 
   return ret;
 }
 
+/* Sets @field from @in when @out lacks it, or fixates it to @in's string value when @out allows several. */
+static void
+take_field (GstStructure * out, const GstStructure * in, const gchar * field)
+{
+  const GValue *v = gst_structure_get_value (in, field);
+
+  if (v == NULL)
+    return;
+  if (!gst_structure_has_field (out, field))
+    gst_structure_set_value (out, field, v);
+  else if (G_VALUE_HOLDS_STRING (v))
+    gst_structure_fixate_field_string (out, field, g_value_get_string (v));
+}
+
+/* Same format, or both YUV 4:2:0: colorimetry and chroma siting carry over. */
+static gboolean
+same_colour_family (const gchar * a, const gchar * b)
+{
+  if (a == NULL || b == NULL)
+    return FALSE;
+  if (g_str_equal (a, b))
+    return TRUE;
+  return (g_str_equal (a, "NV12") || g_str_equal (a, "I420")) && (g_str_equal (b, "NV12")
+      || g_str_equal (b, "I420"));
+}
+
 static GstCaps *
 gst_rds_video_convert_fixate_caps (GstBaseTransform * trans, G_GNUC_UNUSED GstPadDirection direction,
     GstCaps * caps, GstCaps * othercaps)
 {
   const GstStructure *in = gst_caps_get_structure (caps, 0);
   GstStructure *out;
+  GstCaps *same;
   const gchar *format;
   gint v, n, d;
 
-  /* Simplified videoscale-style fixation: the first allowed structure, as close to the input as it allows. */
+  /* The input caps themselves when the other side allows them: that gives passthrough. */
+  same = gst_caps_intersect_full (othercaps, caps, GST_CAPS_INTERSECT_FIRST);
+  if (!gst_caps_is_empty (same)) {
+    gst_caps_unref (othercaps);
+    same = gst_caps_fixate (same);
+    GST_DEBUG_OBJECT (trans, "fixated to the input caps %" GST_PTR_FORMAT, same);
+    return same;
+  }
+  gst_caps_unref (same);
+
+  /* Otherwise a simplified videoscale-style fixation: the first allowed structure, as close to the input as it
+   * allows. */
   othercaps = gst_caps_truncate (othercaps);
   othercaps = gst_caps_make_writable (othercaps);
   out = gst_caps_get_structure (othercaps, 0);
@@ -152,13 +196,18 @@ gst_rds_video_convert_fixate_caps (GstBaseTransform * trans, G_GNUC_UNUSED GstPa
   format = gst_structure_get_string (in, "format");
   if (format != NULL)
     gst_structure_fixate_field_string (out, "format", format);
-  if (gst_structure_has_field (out, "pixel-aspect-ratio")) {
-    if (!gst_structure_get_fraction (in, "pixel-aspect-ratio", &n, &d))
-      n = d = 1;
-    gst_structure_fixate_field_nearest_fraction (out, "pixel-aspect-ratio", n, d);
+  if (gst_structure_get_fraction (in, "pixel-aspect-ratio", &n, &d)) {
+    if (!gst_structure_has_field (out, "pixel-aspect-ratio"))
+      gst_structure_set (out, "pixel-aspect-ratio", GST_TYPE_FRACTION, n, d, NULL);
+    else
+      gst_structure_fixate_field_nearest_fraction (out, "pixel-aspect-ratio", n, d);
   }
   if (gst_structure_has_field (out, "framerate") && gst_structure_get_fraction (in, "framerate", &n, &d))
     gst_structure_fixate_field_nearest_fraction (out, "framerate", n, d);
+  if (same_colour_family (format, gst_structure_get_string (out, "format"))) {
+    take_field (out, in, "colorimetry");
+    take_field (out, in, "chroma-site");
+  }
 
   othercaps = gst_caps_fixate (othercaps);
   GST_DEBUG_OBJECT (trans, "fixated to %" GST_PTR_FORMAT, othercaps);
@@ -184,7 +233,8 @@ gst_rds_video_convert_set_caps (GstBaseTransform * trans, GstCaps * incaps, GstC
   }
 
   GST_OBJECT_LOCK (self);
-  passthrough = !self->disable_passthrough && gst_caps_is_equal (incaps, outcaps);
+  self->caps_equal = gst_caps_is_equal (incaps, outcaps);
+  passthrough = self->caps_equal && !self->disable_passthrough;
   GST_OBJECT_UNLOCK (self);
   gst_base_transform_set_passthrough (trans, passthrough);
   GST_DEBUG_OBJECT (self, "%" GST_PTR_FORMAT " -> %" GST_PTR_FORMAT ", passthrough %d", incaps, outcaps,
@@ -459,26 +509,44 @@ map_failed:
 
 /* ---- properties ---- */
 
+/* Allocation settings are read when the pools are set up: refuse changes once streaming (object lock held). */
+static gboolean
+check_mutable (GstRdsVideoConvert * self, GParamSpec * pspec)
+{
+  if (GST_STATE (self) <= GST_STATE_READY)
+    return TRUE;
+  g_warning ("%s: property '%s' can only be changed in the NULL or READY state; keeping the current value",
+      GST_OBJECT_NAME (self), pspec->name);
+  return FALSE;
+}
+
 static void
 gst_rds_video_convert_set_property (GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec)
 {
   GstRdsVideoConvert *self = GST_RDS_VIDEO_CONVERT (object);
-  gboolean reconfigure = FALSE;
+  GstBaseTransform *trans = GST_BASE_TRANSFORM (object);
+  gboolean update_passthrough = FALSE, passthrough = FALSE;
 
   GST_OBJECT_LOCK (self);
   switch (prop_id) {
     case PROP_GPU_ID:
-      self->gpu_id = g_value_get_uint (value);
+      if (check_mutable (self, pspec))
+        self->gpu_id = g_value_get_uint (value);
       break;
     case PROP_NVBUF_MEMORY_TYPE:
-      self->memory_type = g_value_get_enum (value);
+      if (check_mutable (self, pspec))
+        self->memory_type = g_value_get_enum (value);
       break;
     case PROP_OUTPUT_BUFFERS:
-      self->output_buffers = g_value_get_uint (value);
+      if (check_mutable (self, pspec))
+        self->output_buffers = g_value_get_uint (value);
       break;
     case PROP_DISABLE_PASSTHROUGH:
-      reconfigure = self->disable_passthrough != g_value_get_boolean (value);
-      self->disable_passthrough = g_value_get_boolean (value);
+      if (self->disable_passthrough != g_value_get_boolean (value)) {
+        self->disable_passthrough = g_value_get_boolean (value);
+        passthrough = self->caps_equal && !self->disable_passthrough;
+        update_passthrough = TRUE;
+      }
       break;
     case PROP_SILENT:
       self->silent = g_value_get_boolean (value);
@@ -489,9 +557,17 @@ gst_rds_video_convert_set_property (GObject * object, guint prop_id, const GValu
   }
   GST_OBJECT_UNLOCK (self);
 
-  /* re-runs negotiation, so set_caps decides passthrough again */
-  if (reconfigure)
-    gst_base_transform_reconfigure_src (GST_BASE_TRANSFORM (self));
+  if (update_passthrough) {
+    gboolean was = gst_base_transform_is_passthrough (trans);
+
+    /* Same caps make the base class skip set_caps on renegotiation, so switch here; reconfiguring the source pad
+     * then sets up (or drops) the output pool before the next buffer. */
+    gst_base_transform_set_passthrough (trans, passthrough);
+    gst_base_transform_reconfigure_src (trans);
+    /* upstream's allocation (our proposal or downstream's) changes with passthrough */
+    if (was != gst_base_transform_is_passthrough (trans))
+      gst_pad_push_event (GST_BASE_TRANSFORM_SINK_PAD (trans), gst_event_new_reconfigure ());
+  }
 }
 
 static void
