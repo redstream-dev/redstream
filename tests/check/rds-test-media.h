@@ -67,14 +67,15 @@ rds_test_pull (GstElement * pipe, GstElement * sink)
   return NULL;
 }
 
-/* Encodes @frames frames of videotestsrc @pattern at @width x @height (NV12, 30 fps) with va{codec}enc and returns
- * the byte stream (whole access units, concatenated). @codec is "h264" or "h265". NULL if an element is missing. */
-static inline GBytes *
-rds_test_encode_full (const gchar * codec, guint width, guint height, guint frames, guint b_frames,
+/* Encodes @frames frames of videotestsrc @pattern in @raw_caps (a full video/x-raw caps string) with va{codec}enc
+ * (@enc_extra: more encoder properties, may be NULL) and returns the access units in decode order, one GBytes each.
+ * @codec is "h264" or "h265". NULL if an element is missing. */
+static inline GPtrArray *
+rds_test_encode_aus (const gchar * codec, const gchar * raw_caps, guint frames, guint b_frames,
     const gchar * pattern, const gchar * enc_extra)
 {
   gchar *enc = g_strdup_printf ("va%senc", codec), *parse = g_strdup_printf ("%sparse", codec);
-  GByteArray *out;
+  GPtrArray *aus;
   GstElement *pipe, *sink;
   GstSample *s;
   GError *err = NULL;
@@ -85,20 +86,19 @@ rds_test_encode_full (const gchar * codec, guint width, guint height, guint fram
     g_free (parse);
     return NULL;
   }
-  desc = g_strdup_printf ("videotestsrc pattern=%s num-buffers=%u "
-      "! video/x-raw,format=NV12,width=%u,height=%u,framerate=30/1 ! %s b-frames=%u %s ! %s "
+  desc = g_strdup_printf ("videotestsrc pattern=%s num-buffers=%u ! %s ! %s b-frames=%u %s ! %s "
       "! video/x-%s,stream-format=byte-stream,alignment=au ! appsink name=sink sync=false",
-      pattern, frames, width, height, enc, b_frames, enc_extra ? enc_extra : "", parse, codec);
+      pattern, frames, raw_caps, enc, b_frames, enc_extra ? enc_extra : "", parse, codec);
   pipe = gst_parse_launch (desc, &err);
   g_assert_no_error (err);
   sink = gst_bin_get_by_name (GST_BIN (pipe), "sink");
   g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
-  out = g_byte_array_new ();
+  aus = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
   while ((s = rds_test_pull (pipe, sink)) != NULL) {
     GstMapInfo map;
 
     g_assert_true (gst_buffer_map (gst_sample_get_buffer (s), &map, GST_MAP_READ));
-    g_byte_array_append (out, map.data, map.size);
+    g_ptr_array_add (aus, g_bytes_new (map.data, map.size));
     gst_buffer_unmap (gst_sample_get_buffer (s), &map);
     gst_sample_unref (s);
   }
@@ -109,8 +109,40 @@ rds_test_encode_full (const gchar * codec, guint width, guint height, guint fram
   g_free (desc);
   g_free (enc);
   g_free (parse);
-  g_assert_cmpuint (out->len, >, 0);
+  g_assert_cmpuint (aus->len, >, 0);
+  return aus;
+}
+
+/* Concatenates @n byte streams (or access units) into one. */
+static inline GBytes *
+rds_test_concat (GBytes * const *parts, guint n)
+{
+  GByteArray *out = g_byte_array_new ();
+
+  for (guint i = 0; i < n; i++) {
+    gsize size;
+    gconstpointer data = g_bytes_get_data (parts[i], &size);
+
+    g_byte_array_append (out, data, (guint) size);
+  }
   return g_byte_array_free_to_bytes (out);
+}
+
+/* rds_test_encode_aus with NV12 @width x @height at 30 fps, as one byte stream. */
+static inline GBytes *
+rds_test_encode_full (const gchar * codec, guint width, guint height, guint frames, guint b_frames,
+    const gchar * pattern, const gchar * enc_extra)
+{
+  gchar *caps = g_strdup_printf ("video/x-raw,format=NV12,width=%u,height=%u,framerate=30/1", width, height);
+  GPtrArray *aus = rds_test_encode_aus (codec, caps, frames, b_frames, pattern, enc_extra);
+  GBytes *ret = NULL;
+
+  if (aus != NULL) {
+    ret = rds_test_concat ((GBytes * const *) aus->pdata, aus->len);
+    g_ptr_array_unref (aus);
+  }
+  g_free (caps);
+  return ret;
 }
 
 static inline GBytes *
@@ -121,7 +153,8 @@ rds_test_encode (const gchar * codec, guint width, guint height, guint frames, g
 }
 
 /* Checksum of a mapped NV12 frame: Y (width x height bytes) and UV (2*ceil(w/2) x ceil(h/2) bytes), row by row
- * with the frame's strides, so padding never counts. "y=<md5> uv=<md5>"; free with g_free. */
+ * with the frame's strides, so padding never counts. "<w>x<h> y=<md5> uv=<md5>" (the size comes from the caps, so
+ * a frame that arrives with stale caps differs too); free with g_free. */
 static inline gchar *
 rds_test_nv12_checksum (const GstVideoFrame * frame)
 {
@@ -136,7 +169,7 @@ rds_test_nv12_checksum (const GstVideoFrame * frame)
   for (guint r = 0; r < (h + 1) / 2; r++)
     g_checksum_update (uv, (const guint8 *) GST_VIDEO_FRAME_PLANE_DATA (frame, 1)
         + (gsize) r * GST_VIDEO_FRAME_PLANE_STRIDE (frame, 1), 2 * ((w + 1) / 2));
-  ret = g_strdup_printf ("y=%s uv=%s", g_checksum_get_string (y), g_checksum_get_string (uv));
+  ret = g_strdup_printf ("%ux%u y=%s uv=%s", w, h, g_checksum_get_string (y), g_checksum_get_string (uv));
   g_checksum_free (uv);
   g_checksum_free (y);
   return ret;

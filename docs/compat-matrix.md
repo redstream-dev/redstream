@@ -56,6 +56,25 @@ Names and integers as on NVIDIA's [nvvideoconvert page](https://docs.nvidia.com/
 
 System-memory input or output is converted through device staging surfaces (upload, transform, download).
 
+### `rdsvideodec` (`nvv4l2decoder`) properties
+
+Names, ranges, enum integers and enum nicks as on NVIDIA's
+[nvv4l2decoder page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html)
+(checked 2026-10-24). Input: H.264 and H.265 byte-stream access units (`h264parse`/`h265parse` in front), 8-bit
+4:2:0 only. Output: NV12 in `memory:RDS` when downstream accepts it, otherwise system memory.
+
+| Property | Status | Notes |
+|---|---|---|
+| `gpu-id` | supported | changeable only in NULL or READY; a GPU that does not exist fails the start |
+| `cudadec-memtype` | different default | `0` `memtype_device`, `1` `memtype_pinned`, `2` `memtype_unified`: the memory of the `memory:RDS` output surfaces. **Default `0` (device)**; DeepStream's is `2` (unified), which is slow on discrete AMD GPUs. No effect on system-memory output |
+| `num-extra-surfaces` | supported | 0-24 decode surfaces on top of the stream's minimum (plus 4 of headroom that Redstream always adds) |
+| `drop-frame-interval` | supported | 0-30: outputs displayed frames 0, N, 2N, ...; 0 and 1 output every frame. Counted from the start or the last flush |
+| `skip-frames` | supported | `0` `decode_all`; `2` `decode_key` drops delta frames before decoding; `1` `decode_non_ref` (Jetson-only on DeepStream) decodes every frame and logs a warning |
+| `low-latency-mode` | accepted no-op | pictures are always output as soon as the stream order allows |
+
+NVIDIA's page gives `num-extra-surfaces` as 1-24 and `drop-frame-interval` as 1-30, both with default 0; Redstream
+accepts 0 for both. Jetson-only properties, `capture-io-mode`/`output-io-mode` and the SEI properties are not exposed.
+
 ## NvBufSurface
 
 Types are `typedef`s, functions and enumerators are object-like macros (taking a function's address works).
