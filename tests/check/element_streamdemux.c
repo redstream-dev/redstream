@@ -27,8 +27,8 @@ static const RdsBufSurfaceCreateParams nv12_64 = {
 static GstAllocator *sys_alloc;
 
 /* A system-memory batch of @n frames: slot i holds source @sources[i] (frame meta source_id/pad_index), filled with
- * SLOT_VALUE (i), buf_pts SRC_PTS (@seq, source). The batch itself gets PTS 1000 s + @seq and DISCONT, and a
- * second, unrelated meta, so tests can tell what the outputs take from it. */
+ * SLOT_VALUE (i), buf_pts SRC_PTS (@seq, source). The batch itself gets PTS 1000 s + @seq, the MARKER flag (no
+ * DISCONT) and a second, unrelated meta, so tests can tell what the outputs take from it. */
 static GstBuffer *
 make_batch (guint seq, const guint * sources, guint n)
 {
@@ -58,7 +58,7 @@ make_batch (guint seq, const guint * sources, guint n)
   GST_BUFFER_PTS (buf) = 1000 * GST_SECOND + seq;
   GST_BUFFER_DTS (buf) = 1000 * GST_SECOND + seq;
   GST_BUFFER_DURATION (buf) = 7 * GST_MSECOND;
-  GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
+  GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_MARKER);
   return buf;
 }
 
@@ -259,6 +259,8 @@ test_request_pads (void)
   p1 = gst_element_request_pad_simple (e, "src_%u");
   g_assert_nonnull (p1);
   g_assert_cmpstr (GST_PAD_NAME (p1), ==, "src_1");
+  g_assert_null (gst_element_request_pad_simple (e, "src_-1"));
+  g_assert_null (gst_element_request_pad_simple (e, "src_4294967296"));
 
   gst_element_release_request_pad (e, p0);
   gst_object_unref (p0);
@@ -304,6 +306,8 @@ test_split (void)
     g_assert_cmpuint (GST_BUFFER_PTS (b), ==, SRC_PTS (4, src));
     g_assert_false (GST_BUFFER_DTS_IS_VALID (b));
     g_assert_cmpuint (GST_BUFFER_DURATION (b), ==, 7 * GST_MSECOND);
+    g_assert_true (GST_BUFFER_FLAG_IS_SET (b, GST_BUFFER_FLAG_MARKER));
+    /* the first buffer on the pad */
     g_assert_true (GST_BUFFER_FLAG_IS_SET (b, GST_BUFFER_FLAG_DISCONT));
     /* only the batch meta, rebuilt: no other meta of the batch */
     g_assert_null (gst_buffer_get_video_meta (b));
@@ -375,6 +379,8 @@ test_unrequested_dropped (void)
       GstBuffer *b = gst_harness_pull (d.out[i]);
 
       g_assert_cmpuint (GST_BUFFER_PTS (b), ==, SRC_PTS (seq, i));
+      /* DISCONT on the pad's first buffer only */
+      g_assert_cmpint (GST_BUFFER_FLAG_IS_SET (b, GST_BUFFER_FLAG_DISCONT), ==, seq == 1);
       gst_buffer_unref (b);
     }
   }
@@ -490,7 +496,9 @@ test_event_routing (void)
   g_assert_true (gst_harness_push_event (d.in, rds_event_new_stream_eos (7)));
   g_assert_true (gst_harness_push_event (d.in, gst_event_new_custom (GST_EVENT_CUSTOM_DOWNSTREAM, st)));
   assert_events (d.out[0], "rds-reset:0 custom-downstream");
-  assert_events (d.out[1], "rds-added:1 rds-start:1 rds-eos:1 custom-downstream");
+  /* rds-stream-start starts a new stream on the pad: new stream-id */
+  assert_events (d.out[1],
+      "rds-added:1 stream-start:" UPSTREAM_SID "/1/1 caps rds-start:1 rds-eos:1 custom-downstream");
 
   g_assert_true (gst_harness_push_event (d.in, gst_event_new_flush_start ()));
   g_assert_true (gst_harness_push_event (d.in, gst_event_new_flush_stop (TRUE)));
@@ -551,6 +559,17 @@ check_per_stream_eos (gboolean per_stream)
   g_assert_cmpuint (count_eos (d.out[0]), ==, 1);
   g_assert_cmpuint (count_eos (d.out[1]), ==, per_stream ? 0 : 1);
   demux_clear (&d);
+
+  /* rds-pad-deleted ends the pad either way */
+  demux_init (&d, per_stream ? "per-stream-eos=true" : NULL);
+  demux_add_out (&d, 0);
+  demux_add_out (&d, 1);
+  demux_start (&d);
+  g_assert_cmpint (push_batch (&d, 0, sources, 2), ==, GST_FLOW_OK);
+  g_assert_true (gst_harness_push_event (d.in, rds_event_new_pad_deleted (1)));
+  g_assert_cmpuint (count_eos (d.out[0]), ==, 0);
+  g_assert_cmpuint (count_eos (d.out[1]), ==, 1);
+  demux_clear (&d);
 }
 
 static void
@@ -588,7 +607,8 @@ test_pad_deleted (void)
   g_assert_cmpuint (count_eos (d.out[1]), ==, 1);
 
   g_assert_true (gst_harness_push_event (d.in, rds_event_new_pad_deleted (2)));
-  assert_events (d.out[2], "stream-start:" UPSTREAM_SID "/2 caps segment rds-deleted:2 eos");
+  /* the segment comes only right before the EOS */
+  assert_events (d.out[2], "stream-start:" UPSTREAM_SID "/2 caps rds-deleted:2 segment eos");
 
   g_assert_true (gst_harness_push_event (d.in, gst_event_new_eos ()));
   for (guint i = 0; i < 3; i++)
@@ -616,8 +636,17 @@ test_restart_after_eos (void)
 
   g_assert_true (gst_harness_push_event (d.in, rds_event_new_stream_start (0, "again")));
   g_assert_cmpint (push_batch (&d, 1, only0, 1), ==, GST_FLOW_OK);
-  assert_events (d.out[0], "stream-start:" UPSTREAM_SID "/0 caps segment rds-start:0");
+  /* a new stream-id for the new stream */
+  assert_events (d.out[0], "stream-start:" UPSTREAM_SID "/0/1 caps rds-start:0 segment");
   g_assert_cmpuint (gst_harness_buffers_received (d.out[0]), ==, 2);
+  {
+    GstBuffer *b = gst_harness_pull (d.out[0]);
+
+    gst_buffer_unref (b);
+    b = gst_harness_pull (d.out[0]);
+    g_assert_true (GST_BUFFER_FLAG_IS_SET (b, GST_BUFFER_FLAG_DISCONT));
+    gst_buffer_unref (b);
+  }
   demux_clear (&d);
 }
 
@@ -762,6 +791,248 @@ test_queries (void)
   gst_query_unref (q);
   gst_caps_unref (caps);
   demux_clear (&d);
+}
+
+/* QoS from a branch does not go upstream (it would throttle every source); the same seek (seqnum) from several
+ * branches goes upstream once; a new seek and other upstream events go through. */
+static void
+test_upstream_events (void)
+{
+  GstEvent *seek, *ev;
+  Demux d;
+
+  demux_init (&d, NULL);
+  demux_add_out (&d, 0);
+  demux_add_out (&d, 1);
+  demux_start (&d);
+  while ((ev = gst_harness_try_pull_upstream_event (d.in)) != NULL)
+    gst_event_unref (ev);
+
+  g_assert_true (gst_harness_push_upstream_event (d.out[0], gst_event_new_qos (GST_QOS_TYPE_UNDERFLOW, 0.5,
+              GST_MSECOND, GST_SECOND)));
+  g_assert_null (gst_harness_try_pull_upstream_event (d.in));
+
+  seek = gst_event_new_seek (1.0, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH, GST_SEEK_TYPE_SET, 0, GST_SEEK_TYPE_NONE, 0);
+  for (guint i = 0; i < 2; i++)
+    g_assert_true (gst_harness_push_upstream_event (d.out[i], gst_event_ref (seek)));
+  ev = gst_harness_try_pull_upstream_event (d.in);
+  g_assert_nonnull (ev);
+  g_assert_cmpint (GST_EVENT_TYPE (ev), ==, GST_EVENT_SEEK);
+  g_assert_cmpuint (gst_event_get_seqnum (ev), ==, gst_event_get_seqnum (seek));
+  gst_event_unref (ev);
+  g_assert_null (gst_harness_try_pull_upstream_event (d.in));
+  gst_event_unref (seek);
+
+  seek = gst_event_new_seek (1.0, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH, GST_SEEK_TYPE_SET, 0, GST_SEEK_TYPE_NONE, 0);
+  g_assert_true (gst_harness_push_upstream_event (d.out[1], seek));
+  ev = gst_harness_try_pull_upstream_event (d.in);
+  g_assert_nonnull (ev);
+  g_assert_cmpint (GST_EVENT_TYPE (ev), ==, GST_EVENT_SEEK);
+  gst_event_unref (ev);
+
+  g_assert_true (gst_harness_push_upstream_event (d.out[0], gst_event_new_reconfigure ()));
+  ev = gst_harness_try_pull_upstream_event (d.in);
+  g_assert_nonnull (ev);
+  g_assert_cmpint (GST_EVENT_TYPE (ev), ==, GST_EVENT_RECONFIGURE);
+  gst_event_unref (ev);
+  demux_clear (&d);
+}
+
+/* A source's segment does not outlive a flush, its reset or its pad-deleted: after FLUSH_STOP, rds-stream-reset (N)
+ * goes out without the old segment, and the next frame gets the source's new segment, or the sink segment while
+ * the source has sent none. */
+static void
+test_stale_segment (void)
+{
+  static const guint sources[] = { 0, 1 };
+  GstSegment old_seg, new_seg, seg;
+  GstEvent *ev;
+  const GstSegment *s;
+  Demux d;
+
+  gst_segment_init (&old_seg, GST_FORMAT_TIME);
+  old_seg.start = 10 * GST_SECOND;
+  gst_segment_init (&new_seg, GST_FORMAT_TIME);
+  new_seg.start = 20 * GST_SECOND;
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+
+  demux_init (&d, NULL);
+  demux_add_out (&d, 0);
+  demux_add_out (&d, 1);
+  demux_start (&d);
+  for (guint i = 0; i < 2; i++)
+    g_assert_true (gst_harness_push_event (d.in, rds_event_new_stream_segment (i, &old_seg)));
+  g_assert_cmpint (push_batch (&d, 0, sources, 2), ==, GST_FLOW_OK);
+  for (guint i = 0; i < 2; i++) {
+    gst_buffer_unref (gst_harness_pull (d.out[i]));
+    g_free (drain_events (d.out[i]));
+  }
+
+  g_assert_true (gst_harness_push_event (d.in, gst_event_new_flush_start ()));
+  g_assert_true (gst_harness_push_event (d.in, gst_event_new_flush_stop (TRUE)));
+  g_assert_true (gst_harness_push_event (d.in, gst_event_new_segment (&seg)));
+  g_assert_true (gst_harness_push_event (d.in, rds_event_new_stream_reset (1)));
+  assert_events (d.out[1], "flush-start flush-stop rds-reset:1");
+  g_assert_true (gst_harness_push_event (d.in, rds_event_new_stream_segment (1, &new_seg)));
+  g_assert_cmpint (push_batch (&d, 1, sources, 2), ==, GST_FLOW_OK);
+  assert_events (d.out[1], "rds-segment:1 segment");
+  ev = gst_pad_get_sticky_event (GST_PAD_PEER (d.out[1]->sinkpad), GST_EVENT_SEGMENT, 0);
+  gst_event_parse_segment (ev, &s);
+  g_assert_cmpuint (s->start, ==, 20 * GST_SECOND);
+  gst_event_unref (ev);
+  /* source 0 sent no new segment since the flush: the sink segment */
+  assert_events (d.out[0], "flush-start flush-stop segment");
+  ev = gst_pad_get_sticky_event (GST_PAD_PEER (d.out[0]->sinkpad), GST_EVENT_SEGMENT, 0);
+  gst_event_parse_segment (ev, &s);
+  g_assert_cmpuint (s->start, ==, 0);
+  gst_event_unref (ev);
+
+  /* a reset alone (no flush) also forgets it: the next frame falls back to the sink segment */
+  g_assert_true (gst_harness_push_event (d.in, rds_event_new_stream_reset (1)));
+  g_assert_true (gst_harness_push_event (d.in, gst_event_new_segment (&seg)));
+  g_assert_cmpint (push_batch (&d, 2, sources, 2), ==, GST_FLOW_OK);
+  assert_events (d.out[1], "rds-reset:1 segment");
+  ev = gst_pad_get_sticky_event (GST_PAD_PEER (d.out[1]->sinkpad), GST_EVENT_SEGMENT, 0);
+  gst_event_parse_segment (ev, &s);
+  g_assert_cmpuint (s->start, ==, 0);
+  gst_event_unref (ev);
+
+  /* nor does pad-deleted: a source coming back on the same index starts from the sink segment */
+  g_assert_true (gst_harness_push_event (d.in, rds_event_new_stream_segment (1, &new_seg)));
+  g_assert_true (gst_harness_push_event (d.in, rds_event_new_pad_deleted (1)));
+  g_assert_true (gst_harness_push_event (d.in, rds_event_new_pad_added (1)));
+  g_assert_cmpint (push_batch (&d, 3, sources, 2), ==, GST_FLOW_OK);
+  ev = gst_pad_get_sticky_event (GST_PAD_PEER (d.out[1]->sinkpad), GST_EVENT_SEGMENT, 0);
+  gst_event_parse_segment (ev, &s);
+  g_assert_cmpuint (s->start, ==, 0);
+  gst_event_unref (ev);
+  demux_clear (&d);
+}
+
+/* After a per-stream EOS, a flush (a flushing seek) revives the pad: the source's frames flow again. */
+static void
+test_eos_then_flush (void)
+{
+  static const guint sources[] = { 0, 1 };
+  GstSegment seg;
+  Demux d;
+
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  demux_init (&d, "per-stream-eos=true");
+  demux_add_out (&d, 0);
+  demux_add_out (&d, 1);
+  demux_start (&d);
+  g_assert_cmpint (push_batch (&d, 0, sources, 2), ==, GST_FLOW_OK);
+  g_assert_true (gst_harness_push_event (d.in, rds_event_new_stream_eos (1)));
+  g_assert_cmpuint (count_eos (d.out[1]), ==, 1);
+  g_assert_cmpint (push_batch (&d, 1, sources, 2), ==, GST_FLOW_OK);
+  g_assert_cmpuint (gst_harness_buffers_received (d.out[1]), ==, 1);
+
+  g_assert_true (gst_harness_push_event (d.in, gst_event_new_flush_start ()));
+  g_assert_true (gst_harness_push_event (d.in, gst_event_new_flush_stop (TRUE)));
+  g_assert_true (gst_harness_push_event (d.in, gst_event_new_segment (&seg)));
+  g_assert_cmpint (push_batch (&d, 2, sources, 2), ==, GST_FLOW_OK);
+  g_assert_cmpuint (gst_harness_buffers_received (d.out[1]), ==, 2);
+  g_assert_cmpuint (gst_harness_buffers_received (d.out[0]), ==, 3);
+  demux_clear (&d);
+}
+
+/* PAUSED -> READY -> PLAYING: the pads are reused and get their sticky events again; a pad ended by a per-stream
+ * EOS before flows again. */
+static void
+test_state_cycle (void)
+{
+  static const guint sources[] = { 0, 1 };
+  GstCaps *caps = gst_caps_from_string (IN_CAPS);
+  GstSegment seg;
+  Demux d;
+
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  demux_init (&d, "per-stream-eos=true");
+  demux_add_out (&d, 0);
+  demux_add_out (&d, 1);
+  for (guint round = 0; round < 2; round++) {
+    demux_start (&d);
+    g_assert_cmpint (push_batch (&d, round, sources, 2), ==, GST_FLOW_OK);
+    for (guint i = 0; i < 2; i++) {
+      gchar *sid = g_strdup_printf (UPSTREAM_SID "/%u", i);
+
+      assert_sticky (d.out[i], sid, caps, &seg);
+      gst_buffer_unref (gst_harness_pull (d.out[i]));
+      g_free (sid);
+    }
+    g_assert_true (gst_harness_push_event (d.in, rds_event_new_stream_eos (1)));
+    g_assert_cmpuint (count_eos (d.out[1]), ==, 1);
+    g_assert_cmpint (gst_element_set_state (d.demux, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  }
+  gst_caps_unref (caps);
+  demux_clear (&d);
+}
+
+/* Each branch's running time is its source's: with source 1 in a segment starting at 10 s (base 2 s), a frame at
+ * PTS 10.5 s runs at 2.5 s on src_1, while source 0 (sink segment) runs at its PTS. */
+static void
+test_running_time (void)
+{
+  static const guint sources[] = { 0, 1 };
+  GstSegment seg;
+  GstBuffer *batch, *b;
+  RdsBatchMeta *bm;
+  GstEvent *ev;
+  const GstSegment *s;
+  Demux d;
+
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  seg.start = seg.time = 10 * GST_SECOND;
+  seg.base = 2 * GST_SECOND;
+  demux_init (&d, NULL);
+  demux_add_out (&d, 0);
+  demux_add_out (&d, 1);
+  demux_start (&d);
+  g_assert_true (gst_harness_push_event (d.in, rds_event_new_stream_segment (1, &seg)));
+  batch = make_batch (0, sources, 2);
+  bm = gst_buffer_get_rds_batch_meta (batch);
+  ((RdsFrameMeta *) g_list_nth_data (bm->frame_meta_list, 1))->buf_pts = 10500 * GST_MSECOND;
+  g_assert_cmpint (gst_harness_push (d.in, batch), ==, GST_FLOW_OK);
+
+  for (guint i = 0; i < 2; i++) {
+    b = gst_harness_pull (d.out[i]);
+    ev = gst_pad_get_sticky_event (GST_PAD_PEER (d.out[i]->sinkpad), GST_EVENT_SEGMENT, 0);
+    gst_event_parse_segment (ev, &s);
+    g_assert_cmpuint (gst_segment_to_running_time (s, GST_FORMAT_TIME, GST_BUFFER_PTS (b)), ==,
+        i == 0 ? SRC_PTS (0, 0) : 2500 * GST_MSECOND);
+    gst_event_unref (ev);
+    gst_buffer_unref (b);
+  }
+  demux_clear (&d);
+}
+
+static void
+request_more (GstElement * e, GstPad * pad, gpointer data)
+{
+  GstPad **extra = data;
+
+  if (g_strcmp0 (GST_PAD_NAME (pad), "src_0") == 0)
+    *extra = gst_element_request_pad_simple (e, "src_7");
+}
+
+/* A pad-added handler may request another pad (no lock is held while pads are added). */
+static void
+test_request_from_handler (void)
+{
+  GstElement *e = gst_element_factory_make ("rdsstreamdemux", NULL);
+  GstPad *p0, *extra = NULL;
+
+  g_signal_connect (e, "pad-added", G_CALLBACK (request_more), &extra);
+  p0 = gst_element_request_pad_simple (e, "src_0");
+  g_assert_nonnull (p0);
+  g_assert_nonnull (extra);
+  g_assert_cmpstr (GST_PAD_NAME (extra), ==, "src_7");
+  gst_element_release_request_pad (e, extra);
+  gst_object_unref (extra);
+  gst_element_release_request_pad (e, p0);
+  gst_object_unref (p0);
+  gst_object_unref (e);
 }
 
 /* ---- gpu ---- */
@@ -933,6 +1204,12 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/demux/dynamic-pads", test_dynamic_pads);
   g_test_add_func ("/cpu/demux/writer-isolated", test_writer_isolated);
   g_test_add_func ("/cpu/demux/queries", test_queries);
+  g_test_add_func ("/cpu/demux/upstream-events", test_upstream_events);
+  g_test_add_func ("/cpu/demux/stale-segment", test_stale_segment);
+  g_test_add_func ("/cpu/demux/eos-then-flush", test_eos_then_flush);
+  g_test_add_func ("/cpu/demux/state-cycle", test_state_cycle);
+  g_test_add_func ("/cpu/demux/running-time", test_running_time);
+  g_test_add_func ("/cpu/demux/request-from-handler", test_request_from_handler);
 
   g_test_add_func ("/gpu/demux/mux-demux", test_mux_demux);
   {

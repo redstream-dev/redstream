@@ -4,30 +4,39 @@
  * Buffers: a frame of source N goes out on src_N as a read-only surface view of its batch slot (no copy); the
  * batch returns to its pool once every view is released. The view carries the batch's flags, duration and
  * timestamps with PTS = the frame's buf_pts (the source's original PTS) and no DTS, plus a one-frame RdsBatchMeta
- * (a deep copy of the frame, batch_id 0). Frames of sources without a requested pad, or whose pad has ended, are
- * dropped.
+ * (a deep copy of the frame, batch_id 0). The first buffer of every stream on a pad (and the first after a flush)
+ * is DISCONT. Frames of sources without a requested pad, or whose pad has ended, are dropped.
  *
- * Sticky events, per src pad, before its first buffer or event (also for pads requested while data flows):
- * - STREAM_START: the upstream stream-id plus "/N" (the group id is kept);
+ * Sticky events, per src pad (also for pads requested while data flows):
+ * - STREAM_START: the upstream stream-id plus "/N", and "/N/<k>" for the k-th later stream on the pad (the group id
+ *   is kept); a new one for every rds-stream-start (N) and every restart;
  * - CAPS: the sink caps, again whenever they change;
- * - SEGMENT: the source's own segment (from rds-stream-segment N) once one came, else the sink segment. buf_pts is
- *   in the source's segment, so running times downstream are those of the source.
+ * - SEGMENT, before the first buffer or EOS: the source's own segment (from rds-stream-segment N) once one came,
+ *   else the sink segment. buf_pts is in the source's segment, so running times downstream are those of the
+ *   source. A source's segment is forgotten on a flush and on its rds-stream-start, -stream-reset and -pad-deleted:
+ *   the source sends a new one before its next frame.
+ * Events without a source (GAP and other timed events) are in the mux's output time base, not the sources'.
  *
- * Other events:
+ * Other downstream events:
  * - source-scoped stream events (rds-pad-added, -pad-deleted, -stream-start, -stream-segment, -stream-eos,
  *   -stream-reset for source N) go to src_N only, and are dropped when it does not exist;
  * - rds-stream-eos (N) ends src_N when per-stream-eos is set; rds-pad-deleted (N) always ends it;
  * - the global EOS ends every pad not ended yet (a pad gets EOS at most once per stream);
  * - after a pad has ended, rds-stream-start / -pad-added / -stream-reset for its source start a new stream on it;
  * - flushes and every other event go to every pad.
+ * Upstream events from the src pads: QoS is dropped (it would throttle every source for one branch's lateness), a
+ * seek reaches upstream once however many branches send it (same seqnum), everything else goes upstream.
+ *
  * Flow: the return of a batch combines the pads' returns (GstFlowCombiner): NOT_LINKED only when every pad is.
- * Pads may be requested and released while PLAYING, from any thread.
+ * As with tee, FLUSHING or an error from one branch stops the streaming thread for all: block or unlink a branch
+ * before stopping it. Pads may be requested and released while PLAYING, from any thread (also from pad-added
+ * handlers).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsstreamdemux.h"
 
 #include <gst/base/gstflowcombiner.h>
 #include <rds/rds.h>
-#include <stdio.h>
+#include <string.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_rds_stream_demux_debug);
 #define GST_CAT_DEFAULT gst_rds_stream_demux_debug
@@ -48,6 +57,8 @@ typedef struct
   GstPad *pad;
   guint id;
   gboolean registered;          /* FALSE once released: its flow returns no longer count */
+  guint generation;             /* streams started on this pad: suffix of the next stream-id */
+  gboolean need_discont;
   gboolean need_stream_start;
   gboolean need_caps;
   gboolean need_segment;
@@ -60,9 +71,9 @@ struct _GstRdsStreamDemux
 
   GstPad *sinkpad;
 
-  GMutex request_lock;          /* serializes pad requests and releases */
   GMutex lock;                  /* everything below */
   GHashTable *pads;             /* source id -> SrcPad */
+  GHashTable *reserved;         /* source ids of pads being requested (set) */
   GHashTable *segments;         /* source id -> GstSegment, from rds-stream-segment */
   GstFlowCombiner *flow;
   gchar *stream_id;             /* upstream */
@@ -72,6 +83,8 @@ struct _GstRdsStreamDemux
   GstSegment segment;
   gboolean have_segment;
   gboolean per_stream_eos;
+  gboolean have_seek_seqnum;
+  guint32 seek_seqnum;          /* of the last seek sent upstream */
   guint64 dropped;              /* frames without a pad (debug output) */
 };
 
@@ -102,14 +115,17 @@ src_pad_unref (gpointer data)
   }
 }
 
-/* Lock held. The sticky events @sp still needs, in order, as far as they are known; clears their flags. */
+/* Lock held. The sticky events @sp still needs, in order, as far as they are known; clears their flags. The
+ * segment only with @segment: data and EOS need one, other events don't. */
 static GList *
-take_pending (GstRdsStreamDemux * self, SrcPad * sp)
+take_pending (GstRdsStreamDemux * self, SrcPad * sp, gboolean segment)
 {
   GList *events = NULL;
 
   if (sp->need_stream_start) {
-    gchar *sid = g_strdup_printf ("%s/%u", self->stream_id != NULL ? self->stream_id : "rdsstreamdemux", sp->id);
+    const gchar *up = self->stream_id != NULL ? self->stream_id : "rdsstreamdemux";
+    gchar *sid = sp->generation == 0 ? g_strdup_printf ("%s/%u", up, sp->id) :
+        g_strdup_printf ("%s/%u/%u", up, sp->id, sp->generation);
     GstEvent *ev = gst_event_new_stream_start (sid);
 
     if (self->have_group_id)
@@ -117,12 +133,13 @@ take_pending (GstRdsStreamDemux * self, SrcPad * sp)
     events = g_list_append (events, ev);
     g_free (sid);
     sp->need_stream_start = FALSE;
+    sp->generation++;
   }
   if (sp->need_caps && self->caps != NULL) {
     events = g_list_append (events, gst_event_new_caps (self->caps));
     sp->need_caps = FALSE;
   }
-  if (sp->need_segment) {
+  if (segment && sp->need_segment) {
     const GstSegment *seg = g_hash_table_lookup (self->segments, GUINT_TO_POINTER (sp->id));
 
     if (seg == NULL && self->have_segment)
@@ -143,14 +160,12 @@ push_events (SrcPad * sp, GList * events)
   g_list_free (events);
 }
 
-/* Lock held. A new stream on a pad that has ended. */
+/* Lock held. A new stream on @sp: new stream-start, caps, segment, DISCONT. */
 static void
-restart_if_ended (SrcPad * sp)
+new_stream (SrcPad * sp)
 {
-  if (!sp->eos)
-    return;
   sp->eos = FALSE;
-  sp->need_stream_start = sp->need_caps = sp->need_segment = TRUE;
+  sp->need_stream_start = sp->need_caps = sp->need_segment = sp->need_discont = TRUE;
 }
 
 /* Lock held. The pad of source @id, with a new reference, or NULL. */
@@ -174,7 +189,7 @@ send_eos (GstRdsStreamDemux * self, SrcPad * sp)
     return;
   }
   sp->eos = TRUE;
-  events = take_pending (self, sp);
+  events = take_pending (self, sp, TRUE);
   g_mutex_unlock (&self->lock);
   push_events (sp, events);
   GST_DEBUG_OBJECT (sp->pad, "EOS");
@@ -195,7 +210,7 @@ all_pads (GstRdsStreamDemux * self)
   return pads;
 }
 
-/* Pushes @event (transfer full) on @sp, after its pending sticky events when @sticky. */
+/* Pushes @event (transfer full) on @sp, after its pending stream-start and caps when @sticky. */
 static void
 forward (GstRdsStreamDemux * self, SrcPad * sp, GstEvent * event, gboolean sticky)
 {
@@ -203,7 +218,7 @@ forward (GstRdsStreamDemux * self, SrcPad * sp, GstEvent * event, gboolean stick
 
   if (sticky) {
     g_mutex_lock (&self->lock);
-    events = take_pending (self, sp);
+    events = take_pending (self, sp, FALSE);
     g_mutex_unlock (&self->lock);
   }
   push_events (sp, events);
@@ -242,7 +257,7 @@ handle_stream_event (GstRdsStreamDemux * self, GstEvent * event)
 {
   GstSegment *seg = NULL;
   guint id = 0;
-  gboolean ok, end = FALSE, restart = FALSE;
+  gboolean ok, end = FALSE, restart = FALSE, start = FALSE, forget = FALSE;
   SrcPad *sp;
 
   switch ((RdsEventType) GST_EVENT_TYPE (event)) {
@@ -252,22 +267,24 @@ handle_stream_event (GstRdsStreamDemux * self, GstEvent * event)
       break;
     case RDS_EVENT_STREAM_START:
       ok = rds_event_parse_stream_start (event, &id, NULL);
-      restart = TRUE;
+      start = forget = TRUE;
       break;
     case RDS_EVENT_STREAM_RESET:
       ok = rds_event_parse_stream_reset (event, &id);
-      restart = TRUE;
+      restart = forget = TRUE;
       break;
     case RDS_EVENT_STREAM_SEGMENT:
       ok = rds_event_parse_stream_segment (event, &id, &seg);
       break;
     case RDS_EVENT_STREAM_EOS:
       ok = rds_event_parse_stream_eos (event, &id);
+      g_mutex_lock (&self->lock);
       end = self->per_stream_eos;
+      g_mutex_unlock (&self->lock);
       break;
     case RDS_EVENT_PAD_DELETED:
       ok = rds_event_parse_pad_deleted (event, &id);
-      end = TRUE;
+      end = forget = TRUE;
       break;
     default:
       return FALSE;
@@ -281,12 +298,12 @@ handle_stream_event (GstRdsStreamDemux * self, GstEvent * event)
   g_mutex_lock (&self->lock);
   if (seg != NULL)
     g_hash_table_insert (self->segments, GUINT_TO_POINTER (id), gst_segment_copy (seg));
-  else if ((RdsEventType) GST_EVENT_TYPE (event) == RDS_EVENT_PAD_DELETED)
+  else if (forget)
     g_hash_table_remove (self->segments, GUINT_TO_POINTER (id));
   sp = lookup (self, id);
   if (sp != NULL) {
-    if (restart)
-      restart_if_ended (sp);
+    if (start || (restart && sp->eos))
+      new_stream (sp);
     if (seg != NULL)
       sp->need_segment = TRUE;
   }
@@ -316,7 +333,7 @@ gst_rds_stream_demux_sink_event (G_GNUC_UNUSED GstPad * pad, GstObject * parent,
   switch (GST_EVENT_TYPE (event)) {
     case GST_EVENT_STREAM_START:{
       const gchar *sid = NULL;
-      guint group;
+      guint group = 0;
 
       gst_event_parse_stream_start (event, &sid);
       g_mutex_lock (&self->lock);
@@ -325,6 +342,7 @@ gst_rds_stream_demux_sink_event (G_GNUC_UNUSED GstPad * pad, GstObject * parent,
       self->have_group_id = gst_event_parse_group_id (event, &group);
       self->group_id = group;
       mark_all (self, G_STRUCT_OFFSET (SrcPad, need_stream_start));
+      mark_all (self, G_STRUCT_OFFSET (SrcPad, need_discont));
       g_mutex_unlock (&self->lock);
       gst_event_unref (event);
       return TRUE;
@@ -367,13 +385,14 @@ gst_rds_stream_demux_sink_event (G_GNUC_UNUSED GstPad * pad, GstObject * parent,
         GHashTableIter it;
         gpointer v;
 
-        /* the pads drop their EOS and segment */
+        /* the pads drop their EOS and segment; the sources' segments are stale: they send new ones */
         g_hash_table_iter_init (&it, self->pads);
         while (g_hash_table_iter_next (&it, NULL, &v)) {
           ((SrcPad *) v)->eos = FALSE;
-          ((SrcPad *) v)->need_segment = TRUE;
+          ((SrcPad *) v)->need_segment = ((SrcPad *) v)->need_discont = TRUE;
         }
       }
+      g_hash_table_remove_all (self->segments);
       gst_flow_combiner_reset (self->flow);
       g_mutex_unlock (&self->lock);
       forward_all (self, event, FALSE);
@@ -382,6 +401,38 @@ gst_rds_stream_demux_sink_event (G_GNUC_UNUSED GstPad * pad, GstObject * parent,
       /* flush-start and other out-of-band events as they are; serialized ones after the sticky events */
       forward_all (self, event, GST_EVENT_IS_SERIALIZED (event) && GST_EVENT_TYPE (event) != GST_EVENT_FLUSH_START);
       return TRUE;
+  }
+}
+
+static gboolean
+gst_rds_stream_demux_src_event (GstPad * pad, GstObject * parent, GstEvent * event)
+{
+  GstRdsStreamDemux *self = GST_RDS_STREAM_DEMUX (parent);
+
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_QOS:
+      /* one branch being late must not throttle every source upstream */
+      gst_event_unref (event);
+      return TRUE;
+    case GST_EVENT_SEEK:{
+      guint32 seqnum = gst_event_get_seqnum (event);
+      gboolean repeat;
+
+      g_mutex_lock (&self->lock);
+      repeat = self->have_seek_seqnum && self->seek_seqnum == seqnum;
+      self->have_seek_seqnum = TRUE;
+      self->seek_seqnum = seqnum;
+      g_mutex_unlock (&self->lock);
+      if (repeat) {
+        /* the same seek from another branch: already sent */
+        GST_DEBUG_OBJECT (pad, "seek %u already sent upstream", seqnum);
+        gst_event_unref (event);
+        return TRUE;
+      }
+      return gst_pad_push_event (self->sinkpad, event);
+    }
+    default:
+      return gst_pad_event_default (pad, parent, event);
   }
 }
 
@@ -461,6 +512,7 @@ gst_rds_stream_demux_chain (G_GNUC_UNUSED GstPad * pad, GstObject * parent, GstB
     GList *events;
     GstBuffer *out;
     GstFlowReturn r;
+    gboolean discont;
     SrcPad *sp;
 
     g_mutex_lock (&self->lock);
@@ -474,12 +526,16 @@ gst_rds_stream_demux_chain (G_GNUC_UNUSED GstPad * pad, GstObject * parent, GstB
         src_pad_unref (sp);
       continue;
     }
-    events = take_pending (self, sp);
+    events = take_pending (self, sp, TRUE);
+    discont = sp->need_discont;
+    sp->need_discont = FALSE;
     g_mutex_unlock (&self->lock);
 
     push_events (sp, events);
     out = make_output (self, batch, fm);
     if (out != NULL) {
+      if (discont)
+        GST_BUFFER_FLAG_SET (out, GST_BUFFER_FLAG_DISCONT);
       r = gst_pad_push (sp->pad, out);
       g_mutex_lock (&self->lock);
       /* a pad released meanwhile returns FLUSHING: that must not stop the others */
@@ -493,6 +549,17 @@ gst_rds_stream_demux_chain (G_GNUC_UNUSED GstPad * pad, GstObject * parent, GstB
   return ret;
 }
 
+/* Lock held. TRUE if source @id has a pad or one is being requested. */
+static gboolean
+id_taken (GstRdsStreamDemux * self, guint id)
+{
+  return g_hash_table_contains (self->pads, GUINT_TO_POINTER (id))
+      || g_hash_table_contains (self->reserved, GUINT_TO_POINTER (id));
+}
+
+/* The id is reserved under the lock, but the pad is added (which emits pad-added, and activates the pad when PAUSED
+ * or PLAYING) without it, so a handler may request or release pads. The chain function only sees the pad once it is
+ * added and active. */
 static GstPad *
 gst_rds_stream_demux_request_new_pad (GstElement * element, GstPadTemplate * templ, const gchar * name,
     G_GNUC_UNUSED const GstCaps * caps)
@@ -504,26 +571,27 @@ gst_rds_stream_demux_request_new_pad (GstElement * element, GstPadTemplate * tem
   SrcPad *sp;
   GstPad *pad;
 
-  g_mutex_lock (&self->request_lock);
-  g_mutex_lock (&self->lock);
   if (name != NULL && g_strcmp0 (name, "src_%u") != 0) {
-    gchar end;
+    guint64 v;
 
-    if (sscanf (name, "src_%u%c", &id, &end) != 1) {
-      g_mutex_unlock (&self->lock);
-      g_mutex_unlock (&self->request_lock);
+    if (!g_str_has_prefix (name, "src_")
+        || !g_ascii_string_to_unsigned (name + strlen ("src_"), 10, 0, G_MAXUINT, &v, NULL)) {
       GST_WARNING_OBJECT (self, "bad pad name %s", name);
       return NULL;
     }
-    taken = g_hash_table_contains (self->pads, GUINT_TO_POINTER (id));
+    id = (guint) v;
+    g_mutex_lock (&self->lock);
+    taken = id_taken (self, id);
   } else {
-    while (g_hash_table_contains (self->pads, GUINT_TO_POINTER (id)))
+    g_mutex_lock (&self->lock);
+    while (id_taken (self, id))
       id++;
     taken = FALSE;
   }
+  if (!taken)
+    g_hash_table_add (self->reserved, GUINT_TO_POINTER (id));
   g_mutex_unlock (&self->lock);
   if (taken) {
-    g_mutex_unlock (&self->request_lock);
     GST_WARNING_OBJECT (self, "pad src_%u already exists", id);
     return NULL;
   }
@@ -532,6 +600,7 @@ gst_rds_stream_demux_request_new_pad (GstElement * element, GstPadTemplate * tem
   pad = gst_pad_new_from_template (templ, pad_name);
   g_free (pad_name);
   gst_pad_set_query_function (pad, gst_rds_stream_demux_src_query);
+  gst_pad_set_event_function (pad, gst_rds_stream_demux_src_event);
   gst_pad_use_fixed_caps (pad);
 
   sp = g_new0 (SrcPad, 1);
@@ -539,19 +608,20 @@ gst_rds_stream_demux_request_new_pad (GstElement * element, GstPadTemplate * tem
   sp->pad = gst_object_ref (pad);
   sp->id = id;
   sp->registered = TRUE;
-  sp->need_stream_start = sp->need_caps = sp->need_segment = TRUE;
+  new_stream (sp);
 
-  /* added (and so activated when PAUSED or PLAYING) before the chain function can push on it */
   if (!gst_element_add_pad (element, pad)) {
+    g_mutex_lock (&self->lock);
+    g_hash_table_remove (self->reserved, GUINT_TO_POINTER (id));
+    g_mutex_unlock (&self->lock);
     src_pad_unref (sp);
-    g_mutex_unlock (&self->request_lock);
     return NULL;
   }
   g_mutex_lock (&self->lock);
+  g_hash_table_remove (self->reserved, GUINT_TO_POINTER (id));
   g_hash_table_insert (self->pads, GUINT_TO_POINTER (id), sp);
   gst_flow_combiner_add_pad (self->flow, pad);
   g_mutex_unlock (&self->lock);
-  g_mutex_unlock (&self->request_lock);
   GST_DEBUG_OBJECT (self, "requested %" GST_PTR_FORMAT, pad);
   return pad;
 }
@@ -564,7 +634,6 @@ gst_rds_stream_demux_release_pad (GstElement * element, GstPad * pad)
   gpointer v;
   gboolean found = FALSE;
 
-  g_mutex_lock (&self->request_lock);
   g_mutex_lock (&self->lock);
   g_hash_table_iter_init (&it, self->pads);
   while (g_hash_table_iter_next (&it, NULL, &v)) {
@@ -580,11 +649,11 @@ gst_rds_stream_demux_release_pad (GstElement * element, GstPad * pad)
   }
   g_mutex_unlock (&self->lock);
   if (found) {
+    /* outside the lock: pad-removed handlers may request or release pads */
     GST_DEBUG_OBJECT (self, "releasing %" GST_PTR_FORMAT, pad);
     gst_pad_set_active (pad, FALSE);
     gst_element_remove_pad (element, pad);
   }
-  g_mutex_unlock (&self->request_lock);
 }
 
 static GstStateChangeReturn
@@ -603,13 +672,14 @@ gst_rds_stream_demux_change_state (GstElement * element, GstStateChange transiti
     gst_caps_replace (&self->caps, NULL);
     self->have_segment = FALSE;
     g_hash_table_remove_all (self->segments);
+    self->have_seek_seqnum = FALSE;
     gst_flow_combiner_reset (self->flow);
     g_hash_table_iter_init (&it, self->pads);
     while (g_hash_table_iter_next (&it, NULL, &v)) {
       SrcPad *sp = v;
 
-      sp->eos = FALSE;
-      sp->need_stream_start = sp->need_caps = sp->need_segment = TRUE;
+      sp->generation = 0;
+      new_stream (sp);
     }
     g_mutex_unlock (&self->lock);
   }
@@ -657,11 +727,11 @@ gst_rds_stream_demux_finalize (GObject * object)
 
   g_hash_table_unref (self->pads);
   g_hash_table_unref (self->segments);
+  g_hash_table_unref (self->reserved);
   gst_flow_combiner_free (self->flow);
   g_free (self->stream_id);
   gst_caps_replace (&self->caps, NULL);
   g_mutex_clear (&self->lock);
-  g_mutex_clear (&self->request_lock);
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
@@ -697,8 +767,8 @@ static void
 gst_rds_stream_demux_init (GstRdsStreamDemux * self)
 {
   g_mutex_init (&self->lock);
-  g_mutex_init (&self->request_lock);
   self->pads = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, src_pad_unref);
+  self->reserved = g_hash_table_new (g_direct_hash, g_direct_equal);
   self->segments = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, (GDestroyNotify) gst_segment_free);
   self->flow = gst_flow_combiner_new ();
   self->per_stream_eos = DEFAULT_PER_STREAM_EOS;
