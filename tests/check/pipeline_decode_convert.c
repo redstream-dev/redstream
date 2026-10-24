@@ -449,19 +449,79 @@ vm_rss_bytes (void)
   return kib * 1024;
 }
 
-static gsize
-gpu_free_bytes (void)
+/* Sums the drm-total-vram and drm-total-gtt keys of one DRM fdinfo file into @sum (bytes). FALSE if it has neither. */
+static gboolean
+add_fdinfo_gpu_bytes (const gchar * path, guint64 * sum)
 {
+  static const gchar *keys[] = { "drm-total-vram:", "drm-total-gtt:" };
+  gchar *text = NULL, **lines;
+  gboolean found = FALSE;
+
+  if (!g_file_get_contents (path, &text, NULL, NULL))
+    return FALSE;
+  lines = g_strsplit (text, "\n", -1);
+  for (guint i = 0; lines[i] != NULL; i++) {
+    for (guint k = 0; k < G_N_ELEMENTS (keys); k++) {
+      if (g_str_has_prefix (lines[i], keys[k])) {
+        gchar *end = NULL;
+        guint64 v = g_ascii_strtoull (lines[i] + strlen (keys[k]), &end, 10);
+
+        while (end != NULL && g_ascii_isspace (*end))
+          end++;
+        if (end != NULL && g_str_has_prefix (end, "KiB"))
+          v *= 1024;
+        else if (end != NULL && g_str_has_prefix (end, "MiB"))
+          v *= 1024 * 1024;
+        *sum += v;
+        found = TRUE;
+      }
+    }
+  }
+  g_strfreev (lines);
+  g_free (text);
+  return found;
+}
+
+/* GPU memory held by this process: drm-total-vram + drm-total-gtt from the DRM fdinfo of every render node it has
+ * open. HIP (KFD) allocations are accounted on the render node's DRM client (a 64 MiB hipMalloc moves it by 64 MiB;
+ * on APUs device memory shows up as GTT), and so are VA surfaces. Unlike hipMemGetInfo, which is device-wide, other
+ * processes on the GPU don't move it. Kernels without these fdinfo keys fall back to hipMemGetInfo, where any other
+ * process allocating on the device during the soak skews the delta. */
+static gsize
+gpu_used_bytes (void)
+{
+  GDir *dir = g_dir_open ("/proc/self/fd", 0, NULL);
+  const gchar *name;
+  guint64 sum = 0;
+  gboolean found = FALSE;
   size_t free_b = 0, total = 0;
 
+  g_assert_nonnull (dir);
+  while ((name = g_dir_read_name (dir)) != NULL) {
+    gchar *fd_path = g_build_filename ("/proc/self/fd", name, NULL);
+    gchar *target = g_file_read_link (fd_path, NULL);
+
+    if (target != NULL && g_str_has_prefix (target, "/dev/dri/renderD")) {
+      gchar *info_path = g_build_filename ("/proc/self/fdinfo", name, NULL);
+
+      found = add_fdinfo_gpu_bytes (info_path, &sum) || found;
+      g_free (info_path);
+    }
+    g_free (target);
+    g_free (fd_path);
+  }
+  g_dir_close (dir);
+  if (found)
+    return sum;
+
   g_assert_cmpint (hipMemGetInfo (&free_b, &total), ==, hipSuccess);
-  return free_b;
+  return total - free_b;
 }
 
 typedef struct
 {
   guint frames;
-  gsize rss[SOAK_LOOPS], gpu_free[SOAK_LOOPS];  /* after each loop's last frame */
+  gsize rss[SOAK_LOOPS], gpu_used[SOAK_LOOPS];  /* after each loop's last frame */
 } SoakStats;
 
 /* Runs in the streaming thread: samples memory use when a loop's last frame reaches the sink. */
@@ -475,7 +535,7 @@ soak_probe (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gp
     guint loop = st->frames / SOAK_FRAMES - 1;
 
     st->rss[loop] = vm_rss_bytes ();
-    st->gpu_free[loop] = gpu_free_bytes ();
+    st->gpu_used[loop] = gpu_used_bytes ();
   }
   return GST_PAD_PROBE_OK;
 }
@@ -483,7 +543,7 @@ soak_probe (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gp
 #define MIB(b) ((gdouble) (b) / (1024.0 * 1024.0))
 
 /* A 1280x720 clip of 300 frames decoded and converted 10 times in one pipeline (3000 frames): VmRSS grows by less
- * than 8 MiB and free GPU memory moves by less than 16 MiB between the end of loop 2 and the end of loop 10. */
+ * than 8 MiB and the process's GPU memory moves by less than 16 MiB between the end of loop 2 and the end of loop 10. */
 static void
 test_soak (void)
 {
@@ -542,10 +602,10 @@ test_soak (void)
 
   g_assert_cmpuint (st.frames, ==, SOAK_FRAMES * SOAK_LOOPS);
   for (guint i = 0; i < SOAK_LOOPS; i++)
-    g_test_message ("loop %2u: VmRSS %.1f MiB, GPU free %.1f MiB", i + 1, MIB (st.rss[i]), MIB (st.gpu_free[i]));
+    g_test_message ("loop %2u: VmRSS %.1f MiB, GPU used %.1f MiB", i + 1, MIB (st.rss[i]), MIB (st.gpu_used[i]));
   rss_growth = (gssize) st.rss[SOAK_LOOPS - 1] - (gssize) st.rss[1];
-  gpu_delta = (gssize) st.gpu_free[SOAK_LOOPS - 1] - (gssize) st.gpu_free[1];
-  g_test_message ("%u frames in %.1f s (%.0f fps); VmRSS growth loop 2 -> %u: %+.2f MiB; GPU free delta: %+.2f MiB",
+  gpu_delta = (gssize) st.gpu_used[SOAK_LOOPS - 1] - (gssize) st.gpu_used[1];
+  g_test_message ("%u frames in %.1f s (%.0f fps); VmRSS growth loop 2 -> %u: %+.2f MiB; GPU used delta: %+.2f MiB",
       st.frames, (t1 - t0) / 1e6, st.frames / ((t1 - t0) / 1e6), SOAK_LOOPS, rss_growth / (1024.0 * 1024.0),
       gpu_delta / (1024.0 * 1024.0));
   g_assert_cmpint (rss_growth, <, 8 * 1024 * 1024);

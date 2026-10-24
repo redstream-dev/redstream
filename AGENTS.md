@@ -176,7 +176,9 @@ meson test -C build-asan --print-errorlogs
   registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
   `gst-plugin-scanner` can't load sanitized plugins. ASan runs with `use_sigaltstack=0` (Mesa's LLVM, loaded by the
   VA driver, installs its own alternate signal stack), and only the soak test (`pipeline_soak`, its own build of
-  `pipeline_decode_convert.c`) shrinks the ASan quarantine so its VmRSS check stays meaningful. Tests that need private symbols link `rds_internal_dep`, a
+  `pipeline_decode_convert.c`) shrinks the ASan quarantine so its VmRSS check stays meaningful. Its GPU memory check reads
+  this process's DRM fdinfo (`drm-total-vram` + `drm-total-gtt` of its render-node fds, where HIP allocations are
+  accounted), so other processes on the GPU don't skew it; `hipMemGetInfo` is device-wide. Tests that need private symbols link `rds_internal_dep`, a
   static copy of libgstrds. Such a test must never also link `rds_dep` or load one of our plugins in-process
   (the plugin pulls in the shared libgstrds): two copies of the library register the same GTypes twice. They run
   with `internal_test_env`: no plugin paths and their own registry, so even an in-process scan loads no plugin.
