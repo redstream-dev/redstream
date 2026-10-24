@@ -121,17 +121,17 @@ surface_matches_slot (const RdsBufSurface * s, guint slot)
   return ok;
 }
 
-/* A device batch of 3 (numFilled = 3) whose slot i holds pattern (i, ...). */
+/* A device batch of @n (numFilled = n) whose slot i holds pattern (i, ...). */
 static GstBuffer *
-new_device_batch (GstAllocator * alloc)
+new_device_batch_n (GstAllocator * alloc, guint n)
 {
   RdsBufSurfaceCreateParams p = nv12_640;
   RdsBufSurface *sys = NULL, *dev;
   GstBuffer *buf = gst_buffer_new ();
 
   p.memType = RDS_BUF_MEM_SYSTEM;
-  g_assert_cmpint (rds_buf_surface_create (&sys, 3, &p), ==, 0);
-  for (guint i = 0; i < 3; i++) {
+  g_assert_cmpint (rds_buf_surface_create (&sys, n, &p), ==, 0);
+  for (guint i = 0; i < n; i++) {
     const RdsBufSurfaceParams *sp = &sys->surfaceList[i];
 
     for (guint pl = 0; pl < sp->planeParams.num_planes; pl++) {
@@ -142,15 +142,21 @@ new_device_batch (GstAllocator * alloc)
           ptr[(gsize) y * sp->planeParams.pitch[pl] + x] = pattern (i, pl, x, y);
     }
   }
-  sys->numFilled = 3;
+  sys->numFilled = n;
 
-  gst_buffer_append_memory (buf, rds_allocator_alloc_surface (alloc, 3, &nv12_640));
+  gst_buffer_append_memory (buf, rds_allocator_alloc_surface (alloc, n, &nv12_640));
   dev = rds_buffer_get_surface (buf);
   g_assert_nonnull (dev);
   g_assert_cmpint (rds_buf_surface_copy (sys, dev), ==, 0);
-  g_assert_cmpuint (dev->numFilled, ==, 3);
+  g_assert_cmpuint (dev->numFilled, ==, n);
   g_assert_cmpint (rds_buf_surface_destroy (sys), ==, 0);
   return buf;
+}
+
+static GstBuffer *
+new_device_batch (GstAllocator * alloc)
+{
+  return new_device_batch_n (alloc, 3);
 }
 
 static void
@@ -245,6 +251,127 @@ test_view_device_shared_mirror (void)
   gst_buffer_unref (v1);
   g_assert_cmpint (rds_buf_surface_unmap (bs, -1, -1), ==, 0);
   gst_buffer_unref (batch);
+  gst_object_unref (alloc);
+}
+
+/* ---- concurrent view mapping ---- */
+
+#define CONC_SLOTS 4
+#define CONC_THREADS 8
+#define CONC_ROUNDS 12
+#define CONC_ITERS 3
+
+typedef struct
+{
+  GMutex lock;
+  GCond cond;
+  GstBuffer *batch;             /* this round's batch, set by the main thread */
+  guint round;                  /* incremented to start a round */
+  guint done;                   /* threads finished with the current round */
+  gint failures;
+} ConcState;
+
+typedef struct
+{
+  ConcState *st;
+  guint slot;
+} ConcWorker;
+
+/* Maps a view through the batch's shared mirror and checks both planes. Returns FALSE on any mismatch. */
+static gboolean
+map_and_check (GstBuffer * view, guint slot)
+{
+  RdsBufSurface *vs = rds_buffer_get_surface (view);
+  guint8 *planes[RDS_BUF_SURFACE_MAX_PLANES];
+  gboolean ok;
+
+  if (vs == NULL || rds_buf_surface_map (vs, 0, -1, RDS_BUF_MAP_READ) != 0)
+    return FALSE;
+  ok = rds_buf_surface_sync_for_cpu (vs, 0, -1) == 0;
+  for (guint p = 0; p < vs->surfaceList[0].planeParams.num_planes; p++)
+    planes[p] = vs->surfaceList[0].mappedAddr.addr[p];
+  ok = ok && matches_slot (&vs->surfaceList[0], planes, slot);
+  return rds_buf_surface_unmap (vs, 0, -1) == 0 && ok;
+}
+
+static gpointer
+conc_worker (gpointer data)
+{
+  ConcWorker *w = data;
+  ConcState *st = w->st;
+
+  for (guint round = 1; round <= CONC_ROUNDS; round++) {
+    GstBuffer *batch;
+
+    g_mutex_lock (&st->lock);
+    while (st->round < round)
+      g_cond_wait (&st->cond, &st->lock);
+    batch = gst_buffer_ref (st->batch);
+    g_mutex_unlock (&st->lock);
+
+    /* Every thread's first map of a round races to allocate the fresh batch's mirror. */
+    for (guint i = 0; i < CONC_ITERS; i++) {
+      GstBuffer *view = rds_buffer_new_surface_view (batch, w->slot);
+      GstBuffer *vv = view != NULL ? rds_buffer_new_surface_view (view, 0) : NULL;
+
+      if (vv == NULL || !map_and_check (view, w->slot) || !map_and_check (vv, w->slot))
+        g_atomic_int_inc (&st->failures);
+      if (vv != NULL)
+        gst_buffer_unref (vv);
+      if (view != NULL)
+        gst_buffer_unref (view);
+    }
+    gst_buffer_unref (batch);
+
+    g_mutex_lock (&st->lock);
+    st->done++;
+    g_cond_broadcast (&st->cond);
+    g_mutex_unlock (&st->lock);
+  }
+  return NULL;
+}
+
+/* Views of one device batch mapped from several threads at once: the batch's staging mirror is allocated exactly
+ * once (a lost race must not leave a thread reading a mirror that is no longer the batch's) and every thread reads
+ * its slot. Two threads share each slot: they sync the same unchanging bytes into the same mirror region and only
+ * read them, which is benign; writing through a shared slot from two threads would be the documented race. */
+static void
+test_view_device_concurrent (void)
+{
+  RDS_TEST_REQUIRE_GPU ();
+
+  GstAllocator *alloc = rds_allocator_new (0, RDS_BUF_MEM_DEFAULT);
+  ConcState st = { 0 };
+  ConcWorker workers[CONC_THREADS];
+  GThread *threads[CONC_THREADS];
+
+  g_mutex_init (&st.lock);
+  g_cond_init (&st.cond);
+  for (guint t = 0; t < CONC_THREADS; t++) {
+    workers[t] = (ConcWorker) {.st = &st,.slot = t % CONC_SLOTS };
+    threads[t] = g_thread_new ("view-map", conc_worker, &workers[t]);
+  }
+
+  for (guint round = 1; round <= CONC_ROUNDS; round++) {
+    GstBuffer *batch = new_device_batch_n (alloc, CONC_SLOTS);
+
+    g_mutex_lock (&st.lock);
+    gst_buffer_replace (&st.batch, batch);
+    st.done = 0;
+    st.round = round;
+    g_cond_broadcast (&st.cond);
+    while (st.done < CONC_THREADS)
+      g_cond_wait (&st.cond, &st.lock);
+    g_mutex_unlock (&st.lock);
+    gst_buffer_unref (batch);
+  }
+
+  for (guint t = 0; t < CONC_THREADS; t++)
+    g_thread_join (threads[t]);
+  gst_buffer_replace (&st.batch, NULL);
+  g_assert_cmpint (st.failures, ==, 0);
+  g_cond_clear (&st.cond);
+  g_mutex_clear (&st.lock);
   gst_object_unref (alloc);
 }
 
@@ -398,6 +525,7 @@ main (int argc, char **argv)
   g_test_add_func ("/memory-hip/view-device-write-map", test_view_device_write_map);
   g_test_add_func ("/memory-hip/view-device-shared-mirror", test_view_device_shared_mirror);
   g_test_add_func ("/memory-hip/view-device-map-many", test_view_device_map_many);
+  g_test_add_func ("/memory-hip/view-device-concurrent", test_view_device_concurrent);
   g_test_add_func ("/memory-hip/view-device-outlives-batch", test_view_device_outlives_batch);
   g_test_add_func ("/memory-hip/view-transform-source", test_view_transform_source);
   return g_test_run ();

@@ -15,7 +15,7 @@ G_BEGIN_DECLS
  * one slot of another buffer's batch: base is NULL, dataPtr points into the parent's allocation, and CPU maps of
  * device memory use the owner's staging mirror (slot @index). The parent buffer ref is held by the view's RDS
  * memory (rds-memory.c), which also owns the view's RdsBufSurface, params and this struct; that ref keeps @owner
- * alive (a buffer with views is not writable, so its memory cannot be replaced). */
+ * alive (a buffer with views is not writable, so its memory can be neither replaced nor removed from it). */
 typedef struct _RdsBufSurfacePriv RdsBufSurfacePriv;
 struct _RdsBufSurfacePriv
 {
