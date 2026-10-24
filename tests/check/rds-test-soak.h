@@ -1,5 +1,6 @@
-/* Memory probes for soak tests: VmRSS and this process's GPU memory, plus a small ASan quarantine for the soak
- * builds (RDS_TEST_SMALL_QUARANTINE). Header-only; include it from one source file per executable.
+/* Memory probes for soak tests: host memory (VmRSS, or ASan's live heap under ASan) and this process's GPU memory,
+ * plus a small ASan quarantine for the soak builds (RDS_TEST_SMALL_QUARANTINE). Header-only; include it from one
+ * source file per executable.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_TEST_SOAK_H
 #define RDS_TEST_SOAK_H
@@ -31,7 +32,7 @@ __asan_default_options (void)
 }
 #endif
 
-static gsize
+G_GNUC_UNUSED static gsize
 vm_rss_bytes (void)
 {
   gchar *status = NULL, *line;
@@ -44,6 +45,28 @@ vm_rss_bytes (void)
   g_free (status);
   return kib * 1024;
 }
+
+/* Host memory the soak checks for growth: VmRSS in normal builds. Under ASan, VmRSS also moves with the allocator's
+ * own caches and quarantine (noisy under parallel load, +12 MiB seen once), so the soak reads ASan's count of live
+ * heap bytes instead. That count leaves out memory not allocated through malloc (HIP pinned host memory, driver
+ * mappings): the normal build's VmRSS check covers those. */
+#ifdef RDS_TEST_ASAN
+/* from <sanitizer/allocator_interface.h>, which the dev image's GCC does not install */
+size_t __sanitizer_get_current_allocated_bytes (void);
+#define RDS_TEST_HOST_MEMORY_NAME "ASan live heap"
+static gsize
+host_memory_bytes (void)
+{
+  return __sanitizer_get_current_allocated_bytes ();
+}
+#else
+#define RDS_TEST_HOST_MEMORY_NAME "VmRSS"
+static gsize
+host_memory_bytes (void)
+{
+  return vm_rss_bytes ();
+}
+#endif
 
 /* Sums the drm-total-vram and drm-total-gtt keys of one DRM fdinfo file into @sum (bytes). FALSE if it has neither. */
 static gboolean

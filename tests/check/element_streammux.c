@@ -2649,7 +2649,9 @@ test_timer_from_arrival (void)
 }
 
 /* Demuxed views pin their whole batch, and sinks keep their last buffer: four branches each holding a different
- * batch must not exhaust the default output pool (one frame per batch here, from a different source each time). */
+ * batch (one frame per batch here, from a different source each time) need a buffer-pool-size above four. With the
+ * default (4) this pipeline stalls for good; the size is not raised automatically (it costs memory in pipelines
+ * without a demux), so the application sets it. */
 static void
 test_pool_pinned_by_branches (void)
 {
@@ -2662,6 +2664,7 @@ test_pool_pinned_by_branches (void)
     g_string_append_printf (desc, "appsrc name=s%u format=time caps=\"" APP_CAPS "\" ! m.sink_%u "
         "d.src_%u ! appsink name=o%u sync=false async=false enable-last-sample=true ", i, i, i, i);
   g_string_append (desc, "rdsstreammux name=m width=64 height=48 batch-size=4 batched-push-timeout=10000 "
+      "buffer-pool-size=6 "
       "! rdsstreamdemux name=d");
   pipe = gst_parse_launch (desc->str, &err);
   g_assert_no_error (err);
@@ -2684,7 +2687,7 @@ test_pool_pinned_by_branches (void)
         ==, GST_FLOW_OK);
     sample = gst_app_sink_try_pull_sample (GST_APP_SINK (sink[i]), 5 * GST_SECOND);
     if (sample == NULL)
-      g_error ("frame %u never came out: the output pool is exhausted by the sinks' last buffers", f);
+      g_error ("frame %u never came out: the output pool is held by the sinks' last buffers", f);
     gst_sample_unref (sample);
   }
   gst_element_set_state (pipe, GST_STATE_NULL);
@@ -2693,6 +2696,71 @@ test_pool_pinned_by_branches (void)
     gst_object_unref (sink[i]);
   }
   gst_object_unref (pipe);
+}
+
+/* A GAP event before a frame on the same source: the empty GAP buffer the aggregator queues has no arrival record
+ * and is no frame. The frame's batch still goes out one timeout after the frame arrived. */
+static void
+test_timer_gap_then_frame (void)
+{
+  AppPipe p;
+  GstPad *sink0;
+  gint64 t_frame, t_done;
+
+  RDS_TEST_REQUIRE_GPU ();
+  app_pipe_start (&p, 2, "", "batch-size=2 batched-push-timeout=300000");
+  for (guint i = 0; i < 2; i++)
+    app_push (&p, i, i, 0);
+  g_assert_cmpuint (app_pull (&p, NULL), ==, 2);
+
+  /* source 1 stalls; source 0 sends a GAP, then 50 ms later a frame */
+  sink0 = gst_element_get_static_pad (p.mux, "sink_0");
+  g_assert_true (gst_pad_send_event (sink0, gst_event_new_gap (33 * GST_MSECOND, 33 * GST_MSECOND)));
+  g_usleep (50 * 1000);
+  t_frame = g_get_monotonic_time ();
+  app_push (&p, 0, 2, 66 * GST_MSECOND);
+  g_assert_cmpuint (app_pull (&p, NULL), ==, 1);
+  t_done = g_get_monotonic_time ();
+  g_test_message ("frame after a GAP went out %" G_GINT64_FORMAT " ms after it arrived", (t_done - t_frame) / 1000);
+  /* one timeout (300 ms) after the frame; timing it from when the GAP left the queue would be about 550 ms */
+  g_assert_cmpint (t_done - t_frame, >=, 250 * 1000);
+  g_assert_cmpint (t_done - t_frame, <=, 450 * 1000);
+  gst_object_unref (sink0);
+  app_pipe_stop (&p);
+}
+
+/* A flush of a source drops its queued frame, and the timer of that frame with it: a frame sent after the flush
+ * (later than one timeout) still waits a timeout for the stalled source. */
+static void
+test_timer_after_flush (void)
+{
+  AppPipe p;
+  GstPad *sink0;
+  GstSegment seg;
+  gint64 dt;
+
+  RDS_TEST_REQUIRE_GPU ();
+  app_pipe_start (&p, 2, "", "batch-size=2 batched-push-timeout=200000");
+  for (guint i = 0; i < 2; i++)
+    app_push (&p, i, i, 0);
+  g_assert_cmpuint (app_pull (&p, NULL), ==, 2);
+
+  /* source 1 stalls; source 0's queued frame is flushed right away */
+  sink0 = gst_element_get_static_pad (p.mux, "sink_0");
+  app_push (&p, 0, 2, 33 * GST_MSECOND);
+  g_usleep (5 * 1000);
+  g_assert_true (gst_pad_send_event (sink0, gst_event_new_flush_start ()));
+  g_assert_true (gst_pad_send_event (sink0, gst_event_new_flush_stop (TRUE)));
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  g_assert_true (gst_pad_send_event (sink0, gst_event_new_segment (&seg)));
+  g_usleep (300 * 1000);
+  app_push (&p, 0, 3, 0);
+  g_assert_cmpuint (app_pull (&p, &dt), ==, 1);
+  g_test_message ("frame after the flush went out after %" G_GINT64_FORMAT " ms", dt / 1000);
+  g_assert_cmpint (dt, >=, 150 * 1000);
+  g_assert_cmpint (dt, <=, 1000 * 1000);
+  gst_object_unref (sink0);
+  app_pipe_stop (&p);
 }
 
 int
@@ -2747,6 +2815,8 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/mux/pool-flushing-window", test_pool_flushing_window);
   g_test_add_func ("/gpu/mux/timer-from-arrival", test_timer_from_arrival);
   g_test_add_func ("/gpu/mux/pool-pinned-by-branches", test_pool_pinned_by_branches);
+  g_test_add_func ("/gpu/mux/timer-gap-then-frame", test_timer_gap_then_frame);
+  g_test_add_func ("/gpu/mux/timer-after-flush", test_timer_after_flush);
   {
     /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
      * process exit otherwise (seen under parallel ASan runs) */

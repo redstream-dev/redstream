@@ -221,8 +221,8 @@ meson test -C build-asan --print-errorlogs
   staging mirror: map and sync a slot from one thread at a time.
 - **Demux branches:** every `rdsstreamdemux` branch needs its own `queue` (the branches share the demux's streaming
   thread; the first sink to preroll blocks the rest). Each demuxed view pins its whole batch until released, and
-  sinks keep their last buffer, so N branches can pin N batches: leave `rdsstreammux`'s `buffer-pool-size` unset
-  (default `batch-size + 2`, at least 4) or larger than the number of branches, or the mux stalls. As with `tee`,
+  sinks keep their last buffer, so N branches can pin N batches: set `rdsstreammux`'s `buffer-pool-size` (default 4)
+  larger than the number of branches whose sinks keep their last buffer, or the mux stalls. As with `tee`,
   FLUSHING from one branch stops all of them: block or unlink a branch before setting it to NULL. To remove a source,
   wait for its `rds-stream-eos` downstream before releasing its mux pad (releasing right after sending EOS into the
   pad drops that stream-eos). A sink added while PLAYING needs `async=false`.

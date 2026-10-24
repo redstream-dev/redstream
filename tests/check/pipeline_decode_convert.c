@@ -430,14 +430,15 @@ soak_probe (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gp
   if (st->frames % SOAK_FRAMES == 0 && st->frames / SOAK_FRAMES <= SOAK_LOOPS) {
     guint loop = st->frames / SOAK_FRAMES - 1;
 
-    st->rss[loop] = vm_rss_bytes ();
+    st->rss[loop] = host_memory_bytes ();
     st->gpu_used[loop] = gpu_used_bytes ();
   }
   return GST_PAD_PROBE_OK;
 }
 
-/* A 1280x720 clip of 300 frames decoded and converted 10 times in one pipeline (3000 frames): VmRSS grows by less
- * than 8 MiB and the process's GPU memory moves by less than 16 MiB between the end of loop 2 and the end of loop 10. */
+/* A 1280x720 clip of 300 frames decoded and converted 10 times in one pipeline (3000 frames): VmRSS (under ASan, the
+ * live heap) grows by less than 8 MiB and the process's GPU memory moves by less than 16 MiB between the end of loop 2
+ * and the end of loop 10. */
 static void
 test_soak (void)
 {
@@ -496,12 +497,13 @@ test_soak (void)
 
   g_assert_cmpuint (st.frames, ==, SOAK_FRAMES * SOAK_LOOPS);
   for (guint i = 0; i < SOAK_LOOPS; i++)
-    g_test_message ("loop %2u: VmRSS %.1f MiB, GPU used %.1f MiB", i + 1, MIB (st.rss[i]), MIB (st.gpu_used[i]));
+    g_test_message ("loop %2u: " RDS_TEST_HOST_MEMORY_NAME " %.1f MiB, GPU used %.1f MiB", i + 1, MIB (st.rss[i]),
+        MIB (st.gpu_used[i]));
   rss_growth = (gssize) st.rss[SOAK_LOOPS - 1] - (gssize) st.rss[1];
   gpu_delta = (gssize) st.gpu_used[SOAK_LOOPS - 1] - (gssize) st.gpu_used[1];
-  g_test_message ("%u frames in %.1f s (%.0f fps); VmRSS growth loop 2 -> %u: %+.2f MiB; GPU used delta: %+.2f MiB",
-      st.frames, (t1 - t0) / 1e6, st.frames / ((t1 - t0) / 1e6), SOAK_LOOPS, rss_growth / (1024.0 * 1024.0),
-      gpu_delta / (1024.0 * 1024.0));
+  g_test_message ("%u frames in %.1f s (%.0f fps); " RDS_TEST_HOST_MEMORY_NAME " growth loop 2 -> %u: %+.2f MiB; "
+      "GPU used delta: %+.2f MiB", st.frames, (t1 - t0) / 1e6, st.frames / ((t1 - t0) / 1e6), SOAK_LOOPS,
+      rss_growth / (1024.0 * 1024.0), gpu_delta / (1024.0 * 1024.0));
   g_assert_cmpint (rss_growth, <, 8 * 1024 * 1024);
   g_assert_cmpint (ABS (gpu_delta), <, 16 * 1024 * 1024);
 }

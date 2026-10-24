@@ -972,7 +972,7 @@ mux_soak_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer use
   if (st->batches % SOAK_FRAMES == 0 && st->batches / SOAK_FRAMES <= SOAK_LOOPS) {
     guint loop = st->batches / SOAK_FRAMES - 1;
 
-    st->rss[loop] = vm_rss_bytes ();
+    st->rss[loop] = host_memory_bytes ();
     st->gpu_used[loop] = gpu_used_bytes ();
   }
   return GST_PAD_PROBE_OK;
@@ -986,8 +986,9 @@ count_probe (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, g
 }
 
 /* Four 1280x720 H.264 sources of 300 frames, each looped 10 times (3000 frames per source), through rdsvideodec,
- * rdsstreammux (batch-size 4) and rdsstreamdemux into fakesinks: VmRSS grows by less than 8 MiB and the process's
- * GPU memory moves by less than 16 MiB between the end of loop 2 and the end of loop 10. Reports the fps. */
+ * rdsstreammux (batch-size 4) and rdsstreamdemux into fakesinks: VmRSS (under ASan, the live heap) grows by less than
+ * 8 MiB and the process's GPU memory moves by less than 16 MiB between the end of loop 2 and the end of loop 10.
+ * Reports the fps. */
 static void
 test_mux_soak (void)
 {
@@ -1052,11 +1053,12 @@ test_mux_soak (void)
 
   secs = (t1 - t0) / 1e6;
   for (guint i = 0; i < SOAK_LOOPS; i++)
-    g_test_message ("loop %2u: VmRSS %.1f MiB, GPU used %.1f MiB", i + 1, MIB (st.rss[i]), MIB (st.gpu_used[i]));
+    g_test_message ("loop %2u: " RDS_TEST_HOST_MEMORY_NAME " %.1f MiB, GPU used %.1f MiB", i + 1, MIB (st.rss[i]),
+        MIB (st.gpu_used[i]));
   rss_growth = (gssize) st.rss[SOAK_LOOPS - 1] - (gssize) st.rss[1];
   gpu_delta = (gssize) st.gpu_used[SOAK_LOOPS - 1] - (gssize) st.gpu_used[1];
-  g_test_message ("%u frames in %u batches in %.1f s (%.0f fps, %.0f fps per source); VmRSS growth loop 2 -> %u: "
-      "%+.2f MiB; GPU used delta: %+.2f MiB", st.frames, st.batches, secs, st.frames / secs,
+  g_test_message ("%u frames in %u batches in %.1f s (%.0f fps, %.0f fps per source); " RDS_TEST_HOST_MEMORY_NAME
+      " growth loop 2 -> %u: %+.2f MiB; GPU used delta: %+.2f MiB", st.frames, st.batches, secs, st.frames / secs,
       st.frames / secs / SOAK_SOURCES, SOAK_LOOPS, MIB (rss_growth), MIB (gpu_delta));
   /* without a timeout every batch has a frame of each source */
   g_assert_cmpuint (st.batches, ==, SOAK_FRAMES * SOAK_LOOPS);

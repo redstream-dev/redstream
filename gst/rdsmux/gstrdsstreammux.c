@@ -7,22 +7,22 @@
  * - batched-push-timeout -1 (no timeout): the aggregator is not live, so aggregate () runs once every pad that is not
  *   at EOS has a buffer.
  * - batched-push-timeout >= 0: forced-live aggregation with the aggregator latency set to the timeout, and
- *   get_next_time returning the running time at which the batch's first buffer was seen. A partial batch is then
- *   pushed one timeout after its first buffer, wherever the buffer timestamps sit relative to the clock. (The
- *   aggregator's stock "output position" next time fires late when a file decodes faster than real time and at
- *   once when it decodes slower.)
+ *   get_next_time returning the arrival running time of the oldest frame still queued (recorded per buffer by a
+ *   sink pad probe). A partial batch is then pushed one timeout after its first frame arrived, also when that frame
+ *   queued up while the previous batch was still waiting, and wherever the buffer timestamps sit relative to the
+ *   clock. (The aggregator's stock "output position" next time fires late when a file decodes faster than real
+ *   time and at once when it decodes slower.)
  *   The upstream latency of a live source is taken off again: the timer counts from the batch's first frame only.
  * - sync-inputs: forced-live as well, but get_next_time is the running time of the earliest queued frame. A partial
  *   batch then goes out once the clock reaches that frame's running time plus the latency (batched-push-timeout, or
  *   0, plus max-latency and the upstream latency). A frame already due goes out at once with whatever else is
  *   queued; one ahead of the clock waits for the others until its time. As in every mode, a batch with a frame from
  *   every source goes out as soon as it is complete: inputs are not held back to the clock.
- *   The timer of a partial batch starts when its first frame arrived (recorded per buffer by a sink pad probe),
- *   also when that frame queued up while the previous batch was still waiting.
  * Pool pressure: a live or forced-live aggregator pad queues at least two buffers plus a latency's worth, on top of
  * the one being batched; upstream pools must allow for that. Downstream, every demuxed view keeps its whole batch
- * alive and sinks keep their last buffer, so each demux branch can pin a different batch: unless buffer-pool-size
- * is set, the output pool holds batch-size + 2 batches (at least 4).
+ * alive and sinks keep their last buffer, so each demux branch can pin a different batch: buffer-pool-size (default
+ * 4, allocated up front) must be larger than the number of such branches. It is not sized automatically: the pool
+ * holds buffer-pool-size x batch-size frames, and most pipelines (a tiler, no demux) need no headroom.
  *
  * Stream events (rds-event.h) go downstream in order with the batches:
  * - pad-added before a source's first event or frame, stream-start / stream-segment from its STREAM_START /
@@ -165,7 +165,6 @@ struct _GstRdsStreamMux
   guint gpu_id;
   gint memory_type;             /* RdsBufSurfaceMemType 0..3 */
   guint buffer_pool_size;
-  gboolean buffer_pool_size_set;        /* set by the user: honoured as is */
   gint compute_hw;              /* RdsBufSurfTransform_Compute */
   gint interpolation_method;    /* RdsBufSurfTransform_Inter */
   guint num_surfaces_per_frame;
@@ -207,6 +206,7 @@ struct _GstRdsStreamMux
   hipStream_t stream;           /* created on the first batch, so negotiation errors come before any GPU work */
   guint stream_gpu;
   gboolean timeout_enabled;     /* fixed at start */
+  gint record_arrivals;         /* timeout_enabled, read by the sink pads' arrival probe (atomic) */
   gboolean sync_mode;           /* sync-inputs, fixed at start */
   GstClockTime upstream_latency;        /* the live upstream's share of the aggregator latency */
   GstClockTime batch_start;     /* running time the source thread first saw a queued buffer with no arrival time
@@ -322,10 +322,14 @@ pad_arrival_probe (GstPad * gpad, GstPadProbeInfo * info, G_GNUC_UNUSED gpointer
 {
   GstRdsStreamMuxPad *pad = GST_RDS_STREAM_MUX_PAD (gpad);
   GstElement *element = GST_PAD_PARENT (gpad);
-  Arrival *a = g_new (Arrival, 1);
+  Arrival *a;
 
+  /* only the batched-push-timeout timer uses them */
+  if (element == NULL || !g_atomic_int_get (&GST_RDS_STREAM_MUX (element)->record_arrivals))
+    return GST_PAD_PROBE_OK;
+  a = g_new (Arrival, 1);
   a->buf = GST_PAD_PROBE_INFO_BUFFER (info);
-  a->time = element != NULL ? gst_element_get_current_running_time (element) : GST_CLOCK_TIME_NONE;
+  a->time = gst_element_get_current_running_time (element);
   g_mutex_lock (&pad->arrivals_lock);
   g_queue_push_tail (&pad->arrivals, a);
   g_mutex_unlock (&pad->arrivals_lock);
@@ -333,7 +337,10 @@ pad_arrival_probe (GstPad * gpad, GstPadProbeInfo * info, G_GNUC_UNUSED gpointer
 }
 
 /* Source thread: @buf was popped. Drops its record and any older ones (buffers that left the queue unpopped).
- * A buffer with no record (a GAP buffer the aggregator made from an event) leaves the records alone. */
+ * A buffer with no record (a GAP buffer the aggregator made from an event) leaves the records alone. Records match
+ * by pointer: a stale record (a buffer the pad refused after its probe ran, e.g. on an error) whose address is
+ * reused by a later buffer would be taken for that buffer's, dropping the records in between; flushes and stop
+ * clear the records, so this can only shift one timer start. */
 static void
 pad_take_arrival (GstRdsStreamMuxPad * pad, GstBuffer * buf)
 {
@@ -538,19 +545,6 @@ gst_rds_stream_mux_negotiated_src_caps (GstAggregator * agg, GstCaps * caps)
 
 /* ---- allocation ---- */
 
-/* The output pool size (object lock held). Every demuxed view keeps its whole batch alive, and sinks keep their last
- * buffer (appsink always, basesink with enable-last-sample), so each demux branch can pin a different batch: with
- * buffer-pool-size left at its default the pool holds batch-size + 2 batches (at least 4). A size set explicitly is
- * honoured (start () warns when it is batch-size or less). */
-static guint
-effective_pool_size (GstRdsStreamMux * self)
-{
-  if (self->buffer_pool_size_set)
-    return self->buffer_pool_size;
-  return (guint) MIN ((guint64) MAX_BUFFER_POOL_SIZE, MAX ((guint64) DEFAULT_BUFFER_POOL_SIZE,
-          (guint64) self->batch_size + 2));
-}
-
 static gboolean
 gst_rds_stream_mux_decide_allocation (GstAggregator * agg, GstQuery * query)
 {
@@ -563,7 +557,7 @@ gst_rds_stream_mux_decide_allocation (GstAggregator * agg, GstQuery * query)
   batch_size = self->batch_size;
   mem_type = (RdsBufSurfaceMemType) self->memory_type;
   gpu_id = self->gpu_id;
-  pool_size = effective_pool_size (self);
+  pool_size = self->buffer_pool_size;
   GST_OBJECT_UNLOCK (self);
 
   /* minimum = maximum: a stalled downstream back-pressures the mux instead of growing the pool */
@@ -1013,8 +1007,8 @@ gst_rds_stream_mux_start (GstAggregator * agg)
 {
   GstRdsStreamMux *self = GST_RDS_STREAM_MUX (agg);
   gint timeout;
-  gboolean sync_inputs, small_pool;
-  guint max_latency, pool_size, batch_size;
+  gboolean sync_inputs;
+  guint max_latency;
 
   if (!check_settings (self))
     return FALSE;
@@ -1023,19 +1017,11 @@ gst_rds_stream_mux_start (GstAggregator * agg)
   timeout = self->batched_push_timeout;
   sync_inputs = self->sync_inputs;
   max_latency = self->max_latency;
-  pool_size = self->buffer_pool_size;
-  small_pool = self->buffer_pool_size_set && self->buffer_pool_size <= self->batch_size;
-  batch_size = self->batch_size;
   GST_OBJECT_UNLOCK (self);
-
-  if (small_pool)
-    GST_WARNING_OBJECT (self, "buffer-pool-size %u is not larger than batch-size %u: every demuxed frame keeps its "
-        "whole batch alive and sinks keep their last buffer, so %u or more downstream branches can hold every "
-        "batch and stall the mux. Leave buffer-pool-size unset (batch-size + 2) or make it larger",
-        pool_size, batch_size, pool_size);
 
   self->timeout_enabled = timeout >= 0;
   self->sync_mode = sync_inputs;
+  g_atomic_int_set (&self->record_arrivals, self->timeout_enabled && !self->sync_mode);
   self->upstream_latency = 0;
   self->batch_start = GST_CLOCK_TIME_NONE;
   self->rr_next = 0;
@@ -1420,6 +1406,11 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
 
     if (e.buf != NULL) {
       pad_take_arrival (pad, e.buf);
+      /* the empty buffer GstAggregator makes from a GAP event: no frame */
+      if (GST_BUFFER_FLAG_IS_SET (e.buf, GST_BUFFER_FLAG_GAP) && gst_buffer_n_memory (e.buf) == 0) {
+        gst_buffer_unref (e.buf);
+        continue;
+      }
       GST_OBJECT_LOCK (pad);
       e.running_time = gst_segment_to_running_time (&GST_AGGREGATOR_PAD (pad)->segment, GST_FORMAT_TIME,
           GST_BUFFER_PTS (e.buf));
@@ -1610,10 +1601,8 @@ gst_rds_stream_mux_set_property (GObject * object, guint prop_id, const GValue *
         self->memory_type = g_value_get_enum (value);
       break;
     case PROP_BUFFER_POOL_SIZE:
-      if (check_mutable (self, pspec)) {
+      if (check_mutable (self, pspec))
         self->buffer_pool_size = g_value_get_uint (value);
-        self->buffer_pool_size_set = TRUE;
-      }
       break;
     case PROP_COMPUTE_HW:
       if (check_mutable (self, pspec))
@@ -1866,7 +1855,8 @@ gst_rds_stream_mux_class_init (GstRdsStreamMuxClass * klass)
           GST_TYPE_RDS_STREAM_MUX_MEMORY_TYPE, DEFAULT_MEMORY_TYPE, flags | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_BUFFER_POOL_SIZE,
       g_param_spec_uint ("buffer-pool-size", "Buffer pool size",
-          "Number of batches in the output pool (not set: batch-size + 2, at least 4)", 1,
+          "Number of batches in the output pool; larger than the number of demux branches whose sinks keep their "
+          "last buffer", 1,
           MAX_BUFFER_POOL_SIZE, DEFAULT_BUFFER_POOL_SIZE, flags | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_COMPUTE_HW,
       g_param_spec_enum ("compute-hw", "Compute hardware", "Engine that runs the scaling",
