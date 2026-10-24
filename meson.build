@@ -10,6 +10,7 @@ gst_dep = dependency('gstreamer-1.0', version : '>= 1.28')
 gst_base_dep = dependency('gstreamer-base-1.0', version : '>= 1.28')
 gst_video_dep = dependency('gstreamer-video-1.0', version : '>= 1.28')
 gst_check_dep = dependency('gstreamer-check-1.0', version : '>= 1.28')
+gst_app_dep = dependency('gstreamer-app-1.0', version : '>= 1.28')   # tests only (appsrc/appsink helpers)
 
 # The ROCm image ships no hip.pc; locate the HIP runtime directly.
 fs = import('fs')

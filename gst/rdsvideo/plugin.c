@@ -3,6 +3,7 @@
 #include <gst/gst.h>
 
 #include "gstrdsvideoconvert.h"
+#include "gstrdsvideodec.h"
 
 static gboolean
 plugin_init (GstPlugin * plugin)
@@ -10,6 +11,7 @@ plugin_init (GstPlugin * plugin)
   gboolean ret = FALSE;
 
   ret |= GST_ELEMENT_REGISTER (rdsvideoconvert, plugin);
+  ret |= GST_ELEMENT_REGISTER (rdsvideodec, plugin);
   return ret;
 }
 

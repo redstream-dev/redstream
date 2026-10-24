@@ -71,6 +71,13 @@ test('element_videoconvert_cpu', element_videoconvert_exe, args : ['-p', '/cpu/v
 test('element_videoconvert', element_videoconvert_exe, args : ['-p', '/gpu/videoconvert'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 
+element_videodec_exe = executable('element_videodec', 'check' / 'element_videodec.c',
+  dependencies : test_deps + [gst_app_dep, gst_video_dep])
+test('element_videodec_cpu', element_videodec_exe, args : ['-p', '/cpu/videodec'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_videodec', element_videodec_exe, args : ['-p', '/gpu/videodec'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
+
 test('rds_test3_dry_run',
   find_program('samples/rds_test3_dry_run.sh'),
   args : [rds_test3_exe], suite : 'cpu', env : test_env)
