@@ -127,15 +127,22 @@ RDS_API int rds_buf_surface_destroy (RdsBufSurface * surf);
  *   map -> sync_for_cpu -> read/write through mappedAddr -> sync_for_device -> unmap.
  * sync_for_device writes back the whole plane (pitch * height bytes). If map fails partway through a
  * multi-plane or multi-surface request, some planes may be mapped: call unmap with the same index and plane.
- * map, unmap and the sync calls are not thread-safe for the same surface (as with NvBufSurface): serialize them. */
+ * map, unmap and the sync calls are not thread-safe for the same surface (as with NvBufSurface): serialize them.
+ * The sync calls on device memory are synchronous: they return when the work is complete. They run on the calling
+ * thread's per-thread stream of the surface's GPU and do not wait for work the caller queued on its own streams;
+ * synchronize producers first. */
 RDS_API int rds_buf_surface_map (RdsBufSurface * surf, int index, int plane, RdsBufSurfaceMemMapFlags type);
 RDS_API int rds_buf_surface_unmap (RdsBufSurface * surf, int index, int plane);
 RDS_API int rds_buf_surface_sync_for_cpu (RdsBufSurface * surf, int index, int plane);
 RDS_API int rds_buf_surface_sync_for_device (RdsBufSurface * surf, int index, int plane);
 /* Copies the first src->numFilled surfaces row by row (padding untouched) and sets dst->numFilled.
- * Sizes and formats must match; memory types may differ. */
+ * Sizes and formats must match; memory types may differ.
+ * Synchronous: returns when the work is complete. Runs on the calling thread's per-thread stream of the surface's
+ * GPU and does not wait for work the caller queued on its own streams; synchronize producers first. */
 RDS_API int rds_buf_surface_copy (const RdsBufSurface * src, RdsBufSurface * dst);
-/* Fills whole planes (pitch * height bytes, padding included). */
+/* Fills whole planes (pitch * height bytes, padding included).
+ * Synchronous: returns when the work is complete. Runs on the calling thread's per-thread stream of the surface's
+ * GPU and does not wait for work the caller queued on its own streams; synchronize producers first. */
 RDS_API int rds_buf_surface_memset (RdsBufSurface * surf, int index, int plane, guint8 value);
 
 G_END_DECLS

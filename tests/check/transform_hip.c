@@ -364,19 +364,19 @@ test_batch_slot_view (void)
   {
     RdsBufSurfaceColorFormat fmt;
     guint w, h;
-  } srcs[3] = {
+  } srcs[] = {
     {RDS_BUF_COLOR_FORMAT_NV12, 37, 29},
     {RDS_BUF_COLOR_FORMAT_RGBA, 64, 48},
     {RDS_BUF_COLOR_FORMAT_YUV420, 130, 98},
   };
   const guint bw = 80, bh = 60;
-  RdsBufSurface *batch, *src[3];
+  RdsBufSurface *batch, *src[G_N_ELEMENTS (srcs)];
   RdsBufSurfTransformRect dr = {.top = 0,.left = 0,.width = 80,.height = 46 };
-  HostImage hsrc[3], href[3], hgot;
+  HostImage hsrc[G_N_ELEMENTS (srcs)], href[G_N_ELEMENTS (srcs)], hgot;
 
   RDS_TEST_REQUIRE_GPU ();
-  batch = create_surf (RDS_BUF_MEM_DEFAULT, RDS_BUF_COLOR_FORMAT_NV12, bw, bh, 3, 0);
-  for (guint i = 0; i < 3; i++) {
+  batch = create_surf (RDS_BUF_MEM_DEFAULT, RDS_BUF_COLOR_FORMAT_NV12, bw, bh, G_N_ELEMENTS (srcs), 0);
+  for (guint i = 0; i < G_N_ELEMENTS (srcs); i++) {
     src[i] = create_surf (RDS_BUF_MEM_DEFAULT, srcs[i].fmt, srcs[i].w, srcs[i].h, 1, 0);
     fill_random (src[i], 0, 300 + i);
     src[i]->numFilled = 1;
@@ -386,7 +386,7 @@ test_batch_slot_view (void)
   }
   g_assert_cmpuint (batch->numFilled, ==, 0);
 
-  for (guint i = 0; i < 3; i++) {
+  for (guint i = 0; i < G_N_ELEMENTS (srcs); i++) {
     RdsBufSurface view = {
       .gpuId = batch->gpuId, .batchSize = 1, .numFilled = 0, .memType = batch->memType,
       .surfaceList = &batch->surfaceList[i], ._priv = NULL,
@@ -396,7 +396,7 @@ test_batch_slot_view (void)
     };
     RefRect s = { 0, 0, srcs[i].w, srcs[i].h }, d = { 0, 0, bw, bh };
 
-    if (i == 2) {
+    if (i == G_N_ELEMENTS (srcs) - 1) {
       tp.transform_flag |= RDS_BUFSURF_TRANSFORM_CROP_DST;
       tp.dst_rect = &dr;
       d = (RefRect) { dr.left, dr.top, dr.width, dr.height };
@@ -407,8 +407,8 @@ test_batch_slot_view (void)
     ref_transform (&hsrc[i].im, &href[i].im, s, d, TRUE);
   }
 
-  /* checked after all three: a later slot's transform must not touch an earlier slot */
-  for (guint i = 0; i < 3; i++) {
+  /* checked after all slots: a later slot's transform must not touch an earlier slot */
+  for (guint i = 0; i < G_N_ELEMENTS (srcs); i++) {
     guint m;
 
     snapshot (batch, i, &hgot);

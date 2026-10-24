@@ -186,7 +186,9 @@ meson test -C build-asan --print-errorlogs
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
 - **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never
   waits on a stream. Library copies and memsets are synchronous, on the calling thread's per-thread stream
-  (`hipStreamPerThread`), so they never wait for unrelated work on the legacy null stream.
+  (`hipStreamPerThread`), so they don't wait for other streams' work (the per-thread stream still synchronizes with
+  the legacy null stream: elements use non-blocking streams). The default transform session (`cuda_stream` NULL)
+  runs on the legacy null stream; elements set their own non-blocking stream.
 - Transform sessions are per thread and streaming threads are shared: elements set the transform session before
   each call and restore the previous one after (`rds_buf_surf_transform_get_session_params` first).
 - `memory:RDS` is not `NO_SHARE`: shallow buffer copies share the surface. Pixel writers must own the memory
