@@ -2,7 +2,10 @@ test_env = environment()
 test_env.set('LSAN_OPTIONS', 'suppressions=@0@:print_suppressions=0'.format(
   meson.current_source_dir() / 'lsan.supp'))
 # Let impossible allocations return NULL under ASan, as they do with glibc (buf_surface tests this).
-test_env.set('ASAN_OPTIONS', 'halt_on_error=1:abort_on_error=1:print_summary=1:allocator_may_return_null=1')
+# use_sigaltstack=0: Mesa's LLVM (loaded by the VA driver) installs its own malloc'd alternate signal stack on the
+# threads it runs on, and ASan then tries to munmap that buffer when the thread exits ("unable to unmmap", EINVAL).
+test_env.set('ASAN_OPTIONS',
+  'halt_on_error=1:abort_on_error=1:print_summary=1:allocator_may_return_null=1:use_sigaltstack=0')
 test_env.set('UBSAN_OPTIONS', 'halt_on_error=1:abort_on_error=1:print_stacktrace=1')
 # Element tests load our plugins from the build tree (scanned recursively) next to the stock system plugins,
 # with a private registry so the user's cache is never touched.
@@ -82,11 +85,16 @@ test('element_videodec', element_videodec_exe, args : ['-p', '/gpu/videodec'],
 # Decode + convert integration: autoplugging, end to end against vah264dec + the CPU reference, and the soak.
 # The soak (3000 1280x720 frames, leak check) is its own test entry, `meson test -C build pipeline_soak`; it takes
 # about 9 s (also under ASan), so it stays in the gpu suite.
+# The soak runs from its own build of the file, which (under ASan only) shrinks ASan's quarantine so VmRSS stays
+# meaningful; the other tests keep the default quarantine.
+pipeline_deps = test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)]
 pipeline_exe = executable('pipeline_decode_convert', 'check' / 'pipeline_decode_convert.c',
-  dependencies : test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)])
+  dependencies : pipeline_deps)
+pipeline_soak_exe = executable('pipeline_soak', 'check' / 'pipeline_decode_convert.c',
+  c_args : ['-DRDS_TEST_SMALL_QUARANTINE'], dependencies : pipeline_deps)
 test('pipeline_decode_convert', pipeline_exe, args : ['-p', '/gpu/pipeline'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
-test('pipeline_soak', pipeline_exe, args : ['-p', '/gpu/soak'],
+test('pipeline_soak', pipeline_soak_exe, args : ['-p', '/gpu/soak'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
 # The dry run checks the compat mapping; gst-inspect-1.0 (when found) checks that the mapped decoder and

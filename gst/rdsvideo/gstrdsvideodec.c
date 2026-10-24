@@ -123,6 +123,7 @@ struct _GstRdsVideoDec
   guint num_surfaces;
   guint out_width, out_height;  /* display size: the decoder's output, already cropped */
   gboolean output_dirty;        /* the input caps changed (e.g. framerate): renew the output state */
+  gboolean finishing;           /* inside finish_frame: the output buffer is filled, its memory may not change */
   guint64 display_count;        /* pictures displayed since start or flush (drop-frame-interval) */
   GstRdsSkipFrames last_skip_frames;    /* skip-frames as handle_frame last saw it */
   gboolean wait_sync;           /* a delta frame was skipped: drop delta frames until the next key frame */
@@ -381,11 +382,20 @@ reconfigure_decoder (GstRdsVideoDec * self, const RocdecVideoFormat * fmt, guint
 static gboolean
 gst_rds_video_dec_negotiate (GstVideoDecoder * dec)
 {
+  GstRdsVideoDec *self = GST_RDS_VIDEO_DEC (dec);
   GstVideoDecoderClass *parent = GST_VIDEO_DECODER_CLASS (gst_rds_video_dec_parent_class);
-  GstVideoCodecState *state = gst_video_decoder_get_output_state (dec);
-  GstCaps *rds_caps, *peer;
+  GstVideoCodecState *state;
+  GstCaps *rds_caps, *peer, *prev_caps, *prev_allocation_caps;
   gboolean rds, ok;
 
+  if (self->finishing) {
+    /* finish_frame saw a RECONFIGURE after on_display checked for one: the buffer it is about to push was filled
+     * for the current caps, so keep them, and let the next allocation choose again */
+    GST_DEBUG_OBJECT (self, "RECONFIGURE while finishing a frame: renegotiating with the next frame");
+    gst_pad_mark_reconfigure (GST_VIDEO_DECODER_SRC_PAD (dec));
+    return TRUE;
+  }
+  state = gst_video_decoder_get_output_state (dec);
   if (state == NULL)
     return parent->negotiate (dec);
 
@@ -394,21 +404,38 @@ gst_rds_video_dec_negotiate (GstVideoDecoder * dec)
   peer = gst_pad_peer_query_caps (GST_VIDEO_DECODER_SRC_PAD (dec), rds_caps);
   rds = !gst_caps_is_empty (peer);
   gst_caps_unref (peer);
-  gst_clear_caps (&state->caps);
-  gst_clear_caps (&state->allocation_caps);
+  /* A peer may list memory:RDS in its caps and still refuse the fixed caps. Ask, because pushing caps never says:
+   * gst_pad_set_caps reports success for a refused sticky event, and only the first buffer fails (not-negotiated).
+   * An unlinked pad can't answer; the RECONFIGURE that comes with the link makes us choose again. */
+  if (rds && gst_pad_is_linked (GST_VIDEO_DECODER_SRC_PAD (dec)))
+    rds = gst_pad_peer_query_accept_caps (GST_VIDEO_DECODER_SRC_PAD (dec), rds_caps);
+  /* The state's caps are rewritten in place, without the object lock, as the base class does in its own negotiate:
+   * every writer of the output state holds the stream lock, which all negotiation runs under. */
+  prev_caps = g_steal_pointer (&state->caps);
+  prev_allocation_caps = g_steal_pointer (&state->allocation_caps);
   if (rds)
     state->caps = rds_caps;
   else
     gst_caps_unref (rds_caps);  /* the base class derives system-memory caps from the info */
   ok = parent->negotiate (dec);
   if (!ok && rds) {
-    /* downstream said it takes memory:RDS but then refused it (caps or allocation): fall back to system memory */
+    /* downstream accepted memory:RDS but the allocation failed (no output pool): fall back to system memory */
     GST_INFO_OBJECT (dec, "memory:RDS output did not negotiate, retrying with system memory");
     gst_clear_caps (&state->caps);
     gst_clear_caps (&state->allocation_caps);
     ok = parent->negotiate (dec);
   }
   GST_DEBUG_OBJECT (dec, "output caps %" GST_PTR_FORMAT ": %s", state->caps, ok ? "negotiated" : "failed");
+  if (ok) {
+    gst_clear_caps (&prev_caps);
+    gst_clear_caps (&prev_allocation_caps);
+  } else {
+    /* keep describing what was last negotiated (the pad's caps): buffers in flight were filled for it */
+    gst_clear_caps (&state->caps);
+    gst_clear_caps (&state->allocation_caps);
+    state->caps = prev_caps;
+    state->allocation_caps = prev_allocation_caps;
+  }
   gst_video_codec_state_unref (state);
   return ok;
 }
@@ -428,15 +455,13 @@ set_output_state (GstRdsVideoDec * self, guint width, guint height)
   self->out_width = width;
   self->out_height = height;
   self->output_dirty = FALSE;
-  ok = gst_video_decoder_negotiate (dec);
   /* Pushing the caps can get the pad linked to a new peer (decodebin exposes it then), which sends RECONFIGURE:
-   * choose again now, before a buffer is allocated in the first choice's memory. */
-  if (ok && gst_pad_check_reconfigure (GST_VIDEO_DECODER_SRC_PAD (dec)))
-    ok = gst_video_decoder_negotiate (dec);
+   * the allocation of the first output frame then negotiates again, before any buffer is filled. */
+  ok = gst_video_decoder_negotiate (dec);
   return ok;
 }
 
-/* TRUE if the current output caps carry memory:RDS (what on_display copies into). */
+/* TRUE if the current output caps carry memory:RDS (so newly allocated output buffers do too). */
 static gboolean
 output_is_rds (GstRdsVideoDec * self)
 {
@@ -539,10 +564,11 @@ copy_picture (GstRdsVideoDec * self, GstBuffer * outbuf, void *planes[3], const 
   RdsBufSurface *surf = NULL;
   hipError_t err = hipSuccess;
 
-  if (output_is_rds (self)) {
+  /* the buffer's memory decides, not the caps: they may have moved on since the buffer was allocated */
+  if (rds_buffer_get_surface (outbuf) != NULL) {
     RdsBufSurfaceParams *p;
 
-    if (rds_buffer_get_surface (outbuf) == NULL || !gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
+    if (!gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
       *detail = g_strdup ("the output buffer is not a mappable memory:RDS buffer");
       return FALSE;
     }
@@ -595,6 +621,31 @@ copy_picture (GstRdsVideoDec * self, GstBuffer * outbuf, void *planes[3], const 
   return TRUE;
 }
 
+/* Allocates @frame's output buffer and copies the decoded picture into it; posts an error for fatal failures. */
+static GstFlowReturn
+fill_output_frame (GstRdsVideoDec * self, GstVideoCodecFrame * frame, void *planes[3], const uint32_t pitch[3])
+{
+  GstFlowReturn ret;
+  gchar *detail = NULL;
+
+  ret = gst_video_decoder_allocate_output_frame (GST_VIDEO_DECODER (self), frame);
+  if (ret != GST_FLOW_OK) {
+    GST_DEBUG_OBJECT (self, "cannot allocate an output frame: %s", gst_flow_get_name (ret));
+    if (ret == GST_FLOW_ERROR)
+      GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Cannot allocate an output buffer"), (NULL));
+    return ret;
+  }
+  if (!copy_picture (self, frame->output_buffer, planes, pitch, &detail)) {
+    /* Not a bitstream problem (those stay tolerated, as GST_VIDEO_DECODER_ERROR): the GPU, the output pool or the
+     * negotiated memory is broken, and every later frame would fail the same way. Fatal. */
+    GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Cannot copy the decoded picture into the output buffer"),
+        ("%s", detail));
+    g_free (detail);
+    return GST_FLOW_ERROR;
+  }
+  return GST_FLOW_OK;
+}
+
 static int ROCDECAPI
 on_display (void *user_data, RocdecParserDispInfo * info)
 {
@@ -608,7 +659,6 @@ on_display (void *user_data, RocdecParserDispInfo * info)
   GstFlowReturn ret;
   guint64 index;
   guint interval;
-  gchar *detail = NULL;
 
   frame = gst_video_decoder_get_frame (dec, (int) info->pts);
   if (frame == NULL) {
@@ -655,26 +705,26 @@ on_display (void *user_data, RocdecParserDispInfo * info)
     return 1;
   }
 
-  ret = gst_video_decoder_allocate_output_frame (dec, frame);
+  ret = fill_output_frame (self, frame, planes, pitch);
+  if (ret == GST_FLOW_OK && gst_pad_check_reconfigure (GST_VIDEO_DECODER_SRC_PAD (dec))) {
+    /* A RECONFIGURE arrived after the allocation: negotiate now rather than in finish_frame, which would push this
+     * buffer with caps chosen after it was filled. If the memory type changed, fill a new buffer. */
+    if (!gst_video_decoder_negotiate (dec))
+      ret = GST_PAD_IS_FLUSHING (GST_VIDEO_DECODER_SRC_PAD (dec)) ? GST_FLOW_FLUSHING : GST_FLOW_NOT_NEGOTIATED;
+    else if ((rds_buffer_get_surface (frame->output_buffer) != NULL) != output_is_rds (self)) {
+      GST_DEBUG_OBJECT (self, "output memory changed by a RECONFIGURE: refilling the frame");
+      gst_clear_buffer (&frame->output_buffer);
+      ret = fill_output_frame (self, frame, planes, pitch);
+    }
+  }
   if (ret != GST_FLOW_OK) {
-    GST_DEBUG_OBJECT (self, "cannot allocate an output frame: %s", gst_flow_get_name (ret));
-    if (ret == GST_FLOW_ERROR)
-      GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Cannot allocate an output buffer"), (NULL));
     self->cb_flow = ret;
     gst_video_decoder_release_frame (dec, frame);
     return 1;
   }
-  if (!copy_picture (self, frame->output_buffer, planes, pitch, &detail)) {
-    /* Not a bitstream problem (those stay tolerated, as GST_VIDEO_DECODER_ERROR): the GPU, the output pool or the
-     * negotiated memory is broken, and every later frame would fail the same way. Fatal. */
-    GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Cannot copy the decoded picture into the output buffer"),
-        ("%s", detail));
-    g_free (detail);
-    self->cb_flow = GST_FLOW_ERROR;
-    gst_video_decoder_release_frame (dec, frame);
-    return 1;
-  }
+  self->finishing = TRUE;
   ret = gst_video_decoder_finish_frame (dec, frame);
+  self->finishing = FALSE;
   if (ret != GST_FLOW_OK) {
     GST_DEBUG_OBJECT (self, "finish_frame: %s", gst_flow_get_name (ret));
     self->cb_flow = ret;

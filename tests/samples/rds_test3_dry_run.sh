@@ -14,8 +14,11 @@ echo "$out" | grep -qx 'nveglglessink -> rdsvideosink'
 # nvv4l2decoder and nvvideoconvert now map to real elements of the build tree (GST_PLUGIN_PATH_1_0 comes from the
 # test environment).
 if [ -n "${2:-}" ]; then
-  "$2" rdsvideodec rdsvideoconvert >/dev/null
-  echo 'gst-inspect-1.0 rdsvideodec rdsvideoconvert: ok'
+  # one element per call: given several names, gst-inspect-1.0 only looks at the last one
+  for e in rdsvideodec rdsvideoconvert; do
+    "$2" "$e" >/dev/null || exit 1
+    echo "gst-inspect-1.0 $e: ok"
+  done
 else
   echo 'no gst-inspect-1.0 given (not found, or a sanitized build): element check skipped'
 fi

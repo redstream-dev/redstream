@@ -13,8 +13,10 @@
 #include <string.h>
 
 /* Under ASan, freed memory sits in a quarantine (256 MiB by default) that fills up over the first loops of the soak
- * and reads as VmRSS growth (+170 MiB). A small quarantine keeps use-after-free detection and makes VmRSS meaningful again;
- * LSan still reports real leaks at exit. ASAN_OPTIONS from the environment override this. */
+ * and reads as VmRSS growth (+170 MiB). The soak's own build of this file (RDS_TEST_SMALL_QUARANTINE, see
+ * tests/meson.build) uses a small quarantine, which keeps use-after-free detection and makes VmRSS meaningful
+ * again; LSan still reports real leaks at exit. The other tests keep ASan's defaults. ASAN_OPTIONS from the
+ * environment override this. */
 #if defined(__SANITIZE_ADDRESS__)
 #define RDS_TEST_ASAN 1
 #elif defined(__has_feature)
@@ -22,7 +24,7 @@
 #define RDS_TEST_ASAN 1
 #endif
 #endif
-#ifdef RDS_TEST_ASAN
+#if defined (RDS_TEST_ASAN) && defined (RDS_TEST_SMALL_QUARANTINE)
 const char *__asan_default_options (void);
 
 __attribute__((used, visibility ("default"))) const char *
@@ -228,6 +230,68 @@ test_fallback (gconstpointer data)
   g_assert_cmpuint (n, ==, 30);
   g_test_message ("%s picked %s", decodebin, plugged ? "rdsvideodec" : "another decoder");
   clip_free (clip);
+}
+
+/* A raw H.264 byte stream that changes size midway (two streams back to back), through uridecodebin into a
+ * system-memory-only converter: every frame comes out, with the size of its part. The size change renegotiates
+ * the decoder's output while the decodebin pad is already linked. */
+static void
+test_size_change_fallback (void)
+{
+  const gchar *need[] = { "vah264enc", "h264parse", "videoconvert", "uridecodebin", NULL };
+  GBytes *parts[2], *both;
+  GstElement *pipe, *sink;
+  GError *err = NULL;
+  GstSample *s;
+  gchar *dir, *path, *uri, *desc;
+  guint n = 0;
+
+  RDS_TEST_REQUIRE_GPU ();
+  if (!require_elements (need))
+    return;
+  parts[0] = rds_test_encode ("h264", 320, 240, 10, 2, "ball");
+  parts[1] = rds_test_encode ("h264", 640, 360, 10, 2, "ball");
+  both = rds_test_concat (parts, 2);
+  dir = g_dir_make_tmp ("rds-pipeline-XXXXXX", &err);
+  g_assert_no_error (err);
+  path = g_build_filename (dir, "clip.h264", NULL);
+  g_assert_true (g_file_set_contents (path, g_bytes_get_data (both, NULL), g_bytes_get_size (both), &err));
+  g_assert_no_error (err);
+  uri = g_filename_to_uri (path, NULL, &err);
+  g_assert_no_error (err);
+
+  desc = g_strdup_printf ("uridecodebin uri=%s ! videoconvert ! video/x-raw,format=RGBA ! appsink name=sink "
+      "sync=false", uri);
+  pipe = gst_parse_launch (desc, &err);
+  g_assert_no_error (err);
+  sink = gst_bin_get_by_name (GST_BIN (pipe), "sink");
+  g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  while ((s = rds_test_pull (pipe, sink)) != NULL) {
+    GstStructure *st = gst_caps_get_structure (gst_sample_get_caps (s), 0);
+    gint w = 0, h = 0;
+
+    g_assert_true (gst_structure_get_int (st, "width", &w) && gst_structure_get_int (st, "height", &h));
+    g_assert_cmpint (w, ==, n < 10 ? 320 : 640);
+    g_assert_cmpint (h, ==, n < 10 ? 240 : 360);
+    gst_sample_unref (s);
+    n++;
+  }
+  (void) rds_test_bus_check (pipe);
+  g_assert_true (bin_has_factory (GST_BIN (pipe), "rdsvideodec"));
+  g_assert_cmpuint (n, ==, 20);
+  gst_element_set_state (pipe, GST_STATE_NULL);
+  gst_object_unref (sink);
+  gst_object_unref (pipe);
+
+  g_assert_cmpint (g_unlink (path), ==, 0);
+  g_assert_cmpint (g_rmdir (dir), ==, 0);
+  g_free (desc);
+  g_free (uri);
+  g_free (path);
+  g_free (dir);
+  g_bytes_unref (both);
+  g_bytes_unref (parts[1]);
+  g_bytes_unref (parts[0]);
 }
 
 /* ---- end to end ---- */
@@ -498,6 +562,7 @@ main (int argc, char **argv)
   g_test_add_data_func ("/gpu/pipeline/autoplug-uridecodebin3", "uridecodebin3", test_autoplug);
   g_test_add_data_func ("/gpu/pipeline/fallback-uridecodebin", "uridecodebin", test_fallback);
   g_test_add_data_func ("/gpu/pipeline/fallback-uridecodebin3", "uridecodebin3", test_fallback);
+  g_test_add_func ("/gpu/pipeline/size-change-fallback", test_size_change_fallback);
   g_test_add_func ("/gpu/pipeline/end-to-end", test_end_to_end);
   g_test_add_func ("/gpu/soak/decode-convert", test_soak);
   return g_test_run ();

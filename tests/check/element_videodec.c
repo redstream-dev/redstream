@@ -915,6 +915,155 @@ test_10bit_error (void)
   g_ptr_array_unref (aus);
 }
 
+/* ---- output memory and renegotiation ---- */
+
+typedef struct
+{
+  gint buffers, mismatched;
+} MemCheck;
+
+/* Runs in the streaming thread: a buffer's memory must be what the caps on the pad (the last caps event) say. */
+static GstPadProbeReturn
+check_buffer_memory (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  MemCheck *mc = user_data;
+  GstCaps *caps = gst_pad_get_current_caps (pad);
+  gboolean caps_rds = caps != NULL && rds_caps_has_memory_rds (caps);
+  gboolean buf_rds = rds_buffer_get_surface (GST_PAD_PROBE_INFO_BUFFER (info)) != NULL;
+
+  g_atomic_int_inc (&mc->buffers);
+  if (caps_rds != buf_rds)
+    g_atomic_int_inc (&mc->mismatched);
+  gst_clear_caps (&caps);
+  return GST_PAD_PROBE_OK;
+}
+
+/* A capsfilter that keeps switching between memory:RDS and system NV12 (a RECONFIGURE every 1-3 ms, so some land
+ * between the decoder's allocation and its push): every buffer still matches the caps it is pushed with, and the
+ * stream completes without not-negotiated. Before the fix, 2-13 % of the buffers went out in the memory of the
+ * previous caps. (caps-change-mode=delayed hides the problem: the capsfilter then keeps accepting the old caps.) */
+static void
+test_reconfigure_memory_toggle (void)
+{
+  static const gchar *const caps_str[] = { "video/x-raw(memory:RDS),format=NV12", "video/x-raw,format=NV12" };
+  const guint loops = 5, frames = 300;
+  GstElement *pipe, *src, *cf, *sink;
+  GstCaps *caps[2];
+  MemCheck mc = { 0, 0 };
+  GError *err = NULL;
+  GBytes *stream;
+  GstBus *bus;
+  GstPad *pad;
+  GstMessage *msg = NULL;
+  guint toggles = 0;
+
+  RDS_TEST_REQUIRE_GPU ();
+  REQUIRE_VA_H264 ();
+  stream = rds_test_encode ("h264", 320, 240, frames, 2, "ball");
+  pipe = gst_parse_launch ("appsrc name=src caps=video/x-h264,stream-format=byte-stream format=bytes "
+      "! h264parse ! rdsvideodec ! capsfilter name=cf ! fakesink name=sink sync=false", &err);
+  g_assert_no_error (err);
+  src = gst_bin_get_by_name (GST_BIN (pipe), "src");
+  cf = gst_bin_get_by_name (GST_BIN (pipe), "cf");
+  sink = gst_bin_get_by_name (GST_BIN (pipe), "sink");
+  pad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, check_buffer_memory, &mc, NULL);
+  gst_object_unref (pad);
+  for (guint i = 0; i < 2; i++)
+    caps[i] = gst_caps_from_string (caps_str[i]);
+
+  g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  for (guint i = 0; i < loops; i++)
+    g_assert_cmpint (gst_app_src_push_buffer (GST_APP_SRC (src), gst_buffer_new_wrapped_bytes (stream)), ==,
+        GST_FLOW_OK);
+  g_assert_cmpint (gst_app_src_end_of_stream (GST_APP_SRC (src)), ==, GST_FLOW_OK);
+  bus = gst_element_get_bus (pipe);
+  while ((msg = gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR | GST_MESSAGE_EOS)) == NULL) {
+    g_object_set (cf, "caps", caps[toggles % 2], NULL);
+    g_usleep (1000 * (toggles % 3 + 1));
+    toggles++;
+    g_assert_cmpuint (toggles, <, 100000);
+  }
+  if (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_ERROR) {
+    gst_message_parse_error (msg, &err, NULL);
+    g_error ("pipeline error after %u caps switches: %s", toggles, err->message);
+  }
+  gst_message_unref (msg);
+  gst_object_unref (bus);
+  gst_element_set_state (pipe, GST_STATE_NULL);
+  g_test_message ("%d buffers, %u caps switches, %d with the wrong memory", mc.buffers, toggles, mc.mismatched);
+  g_assert_cmpint (mc.buffers, ==, loops * frames);
+  g_assert_cmpint (mc.mismatched, ==, 0);
+  for (guint i = 0; i < 2; i++)
+    gst_caps_unref (caps[i]);
+  gst_object_unref (sink);
+  gst_object_unref (cf);
+  gst_object_unref (src);
+  gst_object_unref (pipe);
+  g_bytes_unref (stream);
+}
+
+/* Refuses memory:RDS in ACCEPT_CAPS although the CAPS query (appsink: ANY) offers it. */
+static GstPadProbeReturn
+refuse_rds_caps (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstQuery *q = GST_PAD_PROBE_INFO_QUERY (info);
+  GstCaps *caps;
+
+  if (GST_QUERY_TYPE (q) != GST_QUERY_ACCEPT_CAPS)
+    return GST_PAD_PROBE_OK;
+  gst_query_parse_accept_caps (q, &caps);
+  if (!rds_caps_has_memory_rds (caps))
+    return GST_PAD_PROBE_OK;
+  g_atomic_int_inc ((gint *) user_data);
+  gst_query_set_accept_caps_result (q, FALSE);
+  return GST_PAD_PROBE_HANDLED;
+}
+
+/* Downstream advertises memory:RDS in its caps but refuses the fixed caps: the decoder outputs system memory.
+ * (Pushing the refused caps would not tell: gst_pad_set_caps reports success for a refused sticky event and only
+ * the first buffer fails, so the decoder asks with ACCEPT_CAPS before choosing.) */
+static void
+test_rds_refused_fallback (void)
+{
+  GstElement *pipe, *src, *sink;
+  GError *err = NULL;
+  GBytes *stream;
+  GstPad *pad;
+  GstSample *s;
+  gint refused = 0;
+  guint n = 0;
+
+  RDS_TEST_REQUIRE_GPU ();
+  REQUIRE_VA_H264 ();
+  stream = rds_test_encode ("h264", 320, 240, 5, 0, "smpte");
+  pipe = gst_parse_launch ("appsrc name=src caps=video/x-h264,stream-format=byte-stream format=bytes "
+      "! h264parse ! rdsvideodec ! appsink name=sink sync=false", &err);
+  g_assert_no_error (err);
+  src = gst_bin_get_by_name (GST_BIN (pipe), "src");
+  sink = gst_bin_get_by_name (GST_BIN (pipe), "sink");
+  pad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM, refuse_rds_caps, &refused, NULL);
+  gst_object_unref (pad);
+  g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  g_assert_cmpint (gst_app_src_push_buffer (GST_APP_SRC (src), gst_buffer_new_wrapped_bytes (stream)), ==,
+      GST_FLOW_OK);
+  g_assert_cmpint (gst_app_src_end_of_stream (GST_APP_SRC (src)), ==, GST_FLOW_OK);
+  while ((s = rds_test_pull (pipe, sink)) != NULL) {
+    g_assert_false (rds_caps_has_memory_rds (gst_sample_get_caps (s)));
+    g_assert_null (rds_buffer_get_surface (gst_sample_get_buffer (s)));
+    gst_sample_unref (s);
+    n++;
+  }
+  g_assert_cmpuint (n, ==, 5);
+  g_assert_cmpint (refused, >, 0);
+  gst_element_set_state (pipe, GST_STATE_NULL);
+  gst_object_unref (sink);
+  gst_object_unref (src);
+  gst_object_unref (pipe);
+  g_bytes_unref (stream);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -957,5 +1106,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/videodec/num-extra-surfaces", test_extra_surfaces);
   g_test_add_func ("/gpu/videodec/invalid-gpu-id", test_invalid_gpu);
   g_test_add_func ("/gpu/videodec/10-bit-error", test_10bit_error);
+  g_test_add_func ("/gpu/videodec/reconfigure-memory-toggle", test_reconfigure_memory_toggle);
+  g_test_add_func ("/gpu/videodec/rds-refused-fallback", test_rds_refused_fallback);
   return g_test_run ();
 }
