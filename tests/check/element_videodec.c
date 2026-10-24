@@ -1108,5 +1108,12 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/videodec/10-bit-error", test_10bit_error);
   g_test_add_func ("/gpu/videodec/reconfigure-memory-toggle", test_reconfigure_memory_toggle);
   g_test_add_func ("/gpu/videodec/rds-refused-fallback", test_rds_refused_fallback);
-  return g_test_run ();
+  {
+    /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
+     * process exit otherwise (seen under parallel ASan runs) */
+    int ret = g_test_run ();
+
+    gst_deinit ();
+    return ret;
+  }
 }

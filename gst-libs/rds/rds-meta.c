@@ -353,7 +353,8 @@ sweep_pool (RdsBatchMeta * b, RdsMetaPool * pool, ReleaseFunc release)
 RdsBatchMeta *
 rds_create_batch_meta (guint max_batch_size)
 {
-  RdsBatchMeta *self = &g_new0 (RdsBatchMetaPriv, 1)->pub;
+  RdsBatchMetaPriv *priv = g_new0 (RdsBatchMetaPriv, 1);
+  RdsBatchMeta *self = &priv->pub;
 
   rds_meta_ensure_debug_category ();
   self->base_meta.batch_meta = self;

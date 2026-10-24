@@ -80,6 +80,25 @@ test_factory_make_remaps (void)
   gst_object_unref (e);
 }
 
+/* The mux and demux are real elements from the build tree (the test environment has their plugin path). */
+static void
+assert_factory_makes_type (const gchar * nv_name, const gchar * rds_name, const gchar * type_name)
+{
+  GstElement *e = rds_compat_element_factory_make (nv_name, NULL);
+
+  g_assert_nonnull (e);
+  g_assert_cmpstr (gst_plugin_feature_get_name (GST_PLUGIN_FEATURE (gst_element_get_factory (e))), ==, rds_name);
+  g_assert_cmpstr (G_OBJECT_TYPE_NAME (e), ==, type_name);
+  gst_object_unref (e);
+}
+
+static void
+test_factory_make_mux_demux (void)
+{
+  assert_factory_makes_type ("nvstreammux", "rdsstreammux", "GstRdsStreamMux");
+  assert_factory_makes_type ("nvstreamdemux", "rdsstreamdemux", "GstRdsStreamDemux");
+}
+
 static void
 test_parse_launch_remaps (void)
 {
@@ -129,7 +148,15 @@ main (int argc, char **argv)
   g_test_add_func ("/compat/remap-disabled", test_remap_disabled);
   g_test_add_func ("/compat/factory-make-passthrough", test_factory_make_passthrough);
   g_test_add_func ("/compat/factory-make-remaps", test_factory_make_remaps);
+  g_test_add_func ("/compat/factory-make-mux-demux", test_factory_make_mux_demux);
   g_test_add_func ("/compat/parse-launch-remaps", test_parse_launch_remaps);
   g_test_add_func ("/compat/parse-launch-error-names-rds", test_parse_launch_error_names_rds);
-  return g_test_run ();
+  {
+    /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
+     * process exit otherwise (seen under parallel ASan runs) */
+    int ret = g_test_run ();
+
+    gst_deinit ();
+    return ret;
+  }
 }

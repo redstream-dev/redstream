@@ -5,34 +5,13 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-media.h"
+#include "rds-test-soak.h"
 #include "transform-ref.h"
 
 #include <glib/gstdio.h>
 #include <rds/rds.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Under ASan, freed memory sits in a quarantine (256 MiB by default) that fills up over the first loops of the soak
- * and reads as VmRSS growth (+170 MiB). The soak's own build of this file (RDS_TEST_SMALL_QUARANTINE, see
- * tests/meson.build) uses a small quarantine, which keeps use-after-free detection and makes VmRSS meaningful
- * again; LSan still reports real leaks at exit. The other tests keep ASan's defaults. ASAN_OPTIONS from the
- * environment override this. */
-#if defined(__SANITIZE_ADDRESS__)
-#define RDS_TEST_ASAN 1
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define RDS_TEST_ASAN 1
-#endif
-#endif
-#if defined (RDS_TEST_ASAN) && defined (RDS_TEST_SMALL_QUARANTINE)
-const char *__asan_default_options (void);
-
-__attribute__((used, visibility ("default"))) const char *
-__asan_default_options (void)
-{
-  return "quarantine_size_mb=4:thread_local_quarantine_size_kb=64";
-}
-#endif
 
 static gboolean
 require_elements (const gchar * const *names)
@@ -435,33 +414,10 @@ test_end_to_end (void)
 #define SOAK_FRAMES 300
 #define SOAK_LOOPS 10
 
-static gsize
-vm_rss_bytes (void)
-{
-  gchar *status = NULL, *line;
-  gsize kib = 0;
-
-  g_assert_true (g_file_get_contents ("/proc/self/status", &status, NULL, NULL));
-  line = strstr (status, "\nVmRSS:");
-  g_assert_nonnull (line);
-  kib = g_ascii_strtoull (line + strlen ("\nVmRSS:"), NULL, 10);
-  g_free (status);
-  return kib * 1024;
-}
-
-static gsize
-gpu_free_bytes (void)
-{
-  size_t free_b = 0, total = 0;
-
-  g_assert_cmpint (hipMemGetInfo (&free_b, &total), ==, hipSuccess);
-  return free_b;
-}
-
 typedef struct
 {
   guint frames;
-  gsize rss[SOAK_LOOPS], gpu_free[SOAK_LOOPS];  /* after each loop's last frame */
+  gsize rss[SOAK_LOOPS], gpu_used[SOAK_LOOPS];  /* after each loop's last frame */
 } SoakStats;
 
 /* Runs in the streaming thread: samples memory use when a loop's last frame reaches the sink. */
@@ -474,16 +430,15 @@ soak_probe (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gp
   if (st->frames % SOAK_FRAMES == 0 && st->frames / SOAK_FRAMES <= SOAK_LOOPS) {
     guint loop = st->frames / SOAK_FRAMES - 1;
 
-    st->rss[loop] = vm_rss_bytes ();
-    st->gpu_free[loop] = gpu_free_bytes ();
+    st->rss[loop] = host_memory_bytes ();
+    st->gpu_used[loop] = gpu_used_bytes ();
   }
   return GST_PAD_PROBE_OK;
 }
 
-#define MIB(b) ((gdouble) (b) / (1024.0 * 1024.0))
-
-/* A 1280x720 clip of 300 frames decoded and converted 10 times in one pipeline (3000 frames): VmRSS grows by less
- * than 8 MiB and free GPU memory moves by less than 16 MiB between the end of loop 2 and the end of loop 10. */
+/* A 1280x720 clip of 300 frames decoded and converted 10 times in one pipeline (3000 frames): VmRSS (under ASan, the
+ * live heap) grows by less than 8 MiB and the process's GPU memory moves by less than 16 MiB between the end of loop 2
+ * and the end of loop 10. */
 static void
 test_soak (void)
 {
@@ -542,12 +497,13 @@ test_soak (void)
 
   g_assert_cmpuint (st.frames, ==, SOAK_FRAMES * SOAK_LOOPS);
   for (guint i = 0; i < SOAK_LOOPS; i++)
-    g_test_message ("loop %2u: VmRSS %.1f MiB, GPU free %.1f MiB", i + 1, MIB (st.rss[i]), MIB (st.gpu_free[i]));
+    g_test_message ("loop %2u: " RDS_TEST_HOST_MEMORY_NAME " %.1f MiB, GPU used %.1f MiB", i + 1, MIB (st.rss[i]),
+        MIB (st.gpu_used[i]));
   rss_growth = (gssize) st.rss[SOAK_LOOPS - 1] - (gssize) st.rss[1];
-  gpu_delta = (gssize) st.gpu_free[SOAK_LOOPS - 1] - (gssize) st.gpu_free[1];
-  g_test_message ("%u frames in %.1f s (%.0f fps); VmRSS growth loop 2 -> %u: %+.2f MiB; GPU free delta: %+.2f MiB",
-      st.frames, (t1 - t0) / 1e6, st.frames / ((t1 - t0) / 1e6), SOAK_LOOPS, rss_growth / (1024.0 * 1024.0),
-      gpu_delta / (1024.0 * 1024.0));
+  gpu_delta = (gssize) st.gpu_used[SOAK_LOOPS - 1] - (gssize) st.gpu_used[1];
+  g_test_message ("%u frames in %.1f s (%.0f fps); " RDS_TEST_HOST_MEMORY_NAME " growth loop 2 -> %u: %+.2f MiB; "
+      "GPU used delta: %+.2f MiB", st.frames, (t1 - t0) / 1e6, st.frames / ((t1 - t0) / 1e6), SOAK_LOOPS,
+      rss_growth / (1024.0 * 1024.0), gpu_delta / (1024.0 * 1024.0));
   g_assert_cmpint (rss_growth, <, 8 * 1024 * 1024);
   g_assert_cmpint (ABS (gpu_delta), <, 16 * 1024 * 1024);
 }
@@ -565,5 +521,12 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/pipeline/size-change-fallback", test_size_change_fallback);
   g_test_add_func ("/gpu/pipeline/end-to-end", test_end_to_end);
   g_test_add_func ("/gpu/soak/decode-convert", test_soak);
-  return g_test_run ();
+  {
+    /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
+     * process exit otherwise (seen under parallel ASan runs) */
+    int ret = g_test_run ();
+
+    gst_deinit ();
+    return ret;
+  }
 }

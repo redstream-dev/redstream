@@ -152,6 +152,36 @@ rds_test_encode (const gchar * codec, guint width, guint height, guint frames, g
   return rds_test_encode_full (codec, width, height, frames, b_frames, pattern, NULL);
 }
 
+/* Writes @frames frames of videotestsrc ball, NV12 @width x @height at 30 fps, encoded by va{codec}enc into an MP4
+ * file at @path (so a demuxer hands out real PTS/DTS, also with B-frames). @codec is "h264" or "h265". */
+static inline void
+rds_test_write_mp4 (const gchar * codec, guint width, guint height, guint frames, guint b_frames,
+    const gchar * path)
+{
+  GError *err = NULL;
+  GstElement *pipe;
+  GstBus *bus;
+  GstMessage *msg;
+  gchar *desc;
+
+  desc = g_strdup_printf ("videotestsrc pattern=ball num-buffers=%u "
+      "! video/x-raw,format=NV12,width=%u,height=%u,framerate=30/1 ! va%senc b-frames=%u ! %sparse "
+      "! video/x-%s,stream-format=%s,alignment=au ! mp4mux ! filesink location=\"%s\"",
+      frames, width, height, codec, b_frames, codec, codec, g_str_equal (codec, "h265") ? "hvc1" : "avc", path);
+  pipe = gst_parse_launch (desc, &err);
+  g_assert_no_error (err);
+  g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  bus = gst_element_get_bus (pipe);
+  msg = gst_bus_timed_pop_filtered (bus, RDS_TEST_MEDIA_TIMEOUT, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+  g_assert_nonnull (msg);
+  g_assert_cmpint (GST_MESSAGE_TYPE (msg), ==, GST_MESSAGE_EOS);
+  gst_message_unref (msg);
+  gst_object_unref (bus);
+  gst_element_set_state (pipe, GST_STATE_NULL);
+  gst_object_unref (pipe);
+  g_free (desc);
+}
+
 /* Checksum of a mapped NV12 frame: Y (width x height bytes) and UV (2*ceil(w/2) x ceil(h/2) bytes), row by row
  * with the frame's strides, so padding never counts. "<w>x<h> y=<md5> uv=<md5>" (the size comes from the caps, so
  * a frame that arrives with stale caps differs too); free with g_free. */

@@ -34,7 +34,7 @@ test_deps = [rds_dep, gst_check_dep, hip_dep]
 
 # GPU-free tests (hosted CI runs `meson test --suite cpu`): no device needed at run time, but building still
 # needs the ROCm headers and libamdhip64.
-cpu_tests = ['compat_remap', 'compat_header', 'compat_header_nomacros', 'buf_surface', 'memory', 'buffer_pool',
+cpu_tests = ['compat_remap', 'compat_header', 'compat_header_nomacros', 'buf_surface', 'memory', 'surface_view', 'buffer_pool',
   'allocation', 'meta_batch', 'meta_children',
   'meta_copy', 'event', 'compat_meta', 'compat_aliases', 'plugin_load', 'transform_params']
 foreach t : cpu_tests
@@ -92,19 +92,37 @@ test('element_videodec_cpu', element_videodec_exe, args : ['-p', '/cpu/videodec'
 test('element_videodec', element_videodec_exe, args : ['-p', '/gpu/videodec'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
+element_streammux_exe = executable('element_streammux', 'check' / 'element_streammux.c',
+  dependencies : test_deps + [gst_base_dep, gst_app_dep, gst_video_dep, cc.find_library('m', required : false)])
+test('element_streammux_cpu', element_streammux_exe, args : ['-p', '/cpu/mux'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_streammux', element_streammux_exe, args : ['-p', '/gpu/mux'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180, depends : rds_plugins)
+
+element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',
+  dependencies : test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)])
+test('element_streamdemux_cpu', element_streamdemux_exe, args : ['-p', '/cpu/demux'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_streamdemux', element_streamdemux_exe, args : ['-p', '/gpu/demux'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+
 # Decode + convert integration: autoplugging, end to end against vah264dec + the CPU reference, and the soak.
 # The soak (3000 1280x720 frames, leak check) is its own test entry, `meson test -C build pipeline_soak`; it takes
 # about 9 s (also under ASan), so it stays in the gpu suite.
-# The soak runs from its own build of the file, which (under ASan only) shrinks ASan's quarantine so VmRSS stays
-# meaningful; the other tests keep the default quarantine.
 pipeline_deps = test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)]
 pipeline_exe = executable('pipeline_decode_convert', 'check' / 'pipeline_decode_convert.c',
   dependencies : pipeline_deps)
-pipeline_soak_exe = executable('pipeline_soak', 'check' / 'pipeline_decode_convert.c',
-  c_args : ['-DRDS_TEST_SMALL_QUARANTINE'], dependencies : pipeline_deps)
 test('pipeline_decode_convert', pipeline_exe, args : ['-p', '/gpu/pipeline'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
-test('pipeline_soak', pipeline_soak_exe, args : ['-p', '/gpu/soak'],
+test('pipeline_soak', pipeline_exe, args : ['-p', '/gpu/soak'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
+
+# Multi-source mux/demux integration: mixed sources against the CPU reference, a stalled source, dynamic sources,
+# and (its own entry, `pipeline_mux_soak`) four looped 720p sources with the leak check.
+pipeline_mux_exe = executable('pipeline_mux', 'check' / 'pipeline_mux.c', dependencies : pipeline_deps)
+test('pipeline_mux', pipeline_mux_exe, args : ['-p', '/gpu/mux-pipeline'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180, depends : rds_plugins)
+test('pipeline_mux_soak', pipeline_mux_exe, args : ['-p', '/gpu/mux-soak'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
 # The dry run checks the compat mapping; gst-inspect-1.0 (when found) checks that the mapped decoder and

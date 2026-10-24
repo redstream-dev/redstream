@@ -477,5 +477,12 @@ main (int argc, char **argv)
   g_test_add_func ("/meta-copy/parent-in-later-frame", test_copy_parent_in_later_frame);
   g_test_add_func ("/meta-copy/add-twice-refused", test_add_twice_refused);
   g_test_add_func ("/meta-copy/copy-into-existing", test_copy_into_existing);
-  return g_test_run ();
+  {
+    /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
+     * process exit otherwise (seen under parallel ASan runs) */
+    int ret = g_test_run ();
+
+    gst_deinit ();
+    return ret;
+  }
 }

@@ -354,6 +354,75 @@ test_batch (void)
   g_assert_cmpint (rds_buf_surface_destroy (src), ==, 0);
 }
 
+/* A single-surface view of one slot of a batch is a valid transform destination: each frame lands in its own slot,
+ * the view's numFilled becomes 1 and the batch's own numFilled is left alone (the caller sets it after the last
+ * slot). The last slot gets a top-left destination rect, so the rest of that slot must keep its old content. */
+static void
+test_batch_slot_view (void)
+{
+  static const struct
+  {
+    RdsBufSurfaceColorFormat fmt;
+    guint w, h;
+  } srcs[] = {
+    {RDS_BUF_COLOR_FORMAT_NV12, 37, 29},
+    {RDS_BUF_COLOR_FORMAT_RGBA, 64, 48},
+    {RDS_BUF_COLOR_FORMAT_YUV420, 130, 98},
+  };
+  const guint bw = 80, bh = 60;
+  RdsBufSurface *batch, *src[G_N_ELEMENTS (srcs)];
+  RdsBufSurfTransformRect dr = {.top = 0,.left = 0,.width = 80,.height = 46 };
+  HostImage hsrc[G_N_ELEMENTS (srcs)], href[G_N_ELEMENTS (srcs)], hgot;
+
+  RDS_TEST_REQUIRE_GPU ();
+  batch = create_surf (RDS_BUF_MEM_DEFAULT, RDS_BUF_COLOR_FORMAT_NV12, bw, bh, G_N_ELEMENTS (srcs), 0);
+  for (guint i = 0; i < G_N_ELEMENTS (srcs); i++) {
+    src[i] = create_surf (RDS_BUF_MEM_DEFAULT, srcs[i].fmt, srcs[i].w, srcs[i].h, 1, 0);
+    fill_random (src[i], 0, 300 + i);
+    src[i]->numFilled = 1;
+    snapshot (src[i], 0, &hsrc[i]);
+    fill_random (batch, i, 400 + i);
+    snapshot (batch, i, &href[i]);
+  }
+  g_assert_cmpuint (batch->numFilled, ==, 0);
+
+  for (guint i = 0; i < G_N_ELEMENTS (srcs); i++) {
+    RdsBufSurface view = {
+      .gpuId = batch->gpuId, .batchSize = 1, .numFilled = 0, .memType = batch->memType,
+      .surfaceList = &batch->surfaceList[i], ._priv = NULL,
+    };
+    RdsBufSurfTransformParams tp = {
+      .transform_flag = RDS_BUFSURF_TRANSFORM_FILTER, .transform_filter = RdsBufSurfTransformInter_Bilinear,
+    };
+    RefRect s = { 0, 0, srcs[i].w, srcs[i].h }, d = { 0, 0, bw, bh };
+
+    if (i == G_N_ELEMENTS (srcs) - 1) {
+      tp.transform_flag |= RDS_BUFSURF_TRANSFORM_CROP_DST;
+      tp.dst_rect = &dr;
+      d = (RefRect) { dr.left, dr.top, dr.width, dr.height };
+    }
+    g_assert_cmpint (rds_buf_surf_transform (src[i], &view, &tp), ==, RdsBufSurfTransformError_Success);
+    g_assert_cmpuint (view.numFilled, ==, 1);
+    g_assert_cmpuint (batch->numFilled, ==, 0);
+    ref_transform (&hsrc[i].im, &href[i].im, s, d, TRUE);
+  }
+
+  /* checked after all slots: a later slot's transform must not touch an earlier slot */
+  for (guint i = 0; i < G_N_ELEMENTS (srcs); i++) {
+    guint m;
+
+    snapshot (batch, i, &hgot);
+    m = max_diff (&hgot, &href[i], TRUE);
+    g_test_message ("slot %u (%s %ux%u): max diff %u", i, fmt_name (srcs[i].fmt), srcs[i].w, srcs[i].h, m);
+    g_assert_cmpuint (m, <=, 1);
+    host_image_clear (&hgot);
+    host_image_clear (&hsrc[i]);
+    host_image_clear (&href[i]);
+    g_assert_cmpint (rds_buf_surface_destroy (src[i]), ==, 0);
+  }
+  g_assert_cmpint (rds_buf_surface_destroy (batch), ==, 0);
+}
+
 static void
 test_mem_types (void)
 {
@@ -561,6 +630,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/transform/crop", test_crop);
   g_test_add_func ("/gpu/transform/crop-odd-edge", test_crop_odd_edge);
   g_test_add_func ("/gpu/transform/batch", test_batch);
+  g_test_add_func ("/gpu/transform/batch-slot-view", test_batch_slot_view);
   g_test_add_func ("/gpu/transform/mem-types", test_mem_types);
   g_test_add_func ("/gpu/transform/session-stream", test_session_stream);
   g_test_add_func ("/gpu/transform/second-gpu", test_second_gpu);

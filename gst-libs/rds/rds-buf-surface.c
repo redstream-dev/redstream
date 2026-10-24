@@ -12,13 +12,6 @@ GST_DEBUG_CATEGORY_STATIC (rds_buf_surface_debug);
 
 typedef struct
 {
-  gpointer base;                /* one allocation for the whole batch */
-  gsize stride;                 /* bytes between consecutive surfaces */
-  guint8 *staging;              /* pinned mirror of base, for mapping device memory; lazily allocated */
-} RdsBufSurfacePriv;
-
-typedef struct
-{
   guint32 wdiv, hdiv, bpp;
 } PlaneDesc;
 
@@ -118,6 +111,15 @@ rds_device_leave (guint32 gpu, int prev)
   ensure_debug_category ();
   if (prev != (int) gpu)
     RDS_HIP_CHECK (hipSetDevice (prev));
+}
+
+/* Library copies, memsets and staging syncs are queued on the calling thread's per-thread stream, then this waits
+ * for them: the calls stay synchronous (ready-on-push), without the legacy null stream, which would also wait for
+ * every other blocking stream on the device. The caller has made the device current. */
+static gboolean
+sync_thread_stream (void)
+{
+  return RDS_HIP_CHECK (hipStreamSynchronize (hipStreamPerThread));
 }
 
 /* Fills the geometry of one surface (everything except dataPtr and mappedAddr). */
@@ -308,8 +310,10 @@ rds_buf_surface_create (RdsBufSurface ** surf, guint32 batchSize, const RdsBufSu
   }
 
   priv = g_new0 (RdsBufSurfacePriv, 1);
+  priv->magic = RDS_BUF_SURFACE_PRIV_OWNED;
   priv->base = base;
   priv->stride = stride;
+  priv->batch_size = batchSize;
 
   s = g_new0 (RdsBufSurface, 1);
   s->gpuId = params->gpuId;
@@ -330,6 +334,54 @@ rds_buf_surface_create (RdsBufSurface ** surf, guint32 batchSize, const RdsBufSu
   return 0;
 }
 
+gboolean
+rds_buf_surface_is_view (const RdsBufSurface * surf)
+{
+  const RdsBufSurfacePriv *priv = surf->_priv;
+
+  return priv != NULL && priv->magic == RDS_BUF_SURFACE_PRIV_VIEW;
+}
+
+void
+rds_buf_surface_init_view (RdsBufSurface * view, RdsBufSurfaceParams * params, RdsBufSurfacePriv * priv,
+    const RdsBufSurface * src, guint index)
+{
+  RdsBufSurfacePriv *src_priv = src->_priv;
+  gboolean src_is_view = src_priv != NULL && src_priv->magic == RDS_BUF_SURFACE_PRIV_VIEW;
+
+  ensure_debug_category ();
+  *params = src->surfaceList[index];
+  memset (&params->mappedAddr, 0, sizeof (params->mappedAddr));
+
+  memset (priv, 0, sizeof (*priv));
+  priv->magic = RDS_BUF_SURFACE_PRIV_VIEW;
+  /* A view of a view resolves to the original batch's slot and mirror. */
+  priv->owner = src_is_view ? src_priv->owner : src_priv;
+  priv->index = src_is_view ? src_priv->index : index;
+
+  memset (view, 0, sizeof (*view));
+  view->gpuId = src->gpuId;
+  view->batchSize = 1;
+  view->numFilled = 1;
+  view->isContiguous = TRUE;
+  view->memType = src->memType;
+  view->surfaceList = params;
+  view->_priv = priv;
+  GST_DEBUG ("view %p of slot %u of surface %p", view, priv->index, src);
+}
+
+void
+rds_buf_surface_release_view (RdsBufSurface * view)
+{
+  RdsBufSurfacePriv *priv = view->_priv;
+
+  g_return_if_fail (priv != NULL && priv->magic == RDS_BUF_SURFACE_PRIV_VIEW);
+  GST_DEBUG ("releasing view %p of slot %u", view, priv->index);
+  priv->magic = 0;
+  priv->owner = NULL;
+  view->_priv = NULL;
+}
+
 int
 rds_buf_surface_destroy (RdsBufSurface * surf)
 {
@@ -341,7 +393,12 @@ rds_buf_surface_destroy (RdsBufSurface * surf)
   ensure_debug_category ();
 
   priv = surf->_priv;
-  if (priv == NULL) {
+  if (priv != NULL && priv->magic == RDS_BUF_SURFACE_PRIV_VIEW) {
+    GST_ERROR ("surface %p is a view of slot %u of a batch: its memory frees it, not rds_buf_surface_destroy",
+        surf, priv->index);
+    return -1;
+  }
+  if (priv == NULL || priv->magic != RDS_BUF_SURFACE_PRIV_OWNED) {
     GST_ERROR ("surface %p was not created by rds_buf_surface_create", surf);
     return -1;
   }
@@ -354,43 +411,81 @@ rds_buf_surface_destroy (RdsBufSurface * surf)
   mem_free (surf->memType, priv->base);
   if (switched)
     rds_device_leave (surf->gpuId, prev_dev);
+  priv->magic = 0;
   g_free (priv);
   g_free (surf->surfaceList);
   g_free (surf);
   return 0;
 }
 
+/* The private struct that owns @surf's staging mirror, and the mirror slot of surface @index in it: the surface's
+ * own for an owned surface, the batch's for a view. NULL for hand-built surfaces. */
+static RdsBufSurfacePriv *
+staging_owner (RdsBufSurface * surf, guint index, guint * slot)
+{
+  RdsBufSurfacePriv *priv = surf->_priv;
+
+  if (priv == NULL)
+    return NULL;
+  if (priv->magic == RDS_BUF_SURFACE_PRIV_VIEW) {
+    *slot = priv->index;
+    return priv->owner;
+  }
+  if (priv->magic != RDS_BUF_SURFACE_PRIV_OWNED)
+    return NULL;
+  *slot = index;
+  return priv;
+}
+
+/* The owner's staging mirror, allocated on first use. Views of one batch may map from several threads at once, so
+ * the pointer is published with a compare-and-swap; the loser of a race frees its allocation. */
+static guint8 *
+ensure_staging (RdsBufSurfacePriv * owner, guint32 gpu)
+{
+  guint8 *staging = g_atomic_pointer_get (&owner->staging);
+  gsize size = owner->stride * owner->batch_size;
+  gpointer fresh = NULL;
+  gboolean ok;
+  int prev_dev;
+
+  if (staging != NULL)
+    return staging;
+  if (!rds_device_enter (gpu, &prev_dev))
+    return NULL;
+  ok = RDS_HIP_CHECK (hipHostMalloc (&fresh, size, hipHostMallocDefault));
+  if (ok) {
+    memset (fresh, 0, size);
+    if (!g_atomic_pointer_compare_and_exchange (&owner->staging, NULL, fresh)) {
+      RDS_HIP_CHECK (hipHostFree (fresh));
+      fresh = g_atomic_pointer_get (&owner->staging);
+    }
+  }
+  rds_device_leave (gpu, prev_dev);
+  return ok ? fresh : NULL;
+}
+
 static gboolean
 map_plane (RdsBufSurface * surf, guint index, guint plane, G_GNUC_UNUSED gpointer data)
 {
   RdsBufSurfaceParams *sp = &surf->surfaceList[index];
-  RdsBufSurfacePriv *priv = surf->_priv;
+  RdsBufSurfacePriv *owner;
+  guint8 *staging;
+  guint slot = 0;
 
   if (is_host_accessible (surf->memType)) {
     sp->mappedAddr.addr[plane] = (guint8 *) sp->dataPtr + sp->planeParams.offset[plane];
     return TRUE;
   }
 
-  if (priv == NULL) {
+  owner = staging_owner (surf, index, &slot);
+  if (owner == NULL) {
     GST_ERROR ("cannot map device memory of a surface not created by rds_buf_surface_create");
     return FALSE;
   }
-  if (priv->staging == NULL) {
-    gsize size = priv->stride * surf->batchSize;
-    gpointer staging = NULL;
-    gboolean ok;
-    int prev_dev;
-
-    if (!rds_device_enter (surf->gpuId, &prev_dev))
-      return FALSE;
-    ok = RDS_HIP_CHECK (hipHostMalloc (&staging, size, hipHostMallocDefault));
-    rds_device_leave (surf->gpuId, prev_dev);
-    if (!ok)
-      return FALSE;
-    memset (staging, 0, size);
-    priv->staging = staging;
-  }
-  sp->mappedAddr.addr[plane] = priv->staging + index * priv->stride + sp->planeParams.offset[plane];
+  staging = ensure_staging (owner, surf->gpuId);
+  if (staging == NULL)
+    return FALSE;
+  sp->mappedAddr.addr[plane] = staging + slot * owner->stride + sp->planeParams.offset[plane];
   return TRUE;
 }
 
@@ -425,25 +520,31 @@ rds_buf_surface_unmap (RdsBufSurface * surf, int index, int plane)
   return for_each_plane (surf, index, plane, unmap_plane, NULL);
 }
 
-/* Copies one plane between device memory and its staging mirror. The caller has made the device current. */
+/* Copies one plane between device memory and its staging mirror, queued on the per-thread stream. The caller has
+ * made the device current and synchronizes the stream. */
 static gboolean
 sync_plane (RdsBufSurface * surf, guint index, guint plane, gboolean to_cpu)
 {
   RdsBufSurfaceParams *sp = &surf->surfaceList[index];
   RdsBufSurfacePlaneParams *pp = &sp->planeParams;
-  RdsBufSurfacePriv *priv = surf->_priv;
   guint8 *dev = (guint8 *) sp->dataPtr + pp->offset[plane];
-  guint8 *host;
+  RdsBufSurfacePriv *owner;
+  guint8 *host, *staging = NULL;
+  guint slot = 0;
 
-  if (sp->mappedAddr.addr[plane] == NULL || priv == NULL || priv->staging == NULL) {
+  owner = staging_owner (surf, index, &slot);
+  if (owner != NULL)
+    staging = g_atomic_pointer_get (&owner->staging);
+  if (sp->mappedAddr.addr[plane] == NULL || staging == NULL) {
     GST_ERROR ("surface %u plane %u is not mapped", index, plane);
     return FALSE;
   }
   /* Recompute rather than trust mappedAddr, which callers can overwrite. */
-  host = priv->staging + index * priv->stride + pp->offset[plane];
+  host = staging + slot * owner->stride + pp->offset[plane];
   if (to_cpu)
-    return RDS_HIP_CHECK (hipMemcpy (host, dev, pp->psize[plane], hipMemcpyDeviceToHost));
-  return RDS_HIP_CHECK (hipMemcpy (dev, host, pp->psize[plane], hipMemcpyHostToDevice));
+    return RDS_HIP_CHECK (hipMemcpyAsync (host, dev, pp->psize[plane], hipMemcpyDeviceToHost,
+            hipStreamPerThread));
+  return RDS_HIP_CHECK (hipMemcpyAsync (dev, host, pp->psize[plane], hipMemcpyHostToDevice, hipStreamPerThread));
 }
 
 static gboolean
@@ -479,6 +580,9 @@ sync_surface (RdsBufSurface * surf, int index, int plane, PlaneFunc fn)
   if (!rds_device_enter (surf->gpuId, &prev_dev))
     return -1;
   ret = for_each_plane (surf, index, plane, fn, NULL);
+  /* Drain even after a failure: earlier planes may still be in flight. */
+  if (!sync_thread_stream ())
+    ret = -1;
   rds_device_leave (surf->gpuId, prev_dev);
   return ret;
 }
@@ -512,7 +616,7 @@ memset_plane (RdsBufSurface * surf, guint index, guint plane, gpointer data)
     memset (ptr, value, sp->planeParams.psize[plane]);
     return TRUE;
   }
-  return RDS_HIP_CHECK (hipMemset (ptr, value, sp->planeParams.psize[plane]));
+  return RDS_HIP_CHECK (hipMemsetAsync (ptr, value, sp->planeParams.psize[plane], hipStreamPerThread));
 }
 
 int
@@ -531,8 +635,7 @@ rds_buf_surface_memset (RdsBufSurface * surf, int index, int plane, guint8 value
   if (!rds_device_enter (surf->gpuId, &prev_dev))
     return -1;
   ret = for_each_plane (surf, index, plane, memset_plane, GUINT_TO_POINTER (value));
-  /* Library operations are synchronous (ready-on-push). */
-  if (ret == 0 && !RDS_HIP_CHECK (hipStreamSynchronize (NULL)))
+  if (!sync_thread_stream ())
     ret = -1;
   rds_device_leave (surf->gpuId, prev_dev);
   return ret;
@@ -580,8 +683,8 @@ copy_planes (const RdsBufSurface * src, RdsBufSurface * dst, gboolean host_copy)
         for (guint32 y = 0; y < rows; y++)
           memcpy (dptr + (gsize) y * d->planeParams.pitch[p], sptr + (gsize) y * s->planeParams.pitch[p],
               row_bytes);
-      } else if (!RDS_HIP_CHECK (hipMemcpy2D (dptr, d->planeParams.pitch[p], sptr, s->planeParams.pitch[p],
-                  row_bytes, rows, hipMemcpyDefault))) {
+      } else if (!RDS_HIP_CHECK (hipMemcpy2DAsync (dptr, d->planeParams.pitch[p], sptr, s->planeParams.pitch[p],
+                  row_bytes, rows, hipMemcpyDefault, hipStreamPerThread))) {
         return FALSE;
       }
     }
@@ -625,8 +728,8 @@ rds_buf_surface_copy (const RdsBufSurface * src, RdsBufSurface * dst)
     gpu = is_cpu_only (dst->memType) ? src->gpuId : dst->gpuId;
     if (!rds_device_enter (gpu, &prev_dev))
       return -1;
-    /* Library operations are synchronous (ready-on-push). */
-    ok = copy_planes (src, dst, FALSE) && RDS_HIP_CHECK (hipStreamSynchronize (NULL));
+    ok = copy_planes (src, dst, FALSE);
+    ok = sync_thread_stream () && ok;
     rds_device_leave (gpu, prev_dev);
     if (!ok)
       return -1;
