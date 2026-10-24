@@ -63,8 +63,10 @@ struct _GstRdsStreamMuxPad
   GstAggregatorPad parent;
 
   guint index;                  /* the N of sink_N: source_id and pad_index in the frame meta */
-  guint32 flush_seqnum;         /* seqnum of the FLUSH_START in progress, else GST_SEQNUM_INVALID (object lock
-                                 * of the element) */
+  guint32 flush_seqnum;         /* seqnum of the last FLUSH_START (object lock of the element). Kept after
+                                 * FLUSH_STOP, as GstAggregator keeps its own: in a seek-style flush one pad may
+                                 * finish START + STOP before another pad's START, and that START still makes the
+                                 * flush element-wide. */
 
   /* streaming state (aggregator source thread, which also handles the serialized events) */
   GstVideoInfo info;
@@ -452,11 +454,6 @@ gst_rds_stream_mux_sink_event (GstAggregator * agg, GstAggregatorPad * aggpad, G
         set_pool_flushing (self, TRUE);
       break;
     }
-    case GST_EVENT_FLUSH_STOP:
-      GST_OBJECT_LOCK (self);
-      pad->flush_seqnum = GST_SEQNUM_INVALID;
-      GST_OBJECT_UNLOCK (self);
-      break;
     default:
       break;
   }
@@ -681,16 +678,18 @@ typedef struct
 {
   GstRdsStreamMuxPad *pad;
   GstBuffer *buf;
-  RdsBufSurfTransformRect src_rect;     /* the part of the frame that goes into the slot */
+  GstClockTime running_time;    /* of the PTS, taken when popped: a flush may reset the pad's segment later */
+  RdsBufSurfTransformRect src_rect;     /* the part of the frame that goes into the slot (set by fill_slot) */
   gboolean cropped;             /* src_rect is narrower than the frame (a crop meta) */
 } MuxEntry;
 
-/* The part of the input frame the mux reads: the buffer's crop meta clamped to the frame, else the whole frame. */
+/* The part of the source surface (@w x @h) the mux reads: the buffer's crop meta clamped to the surface, else the
+ * whole surface. The surface, not the caps: an element cropping in passthrough (videocrop) announces the cropped
+ * size in its caps but forwards the full surface with a crop meta. */
 static void
-entry_set_src_rect (GstRdsStreamMux * self, MuxEntry * e)
+entry_set_src_rect (GstRdsStreamMux * self, MuxEntry * e, guint w, guint h)
 {
   GstVideoCropMeta *crop = gst_buffer_get_video_crop_meta (e->buf);
-  guint w = GST_VIDEO_INFO_WIDTH (&e->pad->info), h = GST_VIDEO_INFO_HEIGHT (&e->pad->info);
 
   e->src_rect = (RdsBufSurfTransformRect) {.left = 0,.top = 0,.width = w,.height = h };
   e->cropped = FALSE;
@@ -787,6 +786,7 @@ fill_slot (GstRdsStreamMux * self, MuxEntry * e, RdsBufSurface * batch, guint sl
     }
     src = pad->stage;
   }
+  entry_set_src_rect (self, e, src->surfaceList[0].width, src->surfaceList[0].height);
 
   /* Destination: a hand-built single-surface view of the slot (no library ownership: _priv NULL). */
   view = *batch;
@@ -901,8 +901,10 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
     MuxEntry e = {.pad = pad,.buf = gst_aggregator_pad_pop_buffer (GST_AGGREGATOR_PAD (pad)) };
 
     if (e.buf != NULL) {
-      if (pad->have_info)
-        entry_set_src_rect (self, &e);
+      GST_OBJECT_LOCK (pad);
+      e.running_time = gst_segment_to_running_time (&GST_AGGREGATOR_PAD (pad)->segment, GST_FORMAT_TIME,
+          GST_BUFFER_PTS (e.buf));
+      GST_OBJECT_UNLOCK (pad);
       g_array_append_val (entries, e);
     }
   }
@@ -956,7 +958,7 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
   bm = rds_create_batch_meta (batch_size);
   for (guint i = 0; i < entries->len; i++) {
     MuxEntry *e = &g_array_index (entries, MuxEntry, i);
-    GstClockTime rt;
+    GstClockTime rt = e->running_time;
 
     if (!fill_slot (self, e, batch, i, filter, compute, padding)) {
       gst_buffer_unmap (outbuf, &map);
@@ -964,10 +966,6 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
       goto out;
     }
     fill_frame_meta (self, bm, e, i, attach_sys_ts);
-    GST_OBJECT_LOCK (e->pad);
-    rt = gst_segment_to_running_time (&GST_AGGREGATOR_PAD (e->pad)->segment, GST_FORMAT_TIME,
-        GST_BUFFER_PTS (e->buf));
-    GST_OBJECT_UNLOCK (e->pad);
     if (GST_CLOCK_TIME_IS_VALID (rt) && (!GST_CLOCK_TIME_IS_VALID (pts) || rt < pts))
       pts = rt;
   }

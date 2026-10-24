@@ -1423,19 +1423,24 @@ test_timeout (void)
   g_assert_cmpuint (rds_buffer_get_surface (gst_sample_get_buffer (sample))->numFilled, ==, 2);
   gst_sample_unref (sample);
 
-  /* b stalls */
-  t0 = g_get_monotonic_time ();
-  g_assert_cmpint (gst_app_src_push_buffer (GST_APP_SRC (src[0]), sys_frame (caps_str, 2, 33 * GST_MSECOND)), ==,
-      GST_FLOW_OK);
-  sample = gst_app_sink_try_pull_sample (GST_APP_SINK (sink), 5 * GST_SECOND);
-  dt = g_get_monotonic_time () - t0;
-  g_assert_nonnull (sample);
-  g_assert_cmpuint (rds_buffer_get_surface (gst_sample_get_buffer (sample))->numFilled, ==, 1);
-  gst_sample_unref (sample);
-  g_test_message ("partial batch after %" G_GINT64_FORMAT " ms", dt / 1000);
-  /* generous upper bound for loaded CI and sanitizers */
-  g_assert_cmpint (dt, >=, 35 * 1000);
-  g_assert_cmpint (dt, <=, 400 * 1000);
+  /* b stalls: each of a's frames goes out alone, one timeout after it arrived. The pause before the second one
+   * would make a stale timer (the first batch's) fire at once. */
+  for (guint f = 0; f < 2; f++) {
+    if (f > 0)
+      g_usleep (200 * 1000);
+    t0 = g_get_monotonic_time ();
+    g_assert_cmpint (gst_app_src_push_buffer (GST_APP_SRC (src[0]), sys_frame (caps_str, 2 + f,
+                (1 + f) * 33 * GST_MSECOND)), ==, GST_FLOW_OK);
+    sample = gst_app_sink_try_pull_sample (GST_APP_SINK (sink), 5 * GST_SECOND);
+    dt = g_get_monotonic_time () - t0;
+    g_assert_nonnull (sample);
+    g_assert_cmpuint (rds_buffer_get_surface (gst_sample_get_buffer (sample))->numFilled, ==, 1);
+    gst_sample_unref (sample);
+    g_test_message ("partial batch %u after %" G_GINT64_FORMAT " ms", f, dt / 1000);
+    /* generous upper bound for loaded CI and sanitizers */
+    g_assert_cmpint (dt, >=, 35 * 1000);
+    g_assert_cmpint (dt, <=, 400 * 1000);
+  }
 
   for (guint i = 0; i < 2; i++)
     gst_app_src_end_of_stream (GST_APP_SRC (src[i]));
@@ -1452,6 +1457,223 @@ test_timeout (void)
   gst_object_unref (pipe);
 }
 
+/* The crop meta applies to the surface, not the caps size (videocrop in passthrough: cropped caps, full surface). */
+static void
+test_crop_meta_surface (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120) };
+  static const RefRect crops[] = { {0, 0, 160, 120}, {160, 120, 160, 120}, {100, 60, 160, 120} };
+  GstHarness *h, *in[1];
+  GstBufferPool *pool;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("width=160 height=120", in_caps, 1, in);
+  pool = make_pool (RDS_NV12 (320, 240));
+  for (guint c = 0; c < G_N_ELEMENTS (crops); c++) {
+    GstBuffer *b = rds_frame (pool, 80 + c, c * GST_MSECOND), *out;
+    GstVideoCropMeta *crop = gst_buffer_add_video_crop_meta (b);
+    RdsFrameMeta *fm;
+    HostImage hin;
+
+    crop->x = crops[c].left;
+    crop->y = crops[c].top;
+    crop->width = crops[c].width;
+    crop->height = crops[c].height;
+    host_of (b, NULL, &hin);
+    g_assert_cmpint (gst_harness_push (in[0], b), ==, GST_FLOW_OK);
+    out = pull_ok (h);
+    fm = frame_meta_at (gst_buffer_get_rds_batch_meta (out), 0);
+    g_assert_cmpuint (fm->source_frame_width, ==, 160);
+    g_assert_cmpuint (fm->source_frame_height, ==, 120);
+    assert_slot_rect (out, 0, &hin, crops[c], (RefRect) { 0, 0, 160, 120 });
+    host_image_clear (&hin);
+    gst_buffer_unref (out);
+  }
+  mux_teardown (h, in, 1);
+  pool_free (pool);
+}
+
+/* Sets up two sources with a one-batch pool, holds the first batch downstream and pushes a second pair, so the mux
+ * has popped both frames and waits for a pool buffer. Returns the held batch. */
+static GstBuffer *
+block_in_acquire (GstHarness * h, GstHarness ** in, GstBufferPool * pool)
+{
+  GstBuffer *held;
+
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, i, 0)), ==, GST_FLOW_OK);
+  held = pull_ok (h);
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, 2 + i, 33 * GST_MSECOND)), ==, GST_FLOW_OK);
+  g_usleep (100 * 1000);
+  g_assert_null (gst_harness_try_pull (h));
+  return held;
+}
+
+static void
+push_segment (GstHarness * in)
+{
+  GstSegment seg;
+
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  g_assert_true (gst_harness_push_event (in, gst_event_new_segment (&seg)));
+}
+
+typedef struct
+{
+  GstHarness **in;
+  gboolean done;
+  GMutex lock;
+  GCond cond;
+} FlushCtx;
+
+/* A seek-style flush: one seqnum, and the first pad finishes START + STOP before the second pad's START. */
+static gpointer
+flush_thread (gpointer data)
+{
+  FlushCtx *ctx = data;
+  guint32 seqnum = gst_util_seqnum_next ();
+
+  for (guint i = 0; i < 2; i++) {
+    GstEvent *start = gst_event_new_flush_start (), *stop = gst_event_new_flush_stop (TRUE);
+
+    gst_event_set_seqnum (start, seqnum);
+    gst_event_set_seqnum (stop, seqnum);
+    gst_harness_push_event (ctx->in[i], start);
+    gst_harness_push_event (ctx->in[i], stop);
+  }
+  g_mutex_lock (&ctx->lock);
+  ctx->done = TRUE;
+  g_cond_signal (&ctx->cond);
+  g_mutex_unlock (&ctx->lock);
+  return NULL;
+}
+
+/* An element-wide flush while the mux waits for a pool buffer held downstream: the wait gives up, the flush
+ * completes, and batching resumes afterwards. */
+static void
+test_flush_while_blocked (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  FlushCtx ctx = { 0 };
+  GstHarness *h, *in[2];
+  GstBufferPool *pool;
+  GstBuffer *held, *out;
+  GThread *t;
+  gint64 end;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("batch-size=2 width=64 height=64 buffer-pool-size=1", in_caps, 2, in);
+  pool = make_pool (in_caps[0]);
+  held = block_in_acquire (h, in, pool);
+
+  ctx.in = in;
+  g_mutex_init (&ctx.lock);
+  g_cond_init (&ctx.cond);
+  t = g_thread_new ("flush", flush_thread, &ctx);
+  end = g_get_monotonic_time () + 10 * G_TIME_SPAN_SECOND;
+  g_mutex_lock (&ctx.lock);
+  while (!ctx.done)
+    if (!g_cond_wait_until (&ctx.cond, &ctx.lock, end))
+      g_error ("an element-wide flush hangs while the mux waits for a pool buffer");
+  g_mutex_unlock (&ctx.lock);
+  g_thread_join (t);
+  g_cond_clear (&ctx.cond);
+  g_mutex_clear (&ctx.lock);
+
+  gst_buffer_unref (held);
+  for (guint i = 0; i < 2; i++) {
+    push_segment (in[i]);
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, 4 + i, 0)), ==, GST_FLOW_OK);
+  }
+  out = pull_ok (h);
+  /* the flushed batch never comes out: this is the new pair */
+  g_assert_cmpuint (rds_buffer_get_surface (out)->numFilled, ==, 2);
+  g_assert_cmpuint (frame_meta_at (gst_buffer_get_rds_batch_meta (out), 0)->buf_pts, ==, 0);
+  gst_buffer_unref (out);
+  mux_teardown (h, in, 2);
+  pool_free (pool);
+}
+
+/* A flush of one source while the mux waits for a pool buffer, holding that source's popped frame: the batch
+ * still gets the frame's running time (from the segment it arrived in, not the reset one). */
+static void
+test_flush_one_pad_blocked (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[2];
+  GstBufferPool *pool;
+  GstBuffer *held, *out;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("batch-size=2 width=64 height=64 buffer-pool-size=1", in_caps, 2, in);
+  pool = make_pool (in_caps[0]);
+  held = block_in_acquire (h, in, pool);
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_flush_start ()));
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_flush_stop (TRUE)));
+  gst_buffer_unref (held);
+  out = pull_ok (h);
+  g_assert_cmpuint (rds_buffer_get_surface (out)->numFilled, ==, 2);
+  g_assert_cmpuint (GST_BUFFER_PTS (out), ==, 33 * GST_MSECOND);
+  gst_buffer_unref (out);
+
+  push_segment (in[0]);
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, 6 + i, 66 * GST_MSECOND)), ==, GST_FLOW_OK);
+  out = pull_ok (h);
+  g_assert_cmpuint (rds_buffer_get_surface (out)->numFilled, ==, 2);
+  gst_buffer_unref (out);
+  mux_teardown (h, in, 2);
+  pool_free (pool);
+}
+
+/* Batch timestamps never go backwards, even when a source's frame is older than the last batch. */
+static void
+test_pts_monotonic (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120) };
+  static const guint64 in_ms[] = { 100, 50, 150 }, out_ms[] = { 100, 100, 150 };
+  GstHarness *h, *in[1];
+  GstBufferPool *pool;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("width=64 height=64", in_caps, 1, in);
+  pool = make_pool (in_caps[0]);
+  for (guint i = 0; i < G_N_ELEMENTS (in_ms); i++) {
+    GstBuffer *out;
+
+    g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, i, in_ms[i] * GST_MSECOND)), ==, GST_FLOW_OK);
+    out = pull_ok (h);
+    g_assert_cmpuint (GST_BUFFER_PTS (out), ==, out_ms[i] * GST_MSECOND);
+    /* the frame keeps its own PTS */
+    g_assert_cmpuint (frame_meta_at (gst_buffer_get_rds_batch_meta (out), 0)->buf_pts, ==, in_ms[i] * GST_MSECOND);
+    gst_buffer_unref (out);
+  }
+  mux_teardown (h, in, 1);
+  pool_free (pool);
+}
+
+/* batched-push-timeout sets the aggregator latency on every start; without a timeout it is 0 again. */
+static void
+test_latency_on_restart (void)
+{
+  GstElement *e = gst_element_factory_make ("rdsstreammux", NULL);
+  guint64 latency = 1;
+
+  g_object_set (e, "width", 64, "height", 64, "batched-push-timeout", 40000, NULL);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_PAUSED), !=, GST_STATE_CHANGE_FAILURE);
+  g_object_get (e, "latency", &latency, NULL);
+  g_assert_cmpuint (latency, ==, 40 * GST_MSECOND);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+
+  g_object_set (e, "batched-push-timeout", -1, NULL);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_PAUSED), !=, GST_STATE_CHANGE_FAILURE);
+  g_object_get (e, "latency", &latency, NULL);
+  g_assert_cmpuint (latency, ==, 0);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+  gst_object_unref (e);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1462,6 +1684,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/mux/properties", test_properties);
   g_test_add_func ("/cpu/mux/no-size", test_no_size);
   g_test_add_func ("/cpu/mux/unsupported-settings", test_unsupported_settings);
+  g_test_add_func ("/cpu/mux/latency-on-restart", test_latency_on_restart);
 
   g_test_add_func ("/gpu/mux/batch-scaling", test_batch_scaling);
   g_test_add_func ("/gpu/mux/padding", test_padding);
@@ -1478,5 +1701,9 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/mux/batch-rejected", test_batch_rejected);
   g_test_add_func ("/gpu/mux/padding-rgba-odd", test_padding_rgba_odd);
   g_test_add_func ("/gpu/mux/timeout", test_timeout);
+  g_test_add_func ("/gpu/mux/crop-meta-surface", test_crop_meta_surface);
+  g_test_add_func ("/gpu/mux/flush-while-blocked", test_flush_while_blocked);
+  g_test_add_func ("/gpu/mux/flush-one-pad-blocked", test_flush_one_pad_blocked);
+  g_test_add_func ("/gpu/mux/pts-monotonic", test_pts_monotonic);
   return g_test_run ();
 }
