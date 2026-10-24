@@ -37,6 +37,25 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvv4l2h264enc` | `rdsh264enc` | planned | VA (VCN) encode, M2 | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nvv4l2h265enc` | `rdsh265enc` | planned | VA (VCN) encode, M2 | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 
+### `rdsvideoconvert` (`nvvideoconvert`) properties
+
+Names and integers as on NVIDIA's [nvvideoconvert page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideoconvert.html)
+(checked 2026-10-24). That page names no enum nicks except for `nvbuf-memory-type`; the other nicks are Redstream's.
+
+| Property | Status | Notes |
+|---|---|---|
+| `src-crop` | supported | clamped to the frame; when the input buffer has a `GstVideoCropMeta`, relative to that crop (offset by its x/y, clamped to its size) |
+| `dest-crop` | supported | clamped to the frame; the rest of the output is filled with black: Y 16, U/V 128 for YUV, every byte 0 for GRAY8 and RGB formats, so **alpha is 0** outside the rect on RGBA/BGRA |
+| `allow-odd-crop` | supported | odd 4:2:0 destination rects are widened to even coordinates; without it they are an error |
+| `interpolation-method` | supported | filters as in "Transform semantics" (`Algo1`-`Algo3` run bilinear, `Algo4` nearest) |
+| `compute-hw` | supported | `2` (VIC) fails at start |
+| `flip-method` | unsupported | any value but `0` fails at start |
+| `contiguous-buffers`, `copy-hw`, `bl-output` | accepted no-op | batches are always contiguous, copies run on the GPU, output is pitch-linear |
+| `gpu-id`, `nvbuf-memory-type`, `output-buffers` | supported | changeable only in NULL or READY |
+| `disable-passthrough`, `silent` | supported | `silent` has no effect |
+
+System-memory input or output is converted through device staging surfaces (upload, transform, download).
+
 ## NvBufSurface
 
 Types are `typedef`s, functions and enumerators are object-like macros (taking a function's address works).

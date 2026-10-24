@@ -17,6 +17,15 @@ GST_DEBUG_CATEGORY_STATIC (gst_rds_video_convert_debug);
 #define DEFAULT_OUTPUT_BUFFERS 4
 #define DEFAULT_DISABLE_PASSTHROUGH FALSE
 #define DEFAULT_SILENT FALSE
+#define DEFAULT_INTERPOLATION_METHOD RdsBufSurfTransformInter_Default
+#define DEFAULT_COMPUTE_HW 0
+#define DEFAULT_FLIP_METHOD 0
+#define DEFAULT_ALLOW_ODD_CROP TRUE
+#define DEFAULT_CONTIGUOUS_BUFFERS FALSE
+#define DEFAULT_COPY_HW 1
+#define DEFAULT_BL_OUTPUT FALSE
+
+#define COMPUTE_HW_VIC 2
 
 enum
 {
@@ -26,6 +35,15 @@ enum
   PROP_OUTPUT_BUFFERS,
   PROP_DISABLE_PASSTHROUGH,
   PROP_SILENT,
+  PROP_SRC_CROP,
+  PROP_DEST_CROP,
+  PROP_INTERPOLATION_METHOD,
+  PROP_COMPUTE_HW,
+  PROP_FLIP_METHOD,
+  PROP_ALLOW_ODD_CROP,
+  PROP_CONTIGUOUS_BUFFERS,
+  PROP_COPY_HW,
+  PROP_BL_OUTPUT,
 };
 
 struct _GstRdsVideoConvert
@@ -38,6 +56,17 @@ struct _GstRdsVideoConvert
   guint output_buffers;
   gboolean disable_passthrough;
   gboolean silent;
+  gchar *src_crop_str;          /* as set; "" = whole frame */
+  gchar *dest_crop_str;
+  RdsBufSurfTransformRect src_crop;     /* parsed; all zero = whole frame */
+  RdsBufSurfTransformRect dest_crop;
+  gint interpolation_method;    /* RdsBufSurfTransform_Inter */
+  gint compute_hw;              /* GstRdsComputeHW == RdsBufSurfTransform_Compute */
+  gint flip_method;
+  gboolean allow_odd_crop;
+  gboolean contiguous_buffers;  /* no-op: batches are always contiguous */
+  gint copy_hw;                 /* no-op: copies run on the GPU */
+  gboolean bl_output;           /* no-op: Jetson only */
 
   /* streaming state */
   hipStream_t stream;
@@ -45,6 +74,9 @@ struct _GstRdsVideoConvert
   GstVideoInfo in_info;
   GstVideoInfo out_info;
   gboolean caps_equal;          /* negotiated input and output caps are equal (object lock) */
+  gboolean in_rds, out_rds;     /* negotiated memory:RDS on each side */
+  RdsBufSurface *in_stage;      /* device copies of system-memory frames (created on first use) */
+  RdsBufSurface *out_stage;
 };
 
 #define RDS_VIDEO_CONVERT_FORMATS "{ NV12, I420, RGBA, BGRA, RGBx, BGRx, RGB, BGR, GRAY8 }"
@@ -80,6 +112,91 @@ gst_rds_vid_conv_buf_memory_type_get_type (void)
   return type;
 }
 
+/* The integers below are DeepStream's (configs use them); the nicks and descriptions are our own. */
+#define GST_TYPE_RDS_INTERPOLATION_METHOD (gst_rds_interpolation_method_get_type ())
+static GType
+gst_rds_interpolation_method_get_type (void)
+{
+  static GType type = 0;
+  static const GEnumValue values[] = {
+    {RdsBufSurfTransformInter_Nearest, "Nearest neighbour", "nearest"},
+    {RdsBufSurfTransformInter_Bilinear, "Bilinear", "bilinear"},
+    {RdsBufSurfTransformInter_Algo1, "Algorithm 1 (bilinear here)", "algo-1"},
+    {RdsBufSurfTransformInter_Algo2, "Algorithm 2 (bilinear here)", "algo-2"},
+    {RdsBufSurfTransformInter_Algo3, "Algorithm 3 (bilinear here)", "algo-3"},
+    {RdsBufSurfTransformInter_Algo4, "Algorithm 4 (nearest here)", "algo-4"},
+    {RdsBufSurfTransformInter_Default, "Platform default (nearest)", "default"},
+    {0, NULL, NULL},
+  };
+
+  if (g_once_init_enter (&type)) {
+    GType t = g_enum_register_static ("GstRdsInterpolationMethod", values);
+    g_once_init_leave (&type, t);
+  }
+  return type;
+}
+
+#define GST_TYPE_RDS_COMPUTE_HW (gst_rds_compute_hw_get_type ())
+static GType
+gst_rds_compute_hw_get_type (void)
+{
+  static GType type = 0;
+  static const GEnumValue values[] = {
+    {0, "Platform default (the GPU)", "default"},
+    {1, "GPU", "gpu"},
+    {COMPUTE_HW_VIC, "NVIDIA Jetson VIC engine (not available: fails at start)", "vic"},
+    {0, NULL, NULL},
+  };
+
+  if (g_once_init_enter (&type)) {
+    GType t = g_enum_register_static ("GstRdsComputeHW", values);
+    g_once_init_leave (&type, t);
+  }
+  return type;
+}
+
+#define GST_TYPE_RDS_VIDEO_FLIP_METHOD (gst_rds_video_flip_method_get_type ())
+static GType
+gst_rds_video_flip_method_get_type (void)
+{
+  static GType type = 0;
+  static const GEnumValue values[] = {
+    {0, "No rotation or flip", "none"},
+    {1, "Rotate 90 degrees counter-clockwise (not supported yet)", "counterclockwise"},
+    {2, "Rotate 180 degrees (not supported yet)", "rotate-180"},
+    {3, "Rotate 90 degrees clockwise (not supported yet)", "clockwise"},
+    {4, "Mirror left to right (not supported yet)", "horizontal-flip"},
+    {5, "Mirror across the upper-right/lower-left diagonal (not supported yet)", "upper-right-diagonal"},
+    {6, "Mirror top to bottom (not supported yet)", "vertical-flip"},
+    {7, "Mirror across the upper-left/lower-right diagonal (not supported yet)", "upper-left-diagonal"},
+    {0, NULL, NULL},
+  };
+
+  if (g_once_init_enter (&type)) {
+    GType t = g_enum_register_static ("GstRdsVideoFlipMethod", values);
+    g_once_init_leave (&type, t);
+  }
+  return type;
+}
+
+#define GST_TYPE_RDS_COPY_HW_TYPE (gst_rds_copy_hw_type_get_type ())
+static GType
+gst_rds_copy_hw_type_get_type (void)
+{
+  static GType type = 0;
+  static const GEnumValue values[] = {
+    {1, "GPU", "gpu"},
+    {2, "NVIDIA Jetson VIC engine (copies still run on the GPU)", "vic"},
+    {0, NULL, NULL},
+  };
+
+  if (g_once_init_enter (&type)) {
+    GType t = g_enum_register_static ("GstRdsCopyHWType", values);
+    g_once_init_leave (&type, t);
+  }
+  return type;
+}
+
 G_DEFINE_TYPE (GstRdsVideoConvert, gst_rds_video_convert, GST_TYPE_BASE_TRANSFORM);
 GST_ELEMENT_REGISTER_DEFINE (rdsvideoconvert, "rdsvideoconvert", GST_RANK_NONE, GST_TYPE_RDS_VIDEO_CONVERT);
 
@@ -99,6 +216,30 @@ transform_error_name (RdsBufSurfTransform_Error err)
       return "Success";
   }
   return "unknown error";
+}
+
+static gboolean
+rect_is_set (const RdsBufSurfTransformRect * r)
+{
+  return (r->left | r->top | r->width | r->height) != 0;
+}
+
+/* Object lock held. Passthrough needs equal caps and nothing that changes the pixels. */
+static gboolean
+want_passthrough (GstRdsVideoConvert * self)
+{
+  return self->caps_equal && !self->disable_passthrough && !rect_is_set (&self->src_crop)
+      && !rect_is_set (&self->dest_crop) && self->flip_method == 0;
+}
+
+static void
+free_stages (GstRdsVideoConvert * self)
+{
+  if (self->in_stage != NULL)
+    rds_buf_surface_destroy (self->in_stage);
+  if (self->out_stage != NULL)
+    rds_buf_surface_destroy (self->out_stage);
+  self->in_stage = self->out_stage = NULL;
 }
 
 /* ---- caps ---- */
@@ -218,23 +359,36 @@ static gboolean
 gst_rds_video_convert_set_caps (GstBaseTransform * trans, GstCaps * incaps, GstCaps * outcaps)
 {
   GstRdsVideoConvert *self = GST_RDS_VIDEO_CONVERT (trans);
+  GstVideoInfo in_info, out_info;
   gboolean passthrough;
 
-  if (!gst_video_info_from_caps (&self->in_info, incaps) || !gst_video_info_from_caps (&self->out_info, outcaps)) {
+  if (!gst_video_info_from_caps (&in_info, incaps) || !gst_video_info_from_caps (&out_info, outcaps)) {
     GST_ERROR_OBJECT (self, "invalid caps %" GST_PTR_FORMAT " -> %" GST_PTR_FORMAT, incaps, outcaps);
     return FALSE;
   }
-  if (rds_buf_color_format_from_video_format (GST_VIDEO_INFO_FORMAT (&self->in_info))
-      == RDS_BUF_COLOR_FORMAT_INVALID
-      || rds_buf_color_format_from_video_format (GST_VIDEO_INFO_FORMAT (&self->out_info))
+  if (rds_buf_color_format_from_video_format (GST_VIDEO_INFO_FORMAT (&in_info)) == RDS_BUF_COLOR_FORMAT_INVALID
+      || rds_buf_color_format_from_video_format (GST_VIDEO_INFO_FORMAT (&out_info))
       == RDS_BUF_COLOR_FORMAT_INVALID) {
     GST_ERROR_OBJECT (self, "unsupported format in %" GST_PTR_FORMAT " -> %" GST_PTR_FORMAT, incaps, outcaps);
     return FALSE;
   }
+  /* staging surfaces have the old geometry: recreated on the next frame that needs them */
+  if (self->in_stage != NULL && !gst_video_info_is_equal (&in_info, &self->in_info)) {
+    rds_buf_surface_destroy (self->in_stage);
+    self->in_stage = NULL;
+  }
+  if (self->out_stage != NULL && !gst_video_info_is_equal (&out_info, &self->out_info)) {
+    rds_buf_surface_destroy (self->out_stage);
+    self->out_stage = NULL;
+  }
+  self->in_info = in_info;
+  self->out_info = out_info;
+  self->in_rds = rds_caps_has_memory_rds (incaps);
+  self->out_rds = rds_caps_has_memory_rds (outcaps);
 
   GST_OBJECT_LOCK (self);
   self->caps_equal = gst_caps_is_equal (incaps, outcaps);
-  passthrough = self->caps_equal && !self->disable_passthrough;
+  passthrough = want_passthrough (self);
   GST_OBJECT_UNLOCK (self);
   gst_base_transform_set_passthrough (trans, passthrough);
   GST_DEBUG_OBJECT (self, "%" GST_PTR_FORMAT " -> %" GST_PTR_FORMAT ", passthrough %d", incaps, outcaps,
@@ -383,6 +537,30 @@ gst_rds_video_convert_transform_meta (G_GNUC_UNUSED GstBaseTransform * trans, G_
 
 /* ---- streaming ---- */
 
+/* Settings we cannot honour: checked at start and again per frame (they may change while playing). */
+static gboolean
+check_settings (GstRdsVideoConvert * self)
+{
+  gint compute_hw, flip_method;
+
+  GST_OBJECT_LOCK (self);
+  compute_hw = self->compute_hw;
+  flip_method = self->flip_method;
+  GST_OBJECT_UNLOCK (self);
+
+  if (compute_hw == COMPUTE_HW_VIC) {
+    GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("compute-hw=VIC is not available"),
+        ("only the GPU (compute-hw 0 or 1) is supported"));
+    return FALSE;
+  }
+  if (flip_method != 0) {
+    GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("flip-method %d is not supported yet", flip_method),
+        ("only flip-method 0 (no rotation or flip) is supported"));
+    return FALSE;
+  }
+  return TRUE;
+}
+
 static gboolean
 gst_rds_video_convert_start (GstBaseTransform * trans)
 {
@@ -390,6 +568,9 @@ gst_rds_video_convert_start (GstBaseTransform * trans)
   int prev = 0;
   guint gpu_id;
   hipError_t err;
+
+  if (!check_settings (self))
+    return FALSE;
 
   GST_OBJECT_LOCK (self);
   gpu_id = self->gpu_id;
@@ -416,6 +597,7 @@ gst_rds_video_convert_stop (GstBaseTransform * trans)
 {
   GstRdsVideoConvert *self = GST_RDS_VIDEO_CONVERT (trans);
 
+  free_stages (self);
   if (self->stream != NULL) {
     if (hipStreamDestroy (self->stream) != hipSuccess)
       GST_WARNING_OBJECT (self, "hipStreamDestroy failed");
@@ -427,22 +609,114 @@ gst_rds_video_convert_stop (GstBaseTransform * trans)
   return TRUE;
 }
 
-/* The input's crop meta, clamped to the frame, as a source rect. FALSE if there is none (or it is empty). */
+/* The part of the input frame the conversion reads before src-crop: the input's crop meta clamped to the frame,
+ * else the whole frame. TRUE if a crop meta narrowed it. */
 static gboolean
-crop_meta_rect (GstRdsVideoConvert * self, GstBuffer * inbuf, RdsBufSurfTransformRect * rect)
+input_base_rect (GstRdsVideoConvert * self, GstBuffer * inbuf, RdsBufSurfTransformRect * rect)
 {
   GstVideoCropMeta *crop = gst_buffer_get_video_crop_meta (inbuf);
   guint w = GST_VIDEO_INFO_WIDTH (&self->in_info), h = GST_VIDEO_INFO_HEIGHT (&self->in_info);
 
-  if (crop == NULL || crop->x >= w || crop->y >= h)
+  rect->left = rect->top = 0;
+  rect->width = w;
+  rect->height = h;
+  if (crop == NULL || crop->x >= w || crop->y >= h || crop->width == 0 || crop->height == 0)
     return FALSE;
   rect->left = crop->x;
   rect->top = crop->y;
   rect->width = MIN (crop->width, w - crop->x);
   rect->height = MIN (crop->height, h - crop->y);
-  if (rect->left == 0 && rect->top == 0 && rect->width == w && rect->height == h)
+  return rect->left != 0 || rect->top != 0 || rect->width != w || rect->height != h;
+}
+
+/* @crop (relative to @base) clamped into @base, as nvvideoconvert documents for out-of-range crops. */
+static RdsBufSurfTransformRect
+clamp_rect (const RdsBufSurfTransformRect * base, const RdsBufSurfTransformRect * crop)
+{
+  RdsBufSurfTransformRect r;
+  guint32 left = MIN (crop->left, base->width), top = MIN (crop->top, base->height);
+
+  r.left = base->left + left;
+  r.top = base->top + top;
+  r.width = MIN (crop->width, base->width - left);
+  r.height = MIN (crop->height, base->height - top);
+  return r;
+}
+
+/* The black around dest-crop: Y 16, U/V 128 for YUV; every byte 0 for GRAY8 and RGB formats (alpha too). */
+static gboolean
+fill_black (RdsBufSurface * surf)
+{
+  RdsBufSurfaceParams *p = &surf->surfaceList[0];
+  gboolean yuv = p->colorFormat == RDS_BUF_COLOR_FORMAT_NV12 || p->colorFormat == RDS_BUF_COLOR_FORMAT_YUV420;
+
+  for (guint plane = 0; plane < p->planeParams.num_planes; plane++) {
+    guint8 v = yuv ? (plane == 0 ? 16 : 128) : 0;
+
+    if (rds_buf_surface_memset (surf, 0, (int) plane, v) != 0)
+      return FALSE;
+  }
+  return TRUE;
+}
+
+/* A device surface with @info's geometry for staging system-memory frames. */
+static gboolean
+ensure_stage (GstRdsVideoConvert * self, RdsBufSurface ** stage, const GstVideoInfo * info)
+{
+  RdsBufSurfaceCreateParams cp = {
+    .gpuId = self->stream_gpu,
+    .width = GST_VIDEO_INFO_WIDTH (info),
+    .height = GST_VIDEO_INFO_HEIGHT (info),
+    .colorFormat = rds_buf_color_format_from_video_format (GST_VIDEO_INFO_FORMAT (info)),
+    .layout = RDS_BUF_LAYOUT_PITCH,
+    .memType = RDS_BUF_MEM_DEFAULT,
+  };
+
+  if (*stage != NULL)
+    return TRUE;
+  if (rds_buf_surface_create (stage, 1, &cp) != 0) {
+    *stage = NULL;
     return FALSE;
-  return rect->width > 0 && rect->height > 0;
+  }
+  return TRUE;
+}
+
+/* Copies a mapped system frame into @stage (upload) or @stage into it. A frame whose planes the hand-built surface
+ * cannot describe (out of order, see rds_video_frame_wrap_surface) goes through a frame in the default layout. */
+static gboolean
+copy_frame (GstVideoFrame * frame, RdsBufSurface * stage, gboolean upload)
+{
+  RdsBufSurface wrap;
+  RdsBufSurfaceParams wrap_params;
+  GstVideoFrame tmp;
+  GstBuffer *tmpbuf = NULL;
+  gboolean ok;
+
+  if (!rds_video_frame_wrap_surface (frame, &wrap, &wrap_params)) {
+    GstVideoInfo info;
+
+    gst_video_info_set_format (&info, GST_VIDEO_FRAME_FORMAT (frame), GST_VIDEO_FRAME_WIDTH (frame),
+        GST_VIDEO_FRAME_HEIGHT (frame));
+    tmpbuf = gst_buffer_new_allocate (NULL, GST_VIDEO_INFO_SIZE (&info), NULL);
+    if (tmpbuf == NULL || !gst_video_frame_map (&tmp, &info, tmpbuf, GST_MAP_READWRITE)) {
+      gst_clear_buffer (&tmpbuf);
+      return FALSE;
+    }
+    if ((upload && !gst_video_frame_copy (&tmp, frame)) || !rds_video_frame_wrap_surface (&tmp, &wrap,
+            &wrap_params)) {
+      gst_video_frame_unmap (&tmp);
+      gst_buffer_unref (tmpbuf);
+      return FALSE;
+    }
+  }
+  ok = upload ? rds_buf_surface_copy (&wrap, stage) == 0 : rds_buf_surface_copy (stage, &wrap) == 0;
+  if (tmpbuf != NULL) {
+    if (ok && !upload)
+      ok = gst_video_frame_copy (frame, &tmp);
+    gst_video_frame_unmap (&tmp);
+    gst_buffer_unref (tmpbuf);
+  }
+  return ok;
 }
 
 static GstFlowReturn
@@ -450,42 +724,103 @@ gst_rds_video_convert_transform (GstBaseTransform * trans, GstBuffer * inbuf, Gs
 {
   GstRdsVideoConvert *self = GST_RDS_VIDEO_CONVERT (trans);
   RdsBufSurfTransformConfigParams session = {
-    .compute_mode = RdsBufSurfTransformCompute_Default,
     .gpu_id = (gint32) self->stream_gpu,
     .cuda_stream = self->stream,
   };
   RdsBufSurfTransformParams params = { 0 };
-  RdsBufSurfTransformRect src_rect;
+  RdsBufSurfTransformRect src_crop, dest_crop, base, src_rect, dst_rect;
   RdsBufSurfTransform_Error err;
   GstMapInfo in_map, out_map;
+  GstVideoFrame frame;
   RdsBufSurface *src, *dst;
-  GstFlowReturn ret = GST_FLOW_OK;
+  gboolean in_mapped = FALSE, out_mapped = FALSE, allow_odd_crop, meta_crop;
+  gint filter;
+  GstFlowReturn ret = GST_FLOW_ERROR;
 
-  if (rds_buffer_get_surface (inbuf) == NULL || rds_buffer_get_surface (outbuf) == NULL) {
-    GST_ELEMENT_ERROR (self, STREAM, NOT_IMPLEMENTED,
-        ("System-memory conversion is not implemented yet"), ("only memory:RDS to memory:RDS is supported"));
+  if (!check_settings (self))
+    return GST_FLOW_ERROR;
+  GST_OBJECT_LOCK (self);
+  src_crop = self->src_crop;
+  dest_crop = self->dest_crop;
+  filter = self->interpolation_method;
+  allow_odd_crop = self->allow_odd_crop;
+  session.compute_mode = (RdsBufSurfTransform_Compute) self->compute_hw;
+  GST_OBJECT_UNLOCK (self);
+
+  /* Rects first: nvvideoconvert clamps crops to the frame. src-crop is relative to the input's crop meta. */
+  meta_crop = input_base_rect (self, inbuf, &base);
+  src_rect = rect_is_set (&src_crop) ? clamp_rect (&base, &src_crop) : base;
+  if (rect_is_set (&dest_crop)) {
+    RdsBufSurfTransformRect frame_rect = { 0, 0, GST_VIDEO_INFO_WIDTH (&self->out_info),
+      GST_VIDEO_INFO_HEIGHT (&self->out_info)
+    };
+    dst_rect = clamp_rect (&frame_rect, &dest_crop);
+  } else {
+    dst_rect = (RdsBufSurfTransformRect) {
+    0, 0, GST_VIDEO_INFO_WIDTH (&self->out_info), GST_VIDEO_INFO_HEIGHT (&self->out_info)};
+  }
+  if (src_rect.width == 0 || src_rect.height == 0 || dst_rect.width == 0 || dst_rect.height == 0) {
+    GST_ELEMENT_ERROR (self, STREAM, FAILED, ("The crop rectangle is empty after clamping it to the frame"),
+        ("source %ux%u at %u,%u, destination %ux%u at %u,%u", src_rect.width, src_rect.height, src_rect.left,
+            src_rect.top, dst_rect.width, dst_rect.height, dst_rect.left, dst_rect.top));
     return GST_FLOW_ERROR;
   }
-  /* Mapping yields the surface; a WRITE map makes sure the output surface is ours alone. */
-  if (!gst_buffer_map (inbuf, &in_map, GST_MAP_READ))
-    goto map_failed;
-  if (!gst_buffer_map (outbuf, &out_map, GST_MAP_WRITE)) {
-    gst_buffer_unmap (inbuf, &in_map);
-    goto map_failed;
+
+  /* Source: the memory:RDS surface itself, or the system frame uploaded into the staging surface. */
+  if (self->in_rds) {
+    if (rds_buffer_get_surface (inbuf) == NULL || !gst_buffer_map (inbuf, &in_map, GST_MAP_READ))
+      goto map_failed;
+    in_mapped = TRUE;
+    src = (RdsBufSurface *) in_map.data;
+  } else {
+    gboolean ok;
+
+    if (!ensure_stage (self, &self->in_stage, &self->in_info))
+      goto stage_failed;
+    if (!gst_video_frame_map (&frame, &self->in_info, inbuf, GST_MAP_READ))
+      goto map_failed;
+    ok = copy_frame (&frame, self->in_stage, TRUE);
+    gst_video_frame_unmap (&frame);
+    if (!ok)
+      goto copy_failed;
+    src = self->in_stage;
   }
-  src = (RdsBufSurface *) in_map.data;
-  dst = (RdsBufSurface *) out_map.data;
+
+  /* Destination: the output surface (a WRITE map makes it ours alone), or the staging surface downloaded after. */
+  if (self->out_rds) {
+    if (rds_buffer_get_surface (outbuf) == NULL || !gst_buffer_map (outbuf, &out_map, GST_MAP_WRITE))
+      goto map_failed;
+    out_mapped = TRUE;
+    dst = (RdsBufSurface *) out_map.data;
+  } else {
+    if (!ensure_stage (self, &self->out_stage, &self->out_info))
+      goto stage_failed;
+    dst = self->out_stage;
+  }
 
   if (src->batchSize != 1 || dst->batchSize != 1) {
     GST_ELEMENT_ERROR (self, STREAM, NOT_IMPLEMENTED, ("Batched input arrives in Phase 4"),
         ("input batch size %u, output batch size %u; only 1 is supported", src->batchSize, dst->batchSize));
-    ret = GST_FLOW_ERROR;
     goto done;
   }
 
-  if (crop_meta_rect (self, inbuf, &src_rect)) {
+  params.transform_flag = RDS_BUFSURF_TRANSFORM_FILTER;
+  params.transform_filter = (RdsBufSurfTransform_Inter) filter;
+  if (allow_odd_crop)
+    params.transform_flag |= RDS_BUFSURF_TRANSFORM_ALLOW_ODD_CROP;
+  if (meta_crop || rect_is_set (&src_crop)) {
     params.transform_flag |= RDS_BUFSURF_TRANSFORM_CROP_SRC;
     params.src_rect = &src_rect;
+  }
+  if (dst_rect.left != 0 || dst_rect.top != 0 || dst_rect.width != (guint32) GST_VIDEO_INFO_WIDTH (&self->out_info)
+      || dst_rect.height != (guint32) GST_VIDEO_INFO_HEIGHT (&self->out_info)) {
+    params.transform_flag |= RDS_BUFSURF_TRANSFORM_CROP_DST;
+    params.dst_rect = &dst_rect;
+    /* the transform leaves pixels outside the rect alone: black them first (synchronous memset) */
+    if (!fill_black (dst)) {
+      GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot clear the output frame"), (NULL));
+      goto done;
+    }
   }
 
   /* Session parameters are per thread and shared by every element on this streaming thread: set ours before
@@ -496,18 +831,40 @@ gst_rds_video_convert_transform (GstBaseTransform * trans, GstBuffer * inbuf, Gs
   if (err != RdsBufSurfTransformError_Success) {
     GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Video conversion failed"),
         ("rds_buf_surf_transform: %s (%d)", transform_error_name (err), err));
-    ret = GST_FLOW_ERROR;
+    goto done;
   }
-  /* The transform is synchronous: the output is ready when it is pushed. */
+  /* The transform is synchronous: the output is ready when it is pushed (and the download below sees it). */
+
+  if (!self->out_rds) {
+    gboolean ok;
+
+    if (!gst_video_frame_map (&frame, &self->out_info, outbuf, GST_MAP_WRITE))
+      goto map_failed;
+    ok = copy_frame (&frame, self->out_stage, FALSE);
+    gst_video_frame_unmap (&frame);
+    if (!ok)
+      goto copy_failed;
+  }
+  ret = GST_FLOW_OK;
 
 done:
-  gst_buffer_unmap (outbuf, &out_map);
-  gst_buffer_unmap (inbuf, &in_map);
+  if (out_mapped)
+    gst_buffer_unmap (outbuf, &out_map);
+  if (in_mapped)
+    gst_buffer_unmap (inbuf, &in_map);
   return ret;
 
 map_failed:
-  GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot map a memory:RDS buffer"), (NULL));
-  return GST_FLOW_ERROR;
+  GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot map a buffer"), ("memory:RDS input %d, output %d",
+          self->in_rds, self->out_rds));
+  goto done;
+stage_failed:
+  GST_ELEMENT_ERROR (self, RESOURCE, NO_SPACE_LEFT, ("Cannot allocate a staging surface on GPU %u",
+          self->stream_gpu), (NULL));
+  goto done;
+copy_failed:
+  GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot copy a frame between system and device memory"), (NULL));
+  goto done;
 }
 
 /* ---- properties ---- */
@@ -548,24 +905,63 @@ gst_rds_video_convert_set_property (GObject * object, guint prop_id, const GValu
         self->output_buffers = g_value_get_uint (value);
       break;
     case PROP_DISABLE_PASSTHROUGH:
-      if (self->disable_passthrough != g_value_get_boolean (value)) {
-        self->disable_passthrough = g_value_get_boolean (value);
-        passthrough = self->caps_equal && !self->disable_passthrough;
-        update_passthrough = TRUE;
-      }
+      self->disable_passthrough = g_value_get_boolean (value);
+      update_passthrough = TRUE;
       break;
     case PROP_SILENT:
       self->silent = g_value_get_boolean (value);
+      break;
+    case PROP_SRC_CROP:
+    case PROP_DEST_CROP:{
+      const gchar *str = g_value_get_string (value);
+      RdsBufSurfTransformRect rect;
+      gchar **slot = prop_id == PROP_SRC_CROP ? &self->src_crop_str : &self->dest_crop_str;
+
+      if (!rds_video_parse_rect (str, &rect)) {
+        g_warning ("%s: invalid %s \"%s\" (expected left:top:width:height); keeping \"%s\"",
+            GST_OBJECT_NAME (self), pspec->name, str, *slot);
+        break;
+      }
+      g_free (*slot);
+      *slot = g_strdup (str != NULL ? str : "");
+      if (prop_id == PROP_SRC_CROP)
+        self->src_crop = rect;
+      else
+        self->dest_crop = rect;
+      update_passthrough = TRUE;
+      break;
+    }
+    case PROP_INTERPOLATION_METHOD:
+      self->interpolation_method = g_value_get_enum (value);
+      break;
+    case PROP_COMPUTE_HW:
+      self->compute_hw = g_value_get_enum (value);
+      break;
+    case PROP_FLIP_METHOD:
+      self->flip_method = g_value_get_enum (value);
+      update_passthrough = TRUE;
+      break;
+    case PROP_ALLOW_ODD_CROP:
+      self->allow_odd_crop = g_value_get_boolean (value);
+      break;
+    case PROP_CONTIGUOUS_BUFFERS:
+      self->contiguous_buffers = g_value_get_boolean (value);
+      break;
+    case PROP_COPY_HW:
+      self->copy_hw = g_value_get_enum (value);
+      break;
+    case PROP_BL_OUTPUT:
+      self->bl_output = g_value_get_boolean (value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
   }
+  if (update_passthrough)
+    passthrough = want_passthrough (self);
   GST_OBJECT_UNLOCK (self);
 
-  if (update_passthrough) {
-    gboolean was = gst_base_transform_is_passthrough (trans);
-
+  if (update_passthrough && passthrough != gst_base_transform_is_passthrough (trans)) {
     /* Narrow race, accepted: set_caps on the streaming thread may compute passthrough from new caps between our
      * unlock and set_passthrough below, and the last writer wins. It only matters if the caps change at that very
      * moment; the next caps or property change corrects it. */
@@ -574,8 +970,7 @@ gst_rds_video_convert_set_property (GObject * object, guint prop_id, const GValu
     gst_base_transform_set_passthrough (trans, passthrough);
     gst_base_transform_reconfigure_src (trans);
     /* upstream's allocation (our proposal or downstream's) changes with passthrough */
-    if (was != gst_base_transform_is_passthrough (trans))
-      gst_pad_push_event (GST_BASE_TRANSFORM_SINK_PAD (trans), gst_event_new_reconfigure ());
+    gst_pad_push_event (GST_BASE_TRANSFORM_SINK_PAD (trans), gst_event_new_reconfigure ());
   }
 }
 
@@ -601,11 +996,48 @@ gst_rds_video_convert_get_property (GObject * object, guint prop_id, GValue * va
     case PROP_SILENT:
       g_value_set_boolean (value, self->silent);
       break;
+    case PROP_SRC_CROP:
+      g_value_set_string (value, self->src_crop_str);
+      break;
+    case PROP_DEST_CROP:
+      g_value_set_string (value, self->dest_crop_str);
+      break;
+    case PROP_INTERPOLATION_METHOD:
+      g_value_set_enum (value, self->interpolation_method);
+      break;
+    case PROP_COMPUTE_HW:
+      g_value_set_enum (value, self->compute_hw);
+      break;
+    case PROP_FLIP_METHOD:
+      g_value_set_enum (value, self->flip_method);
+      break;
+    case PROP_ALLOW_ODD_CROP:
+      g_value_set_boolean (value, self->allow_odd_crop);
+      break;
+    case PROP_CONTIGUOUS_BUFFERS:
+      g_value_set_boolean (value, self->contiguous_buffers);
+      break;
+    case PROP_COPY_HW:
+      g_value_set_enum (value, self->copy_hw);
+      break;
+    case PROP_BL_OUTPUT:
+      g_value_set_boolean (value, self->bl_output);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
   }
   GST_OBJECT_UNLOCK (self);
+}
+
+static void
+gst_rds_video_convert_finalize (GObject * object)
+{
+  GstRdsVideoConvert *self = GST_RDS_VIDEO_CONVERT (object);
+
+  g_free (self->src_crop_str);
+  g_free (self->dest_crop_str);
+  G_OBJECT_CLASS (gst_rds_video_convert_parent_class)->finalize (object);
 }
 
 static void
@@ -621,6 +1053,7 @@ gst_rds_video_convert_class_init (GstRdsVideoConvertClass * klass)
 
   gobject_class->set_property = gst_rds_video_convert_set_property;
   gobject_class->get_property = gst_rds_video_convert_get_property;
+  gobject_class->finalize = gst_rds_video_convert_finalize;
 
   g_object_class_install_property (gobject_class, PROP_GPU_ID,
       g_param_spec_uint ("gpu-id", "GPU id", "GPU used for the conversion", 0, G_MAXUINT, DEFAULT_GPU_ID,
@@ -637,6 +1070,36 @@ gst_rds_video_convert_class_init (GstRdsVideoConvertClass * klass)
   g_object_class_install_property (gobject_class, PROP_SILENT,
       g_param_spec_boolean ("silent", "Silent", "Accepted for compatibility; has no effect", DEFAULT_SILENT,
           flags));
+  g_object_class_install_property (gobject_class, PROP_SRC_CROP,
+      g_param_spec_string ("src-crop", "Source crop",
+          "Part of the input to convert, as left:top:width:height; clamped to the frame and, when the input has a "
+          "crop meta, relative to that crop. Empty: everything", "", flags));
+  g_object_class_install_property (gobject_class, PROP_DEST_CROP,
+      g_param_spec_string ("dest-crop", "Destination crop",
+          "Where the picture goes in the output, as left:top:width:height; clamped to the frame, the rest is "
+          "filled with black. Empty: the whole frame", "", flags));
+  g_object_class_install_property (gobject_class, PROP_INTERPOLATION_METHOD,
+      g_param_spec_enum ("interpolation-method", "Interpolation method", "Filter used for scaling",
+          GST_TYPE_RDS_INTERPOLATION_METHOD, DEFAULT_INTERPOLATION_METHOD, flags));
+  g_object_class_install_property (gobject_class, PROP_COMPUTE_HW,
+      g_param_spec_enum ("compute-hw", "Compute hardware", "Engine that runs the conversion",
+          GST_TYPE_RDS_COMPUTE_HW, DEFAULT_COMPUTE_HW, flags));
+  g_object_class_install_property (gobject_class, PROP_FLIP_METHOD,
+      g_param_spec_enum ("flip-method", "Flip method", "Rotation or mirroring (only 0 is supported yet)",
+          GST_TYPE_RDS_VIDEO_FLIP_METHOD, DEFAULT_FLIP_METHOD, flags));
+  g_object_class_install_property (gobject_class, PROP_ALLOW_ODD_CROP,
+      g_param_spec_boolean ("allow-odd-crop", "Allow odd crop",
+          "Accept odd destination crops on 4:2:0 output by widening them to even coordinates",
+          DEFAULT_ALLOW_ODD_CROP, flags));
+  g_object_class_install_property (gobject_class, PROP_CONTIGUOUS_BUFFERS,
+      g_param_spec_boolean ("contiguous-buffers", "Contiguous buffers",
+          "Accepted for compatibility; batches are always contiguous", DEFAULT_CONTIGUOUS_BUFFERS, flags));
+  g_object_class_install_property (gobject_class, PROP_COPY_HW,
+      g_param_spec_enum ("copy-hw", "Copy hardware", "Accepted for compatibility; copies run on the GPU",
+          GST_TYPE_RDS_COPY_HW_TYPE, DEFAULT_COPY_HW, flags));
+  g_object_class_install_property (gobject_class, PROP_BL_OUTPUT,
+      g_param_spec_boolean ("bl-output", "Block-linear output",
+          "Accepted for compatibility (Jetson only); output is always pitch-linear", DEFAULT_BL_OUTPUT, flags));
 
   gst_element_class_add_static_pad_template (element_class, &sink_template);
   gst_element_class_add_static_pad_template (element_class, &src_template);
@@ -657,6 +1120,10 @@ gst_rds_video_convert_class_init (GstRdsVideoConvertClass * klass)
   trans_class->passthrough_on_same_caps = FALSE;
 
   gst_type_mark_as_plugin_api (GST_TYPE_RDS_VID_CONV_BUF_MEMORY_TYPE, 0);
+  gst_type_mark_as_plugin_api (GST_TYPE_RDS_INTERPOLATION_METHOD, 0);
+  gst_type_mark_as_plugin_api (GST_TYPE_RDS_COMPUTE_HW, 0);
+  gst_type_mark_as_plugin_api (GST_TYPE_RDS_VIDEO_FLIP_METHOD, 0);
+  gst_type_mark_as_plugin_api (GST_TYPE_RDS_COPY_HW_TYPE, 0);
 }
 
 static void
@@ -667,6 +1134,15 @@ gst_rds_video_convert_init (GstRdsVideoConvert * self)
   self->output_buffers = DEFAULT_OUTPUT_BUFFERS;
   self->disable_passthrough = DEFAULT_DISABLE_PASSTHROUGH;
   self->silent = DEFAULT_SILENT;
+  self->src_crop_str = g_strdup ("");
+  self->dest_crop_str = g_strdup ("");
+  self->interpolation_method = DEFAULT_INTERPOLATION_METHOD;
+  self->compute_hw = DEFAULT_COMPUTE_HW;
+  self->flip_method = DEFAULT_FLIP_METHOD;
+  self->allow_odd_crop = DEFAULT_ALLOW_ODD_CROP;
+  self->contiguous_buffers = DEFAULT_CONTIGUOUS_BUFFERS;
+  self->copy_hw = DEFAULT_COPY_HW;
+  self->bl_output = DEFAULT_BL_OUTPUT;
   gst_video_info_init (&self->in_info);
   gst_video_info_init (&self->out_info);
 }
