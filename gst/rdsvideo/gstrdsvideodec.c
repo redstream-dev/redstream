@@ -48,7 +48,6 @@ struct _GstRdsVideoDec
   RocdecVideoFormat format;     /* the sequence the decoder was created for */
   guint num_surfaces;
   guint out_width, out_height;  /* display size: the decoder's output, already cropped */
-  gboolean output_rds;          /* negotiated memory:RDS output */
   /* results of the callbacks during one rocDecParseVideoData call */
   GstFlowReturn cb_flow;        /* non-OK: stop and return it (an error was already posted if needed) */
   gboolean cb_decode_error;     /* a picture failed to decode or to come out */
@@ -148,10 +147,15 @@ decoder_matches (GstRdsVideoDec * self, const RocdecVideoFormat * fmt)
       && self->num_surfaces >= (guint) fmt->min_num_decode_surfaces + EXTRA_DECODE_SURFACES;
 }
 
-/* rocDecode quirk (rocDecode 1.10, ROCm 10.1, Mesa VA on RDNA2): the first rocDecGetVideoFrame of a decode surface
- * maps a picture of zeros even after its decode completed; every later mapping of that surface is correct. Mapping
- * each surface once before anything is decoded into it avoids the bad frame. These calls report an error (there is
- * no decoded picture yet), but the mapping they set up is kept. */
+/* Works around lost first pictures on small surfaces (seen with rocDecode 1.10 on Mesa 25.2 radeonsi). rocDecode
+ * exports a VA surface to HIP lazily, on the first rocDecGetVideoFrame of that surface. Mesa's amdgpu winsys
+ * slab-suballocates buffers of 1 MiB or less, and exporting a suballocated texture (vaExportSurfaceHandle ->
+ * si_texture_get_handle) moves it into a buffer of its own without its content. So for NV12 surfaces of at most
+ * 1 MiB (e.g. 320x240), the picture decoded before the first export comes out as zeros; later pictures in that
+ * surface are fine. Mapping every surface once before anything is decoded forces the export (and the move) up
+ * front. These calls report an error, since nothing is decoded yet, but the export they trigger is kept. For larger
+ * surfaces the export moves nothing and this is harmless. The proper fix is for rocDecode to create its surfaces
+ * with VA_SURFACE_ATTRIB_USAGE_HINT_EXPORT. */
 static void
 premap_surfaces (GstRdsVideoDec * self)
 {
@@ -215,7 +219,7 @@ set_output_state (GstRdsVideoDec * self, guint width, guint height)
   GstVideoDecoder *dec = GST_VIDEO_DECODER (self);
   GstVideoCodecState *state;
   GstCaps *rds_caps, *peer;
-  gboolean rds;
+  gboolean rds, ok;
 
   state = gst_video_decoder_set_output_state (dec, GST_VIDEO_FORMAT_NV12, width, height, self->input_state);
   if (state == NULL)
@@ -232,10 +236,31 @@ set_output_state (GstRdsVideoDec * self, guint width, guint height)
     state->caps = gst_video_info_to_caps (&state->info);
   }
   GST_DEBUG_OBJECT (self, "output caps %" GST_PTR_FORMAT, state->caps);
-  gst_video_codec_state_unref (state);
   self->out_width = width;
   self->out_height = height;
-  return gst_video_decoder_negotiate (dec);
+  ok = gst_video_decoder_negotiate (dec);
+  if (!ok && rds) {
+    /* downstream said it takes memory:RDS but then refused it (caps or allocation): fall back to system memory */
+    GST_INFO_OBJECT (self, "memory:RDS output did not negotiate, retrying with system memory");
+    gst_clear_caps (&state->caps);
+    gst_clear_caps (&state->allocation_caps);
+    state->caps = gst_video_info_to_caps (&state->info);
+    ok = gst_video_decoder_negotiate (dec);
+  }
+  gst_video_codec_state_unref (state);
+  return ok;
+}
+
+/* TRUE if the current output caps carry memory:RDS (what on_display copies into). */
+static gboolean
+output_is_rds (GstRdsVideoDec * self)
+{
+  GstVideoCodecState *state = gst_video_decoder_get_output_state (GST_VIDEO_DECODER (self));
+  gboolean rds = state != NULL && state->caps != NULL && rds_caps_has_memory_rds (state->caps);
+
+  if (state != NULL)
+    gst_video_codec_state_unref (state);
+  return rds;
 }
 
 /* ---- parser callbacks (called from rocDecParseVideoData, under the stream lock) ---- */
@@ -274,7 +299,8 @@ on_sequence (void *user_data, RocdecVideoFormat * fmt)
   if (decoder_matches (self, fmt))
     return (int) self->num_surfaces;
 
-  /* A new or changed sequence. TODO (resolution changes): rocDecReconfigureDecoder when the new coded size fits. */
+  /* A new or changed sequence. TODO (resolution changes): rocDecReconfigureDecoder when the new coded size fits,
+   * then premap_surfaces () again: reconfiguring recreates the VA surfaces. */
   destroy_decoder (self);
   if (!create_decoder (self, fmt, width, height)) {
     self->cb_flow = GST_FLOW_ERROR;
@@ -325,7 +351,7 @@ copy_picture (GstRdsVideoDec * self, GstBuffer * outbuf, void *planes[3], const 
   RdsBufSurface *surf = NULL;
   hipError_t err = hipSuccess;
 
-  if (self->output_rds) {
+  if (output_is_rds (self)) {
     RdsBufSurfaceParams *p;
 
     if (rds_buffer_get_surface (outbuf) == NULL || !gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
@@ -368,6 +394,7 @@ copy_picture (GstRdsVideoDec * self, GstBuffer * outbuf, void *planes[3], const 
     (void) hipStreamSynchronize (self->stream);
 
   if (surf != NULL) {
+    /* the producer states what it filled, whatever the pool initialised */
     surf->numFilled = 1;
     gst_buffer_unmap (outbuf, &map);
   } else {
@@ -419,6 +446,8 @@ on_display (void *user_data, RocdecParserDispInfo * info)
   ret = gst_video_decoder_allocate_output_frame (dec, frame);
   if (ret != GST_FLOW_OK) {
     GST_DEBUG_OBJECT (self, "cannot allocate an output frame: %s", gst_flow_get_name (ret));
+    if (ret == GST_FLOW_ERROR)
+      GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Cannot allocate an output buffer"), (NULL));
     self->cb_flow = ret;
     gst_video_decoder_release_frame (dec, frame);
     return 1;
@@ -548,7 +577,6 @@ gst_rds_video_dec_stop (GstVideoDecoder * dec)
   }
   g_clear_pointer (&self->input_state, gst_video_codec_state_unref);
   self->out_width = self->out_height = 0;
-  self->output_rds = FALSE;
   return TRUE;
 }
 
@@ -638,8 +666,7 @@ gst_rds_video_dec_decide_allocation (GstVideoDecoder * dec, GstQuery * query)
   gst_query_parse_allocation (query, &caps, NULL);
   if (caps == NULL)
     return FALSE;
-  self->output_rds = rds_caps_has_memory_rds (caps);
-  if (!self->output_rds)
+  if (!rds_caps_has_memory_rds (caps))
     return GST_VIDEO_DECODER_CLASS (gst_rds_video_dec_parent_class)->decide_allocation (dec, query);
 
   /* writes the pool into the query, where the base class picks it up */

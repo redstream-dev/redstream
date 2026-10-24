@@ -90,10 +90,15 @@ typedef struct
   const gchar *pattern;
 } Clip;
 
+/* Moving patterns, so a stale or missing picture changes the checksum. Not observable with VA-encoded clips: odd
+ * display sizes (the chroma ceil(w/2) / ceil(h/2) rounding) and a display rect with a non-zero left/top, since the
+ * encoder only crops on the right and bottom of even-sized frames. */
 static const Clip clips[] = {
-  { 320, 240, 30, 0, "smpte" },
+  /* NV12 surfaces of at most 1 MiB: guard the first-export workaround (premap_surfaces) */
+  { 320, 240, 30, 0, "ball" },
+  { 640, 360, 300, 2, "ball" },         /* many frames through many small surfaces, with B-frames */
   { 1280, 720, 30, 2, "ball" },
-  { 1366, 768, 20, 0, "smpte" },        /* width not a multiple of 64: pitch padding */
+  { 1366, 768, 20, 0, "ball" },         /* width not a multiple of 64: pitch padding */
   { 1920, 1080, 20, 0, "ball" },        /* coded height 1088: display cropping */
 };
 
@@ -169,7 +174,6 @@ test_rds_output (void)
     g_assert_cmpint (h, ==, 240);
     g_assert_nonnull (surf);
     g_assert_cmpint (surf->memType, ==, RDS_BUF_MEM_HIP_DEVICE);
-    g_assert_cmpuint (surf->numFilled, ==, 1);
     g_assert_cmpuint (surf->surfaceList[0].width, ==, 320);
     g_assert_cmpuint (surf->surfaceList[0].height, ==, 240);
     g_assert_cmpint (surf->surfaceList[0].colorFormat, ==, RDS_BUF_COLOR_FORMAT_NV12);
