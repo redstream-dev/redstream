@@ -176,7 +176,11 @@ struct _GstRdsStreamMux
   gboolean in_flight;           /* the source thread is handling a batch or a source's event */
   gboolean can_push;            /* output caps negotiated */
   GRecMutex push_lock;          /* serializes our event pushes across threads (taken before events_lock). Recursive:
-                                 * a probe releasing a pad from inside our push re-enters send_event */
+                                 * a probe releasing a pad from inside our push re-enters send_event. The source
+                                 * thread only holds it while in_flight is set, so another thread holding it is
+                                 * never waiting for the source thread (it pushes directly only when !in_flight).
+                                 * A downstream element whose serialized-event handler waits on the releasing
+                                 * thread could still deadlock against a direct pad-deleted push. */
 
   /* wakes aggregate () waiting with every source ended under drop-pipeline-eos (wait_lock) */
   GMutex wait_lock;
@@ -679,7 +683,8 @@ gst_rds_stream_mux_sink_event (GstAggregator * agg, GstAggregatorPad * aggpad, G
 
   if (queued) {
     events_enter (self);
-    if (pad_announce (self, pad))
+    /* a released pad may have sent pad-deleted already (directly, from the releasing thread): nothing after it */
+    if (pad_announce (self, pad) && g_atomic_int_get (&pad->state) == PAD_STATE_ADDED)
       pad_stream_event (self, pad, event);
   }
 

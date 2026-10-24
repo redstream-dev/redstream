@@ -390,5 +390,12 @@ main (int argc, char **argv)
   g_test_add_func ("/event/switchable", test_switchable);
   g_test_add_func ("/event/malformed", test_malformed);
   g_test_add_func ("/event/passes-elements", test_passes_elements);
-  return g_test_run ();
+  {
+    /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
+     * process exit otherwise (seen under parallel ASan runs) */
+    int ret = g_test_run ();
+
+    gst_deinit ();
+    return ret;
+  }
 }

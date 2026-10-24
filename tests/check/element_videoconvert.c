@@ -1946,5 +1946,12 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/videoconvert/odd-dest-crop", test_odd_dest_crop);
   g_test_add_func ("/gpu/videoconvert/interpolation", test_interpolation);
   g_test_add_func ("/gpu/videoconvert/crop-passthrough", test_crop_passthrough);
-  return g_test_run ();
+  {
+    /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
+     * process exit otherwise (seen under parallel ASan runs) */
+    int ret = g_test_run ();
+
+    gst_deinit ();
+    return ret;
+  }
 }

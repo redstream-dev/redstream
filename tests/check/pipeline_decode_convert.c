@@ -625,5 +625,12 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/pipeline/size-change-fallback", test_size_change_fallback);
   g_test_add_func ("/gpu/pipeline/end-to-end", test_end_to_end);
   g_test_add_func ("/gpu/soak/decode-convert", test_soak);
-  return g_test_run ();
+  {
+    /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
+     * process exit otherwise (seen under parallel ASan runs) */
+    int ret = g_test_run ();
+
+    gst_deinit ();
+    return ret;
+  }
 }

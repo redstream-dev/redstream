@@ -70,5 +70,12 @@ main (int argc, char **argv)
   g_test_add_func ("/compat-header/factory-make-aliased", test_macro_remaps_aliased_name);
   g_test_add_func ("/compat-header/parse-launch-aliased", test_macro_remaps_parse_launch);
   g_test_add_func ("/compat-header/function-pointer", test_function_pointer_still_works);
-  return g_test_run ();
+  {
+    /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
+     * process exit otherwise (seen under parallel ASan runs) */
+    int ret = g_test_run ();
+
+    gst_deinit ();
+    return ret;
+  }
 }

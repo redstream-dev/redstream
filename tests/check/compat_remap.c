@@ -131,5 +131,12 @@ main (int argc, char **argv)
   g_test_add_func ("/compat/factory-make-remaps", test_factory_make_remaps);
   g_test_add_func ("/compat/parse-launch-remaps", test_parse_launch_remaps);
   g_test_add_func ("/compat/parse-launch-error-names-rds", test_parse_launch_error_names_rds);
-  return g_test_run ();
+  {
+    /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
+     * process exit otherwise (seen under parallel ASan runs) */
+    int ret = g_test_run ();
+
+    gst_deinit ();
+    return ret;
+  }
 }
