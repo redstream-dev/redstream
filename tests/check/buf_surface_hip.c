@@ -295,6 +295,65 @@ test_sync_unmapped (void)
   g_assert_cmpint (rds_buf_surface_destroy (s), ==, 0);
 }
 
+/* Library copies, memsets and staging syncs run on the calling thread's per-thread stream, so they don't wait for
+ * unrelated work on other blocking streams (the legacy null stream would). A blocking stream holds a long chain of
+ * memsets on a scratch buffer; each library call must return while that stream is still busy. */
+static void
+test_copy_not_serialized (void)
+{
+  const gsize scratch_size = 64 << 20;
+  const guint chain = 400;
+  hipStream_t busy = NULL;
+  void *scratch = NULL;
+  RdsBufSurface *a, *b, *sys;
+  gint64 t0, t_calls, t_done;
+  hipError_t after_copy, after_memset, after_sync;
+
+  RDS_TEST_REQUIRE_GPU ();
+  a = create (RDS_BUF_MEM_DEFAULT, 256, 128, 1);
+  b = create (RDS_BUF_MEM_DEFAULT, 256, 128, 1);
+  sys = create (RDS_BUF_MEM_SYSTEM, 256, 128, 1);
+  g_assert_cmpint (rds_buf_surface_memset (a, 0, -1, 0x5a), ==, 0);
+  g_assert_cmpint (rds_buf_surface_map (b, 0, -1, RDS_BUF_MAP_READ), ==, 0);
+  a->numFilled = 1;
+
+  g_assert_cmpint (hipStreamCreate (&busy), ==, hipSuccess);     /* blocking flags, as the null stream sees it */
+  g_assert_cmpint (hipMalloc (&scratch, scratch_size), ==, hipSuccess);
+  g_assert_cmpint (hipDeviceSynchronize (), ==, hipSuccess);
+
+  t0 = g_get_monotonic_time ();
+  for (guint i = 0; i < chain; i++)
+    g_assert_cmpint (hipMemsetAsync (scratch, (int) (i & 0xff), scratch_size, busy), ==, hipSuccess);
+
+  g_assert_cmpint (rds_buf_surface_copy (a, b), ==, 0);
+  after_copy = hipStreamQuery (busy);
+  g_assert_cmpint (rds_buf_surface_memset (a, 0, -1, 0x11), ==, 0);
+  after_memset = hipStreamQuery (busy);
+  g_assert_cmpint (rds_buf_surface_sync_for_cpu (b, 0, -1), ==, 0);
+  after_sync = hipStreamQuery (busy);
+  t_calls = g_get_monotonic_time ();
+  g_assert_cmpint (hipStreamSynchronize (busy), ==, hipSuccess);
+  t_done = g_get_monotonic_time ();
+  g_test_message ("library calls returned after %" G_GINT64_FORMAT " us; busy stream done after %" G_GINT64_FORMAT
+      " us", t_calls - t0, t_done - t0);
+
+  /* The calls did their work, without waiting. */
+  g_assert_cmpuint (((guint8 *) b->surfaceList[0].mappedAddr.addr[0])[0], ==, 0x5a);
+  a->numFilled = 1;
+  g_assert_cmpint (rds_buf_surface_copy (a, sys), ==, 0);
+  g_assert_cmpuint (((guint8 *) sys->surfaceList[0].dataPtr)[0], ==, 0x11);
+  g_assert_cmpint (after_copy, ==, hipErrorNotReady);
+  g_assert_cmpint (after_memset, ==, hipErrorNotReady);
+  g_assert_cmpint (after_sync, ==, hipErrorNotReady);
+
+  g_assert_cmpint (hipFree (scratch), ==, hipSuccess);
+  g_assert_cmpint (hipStreamDestroy (busy), ==, hipSuccess);
+  g_assert_cmpint (rds_buf_surface_unmap (b, 0, -1), ==, 0);
+  g_assert_cmpint (rds_buf_surface_destroy (sys), ==, 0);
+  g_assert_cmpint (rds_buf_surface_destroy (b), ==, 0);
+  g_assert_cmpint (rds_buf_surface_destroy (a), ==, 0);
+}
+
 /* Resident set size of this process in KiB. Pinned hipHostMalloc memory is counted here, not in VmPin or VmLck
  * (checked with ROCm 10.1: a 64 MiB hipHostMalloc raises VmRSS by 64 MiB and leaves VmPin/VmLck at 0). */
 static gsize
@@ -378,5 +437,6 @@ main (int argc, char **argv)
   }
   g_test_add_func ("/buf-surface-hip/device/sync-unmapped", test_sync_unmapped);
   g_test_add_func ("/buf-surface-hip/device/no-leak", test_no_leak);
+  g_test_add_func ("/buf-surface-hip/device/copy-not-serialized", test_copy_not_serialized);
   return g_test_run ();
 }

@@ -120,6 +120,15 @@ rds_device_leave (guint32 gpu, int prev)
     RDS_HIP_CHECK (hipSetDevice (prev));
 }
 
+/* Library copies, memsets and staging syncs are queued on the calling thread's per-thread stream, then this waits
+ * for them: the calls stay synchronous (ready-on-push), without the legacy null stream, which would also wait for
+ * every other blocking stream on the device. The caller has made the device current. */
+static gboolean
+sync_thread_stream (void)
+{
+  return RDS_HIP_CHECK (hipStreamSynchronize (hipStreamPerThread));
+}
+
 /* Fills the geometry of one surface (everything except dataPtr and mappedAddr). */
 static void
 fill_params (RdsBufSurfaceParams * sp, const RdsBufSurfaceCreateParams * params,
@@ -425,7 +434,8 @@ rds_buf_surface_unmap (RdsBufSurface * surf, int index, int plane)
   return for_each_plane (surf, index, plane, unmap_plane, NULL);
 }
 
-/* Copies one plane between device memory and its staging mirror. The caller has made the device current. */
+/* Copies one plane between device memory and its staging mirror, queued on the per-thread stream. The caller has
+ * made the device current and synchronizes the stream. */
 static gboolean
 sync_plane (RdsBufSurface * surf, guint index, guint plane, gboolean to_cpu)
 {
@@ -442,8 +452,9 @@ sync_plane (RdsBufSurface * surf, guint index, guint plane, gboolean to_cpu)
   /* Recompute rather than trust mappedAddr, which callers can overwrite. */
   host = priv->staging + index * priv->stride + pp->offset[plane];
   if (to_cpu)
-    return RDS_HIP_CHECK (hipMemcpy (host, dev, pp->psize[plane], hipMemcpyDeviceToHost));
-  return RDS_HIP_CHECK (hipMemcpy (dev, host, pp->psize[plane], hipMemcpyHostToDevice));
+    return RDS_HIP_CHECK (hipMemcpyAsync (host, dev, pp->psize[plane], hipMemcpyDeviceToHost,
+            hipStreamPerThread));
+  return RDS_HIP_CHECK (hipMemcpyAsync (dev, host, pp->psize[plane], hipMemcpyHostToDevice, hipStreamPerThread));
 }
 
 static gboolean
@@ -479,6 +490,9 @@ sync_surface (RdsBufSurface * surf, int index, int plane, PlaneFunc fn)
   if (!rds_device_enter (surf->gpuId, &prev_dev))
     return -1;
   ret = for_each_plane (surf, index, plane, fn, NULL);
+  /* Drain even after a failure: earlier planes may still be in flight. */
+  if (!sync_thread_stream ())
+    ret = -1;
   rds_device_leave (surf->gpuId, prev_dev);
   return ret;
 }
@@ -512,7 +526,7 @@ memset_plane (RdsBufSurface * surf, guint index, guint plane, gpointer data)
     memset (ptr, value, sp->planeParams.psize[plane]);
     return TRUE;
   }
-  return RDS_HIP_CHECK (hipMemset (ptr, value, sp->planeParams.psize[plane]));
+  return RDS_HIP_CHECK (hipMemsetAsync (ptr, value, sp->planeParams.psize[plane], hipStreamPerThread));
 }
 
 int
@@ -531,8 +545,7 @@ rds_buf_surface_memset (RdsBufSurface * surf, int index, int plane, guint8 value
   if (!rds_device_enter (surf->gpuId, &prev_dev))
     return -1;
   ret = for_each_plane (surf, index, plane, memset_plane, GUINT_TO_POINTER (value));
-  /* Library operations are synchronous (ready-on-push). */
-  if (ret == 0 && !RDS_HIP_CHECK (hipStreamSynchronize (NULL)))
+  if (!sync_thread_stream ())
     ret = -1;
   rds_device_leave (surf->gpuId, prev_dev);
   return ret;
@@ -580,8 +593,8 @@ copy_planes (const RdsBufSurface * src, RdsBufSurface * dst, gboolean host_copy)
         for (guint32 y = 0; y < rows; y++)
           memcpy (dptr + (gsize) y * d->planeParams.pitch[p], sptr + (gsize) y * s->planeParams.pitch[p],
               row_bytes);
-      } else if (!RDS_HIP_CHECK (hipMemcpy2D (dptr, d->planeParams.pitch[p], sptr, s->planeParams.pitch[p],
-                  row_bytes, rows, hipMemcpyDefault))) {
+      } else if (!RDS_HIP_CHECK (hipMemcpy2DAsync (dptr, d->planeParams.pitch[p], sptr, s->planeParams.pitch[p],
+                  row_bytes, rows, hipMemcpyDefault, hipStreamPerThread))) {
         return FALSE;
       }
     }
@@ -625,8 +638,8 @@ rds_buf_surface_copy (const RdsBufSurface * src, RdsBufSurface * dst)
     gpu = is_cpu_only (dst->memType) ? src->gpuId : dst->gpuId;
     if (!rds_device_enter (gpu, &prev_dev))
       return -1;
-    /* Library operations are synchronous (ready-on-push). */
-    ok = copy_planes (src, dst, FALSE) && RDS_HIP_CHECK (hipStreamSynchronize (NULL));
+    ok = copy_planes (src, dst, FALSE);
+    ok = sync_thread_stream () && ok;
     rds_device_leave (gpu, prev_dev);
     if (!ok)
       return -1;

@@ -183,7 +183,8 @@ meson test -C build-asan --print-errorlogs
 - Library symbols are hidden by default. Mark public API with `RDS_API` (from `rds/rds-prelude.h`).
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
 - **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never
-  waits on a stream. Library copies and memsets are synchronous.
+  waits on a stream. Library copies and memsets are synchronous, on the calling thread's per-thread stream
+  (`hipStreamPerThread`), so they never wait for unrelated work on the legacy null stream.
 - Transform sessions are per thread and streaming threads are shared: elements set the transform session before
   each call and restore the previous one after (`rds_buf_surf_transform_get_session_params` first).
 - `memory:RDS` is not `NO_SHARE`: shallow buffer copies share the surface. Pixel writers must own the memory
