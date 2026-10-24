@@ -55,11 +55,13 @@ RDS_API RdsBufSurface *rds_buffer_get_surface (GstBuffer * buffer);
  * gst_buffer_copy_deep () also give owned copies. Calling gst_buffer_map (WRITE) on a non-writable buffer is a
  * programming error, as for any buffer.
  *
- * CPU access to a device-memory view (rds_buf_surface_map and the sync calls) goes through a staging mirror owned
- * by the view and freed with it. Library calls that take an RdsBufSurface (rds_buf_surface_copy,
+ * CPU access to a device-memory view (rds_buf_surface_map and the sync calls) goes through the batch's staging
+ * mirror (the slot's part of it, allocated on first use and freed with the batch), so mapping views costs no
+ * allocation per view. Views of different slots may be mapped from different threads; mapping the same slot through
+ * the batch and a view, or two views of it, from different threads at once is a race. Library calls that take an RdsBufSurface (rds_buf_surface_copy,
  * rds_buf_surf_transform) treat a view as an ordinary single surface; writing into one through them writes the
- * batch's slot, which only the batch's producer may do. Never pass a view's surface to rds_buf_surface_destroy:
- * its memory owns it. */
+ * batch's slot, which only the batch's producer may do. rds_buf_surface_destroy refuses a view's surface (returns
+ * -1): its memory frees it. */
 RDS_API GstBuffer *rds_buffer_new_surface_view (GstBuffer * batch, guint index);
 /* TRUE if @mem is an RDS memory created by rds_buffer_new_surface_view. */
 RDS_API gboolean rds_memory_is_view (GstMemory * mem);

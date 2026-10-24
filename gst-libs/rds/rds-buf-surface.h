@@ -127,7 +127,9 @@ RDS_API int rds_buf_surface_destroy (RdsBufSurface * surf);
  *   map -> sync_for_cpu -> read/write through mappedAddr -> sync_for_device -> unmap.
  * sync_for_device writes back the whole plane (pitch * height bytes). If map fails partway through a
  * multi-plane or multi-surface request, some planes may be mapped: call unmap with the same index and plane.
- * map, unmap and the sync calls are not thread-safe for the same surface (as with NvBufSurface): serialize them.
+ * map, unmap and the sync calls are not thread-safe for the same surface (as with NvBufSurface): map and sync a
+ * surface from one thread at a time. Surface views (rds_buffer_new_surface_view) share their batch's staging
+ * mirror, so the same slot through the batch or any of its views counts as the same surface; different slots don't.
  * The sync calls on device memory are synchronous: they return when the work is complete. They run on the calling
  * thread's per-thread stream of the surface's GPU and do not wait for work the caller queued on its own streams;
  * synchronize producers first. */

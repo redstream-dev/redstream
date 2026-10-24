@@ -88,6 +88,9 @@ test_shows_slot (void)
     /* The parent's mapping is not touched by the view's. */
     g_assert_null (bs->surfaceList[i].mappedAddr.addr[0]);
 
+    /* Its memory frees a view; rds_buf_surface_destroy refuses it. */
+    g_assert_cmpint (rds_buf_surface_destroy (vs), ==, -1);
+
     gst_buffer_unref (view);
   }
 

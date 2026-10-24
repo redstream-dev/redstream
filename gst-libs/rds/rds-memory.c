@@ -13,7 +13,8 @@ typedef struct
 } RdsMemory;
 
 /* A read-only view of one slot of another buffer's batch: the surface, its one params entry and its private struct
- * live in the memory's own allocation, and priv.parent is a ref on the buffer holding the batch. */
+ * live in the memory's own allocation, and priv.parent is a ref on the buffer holding the batch (which also keeps the
+ * batch's staging mirror, shared by its views, alive). */
 typedef struct
 {
   RdsMemory m;
@@ -72,9 +73,12 @@ rds_allocator_free (G_GNUC_UNUSED GstAllocator * allocator, GstMemory * mem)
   RdsMemory *m = (RdsMemory *) mem;
   GstBuffer *parent = NULL;
 
-  if (rds_buf_surface_is_view (m->surface))
+  if (rds_buf_surface_is_view (m->surface)) {
     parent = ((RdsViewMemory *) m)->priv.parent;
-  rds_buf_surface_destroy (m->surface);
+    rds_buf_surface_release_view (m->surface);
+  } else {
+    rds_buf_surface_destroy (m->surface);
+  }
   g_free (m);
   /* Last: this may free the batch (or return it to its pool). */
   if (parent != NULL)
@@ -249,6 +253,7 @@ rds_buffer_new_surface_view (GstBuffer * batch, guint index)
   mem = gst_buffer_peek_memory (batch, 0);
   if (!check_whole (mem))
     return NULL;
+  /* numFilled <= batchSize in any valid surface; the batchSize and surfaceList checks guard against a corrupt one. */
   if (index >= src->numFilled || index >= src->batchSize || src->surfaceList == NULL) {
     GST_WARNING ("slot %u out of range (%u filled of %u)", index, src->numFilled, src->batchSize);
     return NULL;

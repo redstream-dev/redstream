@@ -4,6 +4,8 @@
 #include <rds/rds-memory.h>
 #include <rds/rds-transform.h>
 
+#include <string.h>
+
 static const RdsBufSurfaceCreateParams nv12_640 = {
   .width = 640, .height = 480, .colorFormat = RDS_BUF_COLOR_FORMAT_NV12, .layout = RDS_BUF_LAYOUT_PITCH,
 };
@@ -198,6 +200,98 @@ test_view_device (void)
   gst_object_unref (alloc);
 }
 
+/* Views map through the batch's staging mirror: no per-view allocation, the slot's part of the batch's mirror. A
+ * mapping of the batch made before the view is created doesn't leak into the view. */
+static void
+test_view_device_shared_mirror (void)
+{
+  RDS_TEST_REQUIRE_GPU ();
+
+  GstAllocator *alloc = rds_allocator_new (0, RDS_BUF_MEM_DEFAULT);
+  GstBuffer *batch = new_device_batch (alloc);
+  RdsBufSurface *bs = rds_buffer_get_surface (batch);
+  GstBuffer *v1, *v2, *vv;
+  RdsBufSurface *vs1, *vs2, *vvs;
+
+  g_assert_cmpint (rds_buf_surface_map (bs, -1, -1, RDS_BUF_MAP_READ), ==, 0);
+  g_assert_nonnull (bs->surfaceList[1].mappedAddr.addr[0]);
+  v1 = rds_buffer_new_surface_view (batch, 1);
+  v2 = rds_buffer_new_surface_view (batch, 2);
+  vv = rds_buffer_new_surface_view (v2, 0);
+  vs1 = rds_buffer_get_surface (v1);
+  vs2 = rds_buffer_get_surface (v2);
+  vvs = rds_buffer_get_surface (vv);
+  for (guint p = 0; p < RDS_BUF_SURFACE_MAX_PLANES; p++)
+    g_assert_null (vs1->surfaceList[0].mappedAddr.addr[p]);
+
+  g_assert_cmpint (rds_buf_surface_map (vs1, 0, -1, RDS_BUF_MAP_READ), ==, 0);
+  g_assert_cmpint (rds_buf_surface_map (vs2, 0, -1, RDS_BUF_MAP_READ), ==, 0);
+  g_assert_cmpint (rds_buf_surface_map (vvs, 0, -1, RDS_BUF_MAP_READ), ==, 0);
+  for (guint p = 0; p < 2; p++) {
+    g_assert_true (vs1->surfaceList[0].mappedAddr.addr[p] == bs->surfaceList[1].mappedAddr.addr[p]);
+    g_assert_true (vs2->surfaceList[0].mappedAddr.addr[p] == bs->surfaceList[2].mappedAddr.addr[p]);
+    g_assert_true (vvs->surfaceList[0].mappedAddr.addr[p] == bs->surfaceList[2].mappedAddr.addr[p]);
+  }
+  /* A sync through a view fills the slot's part of the batch's mirror. */
+  memset (bs->surfaceList[1].mappedAddr.addr[0], 0, bs->surfaceList[1].planeParams.psize[0]);
+  g_assert_cmpint (rds_buf_surface_sync_for_cpu (vs1, 0, 0), ==, 0);
+  g_assert_cmpuint (((guint8 *) bs->surfaceList[1].mappedAddr.addr[0])[1], ==, pattern (1, 0, 1, 0));
+  g_assert_cmpint (rds_buf_surface_unmap (vs1, 0, -1), ==, 0);
+  g_assert_nonnull (bs->surfaceList[1].mappedAddr.addr[0]);
+  g_assert_cmpint (rds_buf_surface_destroy (vs1), ==, -1);
+
+  gst_buffer_unref (vv);
+  gst_buffer_unref (v2);
+  gst_buffer_unref (v1);
+  g_assert_cmpint (rds_buf_surface_unmap (bs, -1, -1), ==, 0);
+  gst_buffer_unref (batch);
+  gst_object_unref (alloc);
+}
+
+static gsize
+vm_rss_bytes (void)
+{
+  gchar *status = NULL, *line;
+  gsize kib;
+
+  g_assert_true (g_file_get_contents ("/proc/self/status", &status, NULL, NULL));
+  line = strstr (status, "\nVmRSS:");
+  g_assert_nonnull (line);
+  kib = g_ascii_strtoull (line + strlen ("\nVmRSS:"), NULL, 10);
+  g_free (status);
+  return kib * 1024;
+}
+
+/* Creating, CPU-mapping and freeing many device views allocates no memory per view. Pinned staging memory counts in
+ * VmRSS but is invisible to LeakSanitizer, so this is the check that catches a leaked mirror. */
+static void
+test_view_device_map_many (void)
+{
+  RDS_TEST_REQUIRE_GPU ();
+
+  GstAllocator *alloc = rds_allocator_new (0, RDS_BUF_MEM_DEFAULT);
+  GstBuffer *batch = new_device_batch (alloc);
+  gsize rss0 = 0, rss1;
+
+  for (guint i = 0; i < 520; i++) {
+    GstBuffer *view = rds_buffer_new_surface_view (batch, i % 3);
+    RdsBufSurface *vs = rds_buffer_get_surface (view);
+
+    g_assert_cmpint (rds_buf_surface_map (vs, 0, -1, RDS_BUF_MAP_READ), ==, 0);
+    g_assert_cmpint (rds_buf_surface_sync_for_cpu (vs, 0, -1), ==, 0);
+    g_assert_cmpint (rds_buf_surface_unmap (vs, 0, -1), ==, 0);
+    gst_buffer_unref (view);
+    if (i == 19)
+      rss0 = vm_rss_bytes ();
+  }
+  rss1 = vm_rss_bytes ();
+  g_test_message ("VmRSS over 500 mapped views: %+.2f MiB", ((gdouble) rss1 - (gdouble) rss0) / (1024.0 * 1024.0));
+  g_assert_cmpint ((gssize) rss1 - (gssize) rss0, <, 8 * 1024 * 1024);
+
+  gst_buffer_unref (batch);
+  gst_object_unref (alloc);
+}
+
 /* make_writable + a WRITE map swaps an owned device copy of the slot into the buffer; the batch is untouched. */
 static void
 test_view_device_write_map (void)
@@ -302,6 +396,8 @@ main (int argc, char **argv)
   g_test_add_func ("/memory-hip/copy-is-deep", test_copy_is_deep);
   g_test_add_func ("/memory-hip/view-device", test_view_device);
   g_test_add_func ("/memory-hip/view-device-write-map", test_view_device_write_map);
+  g_test_add_func ("/memory-hip/view-device-shared-mirror", test_view_device_shared_mirror);
+  g_test_add_func ("/memory-hip/view-device-map-many", test_view_device_map_many);
   g_test_add_func ("/memory-hip/view-device-outlives-batch", test_view_device_outlives_batch);
   g_test_add_func ("/memory-hip/view-transform-source", test_view_transform_source);
   return g_test_run ();
