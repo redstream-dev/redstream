@@ -188,7 +188,8 @@ meson test -C build-asan --print-errorlogs
 - Transform sessions are per thread and streaming threads are shared: elements set the transform session before
   each call and restore the previous one after (`rds_buf_surf_transform_get_session_params` first).
 - `memory:RDS` is not `NO_SHARE`: shallow buffer copies share the surface. Pixel writers must own the memory
-  exclusively (a WRITE map of shared memory gets a private deep copy).
+  exclusively (a WRITE map of shared memory gets a private deep copy). Surface views (`rds_buffer_new_surface_view`,
+  one slot of a batch) are read-only memory: `gst_buffer_make_writable` then a WRITE map swaps in an owned copy.
 - Dispatch our stream events on the cast type: `switch ((RdsEventType) GST_EVENT_TYPE (ev))`. An uncast switch
   triggers `-Wswitch`, as on DeepStream.
 - Use TDD: write the failing test first.

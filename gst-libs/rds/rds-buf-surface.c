@@ -12,13 +12,6 @@ GST_DEBUG_CATEGORY_STATIC (rds_buf_surface_debug);
 
 typedef struct
 {
-  gpointer base;                /* one allocation for the whole batch */
-  gsize stride;                 /* bytes between consecutive surfaces */
-  guint8 *staging;              /* pinned mirror of base, for mapping device memory; lazily allocated */
-} RdsBufSurfacePriv;
-
-typedef struct
-{
   guint32 wdiv, hdiv, bpp;
 } PlaneDesc;
 
@@ -317,6 +310,7 @@ rds_buf_surface_create (RdsBufSurface ** surf, guint32 batchSize, const RdsBufSu
   }
 
   priv = g_new0 (RdsBufSurfacePriv, 1);
+  priv->magic = RDS_BUF_SURFACE_PRIV_OWNED;
   priv->base = base;
   priv->stride = stride;
 
@@ -339,30 +333,68 @@ rds_buf_surface_create (RdsBufSurface ** surf, guint32 batchSize, const RdsBufSu
   return 0;
 }
 
+gboolean
+rds_buf_surface_is_view (const RdsBufSurface * surf)
+{
+  const RdsBufSurfacePriv *priv = surf->_priv;
+
+  return priv != NULL && priv->magic == RDS_BUF_SURFACE_PRIV_VIEW;
+}
+
+void
+rds_buf_surface_init_view (RdsBufSurface * view, RdsBufSurfaceParams * params, RdsBufSurfacePriv * priv,
+    const RdsBufSurface * src, guint index)
+{
+  const RdsBufSurfacePriv *src_priv = src->_priv;
+
+  *params = src->surfaceList[index];
+  memset (&params->mappedAddr, 0, sizeof (params->mappedAddr));
+
+  memset (priv, 0, sizeof (*priv));
+  priv->magic = RDS_BUF_SURFACE_PRIV_VIEW;
+  priv->stride = GST_ROUND_UP_N ((gsize) params->dataSize, RDS_BUF_SURFACE_PITCH_ALIGN);
+  priv->index = src_priv != NULL && src_priv->magic == RDS_BUF_SURFACE_PRIV_VIEW ? src_priv->index : index;
+
+  memset (view, 0, sizeof (*view));
+  view->gpuId = src->gpuId;
+  view->batchSize = 1;
+  view->numFilled = 1;
+  view->isContiguous = TRUE;
+  view->memType = src->memType;
+  view->surfaceList = params;
+  view->_priv = priv;
+}
+
 int
 rds_buf_surface_destroy (RdsBufSurface * surf)
 {
   RdsBufSurfacePriv *priv;
-  gboolean hip, switched;
+  gboolean hip, switched, view;
   int prev_dev = 0;
 
   g_return_val_if_fail (surf != NULL, -1);
   ensure_debug_category ();
 
   priv = surf->_priv;
-  if (priv == NULL) {
+  if (priv == NULL || (priv->magic != RDS_BUF_SURFACE_PRIV_OWNED && priv->magic != RDS_BUF_SURFACE_PRIV_VIEW)) {
     GST_ERROR ("surface %p was not created by rds_buf_surface_create", surf);
     return -1;
   }
+  view = priv->magic == RDS_BUF_SURFACE_PRIV_VIEW;
 
-  hip = surf->memType != RDS_BUF_MEM_SYSTEM || priv->staging != NULL;
+  hip = (!view && surf->memType != RDS_BUF_MEM_SYSTEM) || priv->staging != NULL;
   /* Free even if the device switch fails: the pointers are still valid on their own device. */
   switched = hip && rds_device_enter (surf->gpuId, &prev_dev);
   if (priv->staging != NULL)
     RDS_HIP_CHECK (hipHostFree (priv->staging));
-  mem_free (surf->memType, priv->base);
+  priv->staging = NULL;
+  if (!view)
+    mem_free (surf->memType, priv->base);
   if (switched)
     rds_device_leave (surf->gpuId, prev_dev);
+  /* A view frees only what it owns (its staging mirror): its memory owns the struct and the parent's pixels. */
+  if (view)
+    return 0;
   g_free (priv);
   g_free (surf->surfaceList);
   g_free (surf);

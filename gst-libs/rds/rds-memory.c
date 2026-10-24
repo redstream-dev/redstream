@@ -1,6 +1,7 @@
 /* Redstream: memory:RDS allocator and memory.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-memory.h"
+#include "rds-buf-surface-private.h"
 
 GST_DEBUG_CATEGORY_STATIC (rds_memory_debug);
 #define GST_CAT_DEFAULT rds_memory_debug
@@ -8,8 +9,18 @@ GST_DEBUG_CATEGORY_STATIC (rds_memory_debug);
 typedef struct
 {
   GstMemory mem;
-  RdsBufSurface *surface;       /* owned */
+  RdsBufSurface *surface;       /* owned; a view's points at RdsViewMemory.surface */
 } RdsMemory;
+
+/* A read-only view of one slot of another buffer's batch: the surface, its one params entry and its private struct
+ * live in the memory's own allocation, and priv.parent is a ref on the buffer holding the batch. */
+typedef struct
+{
+  RdsMemory m;
+  RdsBufSurface surface;
+  RdsBufSurfaceParams params;
+  RdsBufSurfacePriv priv;
+} RdsViewMemory;
 
 struct _RdsAllocator
 {
@@ -59,9 +70,15 @@ static void
 rds_allocator_free (G_GNUC_UNUSED GstAllocator * allocator, GstMemory * mem)
 {
   RdsMemory *m = (RdsMemory *) mem;
+  GstBuffer *parent = NULL;
 
+  if (rds_buf_surface_is_view (m->surface))
+    parent = ((RdsViewMemory *) m)->priv.parent;
   rds_buf_surface_destroy (m->surface);
   g_free (m);
+  /* Last: this may free the batch (or return it to its pool). */
+  if (parent != NULL)
+    gst_buffer_unref (parent);
 }
 
 /* A resized memory no longer covers exactly one RdsBufSurface struct. */
@@ -204,6 +221,52 @@ rds_memory_get_surface (GstMemory * mem)
   if (!rds_is_rds_memory (mem))
     return NULL;
   return ((RdsMemory *) mem)->surface;
+}
+
+gboolean
+rds_memory_is_view (GstMemory * mem)
+{
+  RdsBufSurface *surface = rds_memory_get_surface (mem);
+
+  return surface != NULL && rds_buf_surface_is_view (surface);
+}
+
+GstBuffer *
+rds_buffer_new_surface_view (GstBuffer * batch, guint index)
+{
+  RdsBufSurface *src;
+  RdsViewMemory *v;
+  GstMemory *mem;
+  GstBuffer *parent, *buf;
+
+  g_return_val_if_fail (GST_IS_BUFFER (batch), NULL);
+
+  src = rds_buffer_get_surface (batch);
+  if (src == NULL) {
+    GST_WARNING ("buffer %p holds no RDS surface", batch);
+    return NULL;
+  }
+  mem = gst_buffer_peek_memory (batch, 0);
+  if (!check_whole (mem))
+    return NULL;
+  if (index >= src->numFilled || index >= src->batchSize || src->surfaceList == NULL) {
+    GST_WARNING ("slot %u out of range (%u filled of %u)", index, src->numFilled, src->batchSize);
+    return NULL;
+  }
+
+  /* A view of a view shows the same slot and refs the original batch, so chains never pin intermediate views. */
+  parent = rds_buf_surface_is_view (src) ? ((RdsViewMemory *) mem)->priv.parent : batch;
+
+  v = g_new0 (RdsViewMemory, 1);
+  rds_buf_surface_init_view (&v->surface, &v->params, &v->priv, src, index);
+  v->priv.parent = gst_buffer_ref (parent);
+  v->m.surface = &v->surface;
+  gst_memory_init (GST_MEMORY_CAST (v), GST_MEMORY_FLAG_READONLY, mem->allocator, NULL,
+      sizeof (RdsBufSurface), 0, 0, sizeof (RdsBufSurface));
+
+  buf = gst_buffer_new ();
+  gst_buffer_append_memory (buf, GST_MEMORY_CAST (v));
+  return buf;
 }
 
 RdsBufSurface *

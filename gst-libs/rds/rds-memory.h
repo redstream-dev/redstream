@@ -37,6 +37,33 @@ RDS_API gboolean rds_is_rds_memory (GstMemory * mem);
 RDS_API RdsBufSurface *rds_memory_get_surface (GstMemory * mem);
 /* The surface of a buffer holding exactly one RDS memory, or NULL. Transfer none. */
 RDS_API RdsBufSurface *rds_buffer_get_surface (GstBuffer * buffer);
+/* A new buffer whose single memory:RDS memory shows surface @index of @batch's RdsBufSurface without copying pixels:
+ * a single-surface view (batchSize = numFilled = 1, same GPU and memory type, surfaceList[0] a copy of the slot's
+ * params with mappedAddr cleared). Returns NULL if @batch holds no RDS surface or @index >= numFilled.
+ * Copies no flags, timestamps or metas.
+ *
+ * Lifetime: the view keeps a reference on @batch until its memory is freed, so a pooled batch returns to its pool
+ * only after every view is released. A view of a view shows the same slot and refs the original batch.
+ *
+ * Read-only: the memory is GST_MEMORY_FLAG_READONLY, so gst_memory_map (GST_MAP_WRITE) on it fails, because the
+ * slot's pixels belong to a batch other buffers may share. To write pixels, follow the copy-on-write recipe:
+ *   buf = gst_buffer_make_writable (buf);
+ *   gst_buffer_map (buf, &info, GST_MAP_WRITE);
+ * The write map of the (now writable) buffer fails to lock the read-only memory, so GStreamer swaps in
+ * gst_memory_copy () of it: a private owned single surface (not a view) holding a copy of the slot, and the batch
+ * ref is dropped. info.data is the new RdsBufSurface; the batch is untouched. gst_memory_copy () and
+ * gst_buffer_copy_deep () also give owned copies. Calling gst_buffer_map (WRITE) on a non-writable buffer is a
+ * programming error, as for any buffer.
+ *
+ * CPU access to a device-memory view (rds_buf_surface_map and the sync calls) goes through a staging mirror owned
+ * by the view and freed with it. Library calls that take an RdsBufSurface (rds_buf_surface_copy,
+ * rds_buf_surf_transform) treat a view as an ordinary single surface; writing into one through them writes the
+ * batch's slot, which only the batch's producer may do. Never pass a view's surface to rds_buf_surface_destroy:
+ * its memory owns it. */
+RDS_API GstBuffer *rds_buffer_new_surface_view (GstBuffer * batch, guint index);
+/* TRUE if @mem is an RDS memory created by rds_buffer_new_surface_view. */
+RDS_API gboolean rds_memory_is_view (GstMemory * mem);
+
 /* TRUE if the first caps structure carries the memory:RDS feature. */
 RDS_API gboolean rds_caps_has_memory_rds (const GstCaps * caps);
 
