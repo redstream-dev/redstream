@@ -2618,6 +2618,83 @@ test_pool_flushing_window (void)
   pool_free (pool);
 }
 
+/* The timer of a partial batch starts when its first frame arrived, also for a frame that queued up while the
+ * previous batch was waiting: it does not wait a full timeout after that batch. */
+static void
+test_timer_from_arrival (void)
+{
+  AppPipe p;
+  gint64 t1, t_done;
+
+  RDS_TEST_REQUIRE_GPU ();
+  app_pipe_start (&p, 2, "", "batch-size=2 batched-push-timeout=200000");
+  for (guint i = 0; i < 2; i++)
+    app_push (&p, i, i, 0);
+  g_assert_cmpuint (app_pull (&p, NULL), ==, 2);
+
+  /* source 1 stalls; source 0 sends two frames 20 ms apart */
+  app_push (&p, 0, 2, 33 * GST_MSECOND);
+  g_usleep (20 * 1000);
+  t1 = g_get_monotonic_time ();
+  app_push (&p, 0, 3, 66 * GST_MSECOND);
+  g_assert_cmpuint (app_pull (&p, NULL), ==, 1);
+  g_assert_cmpuint (app_pull (&p, NULL), ==, 1);
+  t_done = g_get_monotonic_time ();
+  g_test_message ("second partial batch %" G_GINT64_FORMAT " ms after its frame", (t_done - t1) / 1000);
+  /* one timeout (200 ms) after the frame arrived; waiting for the first batch and then a full timeout would be
+   * about 380 ms */
+  g_assert_cmpint (t_done - t1, >=, 150 * 1000);
+  g_assert_cmpint (t_done - t1, <=, 300 * 1000);
+  app_pipe_stop (&p);
+}
+
+/* Demuxed views pin their whole batch, and sinks keep their last buffer: four branches each holding a different
+ * batch must not exhaust the default output pool (one frame per batch here, from a different source each time). */
+static void
+test_pool_pinned_by_branches (void)
+{
+  GString *desc = g_string_new (NULL);
+  GstElement *pipe, *src[4], *sink[4];
+  GError *err = NULL;
+
+  RDS_TEST_REQUIRE_GPU ();
+  for (guint i = 0; i < 4; i++)
+    g_string_append_printf (desc, "appsrc name=s%u format=time caps=\"" APP_CAPS "\" ! m.sink_%u "
+        "d.src_%u ! appsink name=o%u sync=false async=false enable-last-sample=true ", i, i, i, i);
+  g_string_append (desc, "rdsstreammux name=m width=64 height=48 batch-size=4 batched-push-timeout=10000 "
+      "! rdsstreamdemux name=d");
+  pipe = gst_parse_launch (desc->str, &err);
+  g_assert_no_error (err);
+  g_string_free (desc, TRUE);
+  for (guint i = 0; i < 4; i++) {
+    gchar *name = g_strdup_printf ("s%u", i);
+
+    src[i] = gst_bin_get_by_name (GST_BIN (pipe), name);
+    g_free (name);
+    name = g_strdup_printf ("o%u", i);
+    sink[i] = gst_bin_get_by_name (GST_BIN (pipe), name);
+    g_free (name);
+  }
+  g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  for (guint f = 0; f < 12; f++) {
+    guint i = f % 4;
+    GstSample *sample;
+
+    g_assert_cmpint (gst_app_src_push_buffer (GST_APP_SRC (src[i]), sys_frame (APP_CAPS, f, f * 10 * GST_MSECOND)),
+        ==, GST_FLOW_OK);
+    sample = gst_app_sink_try_pull_sample (GST_APP_SINK (sink[i]), 5 * GST_SECOND);
+    if (sample == NULL)
+      g_error ("frame %u never came out: the output pool is exhausted by the sinks' last buffers", f);
+    gst_sample_unref (sample);
+  }
+  gst_element_set_state (pipe, GST_STATE_NULL);
+  for (guint i = 0; i < 4; i++) {
+    gst_object_unref (src[i]);
+    gst_object_unref (sink[i]);
+  }
+  gst_object_unref (pipe);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -2668,6 +2745,8 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/mux/rerequest-pad", test_rerequest_pad);
   g_test_add_func ("/gpu/mux/restart-announce", test_restart_announce);
   g_test_add_func ("/gpu/mux/pool-flushing-window", test_pool_flushing_window);
+  g_test_add_func ("/gpu/mux/timer-from-arrival", test_timer_from_arrival);
+  g_test_add_func ("/gpu/mux/pool-pinned-by-branches", test_pool_pinned_by_branches);
   {
     /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
      * process exit otherwise (seen under parallel ASan runs) */

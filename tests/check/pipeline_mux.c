@@ -724,17 +724,17 @@ test_stall (void)
   g_test_message ("stall of %.0f ms: %u batches of 3 in %.0f ms (%.1f batches/s), max gap %.1f ms; source 0's frame "
       "waited %.1f ms on average (max %.1f ms) before its batch went out", (t_unblock - st.t_block) / 1e3, in_window,
       (win1 - win0) / 1e3, rate, gap_max / 1e3, waits ? wait_sum / 1e3 / waits : 0.0, wait_max / 1e3);
-  /* about the 30 fps source rate */
-  g_assert_cmpfloat (rate, >, 24.0);
-  g_assert_cmpfloat (rate, <, 36.0);
-  g_assert_cmpint (gap_max, <, 100 * 1000);
+  /* the 30 fps source rate */
+  g_assert_cmpfloat (rate, >, 27.0);
+  g_assert_cmpfloat (rate, <, 33.0);
+  g_assert_cmpint (gap_max, <, 70 * 1000);
   g_assert_cmpuint (waits, >, 0);
-  /* the batch waits for the missing source (at least about one timeout), but stays bounded. The timer of a batch
-   * starts when the mux first sees a queued frame after the previous batch, not when that frame arrived, so a
-   * frame that queued up behind the previous batch waits for that batch plus a full timeout: about 2-3 frame
-   * periods here, and slightly fewer batches than the source rate. */
+  /* each batch waits for the missing source one timeout (33 ms) after its first frame arrived, also a frame that
+   * queued up while the previous batch was waiting: on average well under two frame periods, and never much more
+   * than the timeout (margin for loaded machines) */
   g_assert_cmpint (wait_sum / waits, >, 25 * 1000);
-  g_assert_cmpint (wait_max, <, 200 * 1000);
+  g_assert_cmpint (wait_sum / waits, <, 55 * 1000);
+  g_assert_cmpint (wait_max, <, 33 * 1000 + 60 * 1000);
 
   g_cond_clear (&st.cond);
   g_mutex_clear (&st.lock);

@@ -101,7 +101,7 @@ default; **ours** marks a default the page does not document, so it may differ f
 | `enable-padding` | boolean | `FALSE` (ours) | supported | keeps the aspect ratio; the frame is placed **top-left** (see below) |
 | `gpu-id` | uint | `0` (ours) | supported | GPU for the scaling and the output batches; a GPU that does not exist is an error at the first batch; changeable only in NULL or READY |
 | `nvbuf-memory-type` | enum | `0` (ours) | supported | `0` `nvbuf-mem-default` (HIP device memory), `1` `nvbuf-mem-cuda-pinned`, `2` `nvbuf-mem-cuda-device`, `3` `nvbuf-mem-cuda-unified`. `4` (Jetson surface array) is not a value of the enum: `g_object_set` rejects it with a warning and keeps the old value. Changeable only in NULL or READY |
-| `buffer-pool-size` | uint | `4` (ours) | supported | batches in the output pool, 1-1024; the pool never grows, so a stalled downstream back-pressures the sources. Changeable only in NULL or READY |
+| `buffer-pool-size` | uint | not set: `batch-size + 2`, at least 4 (ours; reads back `4`) | supported | batches in the output pool, 1-1024; the pool never grows, so a stalled downstream back-pressures the sources. Every demuxed frame keeps its whole batch alive and sinks keep their last buffer (appsink always, other sinks with `enable-last-sample`), so each demux branch can pin a different batch: the default leaves room for `batch-size` branches. A value set explicitly is used as is, with a warning at start when it is `batch-size` or less (with that many branches or more the mux can stall for good). Changeable only in NULL or READY |
 | `compute-hw` | enum | `0` (ours) | supported | `0` default (the GPU), `1` GPU; `2` (VIC) fails at start |
 | `interpolation-method` | enum | `6` (ours) | supported | integers as `NvBufSurfTransform_Inter`, filters as in "Transform semantics" (`6` default and `5` `algo-4` run nearest, `2`-`4` bilinear) |
 | `num-surfaces-per-frame` | uint | `1` (ours) | supported | only `1`; 2-4 fail at start |
@@ -151,7 +151,8 @@ coordinates a pure scale (divide by `pipeline_width / source_frame_width`, no of
   queued, or `batch-size` frames are collected. A stalled source therefore stalls the batch; set a timeout for live
   or unreliable sources.
 - `batched-push-timeout` ≥ 0: a partial batch goes out one timeout after its **first frame arrived**, whether the
-  frames are ahead of the clock (a file decoding faster than real time) or behind it. A live source's upstream
+  frames are ahead of the clock (a file decoding faster than real time) or behind it, and also when that frame
+  queued up while the previous batch was still waiting (it does not wait a full timeout after that batch). A live source's upstream
   latency is not added. During the first upstream-latency of running time, though, the timer cannot start before
   running time 0, so the first partial batches go out late by up to that latency.
 - `sync-inputs=TRUE`: a partial batch goes out once the clock reaches its earliest frame's running time plus the
