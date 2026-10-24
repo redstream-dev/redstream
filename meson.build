@@ -7,6 +7,7 @@ project('redstream', 'c',
 api_version = '1.0'
 cc = meson.get_compiler('c')
 gst_dep = dependency('gstreamer-1.0', version : '>= 1.28')
+gst_base_dep = dependency('gstreamer-base-1.0', version : '>= 1.28')
 gst_video_dep = dependency('gstreamer-video-1.0', version : '>= 1.28')
 gst_check_dep = dependency('gstreamer-check-1.0', version : '>= 1.28')
 
@@ -23,11 +24,42 @@ amdhip_lib = cc.find_library('amdhip64', dirs : [rocm_path / 'lib'], required : 
 if not amdhip_lib.found()
   error('libamdhip64 not found in @0@/lib; pass -Drocm_path=/path/to/rocm'.format(rocm_path))
 endif
+# Link by name (not the find_library path) so the generated .pc says -L<rocm>/lib -lamdhip64.
 hip_dep = declare_dependency(
   compile_args : ['-D__HIP_PLATFORM_AMD__'],
   include_directories : include_directories(rocm_path / 'include', is_system : true),
-  dependencies : amdhip_lib)
+  link_args : ['-L' + rocm_path / 'lib', '-lamdhip64'])
+
+# HIP kernels: meson has no HIP language, so gst-libs/rds compiles them with amdclang++ in a custom_target.
+amdclang = find_program(rocm_path / 'bin/amdclang++', required : false)
+if not amdclang.found()
+  error('amdclang++ not found in @0@/bin; pass -Drocm_path=/path/to/rocm'.format(rocm_path))
+endif
+
+objcopy = find_program('objcopy')
+
+rocdecode_lib = cc.find_library('rocdecode', dirs : [rocm_path / 'lib'], required : false)
+if not rocdecode_lib.found() or not fs.exists(rocm_path / 'include/rocdecode/rocdecode.h')
+  error('rocDecode (librocdecode, include/rocdecode/rocdecode.h) not found in @0@; pass -Drocm_path=/path/to/rocm'
+    .format(rocm_path))
+endif
+rocdecode_dep = declare_dependency(
+  include_directories : include_directories(rocm_path / 'include', is_system : true),
+  dependencies : rocdecode_lib)
+
+# The runtime linker finds ROCm in /opt/rocm/lib through ld.so.conf; other prefixes get an rpath.
+rds_install_rpath = rocm_path == '/opt/rocm' ? '' : rocm_path / 'lib'
+
+# Plugin metadata. RDS_ORIGIN is a placeholder until the public repository exists (TODO before release).
+rds_origin = 'https://example.invalid/redstream'
+rds_plugin_c_args = [
+  '-DPACKAGE="redstream"',
+  '-DPACKAGE_VERSION="@0@"'.format(meson.project_version()),
+  '-DGST_PACKAGE_NAME="redstream"',
+  '-DGST_PACKAGE_ORIGIN="@0@"'.format(rds_origin),
+]
 
 subdir('gst-libs/rds')
+subdir('gst')
 subdir('samples')
 subdir('tests')

@@ -1,3 +1,5 @@
 leak:libhsa-runtime64.so
 leak:libamdhip64.so
 leak:libdrm_amdgpu.so
+# fontconfig's one-time FcInit cache (started by the pango plugin when ASan builds scan plugins in-process)
+leak:libfontconfig.so

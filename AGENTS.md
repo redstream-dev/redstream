@@ -126,7 +126,9 @@ gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
   rds-gst-meta       RdsMeta GstMeta on buffers (gst_buffer_get_rds_batch_meta)
   rds-event          stream events (pad added/deleted, stream start/EOS/segment/reset)
   rds_compat.h       DeepStream compat header (+ rds-compat-aliases.h, rds-compat-remap.c)
+  rds-transform-kernels.hip  HIP kernels (amdclang++, linked in as an object)
   *-private.h        internal headers, not installed (rds-hip-private.h is the only HIP include)
+gst/rdsvideo/      libgstrdsvideo plugin (rocDecode decode, memory:RDS conversion; skeleton, no elements yet)
 docs/              compat-matrix.md: what the compat header maps, with status and sources
 samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
 tests/check/       GLib unit tests (suites cpu/gpu)       tests/samples/  sample-level tests
@@ -135,7 +137,7 @@ spikes/            Phase 0 experiments (rocdec-hip, migraphx-devptr); reference 
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
 ```
 
-Planned next: `gst/` (plugins), `docs/porting.md`, `docs/benchmarks.md`.
+Planned next: more plugins in `gst/`, `docs/porting.md`, `docs/benchmarks.md`.
 
 ## Build and test
 
@@ -154,6 +156,15 @@ meson test -C build-asan --print-errorlogs
 ```
 
 - Warnings are errors (`warning_level=2`, `werror`).
+- HIP kernels (`*.hip`) are compiled by `amdclang++` in a meson `custom_target` for the targets in
+  `-Doffload_arch=` (default `gfx10-3-generic,gfx11-generic,gfx12-generic`; e.g. `-Doffload_arch=gfx1030`), then
+  linked into the C library as objects. A build for the wrong arch fails at kernel launch, not silently.
+- With `-Drocm_path` other than `/opt/rocm`, the library and plugins get an install rpath to `<rocm_path>/lib`;
+  `/opt/rocm/lib` is expected to be on the system linker path.
+- Element tests load plugins from `build/gst` (`GST_PLUGIN_PATH_1_0`) next to the system plugins, with a private
+  registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
+  `gst-plugin-scanner` can't load sanitized plugins. Tests that need private symbols link `rds_internal_dep`, a
+  static copy of libgstrds.
 - Library symbols are hidden by default. Mark public API with `RDS_API` (from `rds/rds-prelude.h`).
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
 - **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never
