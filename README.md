@@ -2,9 +2,8 @@
 
 **GStreamer video and audio analytics on AMD GPUs: an open-source, ROCm-based functional equivalent of NVIDIA DeepStream.**
 
-> Status: **pre-alpha.** Feasibility spikes are done and the core library `libgstrds` is in place: batched GPU
-> surfaces (`memory:RDS`), buffer pools, DeepStream-shaped metadata and stream events, plus the compat header
-> (see [`docs/compat-matrix.md`](docs/compat-matrix.md)). No elements yet. APIs and element names will change.
+> Status: **pre-alpha.** The core library `libgstrds` and the first two elements, `rdsvideodec` and
+> `rdsvideoconvert`, are in place (see "What works" below). APIs and element names will change.
 
 ## Why
 
@@ -30,6 +29,29 @@ surface so existing applications can move over without a rewrite.
 
 Non-goals (for now): binary compatibility with DeepStream, Triton (`nvinferserver`), TAO encrypted models,
 Jetson-specific hardware blocks.
+
+## What works
+
+- **`libgstrds`:** batched GPU surfaces (`RdsBufSurface`, the `memory:RDS` caps feature), buffer pools,
+  DeepStream-shaped metadata (batch, frame, object, user and display meta) and stream events.
+- **`rds_buf_surf_transform`:** batched crop, scale (nearest, bilinear) and colour conversion between NV12, I420,
+  RGBA, BGRA, RGBx, BGRx, RGB, BGR and GRAY8 on the GPU, shaped like `NvBufSurfTransform`.
+- **`rdsvideodec`** (`nvv4l2decoder`): H.264 and H.265 (8-bit 4:2:0) decoding with rocDecode into `memory:RDS` NV12,
+  bit-exact with the stock VA decoders. It ranks above them, so `uridecodebin` picks it; it falls back to system
+  memory for ordinary sinks.
+- **`rdsvideoconvert`** (`nvvideoconvert`): conversion, scaling and cropping between `memory:RDS` and system memory,
+  with `nvvideoconvert`'s property names.
+- **Compat header** `rds/rds_compat.h`: DeepStream names for the above, plus runtime remapping of element names
+  (`nvv4l2decoder` → `rdsvideodec`, …).
+
+[`docs/compat-matrix.md`](docs/compat-matrix.md) lists every mapped name and property with its status. Built from
+this repository (see "Getting started"; `tests/media/make-test-media.sh` generates the clip), a decode and convert
+pipeline looks like this:
+
+```bash
+GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec \
+  ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA,width=640,height=640" ! fakesink sync=false
+```
 
 ## How it maps to DeepStream
 

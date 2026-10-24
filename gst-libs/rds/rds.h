@@ -10,5 +10,6 @@
 #include <rds/rds-meta.h>
 #include <rds/rds-gst-meta.h>
 #include <rds/rds-event.h>
+#include <rds/rds-transform.h>
 
 #endif /* RDS_H */

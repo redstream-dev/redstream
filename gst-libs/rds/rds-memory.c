@@ -20,6 +20,17 @@ struct _RdsAllocator
 
 G_DEFINE_TYPE (RdsAllocator, rds_allocator, GST_TYPE_ALLOCATOR);
 
+static void
+ensure_debug_category (void)
+{
+  static gsize initialized = 0;
+
+  if (g_once_init_enter (&initialized)) {
+    GST_DEBUG_CATEGORY_INIT (rds_memory_debug, "rdsmemory", 0, "Redstream memory:RDS allocator");
+    g_once_init_leave (&initialized, 1);
+  }
+}
+
 static const struct
 {
   GstVideoFormat video;
@@ -124,7 +135,7 @@ rds_allocator_class_init (RdsAllocatorClass * klass)
   alloc_class->alloc = rds_allocator_alloc;
   alloc_class->free = rds_allocator_free;
 
-  GST_DEBUG_CATEGORY_INIT (rds_memory_debug, "rdsmemory", 0, "Redstream memory:RDS allocator");
+  ensure_debug_category ();
 }
 
 static void

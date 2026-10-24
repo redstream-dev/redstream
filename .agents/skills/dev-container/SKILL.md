@@ -47,6 +47,23 @@ $RUN bash -c 'gst-launch-1.0 filesrc location=$VIDEO ! matroskademux ! h264parse
 $RUN migraphx-driver perf model.onnx --input-dim @images 1 3 640 640 --fp16 --iterations 50
 ```
 
+Redstream's own elements, from the build tree (`build/gst`; needs a build and the clips from
+`tests/media/make-test-media.sh`):
+
+```bash
+$RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-inspect-1.0 rdsvideodec | grep Rank'   # primary + 10 (266)
+# decode + convert on the GPU, memory:RDS all the way
+$RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-720p.h264 ! h264parse \
+  ! rdsvideodec ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA,width=640,height=640" ! fakesink sync=false'
+# download to system memory, bilinear scaling
+$RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-1080p.h264 ! h264parse \
+  ! rdsvideodec ! rdsvideoconvert interpolation-method=1 ! video/x-raw,format=RGBA,width=640,height=360 \
+  ! fakesink sync=false'
+# autoplugging: -v shows GstRdsVideoDec inside the decodebin
+$RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 -v uridecodebin uri=file:///src/.cache/media/ball-720p.h264 \
+  ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA" ! fakesink sync=false | grep -o "GstRdsVideoDec:[a-z0-9]*"'
+```
+
 ## Common errors
 
 | Symptom | Fix |
@@ -59,4 +76,6 @@ $RUN migraphx-driver perf model.onnx --input-dim @images 1 3 640 640 --fp16 --it
 | `pci id for fd N: 10de:...` spam | harmless, VA probing the NVIDIA card on mixed-GPU hosts |
 | `device kernel image is invalid` | HIP binary was built without the GPU attached → build inside a GPU container or pass `--offload-arch=gfx1030` |
 | rocDecode wrong frames / `ROCDEC_RUNTIME_ERROR` mid-stream | feed whole NAL units or access units, not byte chunks |
+| `rdsvideodec`/`rdsvideoconvert`: `no element` | set `GST_PLUGIN_PATH_1_0=build/gst` (the build tree's plugins) |
+| first frame of each rocDecode surface all zeros (small clips) | surfaces ≤ 1 MiB must be mapped before the first decode; `rdsvideodec` does it, a bare rocDecode program must too |
 | VA plugin has no `vah264dec` on the host (Fedora) | host Mesa lacks patented codecs → `mesa-va-drivers-freeworld`; the container is fine |

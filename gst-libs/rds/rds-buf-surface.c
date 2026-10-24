@@ -103,19 +103,19 @@ check_mem_type (const RdsBufSurface * surf)
   return FALSE;
 }
 
-/* Makes @gpu the current HIP device and stores the previous one in @prev. Only for HIP memory. */
-static gboolean
-device_enter (guint32 gpu, int *prev)
+gboolean
+rds_device_enter (guint32 gpu, int *prev)
 {
+  ensure_debug_category ();
   if (!RDS_HIP_CHECK (hipGetDevice (prev)))
     return FALSE;
   return *prev == (int) gpu || RDS_HIP_CHECK (hipSetDevice ((int) gpu));
 }
 
-/* Restores the device saved by a successful device_enter (). */
-static void
-device_leave (guint32 gpu, int prev)
+void
+rds_device_leave (guint32 gpu, int prev)
 {
+  ensure_debug_category ();
   if (prev != (int) gpu)
     RDS_HIP_CHECK (hipSetDevice (prev));
 }
@@ -290,7 +290,7 @@ rds_buf_surface_create (RdsBufSurface ** surf, guint32 batchSize, const RdsBufSu
   }
 
   /* Only HIP memory selects a device: the system path never touches HIP. */
-  if (hip && !device_enter (params->gpuId, &prev_dev))
+  if (hip && !rds_device_enter (params->gpuId, &prev_dev))
     return -1;
   base = mem_alloc (params->memType, total);
   if (base != NULL) {
@@ -301,7 +301,7 @@ rds_buf_surface_create (RdsBufSurface ** surf, guint32 batchSize, const RdsBufSu
     }
   }
   if (hip)
-    device_leave (params->gpuId, prev_dev);
+    rds_device_leave (params->gpuId, prev_dev);
   if (base == NULL) {
     GST_ERROR ("failed to allocate %" G_GSIZE_FORMAT " bytes (memory type %d)", total, params->memType);
     return -1;
@@ -348,12 +348,12 @@ rds_buf_surface_destroy (RdsBufSurface * surf)
 
   hip = surf->memType != RDS_BUF_MEM_SYSTEM || priv->staging != NULL;
   /* Free even if the device switch fails: the pointers are still valid on their own device. */
-  switched = hip && device_enter (surf->gpuId, &prev_dev);
+  switched = hip && rds_device_enter (surf->gpuId, &prev_dev);
   if (priv->staging != NULL)
     RDS_HIP_CHECK (hipHostFree (priv->staging));
   mem_free (surf->memType, priv->base);
   if (switched)
-    device_leave (surf->gpuId, prev_dev);
+    rds_device_leave (surf->gpuId, prev_dev);
   g_free (priv);
   g_free (surf->surfaceList);
   g_free (surf);
@@ -381,10 +381,10 @@ map_plane (RdsBufSurface * surf, guint index, guint plane, G_GNUC_UNUSED gpointe
     gboolean ok;
     int prev_dev;
 
-    if (!device_enter (surf->gpuId, &prev_dev))
+    if (!rds_device_enter (surf->gpuId, &prev_dev))
       return FALSE;
     ok = RDS_HIP_CHECK (hipHostMalloc (&staging, size, hipHostMallocDefault));
-    device_leave (surf->gpuId, prev_dev);
+    rds_device_leave (surf->gpuId, prev_dev);
     if (!ok)
       return FALSE;
     memset (staging, 0, size);
@@ -476,10 +476,10 @@ sync_surface (RdsBufSurface * surf, int index, int plane, PlaneFunc fn)
   if (is_host_accessible (surf->memType))
     return for_each_plane (surf, index, plane, sync_noop, NULL);
 
-  if (!device_enter (surf->gpuId, &prev_dev))
+  if (!rds_device_enter (surf->gpuId, &prev_dev))
     return -1;
   ret = for_each_plane (surf, index, plane, fn, NULL);
-  device_leave (surf->gpuId, prev_dev);
+  rds_device_leave (surf->gpuId, prev_dev);
   return ret;
 }
 
@@ -528,13 +528,13 @@ rds_buf_surface_memset (RdsBufSurface * surf, int index, int plane, guint8 value
   if (is_cpu_only (surf->memType))
     return for_each_plane (surf, index, plane, memset_plane, GUINT_TO_POINTER (value));
 
-  if (!device_enter (surf->gpuId, &prev_dev))
+  if (!rds_device_enter (surf->gpuId, &prev_dev))
     return -1;
   ret = for_each_plane (surf, index, plane, memset_plane, GUINT_TO_POINTER (value));
   /* Library operations are synchronous (ready-on-push). */
   if (ret == 0 && !RDS_HIP_CHECK (hipStreamSynchronize (NULL)))
     ret = -1;
-  device_leave (surf->gpuId, prev_dev);
+  rds_device_leave (surf->gpuId, prev_dev);
   return ret;
 }
 
@@ -623,11 +623,11 @@ rds_buf_surface_copy (const RdsBufSurface * src, RdsBufSurface * dst)
   } else {
     /* Run on the GPU that owns the destination, or the source's when the destination is host memory. */
     gpu = is_cpu_only (dst->memType) ? src->gpuId : dst->gpuId;
-    if (!device_enter (gpu, &prev_dev))
+    if (!rds_device_enter (gpu, &prev_dev))
       return -1;
     /* Library operations are synchronous (ready-on-push). */
     ok = copy_planes (src, dst, FALSE) && RDS_HIP_CHECK (hipStreamSynchronize (NULL));
-    device_leave (gpu, prev_dev);
+    rds_device_leave (gpu, prev_dev);
     if (!ok)
       return -1;
   }
