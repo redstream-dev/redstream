@@ -121,6 +121,17 @@ test('pipeline_decode_convert', pipeline_exe, args : ['-p', '/gpu/pipeline'],
 test('pipeline_soak', pipeline_soak_exe, args : ['-p', '/gpu/soak'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
+# Multi-source mux/demux integration: mixed sources against the CPU reference, a stalled source, dynamic sources,
+# and (its own entry, `pipeline_mux_soak`, built like pipeline_soak with the small ASan quarantine) four looped 720p
+# sources with the leak check.
+pipeline_mux_exe = executable('pipeline_mux', 'check' / 'pipeline_mux.c', dependencies : pipeline_deps)
+pipeline_mux_soak_exe = executable('pipeline_mux_soak', 'check' / 'pipeline_mux.c',
+  c_args : ['-DRDS_TEST_SMALL_QUARANTINE'], dependencies : pipeline_deps)
+test('pipeline_mux', pipeline_mux_exe, args : ['-p', '/gpu/mux-pipeline'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180, depends : rds_plugins)
+test('pipeline_mux_soak', pipeline_mux_soak_exe, args : ['-p', '/gpu/mux-soak'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
+
 # The dry run checks the compat mapping; gst-inspect-1.0 (when found) checks that the mapped decoder and
 # converter resolve to real elements from the build tree. Not in ASan builds: the uninstrumented gst-inspect-1.0
 # can't load sanitized plugins in-process (plugin_load covers loading there).
