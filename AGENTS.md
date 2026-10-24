@@ -176,6 +176,10 @@ GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 rdsstreammux name=m batch-size=2 wi
 # ASan + UBSan build; tests/lsan.supp hides HIP runtime leaks
 meson setup build-asan -Db_sanitize=address,undefined -Db_lundef=false
 meson test -C build-asan --print-errorlogs
+
+# optimized build: no CI yet, so check one before merging (GLib macros expand differently under __OPTIMIZE__)
+meson setup build-rel -Dbuildtype=release
+meson test -C build-rel --print-errorlogs
 ```
 
 - Warnings are errors (`warning_level=2`, `werror`).
@@ -187,10 +191,11 @@ meson test -C build-asan --print-errorlogs
 - Element tests load plugins from `build/gst` (`GST_PLUGIN_PATH_1_0`) next to the system plugins, with a private
   registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
   `gst-plugin-scanner` can't load sanitized plugins. ASan runs with `use_sigaltstack=0` (Mesa's LLVM, loaded by the
-  VA driver, installs its own alternate signal stack), and only the soak tests shrink the ASan quarantine so their
-  VmRSS checks stay meaningful: `pipeline_soak` and `pipeline_mux_soak`, each its own build of
-  `pipeline_decode_convert.c` / `pipeline_mux.c` with `RDS_TEST_SMALL_QUARANTINE`. Their memory probes live in
-  `tests/check/rds-test-soak.h`: VmRSS, and GPU memory from this process's DRM fdinfo (`drm-total-vram` +
+  VA driver, installs its own alternate signal stack). The soak tests (`pipeline_soak`, `pipeline_mux_soak`) check
+  host memory growth on VmRSS, or under ASan on ASan's live heap (`__sanitizer_get_current_allocated_bytes`, which
+  leaves out the quarantine, so ASan keeps its default options); the normal build's VmRSS check covers memory that
+  bypasses malloc (HIP pinned memory). Their memory probes live in `tests/check/rds-test-soak.h`: host memory, and
+  GPU memory from this process's DRM fdinfo (`drm-total-vram` +
   `drm-total-gtt` of its render-node fds, where HIP allocations are accounted), so other processes on the GPU don't
   skew it; `hipMemGetInfo` is device-wide.
 - Element and pipeline test `main()`s end with `gst_deinit ()` after `g_test_run ()`. Without it, a test process can

@@ -584,6 +584,156 @@ test_four_sources (void)
   clips_free (clips);
 }
 
+/* ---- demuxed views as a converter's source ---- */
+
+#define CONV_W 640
+#define CONV_H 360
+
+static const ClipSpec conv_specs[] = {
+  {"h264", 640, 360, 20, 2, "rdsvideodec"},
+  {"h264", 1920, 1080, 15, 0, "rdsvideodec"},
+};
+
+/* What one `queue ! rdsvideoconvert ! RGBA` branch's sink saw, checked against @ref (packed CONV_W x CONV_H RGBA). */
+typedef struct
+{
+  guint source_id;
+  GPtrArray *ref;
+  GArray *ref_pts;
+  guint count;
+  guint max_diff;
+} ConvBranch;
+
+static GstPadProbeReturn
+conv_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  ConvBranch *b = user_data;
+  GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info);
+  GstCaps *caps = gst_pad_get_current_caps (pad);
+  GstVideoInfo vinfo;
+  GstVideoFrame frame;
+  const guint8 *ref;
+  guint d = 0;
+
+  g_assert_nonnull (caps);
+  g_assert_true (gst_video_info_from_caps (&vinfo, caps));
+  gst_caps_unref (caps);
+  g_assert_cmpint (GST_VIDEO_INFO_FORMAT (&vinfo), ==, GST_VIDEO_FORMAT_RGBA);
+  g_assert_cmpint (GST_VIDEO_INFO_WIDTH (&vinfo), ==, CONV_W);
+  g_assert_cmpint (GST_VIDEO_INFO_HEIGHT (&vinfo), ==, CONV_H);
+  if (b->count >= b->ref->len)
+    g_error ("src_%u: more frames than the reference (%u)", b->source_id, b->ref->len);
+  if (GST_BUFFER_PTS (buf) != g_array_index (b->ref_pts, GstClockTime, b->count))
+    g_error ("src_%u frame %u: PTS %" GST_TIME_FORMAT ", reference %" GST_TIME_FORMAT, b->source_id, b->count,
+        GST_TIME_ARGS (GST_BUFFER_PTS (buf)), GST_TIME_ARGS (g_array_index (b->ref_pts, GstClockTime, b->count)));
+  g_assert_true (gst_video_frame_map (&frame, &vinfo, buf, GST_MAP_READ));
+  ref = b->ref->pdata[b->count];
+  for (guint y = 0; y < CONV_H; y++) {
+    const guint8 *got = (const guint8 *) GST_VIDEO_FRAME_PLANE_DATA (&frame, 0)
+        + (gsize) y * GST_VIDEO_FRAME_PLANE_STRIDE (&frame, 0);
+    const guint8 *want = ref + (gsize) y * CONV_W * 4;
+
+    for (guint x = 0; x < CONV_W * 4; x++)
+      d = MAX (d, (guint) ABS ((gint) got[x] - (gint) want[x]));
+  }
+  gst_video_frame_unmap (&frame);
+  if (d > 1)
+    g_error ("src_%u frame %u: max |diff| %u against the CPU reference", b->source_id, b->count, d);
+  b->max_diff = MAX (b->max_diff, d);
+  g_free (b->ref->pdata[b->count]);
+  b->ref->pdata[b->count] = NULL;
+  b->count++;
+  return GST_PAD_PROBE_OK;
+}
+
+/* Two sources ! rdsstreammux 1280x720 ! rdsstreamdemux ! 2 x (queue ! rdsvideoconvert ! RGBA 640x360 in system
+ * memory): the converter reads the demuxed views (single-slot surfaces of the shared batch), and every frame equals
+ * the CPU reference of both steps (mux scaling to NV12 1280x720, then conversion to RGBA 640x360, both nearest),
+ * within 1 per channel, with the source's PTS. */
+static void
+test_demux_convert (void)
+{
+  const gchar *need[] = { "vah264enc", "vah264dec", "mp4mux", "qtdemux", "h264parse", NULL };
+  const guint n = G_N_ELEMENTS (conv_specs);
+  ConvBranch br[G_N_ELEMENTS (conv_specs)];
+  GString *desc = g_string_new (NULL);
+  GstElement *pipe;
+  GError *err = NULL;
+  Clips *clips;
+
+  RDS_TEST_REQUIRE_GPU ();
+  if (!require_elements (need))
+    return;
+  clips = clips_new (conv_specs, n);
+  for (guint i = 0; i < n; i++) {
+    GPtrArray *nv12 = g_ptr_array_new_with_free_func (g_free);
+
+    memset (&br[i], 0, sizeof (br[i]));
+    br[i].source_id = i;
+    br[i].ref = g_ptr_array_new_with_free_func (g_free);
+    br[i].ref_pts = g_array_new (FALSE, FALSE, sizeof (GstClockTime));
+    make_reference (&conv_specs[i], clips->path[i], nv12, br[i].ref_pts);
+    g_assert_cmpuint (nv12->len, ==, conv_specs[i].frames);
+    for (guint k = 0; k < nv12->len; k++) {
+      RefImage src = { 0 }, dst = { 0 };
+      guint8 *out = g_malloc ((gsize) CONV_W * CONV_H * 4);
+
+      src.format = RDS_BUF_COLOR_FORMAT_NV12;
+      src.width = MUX_W;
+      src.height = MUX_H;
+      src.plane[0] = nv12->pdata[k];
+      src.plane[1] = (guint8 *) nv12->pdata[k] + (gsize) MUX_W * MUX_H;
+      src.pitch[0] = src.pitch[1] = MUX_W;
+      dst.format = RDS_BUF_COLOR_FORMAT_RGBA;
+      dst.width = CONV_W;
+      dst.height = CONV_H;
+      dst.plane[0] = out;
+      dst.pitch[0] = CONV_W * 4;
+      ref_transform (&src, &dst, (RefRect) {
+          0, 0, MUX_W, MUX_H}, (RefRect) {
+          0, 0, CONV_W, CONV_H}, FALSE);
+      g_ptr_array_add (br[i].ref, out);
+    }
+    g_ptr_array_unref (nv12);
+  }
+
+  for (guint i = 0; i < n; i++) {
+    gchar *src = source_desc (&conv_specs[i], clips->path[i]);
+
+    g_string_append_printf (desc, "%s ! m.sink_%u d.src_%u ! queue ! rdsvideoconvert "
+        "! video/x-raw,format=RGBA,width=%u,height=%u ! fakesink name=o%u " BRANCH_SINK_PROPS " ", src, i, i,
+        CONV_W, CONV_H, i);
+    g_free (src);
+  }
+  g_string_append_printf (desc, "rdsstreammux name=m width=%u height=%u batch-size=%u ! rdsstreamdemux name=d",
+      MUX_W, MUX_H, n);
+  pipe = gst_parse_launch (desc->str, &err);
+  g_assert_no_error (err);
+  g_string_free (desc, TRUE);
+  for (guint i = 0; i < n; i++) {
+    GstElement *sink = get_by_name (pipe, "o%u", i);
+    GstPad *pad = gst_element_get_static_pad (sink, "sink");
+
+    gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, conv_probe, &br[i], NULL);
+    gst_object_unref (pad);
+    gst_object_unref (sink);
+  }
+
+  g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  wait_eos (pipe, 60 * GST_SECOND, NULL, 0);
+  gst_element_set_state (pipe, GST_STATE_NULL);
+
+  for (guint i = 0; i < n; i++) {
+    g_test_message ("src_%u (%ux%u): %u frames, max |diff| %u", i, conv_specs[i].width, conv_specs[i].height,
+        br[i].count, br[i].max_diff);
+    g_assert_cmpuint (br[i].count, ==, conv_specs[i].frames);
+    g_ptr_array_unref (br[i].ref);
+    g_array_unref (br[i].ref_pts);
+  }
+  gst_object_unref (pipe);
+  clips_free (clips);
+}
+
 /* ---- stall ---- */
 
 #define STALL_SOURCES 4
@@ -1076,6 +1226,7 @@ main (int argc, char **argv)
   g_test_init (&argc, &argv, NULL);
 
   g_test_add_func ("/gpu/mux-pipeline/four-sources", test_four_sources);
+  g_test_add_func ("/gpu/mux-pipeline/demux-convert", test_demux_convert);
   g_test_add_func ("/gpu/mux-pipeline/stall", test_stall);
   g_test_add_func ("/gpu/mux-pipeline/dynamic", test_dynamic);
   g_test_add_func ("/gpu/mux-soak/four-sources", test_mux_soak);

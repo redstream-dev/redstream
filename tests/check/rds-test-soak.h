@@ -1,6 +1,5 @@
-/* Memory probes for soak tests: host memory (VmRSS, or ASan's live heap under ASan) and this process's GPU memory,
- * plus a small ASan quarantine for the soak builds (RDS_TEST_SMALL_QUARANTINE). Header-only; include it from one
- * source file per executable.
+/* Memory probes for soak tests: host memory (VmRSS, or ASan's live heap under ASan) and this process's GPU memory.
+ * Header-only; include it from one source file per executable.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_TEST_SOAK_H
 #define RDS_TEST_SOAK_H
@@ -10,26 +9,12 @@
 #include <hip/hip_runtime_api.h>
 #include <string.h>
 
-/* Under ASan, freed memory sits in a quarantine (256 MiB by default) that fills up over the first loops of the soak
- * and reads as VmRSS growth (+170 MiB). A soak test's own build (RDS_TEST_SMALL_QUARANTINE, see tests/meson.build)
- * uses a small quarantine, which keeps use-after-free detection and makes VmRSS meaningful
- * again; LSan still reports real leaks at exit. The other tests keep ASan's defaults. ASAN_OPTIONS from the
- * environment override this. */
 #if defined(__SANITIZE_ADDRESS__)
 #define RDS_TEST_ASAN 1
 #elif defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define RDS_TEST_ASAN 1
 #endif
-#endif
-#if defined (RDS_TEST_ASAN) && defined (RDS_TEST_SMALL_QUARANTINE)
-const char *__asan_default_options (void);
-
-__attribute__((used, visibility ("default"))) const char *
-__asan_default_options (void)
-{
-  return "quarantine_size_mb=4:thread_local_quarantine_size_kb=64";
-}
 #endif
 
 G_GNUC_UNUSED static gsize
@@ -47,9 +32,11 @@ vm_rss_bytes (void)
 }
 
 /* Host memory the soak checks for growth: VmRSS in normal builds. Under ASan, VmRSS also moves with the allocator's
- * own caches and quarantine (noisy under parallel load, +12 MiB seen once), so the soak reads ASan's count of live
- * heap bytes instead. That count leaves out memory not allocated through malloc (HIP pinned host memory, driver
- * mappings): the normal build's VmRSS check covers those. */
+ * own caches and its quarantine of freed chunks (256 MiB by default: +170 MiB over the first loops, and noisy under
+ * parallel load), so the soak reads ASan's count of live heap bytes instead. A free counts as freed when the chunk
+ * enters the quarantine, so quarantined memory is not in that count and the soaks run with ASan's default options.
+ * The count leaves out memory not allocated through malloc (HIP pinned host memory, driver mappings): the normal
+ * build's VmRSS check covers those. */
 #ifdef RDS_TEST_ASAN
 /* from <sanitizer/allocator_interface.h>, which the dev image's GCC does not install */
 size_t __sanitizer_get_current_allocated_bytes (void);

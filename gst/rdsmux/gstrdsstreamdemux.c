@@ -469,27 +469,54 @@ gst_rds_stream_demux_src_query (GstPad * pad, GstObject * parent, GstQuery * que
   return gst_pad_query_default (pad, parent, query);
 }
 
-/* The output for frame @fm of @batch: a view of its slot with a one-frame batch meta, or NULL. */
-static GstBuffer *
-make_output (GstRdsStreamDemux * self, GstBuffer * batch, RdsFrameMeta * fm)
+/* What one output needs from a frame of the batch, taken under the batch's meta lock so that the push (which runs
+ * downstream code, and may block) happens without it. */
+typedef struct
 {
-  GstBuffer *out = rds_buffer_new_surface_view (batch, fm->batch_id);
-  RdsBatchMeta *bm;
-  RdsFrameMeta *copy;
+  guint source_id;
+  guint batch_id;
+  GstClockTime pts;
+  RdsBatchMeta *meta;           /* one-frame batch meta with a deep copy of the frame (batch_id 0), owned */
+} FrameSnapshot;
+
+/* Snapshots every frame of @bm under its meta lock. Returns an array of FrameSnapshot. */
+static GArray *
+snapshot_frames (RdsBatchMeta * bm)
+{
+  GArray *frames;
+
+  rds_acquire_meta_lock (bm);
+  frames = g_array_sized_new (FALSE, FALSE, sizeof (FrameSnapshot), g_list_length (bm->frame_meta_list));
+  for (GList * l = bm->frame_meta_list; l != NULL; l = l->next) {
+    RdsFrameMeta *fm = l->data;
+    FrameSnapshot f = { fm->source_id, fm->batch_id, fm->buf_pts, rds_create_batch_meta (1) };
+    /* locks bm again (recursive) then f.meta: the order rds_copy_frame_meta_to_batch documents */
+    RdsFrameMeta *copy = rds_copy_frame_meta_to_batch (fm, f.meta);
+
+    if (copy != NULL)
+      copy->batch_id = 0;
+    g_array_append_val (frames, f);
+  }
+  rds_release_meta_lock (bm);
+  return frames;
+}
+
+/* The output for frame @f of @batch: a view of its slot carrying f's batch meta (taken), or NULL. */
+static GstBuffer *
+make_output (GstRdsStreamDemux * self, GstBuffer * batch, FrameSnapshot * f)
+{
+  GstBuffer *out = rds_buffer_new_surface_view (batch, f->batch_id);
 
   if (out == NULL) {
-    GST_WARNING_OBJECT (self, "frame of source %u names slot %u, which the batch does not have", fm->source_id,
-        fm->batch_id);
+    GST_WARNING_OBJECT (self, "frame of source %u names slot %u, which the batch does not have", f->source_id,
+        f->batch_id);
     return NULL;
   }
   gst_buffer_copy_into (out, batch, GST_BUFFER_COPY_FLAGS | GST_BUFFER_COPY_TIMESTAMPS, 0, -1);
-  GST_BUFFER_PTS (out) = fm->buf_pts;
+  GST_BUFFER_PTS (out) = f->pts;
   GST_BUFFER_DTS (out) = GST_CLOCK_TIME_NONE;
-  bm = rds_create_batch_meta (1);
-  copy = rds_copy_frame_meta_to_batch (fm, bm);
-  if (copy != NULL)
-    copy->batch_id = 0;
-  rds_buffer_add_batch_meta (out, bm);
+  rds_buffer_add_batch_meta (out, f->meta);
+  f->meta = NULL;
   return out;
 }
 
@@ -499,6 +526,7 @@ gst_rds_stream_demux_chain (G_GNUC_UNUSED GstPad * pad, GstObject * parent, GstB
   GstRdsStreamDemux *self = GST_RDS_STREAM_DEMUX (parent);
   RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (batch);
   GstFlowReturn ret = GST_FLOW_OK;
+  GArray *frames;
 
   if (bm == NULL || rds_buffer_get_surface (batch) == NULL) {
     gst_buffer_unref (batch);
@@ -507,8 +535,11 @@ gst_rds_stream_demux_chain (G_GNUC_UNUSED GstPad * pad, GstObject * parent, GstB
     return GST_FLOW_ERROR;
   }
 
-  for (GList * l = bm->frame_meta_list; l != NULL; l = l->next) {
-    RdsFrameMeta *fm = l->data;
+  /* An upstream probe or another holder of the batch may edit its meta: never walk it unlocked, and never push
+   * with the lock held. */
+  frames = snapshot_frames (bm);
+  for (guint i = 0; i < frames->len; i++) {
+    FrameSnapshot *f = &g_array_index (frames, FrameSnapshot, i);
     GList *events;
     GstBuffer *out;
     GstFlowReturn r;
@@ -516,11 +547,11 @@ gst_rds_stream_demux_chain (G_GNUC_UNUSED GstPad * pad, GstObject * parent, GstB
     SrcPad *sp;
 
     g_mutex_lock (&self->lock);
-    sp = lookup (self, fm->source_id);
+    sp = lookup (self, f->source_id);
     if (sp == NULL || sp->eos) {
       self->dropped++;
       g_mutex_unlock (&self->lock);
-      GST_DEBUG_OBJECT (self, "frame of source %u dropped: %s (%" G_GUINT64_FORMAT " so far)", fm->source_id,
+      GST_DEBUG_OBJECT (self, "frame of source %u dropped: %s (%" G_GUINT64_FORMAT " so far)", f->source_id,
           sp == NULL ? "no pad" : "pad ended", self->dropped);
       if (sp != NULL)
         src_pad_unref (sp);
@@ -532,7 +563,7 @@ gst_rds_stream_demux_chain (G_GNUC_UNUSED GstPad * pad, GstObject * parent, GstB
     g_mutex_unlock (&self->lock);
 
     push_events (sp, events);
-    out = make_output (self, batch, fm);
+    out = make_output (self, batch, f);
     if (out != NULL) {
       if (discont)
         GST_BUFFER_FLAG_SET (out, GST_BUFFER_FLAG_DISCONT);
@@ -545,6 +576,9 @@ gst_rds_stream_demux_chain (G_GNUC_UNUSED GstPad * pad, GstObject * parent, GstB
     }
     src_pad_unref (sp);
   }
+  for (guint i = 0; i < frames->len; i++)
+    rds_destroy_batch_meta (g_array_index (frames, FrameSnapshot, i).meta);     /* dropped frames' metas */
+  g_array_unref (frames);
   gst_buffer_unref (batch);
   return ret;
 }

@@ -259,8 +259,15 @@ rds_buffer_new_surface_view (GstBuffer * batch, guint index)
     return NULL;
   }
 
-  /* A view of a view shows the same slot and refs the original batch, so chains never pin intermediate views. */
-  parent = rds_buf_surface_is_view (src) ? ((RdsViewMemory *) mem)->priv.parent : batch;
+  /* A view of a view shows the same slot and refs the original batch, so chains never pin intermediate views.
+   * Only RdsViewMemory carries a view surface (copies of a view own their surface), so the cast is safe; check it
+   * anyway, since a bad cast would read a parent out of unrelated memory. */
+  if (rds_buf_surface_is_view (src)) {
+    g_return_val_if_fail (src == &((RdsViewMemory *) mem)->surface, NULL);
+    parent = ((RdsViewMemory *) mem)->priv.parent;
+  } else {
+    parent = batch;
+  }
 
   v = g_new0 (RdsViewMemory, 1);
   rds_buf_surface_init_view (&v->surface, &v->params, &v->priv, src, index);
