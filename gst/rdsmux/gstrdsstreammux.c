@@ -61,7 +61,7 @@ GST_DEBUG_CATEGORY_STATIC (gst_rds_stream_mux_debug);
 #define DEFAULT_DROP_PIPELINE_EOS FALSE
 #define DEFAULT_FRAME_NUM_RESET_ON_EOS FALSE
 #define DEFAULT_FRAME_NUM_RESET_ON_STREAM_RESET FALSE
-#define DEFAULT_FRAME_DURATION 0
+#define DEFAULT_FRAME_DURATION G_MAXUINT64       /* -1 as documented: none */
 #define DEFAULT_CACHE_BUFFER_TIMEOUT -1
 #define DEFAULT_SYNC_INPUTS_NTP 0
 #define DEFAULT_FAILSAFE_FLUSH_COUNT 10
@@ -113,7 +113,8 @@ enum
 {
   PAD_STATE_NEW,
   PAD_STATE_ADDED,
-  PAD_STATE_RELEASED,
+  PAD_STATE_RELEASED,           /* after pad-added: pad-deleted is due */
+  PAD_STATE_RELEASED_NEW,       /* never announced: its frames are dropped, no pad-deleted */
 };
 
 struct _GstRdsStreamMuxPad
@@ -170,9 +171,12 @@ struct _GstRdsStreamMux
 
   /* downstream stream events (events_lock) */
   GMutex events_lock;
-  GQueue pending;               /* GstEvent *, oldest first */
-  gboolean in_flight;           /* the source thread is handling a batch or a source's event: events queue up */
+  GQueue pending;               /* GstEvent *, oldest first: the source thread's */
+  GQueue deferred;              /* from other threads while in_flight: they go after the batch or event in hand */
+  gboolean in_flight;           /* the source thread is handling a batch or a source's event */
   gboolean can_push;            /* output caps negotiated */
+  GRecMutex push_lock;          /* serializes our event pushes across threads (taken before events_lock). Recursive:
+                                 * a probe releasing a pad from inside our push re-enters send_event */
 
   /* wakes aggregate () waiting with every source ended under drop-pipeline-eos (wait_lock) */
   GMutex wait_lock;
@@ -361,7 +365,12 @@ gst_rds_stream_mux_release_pad (GstElement * element, GstPad * pad)
   GstRdsStreamMux *self = GST_RDS_STREAM_MUX (element);
   GstRdsStreamMuxPad *mpad = GST_RDS_STREAM_MUX_PAD (pad);
   guint index = mpad->index;
-  gint prev = g_atomic_int_exchange (&mpad->state, PAD_STATE_RELEASED);
+  gint prev;
+
+  do {
+    prev = g_atomic_int_get (&mpad->state);
+  } while (!g_atomic_int_compare_and_exchange (&mpad->state, prev,
+          prev == PAD_STATE_ADDED ? PAD_STATE_RELEASED : PAD_STATE_RELEASED_NEW));
 
   GST_ELEMENT_CLASS (gst_rds_stream_mux_parent_class)->release_pad (element, pad);
   if (prev == PAD_STATE_ADDED)
@@ -523,9 +532,11 @@ set_pool_flushing (GstRdsStreamMux * self, gboolean flushing)
 
 /* ---- stream events ----
  *
- * The source thread queues events and pushes them (in order, after the mux's mandatory events) once the output caps
- * are negotiated; while it handles a batch or a source's event (in_flight), events from other threads queue up
- * behind it. */
+ * The source thread queues its events (pending) and pushes them, in order and after the mux's mandatory events,
+ * once the output caps are negotiated: before a batch, and when it is done with a batch or a source's event. While
+ * it handles one (in_flight), events from other threads (pad-deleted) wait in deferred and follow it: the batch in
+ * hand may hold the released pad's last frame. push_lock orders a direct push from another thread against the
+ * source thread's pushes, so a pad-deleted cannot overtake the pad-added of a pad requested after it. */
 
 static void
 wake_idle (GstRdsStreamMux * self)
@@ -552,52 +563,64 @@ events_enter (GstRdsStreamMux * self)
   g_mutex_unlock (&self->events_lock);
 }
 
-/* Source thread: pushes the queued events (when the caps allow); with @leave, also ends in_flight once the queue is
- * empty, so events from other threads go straight downstream again. */
+/* Source thread: pushes its queued events (when the caps allow). With @leave (done with the batch or event in hand),
+ * the deferred events from other threads follow, and in_flight ends once both queues are empty. */
 static void
 events_push (GstRdsStreamMux * self, gboolean leave)
 {
+  g_rec_mutex_lock (&self->push_lock);
   for (;;) {
     GstEvent *event = NULL;
 
     g_mutex_lock (&self->events_lock);
+    if (leave)
+      while (!g_queue_is_empty (&self->deferred))
+        g_queue_push_tail (&self->pending, g_queue_pop_head (&self->deferred));
     if (self->can_push)
       event = g_queue_pop_head (&self->pending);
     if (event == NULL && leave)
       self->in_flight = FALSE;
     g_mutex_unlock (&self->events_lock);
     if (event == NULL)
-      return;
+      break;
     GST_LOG_OBJECT (self, "pushing %" GST_PTR_FORMAT, event);
     if (!gst_aggregator_push_src_event (GST_AGGREGATOR (self), event))
       GST_DEBUG_OBJECT (self, "a stream event was not handled downstream");
   }
+  g_rec_mutex_unlock (&self->push_lock);
 }
 
-/* Any thread: pushes @event now unless the source thread is busy or events are waiting (then it queues). */
+/* Any other thread: pushes @event now, unless the source thread is handling a batch or event or events are waiting
+ * (then it follows them). */
 static void
 send_event (GstRdsStreamMux * self, GstEvent * event)
 {
   gboolean now;
 
+  g_rec_mutex_lock (&self->push_lock);
   g_mutex_lock (&self->events_lock);
-  now = !self->in_flight && self->can_push && g_queue_is_empty (&self->pending);
+  now = !self->in_flight && self->can_push && g_queue_is_empty (&self->pending)
+      && g_queue_is_empty (&self->deferred);
   if (!now)
-    g_queue_push_tail (&self->pending, event);
+    g_queue_push_tail (&self->deferred, event);
   g_mutex_unlock (&self->events_lock);
   if (now && !gst_pad_push_event (GST_AGGREGATOR_SRC_PAD (self), event))
     GST_DEBUG_OBJECT (self, "a stream event was not handled downstream");
+  g_rec_mutex_unlock (&self->push_lock);
 }
 
 /* Source thread: the per-source events due before anything else from @pad: pad-added (once) and stream-reset after
- * a flush (restarting the frame numbers with frame-num-reset-on-stream-reset). */
-static void
+ * a flush (restarting the frame numbers with frame-num-reset-on-stream-reset). FALSE for a pad released before it
+ * was announced: nothing of it goes downstream. */
+static gboolean
 pad_announce (GstRdsStreamMux * self, GstRdsStreamMuxPad * pad)
 {
   gboolean reset_frames;
 
   if (g_atomic_int_compare_and_exchange (&pad->state, PAD_STATE_NEW, PAD_STATE_ADDED))
     queue_event (self, rds_event_new_pad_added (pad->index));
+  if (g_atomic_int_get (&pad->state) == PAD_STATE_RELEASED_NEW)
+    return FALSE;
   if (g_atomic_int_compare_and_exchange (&pad->reset_pending, TRUE, FALSE)) {
     GST_OBJECT_LOCK (self);
     reset_frames = self->frame_num_reset_on_stream_reset;
@@ -606,6 +629,7 @@ pad_announce (GstRdsStreamMux * self, GstRdsStreamMuxPad * pad)
     if (reset_frames)
       pad->frame_num = 0;
   }
+  return TRUE;
 }
 
 /* Source thread: a source's serialized event becomes its stream event. */
@@ -655,8 +679,8 @@ gst_rds_stream_mux_sink_event (GstAggregator * agg, GstAggregatorPad * aggpad, G
 
   if (queued) {
     events_enter (self);
-    pad_announce (self, pad);
-    pad_stream_event (self, pad, event);
+    if (pad_announce (self, pad))
+      pad_stream_event (self, pad, event);
   }
 
   switch (type) {
@@ -750,8 +774,6 @@ gst_rds_stream_mux_flush (GstAggregator * agg)
 
 /* ---- timing ---- */
 
-/* With a timeout, the batch is due one aggregator latency (the timeout) after its first buffer was seen. Called
- * by the aggregator on the source thread before it waits; NONE (no buffer yet, or no timeout) waits for data. */
 /* sync-inputs: the running time of the earliest frame queued on any pad, or NONE. */
 static GstClockTime
 earliest_queued (GstRdsStreamMux * self)
@@ -838,6 +860,7 @@ events_reset (GstRdsStreamMux * self)
 {
   g_mutex_lock (&self->events_lock);
   g_queue_clear_full (&self->pending, (GDestroyNotify) gst_event_unref);
+  g_queue_clear_full (&self->deferred, (GDestroyNotify) gst_event_unref);
   self->in_flight = FALSE;
   self->can_push = FALSE;
   g_mutex_unlock (&self->events_lock);
@@ -1282,9 +1305,11 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
       e.running_time = gst_segment_to_running_time (&GST_AGGREGATOR_PAD (pad)->segment, GST_FORMAT_TIME,
           GST_BUFFER_PTS (e.buf));
       GST_OBJECT_UNLOCK (pad);
-      /* a source with no event since it was added or flushed */
-      pad_announce (self, pad);
-      g_array_append_val (entries, e);
+      /* a source with no event since it was added or flushed; a frame of a pad released unannounced is dropped */
+      if (pad_announce (self, pad))
+        g_array_append_val (entries, e);
+      else
+        gst_buffer_unref (e.buf);
     }
   }
   if (n > 0)
@@ -1334,6 +1359,14 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
   }
   /* blocks while every pool buffer is downstream (bounded pool) */
   ret = gst_buffer_pool_acquire_buffer (pool, &outbuf, NULL);
+  if (ret == GST_FLOW_FLUSHING) {
+    /* An element-wide flush (or a stop) woke the wait: drop the frames. Not FLUSHING: the aggregator may not have
+     * marked itself flushing yet (we set the pool flushing before chaining FLUSH_START up), and would then set
+     * every sink pad flushing for good, including one whose FLUSH_STOP already came. */
+    GST_DEBUG_OBJECT (self, "pool flushing: dropping a batch of %u", entries->len);
+    ret = GST_AGGREGATOR_FLOW_NEED_DATA;
+    goto out;
+  }
   if (ret != GST_FLOW_OK)
     goto out;
   ret = GST_FLOW_ERROR;
@@ -1666,7 +1699,9 @@ gst_rds_stream_mux_finalize (GObject * object)
   GstRdsStreamMux *self = GST_RDS_STREAM_MUX (object);
 
   g_queue_clear_full (&self->pending, (GDestroyNotify) gst_event_unref);
+  g_queue_clear_full (&self->deferred, (GDestroyNotify) gst_event_unref);
   g_mutex_clear (&self->events_lock);
+  g_rec_mutex_clear (&self->push_lock);
   g_cond_clear (&self->wait_cond);
   g_mutex_clear (&self->wait_lock);
   G_OBJECT_CLASS (gst_rds_stream_mux_parent_class)->finalize (object);
@@ -1841,6 +1876,8 @@ gst_rds_stream_mux_init (GstRdsStreamMux * self)
   self->failsafe_flush_count = DEFAULT_FAILSAFE_FLUSH_COUNT;
   g_mutex_init (&self->events_lock);
   g_queue_init (&self->pending);
+  g_queue_init (&self->deferred);
+  g_rec_mutex_init (&self->push_lock);
   g_mutex_init (&self->wait_lock);
   g_cond_init (&self->wait_cond);
   self->batch_start = GST_CLOCK_TIME_NONE;

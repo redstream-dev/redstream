@@ -2426,7 +2426,7 @@ test_more_properties (void)
   check_int (e, "sync-inputs-ntp", 0, 0, G_MAXINT);
   check_uint (e, "failsafe-flush-count", 10, 1, 1024);
   p64 = G_PARAM_SPEC_UINT64 (find_prop (e, "frame-duration", G_TYPE_PARAM_UINT64));
-  g_assert_cmpuint (p64->default_value, ==, 0);
+  g_assert_cmpuint (p64->default_value, ==, G_MAXUINT64);
   g_assert_cmpuint (p64->maximum, ==, G_MAXUINT64);
   gst_object_unref (e);
 
@@ -2465,6 +2465,157 @@ test_noop_log_once (void)
   gst_debug_set_threshold_for_name ("rdsstreammux", GST_LEVEL_NONE);
   for (guint i = 0; i < 2; i++)
     gst_object_unref (e[i]);
+}
+
+/* A pad released while the batch holding its last frame waits for a pool buffer: pad-deleted follows that batch. */
+static void
+test_release_while_blocked (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[2];
+  GstBufferPool *pool;
+  GstBuffer *held;
+  Recorder rec;
+  gint i_last, i_del;
+
+  RDS_TEST_REQUIRE_GPU ();
+  recorder_init (&rec);
+  h = mux_harness_full ("batch-size=2 width=64 height=64 buffer-pool-size=1", in_caps, 2, in, NULL, NULL, &rec);
+  pool = make_pool (in_caps[0]);
+  held = block_in_acquire (h, in, pool);
+  /* the second pair (round robin: source 1 first) is popped and waits for the held batch */
+  gst_harness_teardown (in[1]);
+  gst_buffer_unref (held);
+  i_last = rec_wait (&rec, "B:1:0", 0);
+  i_del = rec_wait (&rec, "deleted:1", 0);
+  if (i_del < i_last) {
+    rec_dump (&rec);
+    g_error ("pad-deleted came before the batch with the pad's last frame");
+  }
+  drop_output (h);
+  g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, 4, 66 * GST_MSECOND)), ==, GST_FLOW_OK);
+  rec_wait (&rec, "B:0", i_del);
+  mux_teardown (h, in, 1);
+  pool_free (pool);
+  recorder_clear (&rec);
+}
+
+/* Releasing a pad and requesting the same one again at once: pad-deleted before the new pad-added. */
+static void
+test_rerequest_pad (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[2];
+  GstBufferPool *pool;
+  Recorder rec;
+
+  RDS_TEST_REQUIRE_GPU ();
+  recorder_init (&rec);
+  h = mux_harness_full ("batch-size=2 width=64 height=64 sort-batch=true", in_caps, 2, in, NULL, NULL, &rec);
+  pool = make_pool (in_caps[0]);
+  for (guint round = 0; round < 5; round++) {
+    gint i_del, i_add;
+
+    g_mutex_lock (&rec.lock);
+    g_ptr_array_set_size (rec.log, 0);
+    g_mutex_unlock (&rec.lock);
+    for (guint i = 0; i < 2; i++)
+      g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, i, round * 66 * GST_MSECOND)), ==, GST_FLOW_OK);
+    i_add = rec_wait (&rec, "B:0:1", 0);
+    drop_output (h);
+    gst_harness_teardown (in[1]);
+    in[1] = gst_harness_new_with_element (h->element, "sink_1", NULL);
+    gst_harness_set_src_caps_str (in[1], in_caps[1]);
+    for (guint i = 0; i < 2; i++)
+      g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, 2 + i, (round * 66 + 33) * GST_MSECOND)), ==,
+          GST_FLOW_OK);
+    i_add = rec_wait (&rec, "added:1", i_add + 1);
+    i_del = rec_wait (&rec, "deleted:1", 0);
+    if (i_del > i_add) {
+      rec_dump (&rec);
+      g_error ("pad-added of the re-requested pad overtook the pad-deleted of the released one");
+    }
+    rec_wait (&rec, "B:0:1", i_add);
+    drop_output (h);
+  }
+  mux_teardown (h, in, 2);
+  pool_free (pool);
+  recorder_clear (&rec);
+}
+
+/* After READY -> PLAYING every source is announced again; a pad released without ever having been fed sends no
+ * pad-deleted (it never had a pad-added). */
+static void
+test_restart_announce (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120) };
+  GstHarness *h, *in[1];
+  GstBufferPool *pool;
+  GstPad *unfed;
+  gchar *deleted;
+  Recorder rec;
+
+  RDS_TEST_REQUIRE_GPU ();
+  recorder_init (&rec);
+  h = mux_harness_full ("width=64 height=64", in_caps, 1, in, NULL, NULL, &rec);
+  pool = make_pool (in_caps[0]);
+  g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, 0, 0)), ==, GST_FLOW_OK);
+  rec_wait (&rec, "B:0", 0);
+  drop_output (h);
+
+  unfed = gst_element_request_pad_simple (h->element, "sink_%u");
+  g_assert_nonnull (unfed);
+  deleted = g_strdup_printf ("deleted:%s", GST_PAD_NAME (unfed) + strlen ("sink_"));
+  gst_element_release_request_pad (h->element, unfed);
+  gst_object_unref (unfed);
+  g_usleep (200 * 1000);
+  g_assert_cmpint (rec_find (&rec, deleted, 0), <, 0);
+  g_free (deleted);
+
+  g_assert_cmpint (gst_element_set_state (h->element, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  g_assert_cmpint (gst_element_set_state (h->element, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_stream_start ("after-restart")));
+  gst_harness_set_src_caps_str (in[0], in_caps[0]);
+  g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, 1, 0)), ==, GST_FLOW_OK);
+  rec_wait (&rec, "B:0", rec_wait (&rec, "start:0:after-restart", 0));
+  g_assert_cmpint (rec_count (&rec, "added:0"), ==, 2);
+  drop_output (h);
+  mux_teardown (h, in, 1);
+  pool_free (pool);
+  recorder_clear (&rec);
+}
+
+/* The output pool woken by an element-wide flush before the aggregator marks itself flushing (the mux sets the pool
+ * flushing before chaining FLUSH_START up). Simulated by setting the pool flushing with no flush at all: the popped
+ * batch is dropped, but the sink pads must not be left flushing. */
+static void
+test_pool_flushing_window (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[2];
+  GstBufferPool *pool, *out_pool;
+  GstBuffer *held, *out;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("batch-size=2 width=64 height=64 buffer-pool-size=1", in_caps, 2, in);
+  pool = make_pool (in_caps[0]);
+  held = block_in_acquire (h, in, pool);
+  out_pool = gst_aggregator_get_buffer_pool (GST_AGGREGATOR (h->element));
+  gst_buffer_pool_set_flushing (out_pool, TRUE);
+  g_usleep (100 * 1000);
+  gst_buffer_pool_set_flushing (out_pool, FALSE);
+  gst_object_unref (out_pool);
+  gst_buffer_unref (held);
+  g_assert_null (pull_within (h, 100));
+
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, 4 + i, 66 * GST_MSECOND)), ==, GST_FLOW_OK);
+  out = pull_ok (h);
+  g_assert_cmpuint (rds_buffer_get_surface (out)->numFilled, ==, 2);
+  g_assert_cmpuint (GST_BUFFER_PTS (out), ==, 66 * GST_MSECOND);
+  gst_buffer_unref (out);
+  mux_teardown (h, in, 2);
+  pool_free (pool);
 }
 
 int
@@ -2513,5 +2664,9 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/mux/stall-timeout", test_stall_timeout);
   g_test_add_func ("/gpu/mux/timeout-live-upstream", test_timeout_live_upstream);
   g_test_add_func ("/gpu/mux/sync-inputs", test_sync_inputs);
+  g_test_add_func ("/gpu/mux/release-while-blocked", test_release_while_blocked);
+  g_test_add_func ("/gpu/mux/rerequest-pad", test_rerequest_pad);
+  g_test_add_func ("/gpu/mux/restart-announce", test_restart_announce);
+  g_test_add_func ("/gpu/mux/pool-flushing-window", test_pool_flushing_window);
   return g_test_run ();
 }
