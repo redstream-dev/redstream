@@ -2,7 +2,7 @@
  * ROCm device).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
-#include "transform-ref.h"
+#include "rds-test-surface.h"
 #include "../../gst/rdsvideo/rds-video-util.h"
 
 #include <gst/base/gstbasetransform.h>
@@ -243,95 +243,27 @@ make_pool (const gchar * caps_str, guint batch_size)
   return pool;
 }
 
-/* Fills every surface of @buf's batch with a deterministic pseudo-random pattern and marks them filled. */
+/* Fills every surface of @buf's batch with a deterministic pattern and marks them filled. */
 static void
 fill_buffer (GstBuffer * buf, guint32 seed)
 {
   RdsBufSurface *s = rds_buffer_get_surface (buf);
-  guint32 state = seed * 2654435761u + 1;
 
   g_assert_nonnull (s);
   for (guint i = 0; i < s->batchSize; i++) {
-    RdsBufSurfaceParams *p = &s->surfaceList[i];
-
-    g_assert_nonnull (p->dataPtr);
-    g_assert_cmpint (rds_buf_surface_map (s, i, -1, RDS_BUF_MAP_WRITE), ==, 0);
-    for (guint pl = 0; pl < p->planeParams.num_planes; pl++) {
-      guint row_bytes = p->planeParams.width[pl] * p->planeParams.bytesPerPix[pl];
-      for (guint y = 0; y < p->planeParams.height[pl]; y++) {
-        guint8 *row = (guint8 *) p->mappedAddr.addr[pl] + (gsize) y * p->planeParams.pitch[pl];
-        for (guint x = 0; x < row_bytes; x++) {
-          state ^= state << 13;
-          state ^= state >> 17;
-          state ^= state << 5;
-          row[x] = (guint8) (state >> 11);
-        }
-      }
-    }
-    g_assert_cmpint (rds_buf_surface_sync_for_device (s, i, -1), ==, 0);
-    g_assert_cmpint (rds_buf_surface_unmap (s, i, -1), ==, 0);
+    g_assert_nonnull (s->surfaceList[i].dataPtr);
+    fill_random (s, i, seed + i);
   }
   s->numFilled = s->batchSize;
 }
 
-typedef struct
-{
-  RefImage im;
-  guint num_planes;
-  guint row_bytes[3];
-  guint rows[3];
-} HostImage;
-
 static void
-snapshot (GstBuffer * buf, HostImage * h)
+snapshot_buffer (GstBuffer * buf, HostImage * h)
 {
   RdsBufSurface *s = rds_buffer_get_surface (buf);
-  RdsBufSurfaceParams *p;
 
   g_assert_nonnull (s);
-  p = &s->surfaceList[0];
-  memset (h, 0, sizeof (*h));
-  h->im.format = p->colorFormat;
-  h->im.width = p->width;
-  h->im.height = p->height;
-  h->num_planes = p->planeParams.num_planes;
-  g_assert_cmpint (rds_buf_surface_map (s, 0, -1, RDS_BUF_MAP_READ), ==, 0);
-  g_assert_cmpint (rds_buf_surface_sync_for_cpu (s, 0, -1), ==, 0);
-  for (guint pl = 0; pl < h->num_planes; pl++) {
-    h->im.pitch[pl] = p->planeParams.pitch[pl];
-    h->im.plane[pl] = g_memdup2 (p->mappedAddr.addr[pl], (gsize) p->planeParams.pitch[pl]
-        * p->planeParams.height[pl]);
-    h->row_bytes[pl] = p->planeParams.width[pl] * p->planeParams.bytesPerPix[pl];
-    h->rows[pl] = p->planeParams.height[pl];
-  }
-  g_assert_cmpint (rds_buf_surface_unmap (s, 0, -1), ==, 0);
-}
-
-static void
-host_image_clear (HostImage * h)
-{
-  for (guint pl = 0; pl < h->num_planes; pl++)
-    g_free (h->im.plane[pl]);
-  memset (h, 0, sizeof (*h));
-}
-
-static guint
-max_diff (const HostImage * a, const HostImage * b)
-{
-  guint m = 0;
-
-  g_assert_cmpuint (a->num_planes, ==, b->num_planes);
-  for (guint pl = 0; pl < a->num_planes; pl++) {
-    g_assert_cmpuint (a->row_bytes[pl], ==, b->row_bytes[pl]);
-    g_assert_cmpuint (a->rows[pl], ==, b->rows[pl]);
-    for (guint y = 0; y < a->rows[pl]; y++) {
-      const guint8 *ra = a->im.plane[pl] + (gsize) y * a->im.pitch[pl];
-      const guint8 *rb = b->im.plane[pl] + (gsize) y * b->im.pitch[pl];
-      for (guint x = 0; x < a->row_bytes[pl]; x++)
-        m = MAX (m, (guint) ABS ((gint) ra[x] - (gint) rb[x]));
-    }
-  }
-  return m;
+  snapshot (s, 0, h);
 }
 
 static GstHarness *
@@ -365,7 +297,7 @@ test_convert_scale (void)
   g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &in, NULL), ==, GST_FLOW_OK);
   fill_buffer (in, 3);
   GST_BUFFER_PTS (in) = 42 * GST_MSECOND;
-  snapshot (in, &hin);
+  snapshot_buffer (in, &hin);
 
   out = gst_harness_push_and_pull (h, in);
   g_assert_nonnull (out);
@@ -376,7 +308,7 @@ test_convert_scale (void)
   gst_caps_unref (expected);
   gst_caps_unref (caps);
   g_assert_cmpuint (rds_buffer_get_surface (out)->numFilled, ==, 1);
-  snapshot (out, &hout);
+  snapshot_buffer (out, &hout);
 
   /* the whole destination is written: start the reference from a copy of the output */
   href = hout;
@@ -384,7 +316,7 @@ test_convert_scale (void)
     href.im.plane[pl] = g_memdup2 (hout.im.plane[pl], (gsize) hout.im.pitch[pl] * hout.rows[pl]);
   memset (href.im.plane[0], 0, (gsize) href.im.pitch[0] * href.rows[0]);
   ref_transform (&hin.im, &href.im, s, d, FALSE);
-  g_assert_cmpuint (max_diff (&hout, &href), <=, 1);
+  g_assert_cmpuint (max_diff (&hout, &href, TRUE), <=, 1);
 
   host_image_clear (&href);
   host_image_clear (&hout);
@@ -464,13 +396,13 @@ test_passthrough (void)
   g_object_set (h->element, "disable-passthrough", TRUE, NULL);
   gst_harness_set_src_caps_str (h, NV12_320);
   gst_harness_set_sink_caps_str (h, NV12_320);
-  snapshot (in, &hin);
+  snapshot_buffer (in, &hin);
   out = gst_harness_push_and_pull (h, gst_buffer_ref (in));
   g_assert_nonnull (out);
   g_assert_true (out != in);
   g_assert_true (rds_buffer_get_surface (out) != rds_buffer_get_surface (in));
-  snapshot (out, &hout);
-  g_assert_cmpuint (max_diff (&hin, &hout), ==, 0);
+  snapshot_buffer (out, &hout);
+  g_assert_cmpuint (max_diff (&hin, &hout, TRUE), ==, 0);
   host_image_clear (&hout);
   host_image_clear (&hin);
   gst_buffer_unref (out);
