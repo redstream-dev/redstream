@@ -11,8 +11,25 @@
  *   pushed one timeout after its first buffer, wherever the buffer timestamps sit relative to the clock. (The
  *   aggregator's stock "output position" next time fires late when a file decodes faster than real time and at
  *   once when it decodes slower.)
+ *   The upstream latency of a live source is taken off again: the timer counts from the batch's first frame only.
+ * - sync-inputs: forced-live as well, but get_next_time is the running time of the earliest queued frame. A partial
+ *   batch then goes out once the clock reaches that frame's running time plus the latency (batched-push-timeout, or
+ *   0, plus max-latency and the upstream latency). A frame already due goes out at once with whatever else is
+ *   queued; one ahead of the clock waits for the others until its time. As in every mode, a batch with a frame from
+ *   every source goes out as soon as it is complete: inputs are not held back to the clock.
  * Pool pressure: a live or forced-live aggregator pad queues at least two buffers plus a latency's worth, on top of
  * the one being batched; upstream pools must allow for that.
+ *
+ * Stream events (rds-event.h) go downstream in order with the batches:
+ * - pad-added before a source's first event or frame, stream-start / stream-segment from its STREAM_START /
+ *   SEGMENT, stream-eos from its EOS, stream-reset before its first event or frame after a flush. The aggregator
+ *   queues serialized events with the buffers and hands them to sink_event on the source thread once the buffers
+ *   in front of them have been taken, so a source's stream-eos follows the batch with its last frame and precedes
+ *   every later batch.
+ * - pad-deleted when a pad is released: right away from the releasing thread, or, while a batch is being built
+ *   (it may hold the pad's last frame), after that batch.
+ * Events wait in a queue until the output caps are negotiated, so they never come before the mux's own
+ * stream-start, caps and segment.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsstreammux.h"
 #include "../rdsvideo/rds-video-util.h"
@@ -38,6 +55,19 @@ GST_DEBUG_CATEGORY_STATIC (gst_rds_stream_mux_debug);
 #define DEFAULT_NUM_SURFACES_PER_FRAME 1
 #define DEFAULT_SORT_BATCH FALSE
 #define DEFAULT_ATTACH_SYS_TS TRUE
+#define DEFAULT_LIVE_SOURCE FALSE
+#define DEFAULT_MAX_LATENCY 0
+#define DEFAULT_SYNC_INPUTS FALSE
+#define DEFAULT_DROP_PIPELINE_EOS FALSE
+#define DEFAULT_FRAME_NUM_RESET_ON_EOS FALSE
+#define DEFAULT_FRAME_NUM_RESET_ON_STREAM_RESET FALSE
+#define DEFAULT_FRAME_DURATION 0
+#define DEFAULT_CACHE_BUFFER_TIMEOUT -1
+#define DEFAULT_SYNC_INPUTS_NTP 0
+#define DEFAULT_FAILSAFE_FLUSH_COUNT 10
+
+/* with drop-pipeline-eos and every source ended, aggregate () waits this long at most for something to change */
+#define IDLE_WAIT_US (100 * 1000)
 
 #define MAX_BUFFER_POOL_SIZE 1024
 #define COMPUTE_HW_VIC 2
@@ -56,6 +86,34 @@ enum
   PROP_COMPUTE_HW,
   PROP_INTERPOLATION_METHOD,
   PROP_NUM_SURFACES_PER_FRAME,
+  PROP_SORT_BATCH,
+  PROP_ATTACH_SYS_TS,
+  PROP_LIVE_SOURCE,
+  PROP_MAX_LATENCY,
+  PROP_SYNC_INPUTS,
+  PROP_DROP_PIPELINE_EOS,
+  PROP_FRAME_NUM_RESET_ON_EOS,
+  PROP_FRAME_NUM_RESET_ON_STREAM_RESET,
+  /* accepted, no effect */
+  PROP_FRAME_DURATION,
+  PROP_ALIGN_FIRST_BUFFER,
+  PROP_ALIGN_INPUTS,
+  PROP_CACHE_BUFFER,
+  PROP_CACHE_BUFFER_TIMEOUT,
+  PROP_EXTRACT_SEI_SIM_TIME,
+  PROP_EXTRACT_SEI_TYPE5_DATA,
+  PROP_DROP_BACKWARD_SEI,
+  PROP_SYNC_INPUTS_NTP,
+  PROP_FAILSAFE_FLUSH_COUNT,
+  PROP_ASYNC_PROCESS,
+};
+
+/* GstRdsStreamMuxPad.state: whether pad-added went downstream, and whether the pad was released */
+enum
+{
+  PAD_STATE_NEW,
+  PAD_STATE_ADDED,
+  PAD_STATE_RELEASED,
 };
 
 struct _GstRdsStreamMuxPad
@@ -74,6 +132,9 @@ struct _GstRdsStreamMuxPad
   gboolean is_rds;              /* memory:RDS input; otherwise system memory, uploaded through stage */
   RdsBufSurface *stage;         /* device copy of system-memory frames (created on first use) */
   gint frame_num;
+
+  gint state;                   /* PAD_STATE_* (atomic) */
+  gint reset_pending;           /* flushed since: rds-stream-reset is due before its next event or frame (atomic) */
 };
 
 struct _GstRdsStreamMux
@@ -93,11 +154,37 @@ struct _GstRdsStreamMux
   guint num_surfaces_per_frame;
   gboolean sort_batch;
   gboolean attach_sys_ts;
+  gboolean live_source;
+  guint max_latency;            /* ns */
+  gboolean sync_inputs;
+  gboolean drop_pipeline_eos;
+  gboolean frame_num_reset_on_eos;
+  gboolean frame_num_reset_on_stream_reset;
+  /* accepted, no effect (stored so they read back) */
+  guint64 frame_duration;
+  gboolean align_first_buffer, align_inputs, cache_buffer, extract_sei_sim_time, extract_sei_type5_data;
+  gboolean drop_backward_sei, async_process;
+  gint cache_buffer_timeout, sync_inputs_ntp;
+  guint failsafe_flush_count;
+  gboolean noop_logged;
+
+  /* downstream stream events (events_lock) */
+  GMutex events_lock;
+  GQueue pending;               /* GstEvent *, oldest first */
+  gboolean in_flight;           /* the source thread is handling a batch or a source's event: events queue up */
+  gboolean can_push;            /* output caps negotiated */
+
+  /* wakes aggregate () waiting with every source ended under drop-pipeline-eos (wait_lock) */
+  GMutex wait_lock;
+  GCond wait_cond;
+  guint wake_seq;
 
   /* streaming state (source thread) */
   hipStream_t stream;           /* created on the first batch, so negotiation errors come before any GPU work */
   guint stream_gpu;
   gboolean timeout_enabled;     /* fixed at start */
+  gboolean sync_mode;           /* sync-inputs, fixed at start */
+  GstClockTime upstream_latency;        /* the live upstream's share of the aggregator latency */
   GstClockTime batch_start;     /* running time the pending batch's first buffer was seen, or NONE */
   guint rr_next;                /* position (in pad-index order) of the pad visited first in the next batch */
   GstClockTime last_pts;        /* of the last batch pushed: batch timestamps never go backwards */
@@ -181,6 +268,9 @@ gst_rds_stream_mux_compute_hw_get_type (void)
   return type;
 }
 
+static void wake_idle (GstRdsStreamMux * self);
+static void send_event (GstRdsStreamMux * self, GstEvent * event);
+
 /* ---- pad ---- */
 
 G_DEFINE_TYPE (GstRdsStreamMuxPad, gst_rds_stream_mux_pad, GST_TYPE_AGGREGATOR_PAD);
@@ -248,6 +338,35 @@ gst_rds_stream_mux_create_new_pad (GstAggregator * agg, GstPadTemplate * templ, 
     GST_RDS_STREAM_MUX_PAD (pad)->index = (guint) g_ascii_strtoull (name + strlen ("sink_"), NULL, 10);
   }
   return pad;
+}
+
+static GstPad *
+gst_rds_stream_mux_request_new_pad (GstElement * element, GstPadTemplate * templ, const gchar * name,
+    const GstCaps * caps)
+{
+  GstPad *pad = GST_ELEMENT_CLASS (gst_rds_stream_mux_parent_class)->request_new_pad (element, templ, name, caps);
+
+  /* with drop-pipeline-eos, a mux whose sources all ended waits for a new one. Its pad-added goes downstream
+   * before its first event or frame, from the source thread (as DeepStream documents: on a new source's data). */
+  if (pad != NULL)
+    wake_idle (GST_RDS_STREAM_MUX (element));
+  return pad;
+}
+
+/* pad-deleted, once the pad can give no more frames: after the batch being built (which may hold its last frame),
+ * or right away. Only for a source that was announced. */
+static void
+gst_rds_stream_mux_release_pad (GstElement * element, GstPad * pad)
+{
+  GstRdsStreamMux *self = GST_RDS_STREAM_MUX (element);
+  GstRdsStreamMuxPad *mpad = GST_RDS_STREAM_MUX_PAD (pad);
+  guint index = mpad->index;
+  gint prev = g_atomic_int_exchange (&mpad->state, PAD_STATE_RELEASED);
+
+  GST_ELEMENT_CLASS (gst_rds_stream_mux_parent_class)->release_pad (element, pad);
+  if (prev == PAD_STATE_ADDED)
+    send_event (self, rds_event_new_pad_deleted (index));
+  wake_idle (self);
 }
 
 /* ---- caps ---- */
@@ -327,6 +446,9 @@ gst_rds_stream_mux_negotiated_src_caps (GstAggregator * agg, GstCaps * caps)
     return FALSE;
   self->out_info = info;
   self->have_out_info = TRUE;
+  g_mutex_lock (&self->events_lock);
+  self->can_push = TRUE;
+  g_mutex_unlock (&self->events_lock);
   GST_OBJECT_LOCK (self);
   self->fps_n = GST_VIDEO_INFO_FPS_N (&info);
   self->fps_d = GST_VIDEO_INFO_FPS_D (&info);
@@ -399,13 +521,145 @@ set_pool_flushing (GstRdsStreamMux * self, gboolean flushing)
   gst_object_unref (pool);
 }
 
+/* ---- stream events ----
+ *
+ * The source thread queues events and pushes them (in order, after the mux's mandatory events) once the output caps
+ * are negotiated; while it handles a batch or a source's event (in_flight), events from other threads queue up
+ * behind it. */
+
+static void
+wake_idle (GstRdsStreamMux * self)
+{
+  g_mutex_lock (&self->wait_lock);
+  self->wake_seq++;
+  g_cond_broadcast (&self->wait_cond);
+  g_mutex_unlock (&self->wait_lock);
+}
+
+static void
+queue_event (GstRdsStreamMux * self, GstEvent * event)
+{
+  g_mutex_lock (&self->events_lock);
+  g_queue_push_tail (&self->pending, event);
+  g_mutex_unlock (&self->events_lock);
+}
+
+static void
+events_enter (GstRdsStreamMux * self)
+{
+  g_mutex_lock (&self->events_lock);
+  self->in_flight = TRUE;
+  g_mutex_unlock (&self->events_lock);
+}
+
+/* Source thread: pushes the queued events (when the caps allow); with @leave, also ends in_flight once the queue is
+ * empty, so events from other threads go straight downstream again. */
+static void
+events_push (GstRdsStreamMux * self, gboolean leave)
+{
+  for (;;) {
+    GstEvent *event = NULL;
+
+    g_mutex_lock (&self->events_lock);
+    if (self->can_push)
+      event = g_queue_pop_head (&self->pending);
+    if (event == NULL && leave)
+      self->in_flight = FALSE;
+    g_mutex_unlock (&self->events_lock);
+    if (event == NULL)
+      return;
+    GST_LOG_OBJECT (self, "pushing %" GST_PTR_FORMAT, event);
+    if (!gst_aggregator_push_src_event (GST_AGGREGATOR (self), event))
+      GST_DEBUG_OBJECT (self, "a stream event was not handled downstream");
+  }
+}
+
+/* Any thread: pushes @event now unless the source thread is busy or events are waiting (then it queues). */
+static void
+send_event (GstRdsStreamMux * self, GstEvent * event)
+{
+  gboolean now;
+
+  g_mutex_lock (&self->events_lock);
+  now = !self->in_flight && self->can_push && g_queue_is_empty (&self->pending);
+  if (!now)
+    g_queue_push_tail (&self->pending, event);
+  g_mutex_unlock (&self->events_lock);
+  if (now && !gst_pad_push_event (GST_AGGREGATOR_SRC_PAD (self), event))
+    GST_DEBUG_OBJECT (self, "a stream event was not handled downstream");
+}
+
+/* Source thread: the per-source events due before anything else from @pad: pad-added (once) and stream-reset after
+ * a flush (restarting the frame numbers with frame-num-reset-on-stream-reset). */
+static void
+pad_announce (GstRdsStreamMux * self, GstRdsStreamMuxPad * pad)
+{
+  gboolean reset_frames;
+
+  if (g_atomic_int_compare_and_exchange (&pad->state, PAD_STATE_NEW, PAD_STATE_ADDED))
+    queue_event (self, rds_event_new_pad_added (pad->index));
+  if (g_atomic_int_compare_and_exchange (&pad->reset_pending, TRUE, FALSE)) {
+    GST_OBJECT_LOCK (self);
+    reset_frames = self->frame_num_reset_on_stream_reset;
+    GST_OBJECT_UNLOCK (self);
+    queue_event (self, rds_event_new_stream_reset (pad->index));
+    if (reset_frames)
+      pad->frame_num = 0;
+  }
+}
+
+/* Source thread: a source's serialized event becomes its stream event. */
+static void
+pad_stream_event (GstRdsStreamMux * self, GstRdsStreamMuxPad * pad, GstEvent * event)
+{
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_STREAM_START:{
+      const gchar *stream_id = NULL;
+
+      gst_event_parse_stream_start (event, &stream_id);
+      queue_event (self, rds_event_new_stream_start (pad->index, stream_id));
+      break;
+    }
+    case GST_EVENT_SEGMENT:{
+      const GstSegment *segment;
+
+      gst_event_parse_segment (event, &segment);
+      queue_event (self, rds_event_new_stream_segment (pad->index, segment));
+      break;
+    }
+    case GST_EVENT_EOS:{
+      gboolean reset_frames;
+
+      GST_OBJECT_LOCK (self);
+      reset_frames = self->frame_num_reset_on_eos;
+      GST_OBJECT_UNLOCK (self);
+      queue_event (self, rds_event_new_stream_eos (pad->index));
+      if (reset_frames)
+        pad->frame_num = 0;
+      break;
+    }
+    default:
+      break;
+  }
+}
+
 static gboolean
 gst_rds_stream_mux_sink_event (GstAggregator * agg, GstAggregatorPad * aggpad, GstEvent * event)
 {
   GstRdsStreamMux *self = GST_RDS_STREAM_MUX (agg);
   GstRdsStreamMuxPad *pad = GST_RDS_STREAM_MUX_PAD (aggpad);
+  GstEventType type = GST_EVENT_TYPE (event);
+  /* serialized events but FLUSH_STOP were queued by the aggregator: this is the source thread, in stream order */
+  gboolean queued = GST_EVENT_IS_SERIALIZED (event) && type != GST_EVENT_FLUSH_STOP;
+  gboolean ret;
 
-  switch (GST_EVENT_TYPE (event)) {
+  if (queued) {
+    events_enter (self);
+    pad_announce (self, pad);
+    pad_stream_event (self, pad, event);
+  }
+
+  switch (type) {
     case GST_EVENT_CAPS:{
       GstCaps *caps;
       GstVideoInfo info;
@@ -417,7 +671,8 @@ gst_rds_stream_mux_sink_event (GstAggregator * agg, GstAggregatorPad * aggpad, G
           == RDS_BUF_COLOR_FORMAT_INVALID) {
         GST_ERROR_OBJECT (pad, "unsupported caps %" GST_PTR_FORMAT, caps);
         gst_event_unref (event);
-        return FALSE;
+        ret = FALSE;
+        goto done;
       }
       /* the staging surface has the old geometry: recreated on the next frame that needs it */
       if (pad->stage != NULL && !gst_video_info_is_equal (&info, &pad->info))
@@ -452,12 +707,34 @@ gst_rds_stream_mux_sink_event (GstAggregator * agg, GstAggregatorPad * aggpad, G
       /* a batch waiting for a pool buffer must give up so the source task can stop */
       if (all)
         set_pool_flushing (self, TRUE);
+      wake_idle (self);
       break;
     }
     default:
       break;
   }
-  return GST_AGGREGATOR_CLASS (gst_rds_stream_mux_parent_class)->sink_event (agg, aggpad, event);
+  ret = GST_AGGREGATOR_CLASS (gst_rds_stream_mux_parent_class)->sink_event (agg, aggpad, event);
+
+  if (type == GST_EVENT_FLUSH_STOP) {
+    /* the source's next event or frame is preceded by rds-stream-reset; the pad is no longer at EOS */
+    g_atomic_int_set (&pad->reset_pending, TRUE);
+    wake_idle (self);
+  }
+done:
+  if (queued)
+    events_push (self, TRUE);
+  return ret;
+}
+
+static GstFlowReturn
+gst_rds_stream_mux_sink_event_pre_queue (GstAggregator * agg, GstAggregatorPad * aggpad, GstEvent * event)
+{
+  GstFlowReturn ret = GST_AGGREGATOR_CLASS (gst_rds_stream_mux_parent_class)->sink_event_pre_queue (agg, aggpad,
+      event);
+
+  /* a STREAM_START after EOS revives a source */
+  wake_idle (GST_RDS_STREAM_MUX (agg));
+  return ret;
 }
 
 static GstFlowReturn
@@ -475,27 +752,105 @@ gst_rds_stream_mux_flush (GstAggregator * agg)
 
 /* With a timeout, the batch is due one aggregator latency (the timeout) after its first buffer was seen. Called
  * by the aggregator on the source thread before it waits; NONE (no buffer yet, or no timeout) waits for data. */
+/* sync-inputs: the running time of the earliest frame queued on any pad, or NONE. */
+static GstClockTime
+earliest_queued (GstRdsStreamMux * self)
+{
+  GstClockTime earliest = GST_CLOCK_TIME_NONE;
+  GPtrArray *pads = g_ptr_array_new_with_free_func (gst_object_unref);
+
+  GST_OBJECT_LOCK (self);
+  for (GList * l = GST_ELEMENT (self)->sinkpads; l != NULL; l = l->next)
+    g_ptr_array_add (pads, gst_object_ref (l->data));
+  GST_OBJECT_UNLOCK (self);
+  for (guint i = 0; i < pads->len; i++) {
+    GstAggregatorPad *pad = g_ptr_array_index (pads, i);
+    GstBuffer *buf = gst_aggregator_pad_peek_buffer (pad);
+    GstClockTime rt;
+
+    if (buf == NULL)
+      continue;
+    GST_OBJECT_LOCK (pad);
+    rt = gst_segment_to_running_time (&pad->segment, GST_FORMAT_TIME, GST_BUFFER_PTS (buf));
+    GST_OBJECT_UNLOCK (pad);
+    gst_buffer_unref (buf);
+    if (GST_CLOCK_TIME_IS_VALID (rt) && (!GST_CLOCK_TIME_IS_VALID (earliest) || rt < earliest))
+      earliest = rt;
+  }
+  g_ptr_array_unref (pads);
+  return earliest;
+}
+
+/* Called by the aggregator on the source thread before it waits; NONE waits for data. The aggregator waits until
+ * the clock reaches the returned running time plus its whole latency, the upstream's included.
+ * - sync-inputs: the earliest queued frame's running time.
+ * - batched-push-timeout: the running time at which the pending batch's first buffer was seen, minus the upstream
+ *   latency (that buffer has arrived already): the batch is due one timeout (plus max-latency) after it. */
 static GstClockTime
 gst_rds_stream_mux_get_next_time (GstAggregator * agg)
 {
   GstRdsStreamMux *self = GST_RDS_STREAM_MUX (agg);
   gboolean any = FALSE;
 
+  if (self->sync_mode)
+    return earliest_queued (self);
   if (!self->timeout_enabled)
     return GST_CLOCK_TIME_NONE;
-  if (GST_CLOCK_TIME_IS_VALID (self->batch_start))
-    return self->batch_start;
 
+  if (!GST_CLOCK_TIME_IS_VALID (self->batch_start)) {
+    GST_OBJECT_LOCK (self);
+    for (GList * l = GST_ELEMENT (self)->sinkpads; l != NULL && !any; l = l->next)
+      any = gst_aggregator_pad_has_buffer (GST_AGGREGATOR_PAD (l->data));
+    GST_OBJECT_UNLOCK (self);
+    if (any)
+      self->batch_start = gst_element_get_current_running_time (GST_ELEMENT (self));
+  }
+  if (!GST_CLOCK_TIME_IS_VALID (self->batch_start))
+    return GST_CLOCK_TIME_NONE;
+  /* (in the first upstream-latency of running time this clamps at 0: the batch is due later than the timeout) */
+  return self->batch_start - MIN (self->batch_start, self->upstream_latency);
+}
+
+/* Source thread, no aggregator lock held: the upstream's share of the aggregator latency, for get_next_time. */
+static void
+update_upstream_latency (GstRdsStreamMux * self)
+{
+  GstClockTime total, own;
+  gint timeout;
+  guint max_latency;
+
+  if (!self->timeout_enabled || self->sync_mode)
+    return;
   GST_OBJECT_LOCK (self);
-  for (GList * l = GST_ELEMENT (self)->sinkpads; l != NULL && !any; l = l->next)
-    any = gst_aggregator_pad_has_buffer (GST_AGGREGATOR_PAD (l->data));
+  timeout = self->batched_push_timeout;
+  max_latency = self->max_latency;
   GST_OBJECT_UNLOCK (self);
-  if (any)
-    self->batch_start = gst_element_get_current_running_time (GST_ELEMENT (self));
-  return self->batch_start;
+  own = (GstClockTime) MAX (timeout, 0) * GST_USECOND + max_latency;
+  total = gst_aggregator_get_latency (GST_AGGREGATOR (self));
+  self->upstream_latency = GST_CLOCK_TIME_IS_VALID (total) && total > own ? total - own : 0;
 }
 
 /* ---- start / stop ---- */
+
+/* Forgets queued stream events and which pads were announced: a restart announces every source again. */
+static void
+events_reset (GstRdsStreamMux * self)
+{
+  g_mutex_lock (&self->events_lock);
+  g_queue_clear_full (&self->pending, (GDestroyNotify) gst_event_unref);
+  self->in_flight = FALSE;
+  self->can_push = FALSE;
+  g_mutex_unlock (&self->events_lock);
+
+  GST_OBJECT_LOCK (self);
+  for (GList * l = GST_ELEMENT (self)->sinkpads; l != NULL; l = l->next) {
+    GstRdsStreamMuxPad *pad = l->data;
+
+    g_atomic_int_compare_and_exchange (&pad->state, PAD_STATE_ADDED, PAD_STATE_NEW);
+    g_atomic_int_set (&pad->reset_pending, FALSE);
+  }
+  GST_OBJECT_UNLOCK (self);
+}
 
 /* Settings we cannot honour: checked at start, before any GPU work. */
 static gboolean
@@ -527,23 +882,32 @@ gst_rds_stream_mux_start (GstAggregator * agg)
 {
   GstRdsStreamMux *self = GST_RDS_STREAM_MUX (agg);
   gint timeout;
+  gboolean sync_inputs;
+  guint max_latency;
 
   if (!check_settings (self))
     return FALSE;
 
   GST_OBJECT_LOCK (self);
   timeout = self->batched_push_timeout;
+  sync_inputs = self->sync_inputs;
+  max_latency = self->max_latency;
   GST_OBJECT_UNLOCK (self);
 
   self->timeout_enabled = timeout >= 0;
+  self->sync_mode = sync_inputs;
+  self->upstream_latency = 0;
   self->batch_start = GST_CLOCK_TIME_NONE;
   self->rr_next = 0;
   self->last_pts = GST_CLOCK_TIME_NONE;
   self->have_out_info = FALSE;
+  events_reset (self);
   /* batched-push-timeout owns the aggregator's "latency" property: set on every start (the timeout, or 0 without
-   * one), so a value set directly, or left over from an earlier run with a timeout, never applies. */
-  gst_aggregator_set_force_live (agg, self->timeout_enabled);
+   * one), so a value set directly, or left over from an earlier run with a timeout, never applies. max-latency is
+   * the subclass latency: reported, and waited for in live mode. */
+  gst_aggregator_set_force_live (agg, self->timeout_enabled || self->sync_mode);
   g_object_set (self, "latency", self->timeout_enabled ? (guint64) timeout * GST_USECOND : (guint64) 0, NULL);
+  gst_aggregator_set_latency (agg, max_latency, max_latency);
   return TRUE;
 }
 
@@ -576,6 +940,7 @@ gst_rds_stream_mux_stop (GstAggregator * agg)
     self->stream = NULL;
   }
   self->have_out_info = FALSE;
+  events_reset (self);
   return TRUE;
 }
 
@@ -583,8 +948,10 @@ static GstStateChangeReturn
 gst_rds_stream_mux_change_state (GstElement * element, GstStateChange transition)
 {
   /* the source task may be waiting for a pool buffer held downstream: wake it before the aggregator stops it */
-  if (transition == GST_STATE_CHANGE_PAUSED_TO_READY)
+  if (transition == GST_STATE_CHANGE_PAUSED_TO_READY) {
     set_pool_flushing (GST_RDS_STREAM_MUX (element), TRUE);
+    wake_idle (GST_RDS_STREAM_MUX (element));
+  }
   return GST_ELEMENT_CLASS (gst_rds_stream_mux_parent_class)->change_state (element, transition);
 }
 
@@ -876,8 +1243,16 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
   guint batch_size, n;
   gint filter;
   RdsBufSurfTransform_Compute compute;
-  gboolean padding, sort_batch, attach_sys_ts, all_eos = TRUE;
+  gboolean padding, sort_batch, attach_sys_ts, live_source, drop_eos, all_eos = TRUE;
   GstFlowReturn ret = GST_FLOW_ERROR;
+  guint wake_seq;
+
+  /* events from other threads (pad-deleted) wait until this batch is out: it may hold the pad's last frame */
+  events_enter (self);
+  update_upstream_latency (self);
+  g_mutex_lock (&self->wait_lock);
+  wake_seq = self->wake_seq;
+  g_mutex_unlock (&self->wait_lock);
 
   GST_OBJECT_LOCK (self);
   batch_size = self->batch_size;
@@ -886,6 +1261,8 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
   padding = self->enable_padding;
   sort_batch = self->sort_batch;
   attach_sys_ts = self->attach_sys_ts;
+  live_source = self->live_source;
+  drop_eos = self->drop_pipeline_eos;
   pads = g_ptr_array_new_with_free_func (gst_object_unref);
   for (GList * l = GST_ELEMENT (self)->sinkpads; l != NULL; l = l->next)
     g_ptr_array_add (pads, gst_object_ref (l->data));
@@ -905,6 +1282,8 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
       e.running_time = gst_segment_to_running_time (&GST_AGGREGATOR_PAD (pad)->segment, GST_FORMAT_TIME,
           GST_BUFFER_PTS (e.buf));
       GST_OBJECT_UNLOCK (pad);
+      /* a source with no event since it was added or flushed */
+      pad_announce (self, pad);
       g_array_append_val (entries, e);
     }
   }
@@ -915,6 +1294,22 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
     for (guint i = 0; i < n; i++)
       all_eos &= gst_aggregator_pad_is_eos (g_ptr_array_index (pads, i));
     ret = n > 0 && all_eos ? GST_FLOW_EOS : GST_AGGREGATOR_FLOW_NEED_DATA;
+    if (ret == GST_FLOW_EOS && drop_eos) {
+      /* No EOS downstream: the aggregator would pause its task, and the pad stays EOS. Wait instead (returning at
+       * once would spin: the aggregator calls aggregate () again right away while every pad is at EOS) until a
+       * source is added, revived (STREAM_START) or flushed, or the element stops. Bounded, so a missed wake-up
+       * costs one period at most. */
+      gint64 end = g_get_monotonic_time () + IDLE_WAIT_US;
+
+      events_push (self, TRUE);
+      GST_LOG_OBJECT (self, "every source ended, drop-pipeline-eos: waiting");
+      g_mutex_lock (&self->wait_lock);
+      while (self->wake_seq == wake_seq)
+        if (!g_cond_wait_until (&self->wait_cond, &self->wait_lock, end))
+          break;
+      g_mutex_unlock (&self->wait_lock);
+      ret = GST_AGGREGATOR_FLOW_NEED_DATA;
+    }
     goto out;
   }
   if (sort_batch)
@@ -966,7 +1361,10 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
       goto out;
     }
     fill_frame_meta (self, bm, e, i, attach_sys_ts);
-    if (GST_CLOCK_TIME_IS_VALID (rt) && (!GST_CLOCK_TIME_IS_VALID (pts) || rt < pts))
+    /* live-source: the last copied frame's timestamp (as documented); else the earliest frame's */
+    if (live_source)
+      pts = rt;
+    else if (GST_CLOCK_TIME_IS_VALID (rt) && (!GST_CLOCK_TIME_IS_VALID (pts) || rt < pts))
       pts = rt;
   }
   batch->numFilled = entries->len;
@@ -988,10 +1386,15 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
     GST_OBJECT_UNLOCK (self);
   }
   gst_aggregator_selected_samples (agg, pts, GST_CLOCK_TIME_NONE, GST_CLOCK_TIME_NONE, NULL);
+  /* the sources' events from before this batch go first */
+  events_push (self, FALSE);
   ret = gst_aggregator_finish_buffer (agg, outbuf);
   outbuf = NULL;
 
 out:
+  /* the remaining events (all of them on an early return), then events from other threads go straight out again;
+   * on EOS, before the aggregator's EOS */
+  events_push (self, TRUE);
   if (outbuf != NULL)
     gst_buffer_unref (outbuf);
   if (pool != NULL)
@@ -1023,6 +1426,7 @@ static void
 gst_rds_stream_mux_set_property (GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec)
 {
   GstRdsStreamMux *self = GST_RDS_STREAM_MUX (object);
+  gboolean noop = FALSE, log_noop;
 
   GST_OBJECT_LOCK (self);
   switch (prop_id) {
@@ -1068,11 +1472,88 @@ gst_rds_stream_mux_set_property (GObject * object, guint prop_id, const GValue *
       if (check_mutable (self, pspec))
         self->num_surfaces_per_frame = g_value_get_uint (value);
       break;
+    case PROP_SORT_BATCH:
+      self->sort_batch = g_value_get_boolean (value);
+      break;
+    case PROP_ATTACH_SYS_TS:
+      self->attach_sys_ts = g_value_get_boolean (value);
+      break;
+    case PROP_LIVE_SOURCE:
+      self->live_source = g_value_get_boolean (value);
+      break;
+    case PROP_MAX_LATENCY:
+      if (check_mutable (self, pspec))
+        self->max_latency = g_value_get_uint (value);
+      break;
+    case PROP_SYNC_INPUTS:
+      if (check_mutable (self, pspec))
+        self->sync_inputs = g_value_get_boolean (value);
+      break;
+    case PROP_DROP_PIPELINE_EOS:
+      self->drop_pipeline_eos = g_value_get_boolean (value);
+      break;
+    case PROP_FRAME_NUM_RESET_ON_EOS:
+      self->frame_num_reset_on_eos = g_value_get_boolean (value);
+      break;
+    case PROP_FRAME_NUM_RESET_ON_STREAM_RESET:
+      self->frame_num_reset_on_stream_reset = g_value_get_boolean (value);
+      break;
+    case PROP_FRAME_DURATION:
+      self->frame_duration = g_value_get_uint64 (value);
+      noop = TRUE;
+      break;
+    case PROP_ALIGN_FIRST_BUFFER:
+      self->align_first_buffer = g_value_get_boolean (value);
+      noop = TRUE;
+      break;
+    case PROP_ALIGN_INPUTS:
+      self->align_inputs = g_value_get_boolean (value);
+      noop = TRUE;
+      break;
+    case PROP_CACHE_BUFFER:
+      self->cache_buffer = g_value_get_boolean (value);
+      noop = TRUE;
+      break;
+    case PROP_CACHE_BUFFER_TIMEOUT:
+      self->cache_buffer_timeout = g_value_get_int (value);
+      noop = TRUE;
+      break;
+    case PROP_EXTRACT_SEI_SIM_TIME:
+      self->extract_sei_sim_time = g_value_get_boolean (value);
+      noop = TRUE;
+      break;
+    case PROP_EXTRACT_SEI_TYPE5_DATA:
+      self->extract_sei_type5_data = g_value_get_boolean (value);
+      noop = TRUE;
+      break;
+    case PROP_DROP_BACKWARD_SEI:
+      self->drop_backward_sei = g_value_get_boolean (value);
+      noop = TRUE;
+      break;
+    case PROP_SYNC_INPUTS_NTP:
+      self->sync_inputs_ntp = g_value_get_int (value);
+      noop = TRUE;
+      break;
+    case PROP_FAILSAFE_FLUSH_COUNT:
+      self->failsafe_flush_count = g_value_get_uint (value);
+      noop = TRUE;
+      break;
+    case PROP_ASYNC_PROCESS:
+      self->async_process = g_value_get_boolean (value);
+      noop = TRUE;
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
   }
+  log_noop = noop && !self->noop_logged;
+  if (log_noop)
+    self->noop_logged = TRUE;
   GST_OBJECT_UNLOCK (self);
+  /* outside the object lock: logging an object takes it */
+  if (log_noop)
+    GST_INFO_OBJECT (self, "property '%s' is accepted for compatibility but has no effect (logged once: other "
+        "such properties are not reported)", pspec->name);
 }
 
 static void
@@ -1115,11 +1596,80 @@ gst_rds_stream_mux_get_property (GObject * object, guint prop_id, GValue * value
     case PROP_NUM_SURFACES_PER_FRAME:
       g_value_set_uint (value, self->num_surfaces_per_frame);
       break;
+    case PROP_SORT_BATCH:
+      g_value_set_boolean (value, self->sort_batch);
+      break;
+    case PROP_ATTACH_SYS_TS:
+      g_value_set_boolean (value, self->attach_sys_ts);
+      break;
+    case PROP_LIVE_SOURCE:
+      g_value_set_boolean (value, self->live_source);
+      break;
+    case PROP_MAX_LATENCY:
+      g_value_set_uint (value, self->max_latency);
+      break;
+    case PROP_SYNC_INPUTS:
+      g_value_set_boolean (value, self->sync_inputs);
+      break;
+    case PROP_DROP_PIPELINE_EOS:
+      g_value_set_boolean (value, self->drop_pipeline_eos);
+      break;
+    case PROP_FRAME_NUM_RESET_ON_EOS:
+      g_value_set_boolean (value, self->frame_num_reset_on_eos);
+      break;
+    case PROP_FRAME_NUM_RESET_ON_STREAM_RESET:
+      g_value_set_boolean (value, self->frame_num_reset_on_stream_reset);
+      break;
+    case PROP_FRAME_DURATION:
+      g_value_set_uint64 (value, self->frame_duration);
+      break;
+    case PROP_ALIGN_FIRST_BUFFER:
+      g_value_set_boolean (value, self->align_first_buffer);
+      break;
+    case PROP_ALIGN_INPUTS:
+      g_value_set_boolean (value, self->align_inputs);
+      break;
+    case PROP_CACHE_BUFFER:
+      g_value_set_boolean (value, self->cache_buffer);
+      break;
+    case PROP_CACHE_BUFFER_TIMEOUT:
+      g_value_set_int (value, self->cache_buffer_timeout);
+      break;
+    case PROP_EXTRACT_SEI_SIM_TIME:
+      g_value_set_boolean (value, self->extract_sei_sim_time);
+      break;
+    case PROP_EXTRACT_SEI_TYPE5_DATA:
+      g_value_set_boolean (value, self->extract_sei_type5_data);
+      break;
+    case PROP_DROP_BACKWARD_SEI:
+      g_value_set_boolean (value, self->drop_backward_sei);
+      break;
+    case PROP_SYNC_INPUTS_NTP:
+      g_value_set_int (value, self->sync_inputs_ntp);
+      break;
+    case PROP_FAILSAFE_FLUSH_COUNT:
+      g_value_set_uint (value, self->failsafe_flush_count);
+      break;
+    case PROP_ASYNC_PROCESS:
+      g_value_set_boolean (value, self->async_process);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
   }
   GST_OBJECT_UNLOCK (self);
+}
+
+static void
+gst_rds_stream_mux_finalize (GObject * object)
+{
+  GstRdsStreamMux *self = GST_RDS_STREAM_MUX (object);
+
+  g_queue_clear_full (&self->pending, (GDestroyNotify) gst_event_unref);
+  g_mutex_clear (&self->events_lock);
+  g_cond_clear (&self->wait_cond);
+  g_mutex_clear (&self->wait_lock);
+  G_OBJECT_CLASS (gst_rds_stream_mux_parent_class)->finalize (object);
 }
 
 static void
@@ -1171,6 +1721,67 @@ gst_rds_stream_mux_class_init (GstRdsStreamMuxClass * klass)
       g_param_spec_uint ("num-surfaces-per-frame", "Surfaces per frame",
           "Surfaces per frame (only 1 is supported; other values fail at start)", 1, 4,
           DEFAULT_NUM_SURFACES_PER_FRAME, flags | GST_PARAM_MUTABLE_READY));
+  g_object_class_install_property (gobject_class, PROP_SORT_BATCH,
+      g_param_spec_boolean ("sort-batch", "Sort batch", "Order the frames of a batch by sink pad index",
+          DEFAULT_SORT_BATCH, flags | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_ATTACH_SYS_TS,
+      g_param_spec_boolean ("attach-sys-ts", "Attach system timestamp",
+          "Set each frame's ntp_timestamp to the system (wall-clock) time in ns; otherwise 0", DEFAULT_ATTACH_SYS_TS,
+          flags | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_LIVE_SOURCE,
+      g_param_spec_boolean ("live-source", "Live source",
+          "The sources are live: a batch takes the timestamp of the last frame copied into it (otherwise the "
+          "earliest frame's)", DEFAULT_LIVE_SOURCE, flags | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_MAX_LATENCY,
+      g_param_spec_uint ("max-latency", "Maximum latency",
+          "Additional latency in live mode (ns), reported downstream and waited for before a partial batch", 0,
+          G_MAXUINT, DEFAULT_MAX_LATENCY, flags | GST_PARAM_MUTABLE_READY));
+  g_object_class_install_property (gobject_class, PROP_SYNC_INPUTS,
+      g_param_spec_boolean ("sync-inputs", "Synchronize inputs",
+          "Push a partial batch once the clock reaches its earliest frame's running time (plus the latency), "
+          "instead of waiting for every source", DEFAULT_SYNC_INPUTS, flags | GST_PARAM_MUTABLE_READY));
+  g_object_class_install_property (gobject_class, PROP_DROP_PIPELINE_EOS,
+      g_param_spec_boolean ("drop-pipeline-eos", "Drop pipeline EOS",
+          "Do not send EOS downstream when every source has ended (the per-source stream EOS events still go)",
+          DEFAULT_DROP_PIPELINE_EOS, flags | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_FRAME_NUM_RESET_ON_EOS,
+      g_param_spec_boolean ("frame-num-reset-on-eos", "Reset frame numbers on EOS",
+          "Restart a source's frame_num from 0 after its EOS", DEFAULT_FRAME_NUM_RESET_ON_EOS,
+          flags | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_FRAME_NUM_RESET_ON_STREAM_RESET,
+      g_param_spec_boolean ("frame-num-reset-on-stream-reset", "Reset frame numbers on stream reset",
+          "Restart a source's frame_num from 0 after it is flushed (stream reset)",
+          DEFAULT_FRAME_NUM_RESET_ON_STREAM_RESET, flags | GST_PARAM_MUTABLE_PLAYING));
+
+  /* Accepted so that configurations and code setting them keep working; they have no effect. */
+  g_object_class_install_property (gobject_class, PROP_FRAME_DURATION,
+      g_param_spec_uint64 ("frame-duration", "Frame duration", "Accepted, no effect", 0, G_MAXUINT64,
+          DEFAULT_FRAME_DURATION, flags));
+  g_object_class_install_property (gobject_class, PROP_ALIGN_FIRST_BUFFER,
+      g_param_spec_boolean ("align-first-buffer", "Align first buffer", "Accepted, no effect", FALSE, flags));
+  g_object_class_install_property (gobject_class, PROP_ALIGN_INPUTS,
+      g_param_spec_boolean ("align-inputs", "Align inputs", "Accepted, no effect", FALSE, flags));
+  g_object_class_install_property (gobject_class, PROP_CACHE_BUFFER,
+      g_param_spec_boolean ("cache-buffer", "Cache buffer", "Accepted, no effect", FALSE, flags));
+  g_object_class_install_property (gobject_class, PROP_CACHE_BUFFER_TIMEOUT,
+      g_param_spec_int ("cache-buffer-timeout", "Cache buffer timeout", "Accepted, no effect", -1, G_MAXINT,
+          DEFAULT_CACHE_BUFFER_TIMEOUT, flags));
+  g_object_class_install_property (gobject_class, PROP_EXTRACT_SEI_SIM_TIME,
+      g_param_spec_boolean ("extract-sei-sim-time", "Extract SEI simulation time", "Accepted, no effect", FALSE,
+          flags));
+  g_object_class_install_property (gobject_class, PROP_EXTRACT_SEI_TYPE5_DATA,
+      g_param_spec_boolean ("extract-sei-type5-data", "Extract SEI type 5 data", "Accepted, no effect", FALSE,
+          flags));
+  g_object_class_install_property (gobject_class, PROP_DROP_BACKWARD_SEI,
+      g_param_spec_boolean ("drop-backward-sei", "Drop backward SEI", "Accepted, no effect", FALSE, flags));
+  g_object_class_install_property (gobject_class, PROP_SYNC_INPUTS_NTP,
+      g_param_spec_int ("sync-inputs-ntp", "Synchronize inputs by NTP", "Accepted, no effect", 0, G_MAXINT,
+          DEFAULT_SYNC_INPUTS_NTP, flags));
+  g_object_class_install_property (gobject_class, PROP_FAILSAFE_FLUSH_COUNT,
+      g_param_spec_uint ("failsafe-flush-count", "Failsafe flush count", "Accepted, no effect", 1,
+          MAX_BUFFER_POOL_SIZE, DEFAULT_FAILSAFE_FLUSH_COUNT, flags));
+  g_object_class_install_property (gobject_class, PROP_ASYNC_PROCESS,
+      g_param_spec_boolean ("async-process", "Asynchronous processing", "Accepted, no effect", FALSE, flags));
 
   gst_element_class_add_static_pad_template_with_gtype (element_class, &sink_template,
       GST_TYPE_RDS_STREAM_MUX_PAD);
@@ -1179,13 +1790,17 @@ gst_rds_stream_mux_class_init (GstRdsStreamMuxClass * klass)
       "Batches frames from several sources into one memory:RDS batch, scaling each into its slot",
       "Redstream contributors");
 
+  gobject_class->finalize = gst_rds_stream_mux_finalize;
   element_class->change_state = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_change_state);
+  element_class->request_new_pad = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_request_new_pad);
+  element_class->release_pad = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_release_pad);
   agg_class->create_new_pad = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_create_new_pad);
   agg_class->update_src_caps = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_update_src_caps);
   agg_class->negotiated_src_caps = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_negotiated_src_caps);
   agg_class->decide_allocation = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_decide_allocation);
   agg_class->propose_allocation = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_propose_allocation);
   agg_class->sink_event = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_sink_event);
+  agg_class->sink_event_pre_queue = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_sink_event_pre_queue);
   agg_class->flush = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_flush);
   agg_class->get_next_time = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_get_next_time);
   agg_class->start = GST_DEBUG_FUNCPTR (gst_rds_stream_mux_start);
@@ -1214,6 +1829,20 @@ gst_rds_stream_mux_init (GstRdsStreamMux * self)
   self->num_surfaces_per_frame = DEFAULT_NUM_SURFACES_PER_FRAME;
   self->sort_batch = DEFAULT_SORT_BATCH;
   self->attach_sys_ts = DEFAULT_ATTACH_SYS_TS;
+  self->live_source = DEFAULT_LIVE_SOURCE;
+  self->max_latency = DEFAULT_MAX_LATENCY;
+  self->sync_inputs = DEFAULT_SYNC_INPUTS;
+  self->drop_pipeline_eos = DEFAULT_DROP_PIPELINE_EOS;
+  self->frame_num_reset_on_eos = DEFAULT_FRAME_NUM_RESET_ON_EOS;
+  self->frame_num_reset_on_stream_reset = DEFAULT_FRAME_NUM_RESET_ON_STREAM_RESET;
+  self->frame_duration = DEFAULT_FRAME_DURATION;
+  self->cache_buffer_timeout = DEFAULT_CACHE_BUFFER_TIMEOUT;
+  self->sync_inputs_ntp = DEFAULT_SYNC_INPUTS_NTP;
+  self->failsafe_flush_count = DEFAULT_FAILSAFE_FLUSH_COUNT;
+  g_mutex_init (&self->events_lock);
+  g_queue_init (&self->pending);
+  g_mutex_init (&self->wait_lock);
+  g_cond_init (&self->wait_cond);
   self->batch_start = GST_CLOCK_TIME_NONE;
   self->last_pts = GST_CLOCK_TIME_NONE;
   self->fps_n = 0;

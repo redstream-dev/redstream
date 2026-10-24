@@ -1,5 +1,5 @@
-/* rdsstreammux: aggregator timing probe, factory, properties, caps (cpu) and memory:RDS batching (gpu, skipped
- * without a ROCm device).
+/* rdsstreammux: aggregator timing probe, factory, properties, caps, latency (cpu) and memory:RDS batching, timing,
+ * stream events, EOS and dynamic pads (gpu, skipped without a ROCm device).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-surface.h"
@@ -665,9 +665,158 @@ assert_slot (GstBuffer * batch, guint slot, const HostImage * hin, RefRect d)
 
 /* A mux with @n_in input harnesses on sink_0.., each with fixed caps, and its output harness with @out_caps
  * (NULL: NV12). @bus (optional) gets the element's messages. */
+/* Records what leaves the mux, in order: batches ("B:<source ids in slot order>"), our stream events
+ * ("added:N", "deleted:N", "start:N:<stream id>", "seg:N:<segment base in ms>", "eos:N", "reset:N") and EOS. */
+typedef struct
+{
+  GMutex lock;
+  GPtrArray *log;
+} Recorder;
+
+static GstPadProbeReturn
+record_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  Recorder *r = user_data;
+  gchar *s = NULL;
+
+  if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
+    RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (GST_PAD_PROBE_INFO_BUFFER (info));
+    GString *g = g_string_new ("B");
+
+    for (GList * l = bm != NULL ? bm->frame_meta_list : NULL; l != NULL; l = l->next)
+      g_string_append_printf (g, ":%u", ((RdsFrameMeta *) l->data)->source_id);
+    s = g_string_free (g, FALSE);
+  } else if (info->type & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) {
+    GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info);
+    GstSegment *seg = NULL;
+    gchar *sid = NULL;
+    guint id = 0;
+
+    switch ((RdsEventType) GST_EVENT_TYPE (ev)) {
+      case RDS_EVENT_PAD_ADDED:
+        g_assert_true (rds_event_parse_pad_added (ev, &id));
+        s = g_strdup_printf ("added:%u", id);
+        break;
+      case RDS_EVENT_PAD_DELETED:
+        g_assert_true (rds_event_parse_pad_deleted (ev, &id));
+        s = g_strdup_printf ("deleted:%u", id);
+        break;
+      case RDS_EVENT_STREAM_START:
+        g_assert_true (rds_event_parse_stream_start (ev, &id, &sid));
+        s = g_strdup_printf ("start:%u:%s", id, sid);
+        break;
+      case RDS_EVENT_STREAM_SEGMENT:
+        g_assert_true (rds_event_parse_stream_segment (ev, &id, &seg));
+        s = g_strdup_printf ("seg:%u:%" G_GUINT64_FORMAT, id, seg->base / GST_MSECOND);
+        break;
+      case RDS_EVENT_STREAM_EOS:
+        g_assert_true (rds_event_parse_stream_eos (ev, &id));
+        s = g_strdup_printf ("eos:%u", id);
+        break;
+      case RDS_EVENT_STREAM_RESET:
+        g_assert_true (rds_event_parse_stream_reset (ev, &id));
+        s = g_strdup_printf ("reset:%u", id);
+        break;
+      default:
+        if (GST_EVENT_TYPE (ev) == GST_EVENT_EOS)
+          s = g_strdup ("EOS");
+        break;
+    }
+  }
+  if (s != NULL) {
+    g_mutex_lock (&r->lock);
+    g_ptr_array_add (r->log, s);
+    g_mutex_unlock (&r->lock);
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+static void
+recorder_init (Recorder * r)
+{
+  g_mutex_init (&r->lock);
+  r->log = g_ptr_array_new_with_free_func (g_free);
+}
+
+static void
+recorder_clear (Recorder * r)
+{
+  g_ptr_array_unref (r->log);
+  g_mutex_clear (&r->lock);
+}
+
+static void
+recorder_attach (Recorder * r, GstElement * mux)
+{
+  GstPad *src = gst_element_get_static_pad (mux, "src");
+
+  gst_pad_add_probe (src, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, record_probe, r, NULL);
+  gst_object_unref (src);
+}
+
+/* Index of the first entry equal to @what at or after @from, or -1. */
+static gint
+rec_find (Recorder * r, const gchar * what, gint from)
+{
+  gint found = -1;
+
+  g_mutex_lock (&r->lock);
+  for (guint i = MAX (from, 0); i < r->log->len && found < 0; i++)
+    if (g_strcmp0 (g_ptr_array_index (r->log, i), what) == 0)
+      found = (gint) i;
+  g_mutex_unlock (&r->lock);
+  return found;
+}
+
+static gint
+rec_count (Recorder * r, const gchar * what)
+{
+  gint n = 0;
+
+  for (gint i = rec_find (r, what, 0); i >= 0; i = rec_find (r, what, i + 1))
+    n++;
+  return n;
+}
+
+static void
+rec_dump (Recorder * r)
+{
+  g_mutex_lock (&r->lock);
+  for (guint i = 0; i < r->log->len; i++)
+    g_test_message ("  [%u] %s", i, (const gchar *) g_ptr_array_index (r->log, i));
+  g_mutex_unlock (&r->lock);
+}
+
+/* Waits (up to 10 s) for @what at or after @from; returns its index (fails the test if it never comes). */
+static gint
+rec_wait (Recorder * r, const gchar * what, gint from)
+{
+  gint64 end = g_get_monotonic_time () + 10 * G_TIME_SPAN_SECOND;
+  gint i;
+
+  while ((i = rec_find (r, what, from)) < 0 && g_get_monotonic_time () < end)
+    g_usleep (2000);
+  if (i < 0) {
+    rec_dump (r);
+    g_error ("'%s' never left the mux", what);
+  }
+  return i;
+}
+
+static void
+rec_assert_before (Recorder * r, const gchar * first, const gchar * second)
+{
+  gint a = rec_find (r, first, 0), b = rec_find (r, second, 0);
+
+  if (a < 0 || b < 0 || a >= b) {
+    rec_dump (r);
+    g_error ("expected '%s' before '%s' (%d, %d)", first, second, a, b);
+  }
+}
+
 static GstHarness *
 mux_harness_full (const gchar * props, const gchar * const *in_caps, guint n_in, GstHarness ** in,
-    const gchar * out_caps, GstBus * bus)
+    const gchar * out_caps, GstBus * bus, Recorder * rec)
 {
   gchar *desc = g_strdup_printf ("rdsstreammux %s", props);
   GError *err = NULL;
@@ -678,6 +827,8 @@ mux_harness_full (const gchar * props, const gchar * const *in_caps, guint n_in,
   gst_object_ref_sink (e);
   if (bus != NULL)
     gst_element_set_bus (e, bus);
+  if (rec != NULL)
+    recorder_attach (rec, e);
   h = gst_harness_new_with_element (e, NULL, "src");
   gst_harness_set_sink_caps_str (h, out_caps != NULL ? out_caps : OUT_NV12);
   for (guint i = 0; i < n_in; i++) {
@@ -695,7 +846,7 @@ mux_harness_full (const gchar * props, const gchar * const *in_caps, guint n_in,
 static GstHarness *
 mux_harness (const gchar * props, const gchar * const *in_caps, guint n_in, GstHarness ** in)
 {
-  return mux_harness_full (props, in_caps, n_in, in, NULL, NULL);
+  return mux_harness_full (props, in_caps, n_in, in, NULL, NULL, NULL);
 }
 
 static void
@@ -1333,7 +1484,7 @@ test_batch_rejected (void)
   GError *err = NULL;
 
   RDS_TEST_REQUIRE_GPU ();
-  h = mux_harness_full ("width=64 height=64", in_caps, 1, in, NULL, bus);
+  h = mux_harness_full ("width=64 height=64", in_caps, 1, in, NULL, bus, NULL);
   pool = make_pool_batch (in_caps[0], 2);
   g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &b, NULL), ==, GST_FLOW_OK);
   s = rds_buffer_get_surface (b);
@@ -1375,7 +1526,7 @@ test_padding_rgba_odd (void)
     GstBuffer *b, *out;
     HostImage hin;
 
-    h = mux_harness_full ("width=320 height=240 enable-padding=true", in_caps, 1, in, cases[c].out, NULL);
+    h = mux_harness_full ("width=320 height=240 enable-padding=true", in_caps, 1, in, cases[c].out, NULL, NULL);
     b = rds_frame (pool, 70 + c, 0);
     host_of (b, NULL, &hin);
     g_assert_cmpint (gst_harness_push (in[0], b), ==, GST_FLOW_OK);
@@ -1674,6 +1825,648 @@ test_latency_on_restart (void)
   gst_object_unref (e);
 }
 
+/* ---- stream events, EOS, dynamic pads, remaining properties ---- */
+
+/* The stream-id a source sent on sink_@i (the input harness's). */
+static gchar *
+upstream_stream_id (GstHarness * h, guint i)
+{
+  gchar *name = g_strdup_printf ("sink_%u", i);
+  GstPad *pad = gst_element_get_static_pad (h->element, name);
+  GstEvent *ev = gst_pad_get_sticky_event (pad, GST_EVENT_STREAM_START, 0);
+  const gchar *sid = NULL;
+  gchar *ret;
+
+  g_assert_nonnull (ev);
+  gst_event_parse_stream_start (ev, &sid);
+  ret = g_strdup (sid);
+  gst_event_unref (ev);
+  gst_object_unref (pad);
+  g_free (name);
+  return ret;
+}
+
+static void
+push_segment_base (GstHarness * in, GstClockTime base)
+{
+  GstSegment seg;
+
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  seg.base = base;
+  g_assert_true (gst_harness_push_event (in, gst_event_new_segment (&seg)));
+}
+
+static void
+drop_output (GstHarness * h)
+{
+  GstBuffer *b;
+
+  while ((b = gst_harness_try_pull (h)) != NULL)
+    gst_buffer_unref (b);
+}
+
+/* Each source's pad-added, stream-start (with the upstream stream-id) and stream-segment (with its segment) go
+ * downstream before its first frame; releasing a pad sends pad-deleted. */
+static void
+test_stream_events (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[2];
+  GstBufferPool *pool;
+  Recorder rec;
+
+  RDS_TEST_REQUIRE_GPU ();
+  recorder_init (&rec);
+  h = mux_harness_full ("batch-size=2 width=64 height=64", in_caps, 2, in, NULL, NULL, &rec);
+  pool = make_pool (in_caps[0]);
+  push_segment_base (in[1], 5 * GST_SECOND);
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, i, 0)), ==, GST_FLOW_OK);
+  rec_wait (&rec, "B:0:1", 0);
+
+  for (guint i = 0; i < 2; i++) {
+    gchar *sid = upstream_stream_id (h, i);
+    gchar *added = g_strdup_printf ("added:%u", i), *start = g_strdup_printf ("start:%u:%s", i, sid);
+    gchar *seg = g_strdup_printf ("seg:%u:0", i);
+
+    g_assert_cmpint (rec_count (&rec, added), ==, 1);
+    rec_assert_before (&rec, added, start);
+    rec_assert_before (&rec, start, seg);
+    rec_assert_before (&rec, seg, "B:0:1");
+    g_free (seg);
+    g_free (start);
+    g_free (added);
+    g_free (sid);
+  }
+  /* the second segment of source 1 follows its first */
+  g_assert_cmpint (rec_find (&rec, "seg:1:5000", rec_find (&rec, "seg:1:0", 0)), >=, 0);
+  rec_assert_before (&rec, "seg:1:5000", "B:0:1");
+  g_assert_cmpint (rec_find (&rec, "deleted:0", 0), <, 0);
+
+  /* releasing the request pads (harness teardown) */
+  mux_teardown (h, in, 2);
+  g_assert_cmpint (rec_count (&rec, "deleted:0"), ==, 1);
+  g_assert_cmpint (rec_count (&rec, "deleted:1"), ==, 1);
+  pool_free (pool);
+  recorder_clear (&rec);
+}
+
+/* A source's EOS becomes stream-eos after its last frame has been batched and before any later batch; the global
+ * EOS follows once every source has ended, unless drop-pipeline-eos. Then a new source still gets batched. */
+static void
+check_stream_eos (gboolean drop)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[2], *in2;
+  GstBufferPool *pool;
+  Recorder rec;
+  gint i_eos1;
+
+  recorder_init (&rec);
+  h = mux_harness_full (drop ? "batch-size=2 width=64 height=64 drop-pipeline-eos=true" :
+      "batch-size=2 width=64 height=64", in_caps, 2, in, NULL, NULL, &rec);
+  pool = make_pool (in_caps[0]);
+  /* source 1's last frame and its EOS are queued before source 0's frame completes the batch */
+  g_assert_cmpint (gst_harness_push (in[1], rds_frame (pool, 1, 0)), ==, GST_FLOW_OK);
+  g_assert_true (gst_harness_push_event (in[1], gst_event_new_eos ()));
+  g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, 0, 0)), ==, GST_FLOW_OK);
+  i_eos1 = rec_wait (&rec, "eos:1", 0);
+  g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, 2, 33 * GST_MSECOND)), ==, GST_FLOW_OK);
+  rec_wait (&rec, "B:0", i_eos1);
+  rec_assert_before (&rec, "B:0:1", "eos:1");
+  g_assert_cmpint (rec_count (&rec, "eos:1"), ==, 1);
+  g_assert_cmpint (rec_find (&rec, "EOS", 0), <, 0);
+  drop_output (h);
+
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_eos ()));
+  rec_wait (&rec, "eos:0", 0);
+  if (!drop) {
+    rec_wait (&rec, "EOS", 0);
+    rec_assert_before (&rec, "eos:0", "EOS");
+  } else {
+    g_usleep (300 * 1000);
+    g_assert_cmpint (rec_find (&rec, "EOS", 0), <, 0);
+    /* the mux is still alive: a source added now gets batched */
+    in2 = gst_harness_new_with_element (h->element, "sink_2", NULL);
+    gst_harness_set_src_caps_str (in2, in_caps[0]);
+    g_assert_cmpint (gst_harness_push (in2, rds_frame (pool, 3, 66 * GST_MSECOND)), ==, GST_FLOW_OK);
+    rec_wait (&rec, "B:2", 0);
+    rec_assert_before (&rec, "added:2", "B:2");
+    gst_harness_teardown (in2);
+    rec_wait (&rec, "deleted:2", 0);
+    g_assert_cmpint (rec_find (&rec, "EOS", 0), <, 0);
+  }
+  mux_teardown (h, in, 2);
+  pool_free (pool);
+  recorder_clear (&rec);
+}
+
+static void
+test_stream_eos (void)
+{
+  RDS_TEST_REQUIRE_GPU ();
+  check_stream_eos (FALSE);
+}
+
+static void
+test_drop_pipeline_eos (void)
+{
+  RDS_TEST_REQUIRE_GPU ();
+  check_stream_eos (TRUE);
+}
+
+/* A pad requested while PLAYING joins the next batch (after its pad-added); a released one leaves the batches
+ * after its pad-deleted. */
+static void
+test_dynamic_pads (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[2], *in2;
+  GstBufferPool *pool;
+  Recorder rec;
+  gint i_del;
+
+  RDS_TEST_REQUIRE_GPU ();
+  recorder_init (&rec);
+  h = mux_harness_full ("batch-size=3 width=64 height=64 sort-batch=true", in_caps, 2, in, NULL, NULL, &rec);
+  pool = make_pool (in_caps[0]);
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, i, 0)), ==, GST_FLOW_OK);
+  rec_wait (&rec, "B:0:1", 0);
+  g_assert_cmpint (rec_find (&rec, "added:2", 0), <, 0);
+
+  in2 = gst_harness_new_with_element (h->element, "sink_2", NULL);
+  gst_harness_set_src_caps_str (in2, in_caps[0]);
+  for (guint i = 0; i < 3; i++)
+    g_assert_cmpint (gst_harness_push (i < 2 ? in[i] : in2, rds_frame (pool, 10 + i, 33 * GST_MSECOND)), ==,
+        GST_FLOW_OK);
+  rec_wait (&rec, "B:0:1:2", 0);
+  rec_assert_before (&rec, "added:2", "B:0:1:2");
+  drop_output (h);
+
+  gst_harness_teardown (in2);
+  i_del = rec_wait (&rec, "deleted:2", 0);
+  for (guint round = 0; round < 2; round++) {
+    for (guint i = 0; i < 2; i++)
+      g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, 20 + i, (66 + round * 33) * GST_MSECOND)), ==,
+          GST_FLOW_OK);
+    i_del = rec_wait (&rec, "B:0:1", i_del + 1);
+    drop_output (h);
+  }
+  g_assert_cmpint (rec_find (&rec, "B:0:1:2", rec_find (&rec, "deleted:2", 0)), <, 0);
+  mux_teardown (h, in, 2);
+  pool_free (pool);
+  recorder_clear (&rec);
+}
+
+static gint
+pull_frame_num (GstHarness * h)
+{
+  GstBuffer *out = pull_ok (h);
+  gint n = frame_meta_at (gst_buffer_get_rds_batch_meta (out), 0)->frame_num;
+
+  gst_buffer_unref (out);
+  return n;
+}
+
+/* Per-source frame numbers restart after EOS (frame-num-reset-on-eos) and after a flush
+ * (frame-num-reset-on-stream-reset, with rds-stream-reset before the source's next frame); otherwise they go on. */
+static void
+check_frame_num (gboolean on_eos, gboolean on_reset)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120) };
+  gchar *props = g_strdup_printf ("width=64 height=64 frame-num-reset-on-eos=%d frame-num-reset-on-stream-reset=%d",
+      on_eos, on_reset);
+  GstHarness *h, *in[1];
+  GstBufferPool *pool;
+  Recorder rec;
+  gint i_reset;
+
+  recorder_init (&rec);
+  h = mux_harness_full (props, in_caps, 1, in, NULL, NULL, &rec);
+  pool = make_pool (in_caps[0]);
+  for (gint f = 0; f < 2; f++) {
+    g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, f, f * 33 * GST_MSECOND)), ==, GST_FLOW_OK);
+    g_assert_cmpint (pull_frame_num (h), ==, f);
+  }
+
+  /* the source ends and starts again */
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_eos ()));
+  rec_wait (&rec, "eos:0", 0);
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_stream_start ("second-stream")));
+  push_segment (in[0]);
+  g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, 2, 0)), ==, GST_FLOW_OK);
+  g_assert_cmpint (pull_frame_num (h), ==, on_eos ? 0 : 2);
+  rec_wait (&rec, "start:0:second-stream", 0);
+
+  /* a flush of the source: stream-reset before its next frame */
+  g_assert_cmpint (rec_find (&rec, "reset:0", 0), <, 0);
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_flush_start ()));
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_flush_stop (TRUE)));
+  push_segment (in[0]);
+  g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, 3, 0)), ==, GST_FLOW_OK);
+  g_assert_cmpint (pull_frame_num (h), ==, on_reset ? 0 : (on_eos ? 1 : 3));
+  i_reset = rec_wait (&rec, "reset:0", 0);
+  g_assert_cmpint (rec_find (&rec, "B:0", i_reset), >, i_reset);
+  g_assert_cmpint (rec_count (&rec, "reset:0"), ==, 1);
+
+  mux_teardown (h, in, 1);
+  pool_free (pool);
+  recorder_clear (&rec);
+  g_free (props);
+}
+
+static void
+test_frame_num (void)
+{
+  RDS_TEST_REQUIRE_GPU ();
+  check_frame_num (FALSE, FALSE);
+  check_frame_num (TRUE, FALSE);
+  check_frame_num (FALSE, TRUE);
+}
+
+/* attach-sys-ts=FALSE leaves ntp_timestamp at 0 (TRUE is checked in batch-scaling). */
+static void
+test_attach_sys_ts_off (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120) };
+  GstHarness *h, *in[1];
+  GstBufferPool *pool;
+  GstBuffer *out;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("width=64 height=64 attach-sys-ts=false", in_caps, 1, in);
+  pool = make_pool (in_caps[0]);
+  g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, 0, 0)), ==, GST_FLOW_OK);
+  out = pull_ok (h);
+  g_assert_cmpuint (frame_meta_at (gst_buffer_get_rds_batch_meta (out), 0)->ntp_timestamp, ==, 0);
+  gst_buffer_unref (out);
+  mux_teardown (h, in, 1);
+  pool_free (pool);
+}
+
+/* live-source: the batch PTS is the last copied frame's; otherwise the earliest frame's. */
+static void
+test_live_pts (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+
+  RDS_TEST_REQUIRE_GPU ();
+  for (guint live = 0; live < 2; live++) {
+    GstHarness *h, *in[2];
+    GstBufferPool *pool;
+    GstBuffer *out;
+
+    h = mux_harness (live ? "batch-size=2 width=64 height=64 live-source=true" : "batch-size=2 width=64 height=64",
+        in_caps, 2, in);
+    pool = make_pool (in_caps[0]);
+    for (guint i = 0; i < 2; i++)
+      g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, i, (50 + 50 * i) * GST_MSECOND)), ==, GST_FLOW_OK);
+    out = pull_ok (h);
+    /* slots in visiting order: source 0, then source 1 (copied last) */
+    g_assert_cmpuint (frame_meta_at (gst_buffer_get_rds_batch_meta (out), 1)->source_id, ==, 1);
+    g_assert_cmpuint (GST_BUFFER_PTS (out), ==, (live ? 100 : 50) * GST_MSECOND);
+    gst_buffer_unref (out);
+    mux_teardown (h, in, 2);
+    pool_free (pool);
+  }
+}
+
+/* sort-batch: slots in pad order whatever pad the round robin visits first. */
+static void
+test_sort_batch (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[2];
+  GstBufferPool *pool;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("batch-size=2 width=64 height=64 sort-batch=true", in_caps, 2, in);
+  pool = make_pool (in_caps[0]);
+  for (guint round = 0; round < 2; round++) {
+    GstBuffer *out;
+    RdsBatchMeta *bm;
+
+    for (guint i = 0; i < 2; i++)
+      g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, i, round * 33 * GST_MSECOND)), ==, GST_FLOW_OK);
+    out = pull_ok (h);
+    bm = gst_buffer_get_rds_batch_meta (out);
+    for (guint slot = 0; slot < 2; slot++) {
+      g_assert_cmpuint (frame_meta_at (bm, slot)->source_id, ==, slot);
+      g_assert_cmpuint (frame_meta_at (bm, slot)->batch_id, ==, slot);
+    }
+    gst_buffer_unref (out);
+  }
+  mux_teardown (h, in, 2);
+  pool_free (pool);
+}
+
+/* Without a timeout (and not live), a stalled source holds the batch until it ends; then the others go on. */
+static void
+test_stall_no_timeout (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[3];
+  GstBufferPool *pool;
+  GstBuffer *out;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("batch-size=3 width=64 height=64", in_caps, 3, in);
+  pool = make_pool (in_caps[0]);
+  for (guint i = 0; i < 3; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, i, 0)), ==, GST_FLOW_OK);
+  out = pull_ok (h);
+  g_assert_cmpuint (rds_buffer_get_surface (out)->numFilled, ==, 3);
+  gst_buffer_unref (out);
+
+  /* source 2 stalls */
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, 3 + i, 33 * GST_MSECOND)), ==, GST_FLOW_OK);
+  g_assert_null (pull_within (h, 300));
+  g_assert_true (gst_harness_push_event (in[2], gst_event_new_eos ()));
+  out = pull_ok (h);
+  g_assert_cmpuint (rds_buffer_get_surface (out)->numFilled, ==, 2);
+  gst_buffer_unref (out);
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, 5 + i, 66 * GST_MSECOND)), ==, GST_FLOW_OK);
+  out = pull_ok (h);
+  g_assert_cmpuint (rds_buffer_get_surface (out)->numFilled, ==, 2);
+  gst_buffer_unref (out);
+  mux_teardown (h, in, 3);
+  pool_free (pool);
+}
+
+/* ---- pipelines with appsrcs (the clock runs) ---- */
+
+#define APP_CAPS "video/x-raw,format=NV12,width=64,height=48,framerate=30/1"
+
+typedef struct
+{
+  GstElement *pipe, *mux, *sink;
+  GstElement *src[4];
+  guint n;
+} AppPipe;
+
+/* @n appsrcs (each with @src_props) into rdsstreammux (@mux_props) into an appsink. */
+static void
+app_pipe_start (AppPipe * p, guint n, const gchar * src_props, const gchar * mux_props)
+{
+  GString *desc = g_string_new (NULL);
+  GError *err = NULL;
+
+  for (guint i = 0; i < n; i++)
+    g_string_append_printf (desc, "appsrc name=s%u format=time caps=\"" APP_CAPS "\" %s ! m.sink_%u ", i, src_props,
+        i);
+  g_string_append_printf (desc, "rdsstreammux name=m width=64 height=48 %s ! appsink name=out sync=false", mux_props);
+  p->pipe = gst_parse_launch (desc->str, &err);
+  g_assert_no_error (err);
+  g_string_free (desc, TRUE);
+  p->n = n;
+  for (guint i = 0; i < n; i++) {
+    gchar *name = g_strdup_printf ("s%u", i);
+
+    p->src[i] = gst_bin_get_by_name (GST_BIN (p->pipe), name);
+    g_free (name);
+  }
+  p->mux = gst_bin_get_by_name (GST_BIN (p->pipe), "m");
+  p->sink = gst_bin_get_by_name (GST_BIN (p->pipe), "out");
+  g_assert_cmpint (gst_element_set_state (p->pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+}
+
+static void
+app_push (AppPipe * p, guint i, guint32 seed, GstClockTime pts)
+{
+  g_assert_cmpint (gst_app_src_push_buffer (GST_APP_SRC (p->src[i]), sys_frame (APP_CAPS, seed, pts)), ==,
+      GST_FLOW_OK);
+}
+
+/* The next batch's number of frames (fails after 5 s); @dt_us gets the wait. */
+static guint
+app_pull (AppPipe * p, gint64 * dt_us)
+{
+  gint64 t0 = g_get_monotonic_time ();
+  GstSample *sample = gst_app_sink_try_pull_sample (GST_APP_SINK (p->sink), 5 * GST_SECOND);
+  guint n;
+
+  if (dt_us != NULL)
+    *dt_us = g_get_monotonic_time () - t0;
+  g_assert_nonnull (sample);
+  n = rds_buffer_get_surface (gst_sample_get_buffer (sample))->numFilled;
+  gst_sample_unref (sample);
+  return n;
+}
+
+static void
+app_pipe_stop (AppPipe * p)
+{
+  gst_element_set_state (p->pipe, GST_STATE_NULL);
+  for (guint i = 0; i < p->n; i++)
+    gst_object_unref (p->src[i]);
+  gst_object_unref (p->mux);
+  gst_object_unref (p->sink);
+  gst_object_unref (p->pipe);
+}
+
+/* batched-push-timeout with three sources, one of which stops after 5 frames: every later batch carries the other
+ * two and comes about one timeout after their frames. */
+static void
+test_stall_timeout (void)
+{
+  AppPipe p;
+
+  RDS_TEST_REQUIRE_GPU ();
+  app_pipe_start (&p, 3, "", "batch-size=3 batched-push-timeout=40000");
+  for (guint f = 0; f < 5; f++) {
+    for (guint i = 0; i < 3; i++)
+      app_push (&p, i, 3 * f + i, f * 33 * GST_MSECOND);
+    g_assert_cmpuint (app_pull (&p, NULL), ==, 3);
+  }
+  for (guint f = 5; f < 9; f++) {
+    gint64 dt;
+
+    for (guint i = 0; i < 2; i++)
+      app_push (&p, i, 3 * f + i, f * 33 * GST_MSECOND);
+    g_assert_cmpuint (app_pull (&p, &dt), ==, 2);
+    g_test_message ("batch %u after %" G_GINT64_FORMAT " ms", f, dt / 1000);
+    /* generous: loaded CI and sanitizers */
+    g_assert_cmpint (dt, >=, 30 * 1000);
+    g_assert_cmpint (dt, <=, 1000 * 1000);
+  }
+  app_pipe_stop (&p);
+}
+
+/* With a live upstream, the timeout still counts from the batch's first frame: the upstream latency (here 1 s) is
+ * not added on top. (Only once the running time is past that latency: before, there is nothing to take it off.) */
+static void
+test_timeout_live_upstream (void)
+{
+  AppPipe p;
+
+  RDS_TEST_REQUIRE_GPU ();
+  app_pipe_start (&p, 2, "is-live=true do-timestamp=true min-latency=1000000000",
+      "batch-size=2 batched-push-timeout=40000");
+  for (guint i = 0; i < 2; i++)
+    app_push (&p, i, i, GST_CLOCK_TIME_NONE);
+  g_assert_cmpuint (app_pull (&p, NULL), ==, 2);
+  g_usleep (1200 * 1000);
+  for (guint f = 0; f < 3; f++) {
+    gint64 dt;
+
+    g_usleep (100 * 1000);
+    app_push (&p, 0, 2 + f, GST_CLOCK_TIME_NONE);
+    g_assert_cmpuint (app_pull (&p, &dt), ==, 1);
+    g_test_message ("partial batch %u after %" G_GINT64_FORMAT " ms", f, dt / 1000);
+    g_assert_cmpint (dt, >=, 30 * 1000);
+    g_assert_cmpint (dt, <=, 600 * 1000);
+  }
+  app_pipe_stop (&p);
+}
+
+/* sync-inputs: a partial batch waits until the clock reaches its earliest frame's running time; a frame already
+ * due goes out at once, one ahead of the clock waits for it. */
+static void
+test_sync_inputs (void)
+{
+  AppPipe p;
+  GstClockTime now;
+  gint64 dt;
+
+  RDS_TEST_REQUIRE_GPU ();
+  app_pipe_start (&p, 2, "", "batch-size=2 sync-inputs=true");
+  g_assert_cmpint (gst_element_get_state (p.pipe, NULL, NULL, 5 * GST_SECOND), !=, GST_STATE_CHANGE_FAILURE);
+  /* frames due in 300 ms: both are there by then, however slow this machine is */
+  now = gst_element_get_current_running_time (p.mux);
+  g_assert_true (GST_CLOCK_TIME_IS_VALID (now));
+  for (guint i = 0; i < 2; i++)
+    app_push (&p, i, i, now + 300 * GST_MSECOND);
+  g_assert_cmpuint (app_pull (&p, NULL), ==, 2);
+
+  /* source 1 stalls; source 0's frame is due now */
+  now = gst_element_get_current_running_time (p.mux);
+  app_push (&p, 0, 2, now);
+  g_assert_cmpuint (app_pull (&p, &dt), ==, 1);
+  g_test_message ("due frame after %" G_GINT64_FORMAT " ms", dt / 1000);
+  g_assert_cmpint (dt, <=, 400 * 1000);
+
+  /* one 600 ms ahead of the clock */
+  now = gst_element_get_current_running_time (p.mux);
+  app_push (&p, 0, 3, now + 600 * GST_MSECOND);
+  g_assert_cmpuint (app_pull (&p, &dt), ==, 1);
+  g_test_message ("early frame after %" G_GINT64_FORMAT " ms", dt / 1000);
+  g_assert_cmpint (dt, >=, 500 * 1000);
+  g_assert_cmpint (dt, <=, 3000 * 1000);
+  app_pipe_stop (&p);
+}
+
+/* ---- cpu: remaining properties ---- */
+
+/* max-latency is added to the latency the mux reports, on top of the timeout and the upstream latency. */
+static void
+test_max_latency (void)
+{
+  AppPipe p;
+  GstPad *src;
+  GstQuery *q = gst_query_new_latency ();
+  GstClockTime min = 0, max = 0;
+  gboolean live = FALSE;
+
+  app_pipe_start (&p, 1, "is-live=true min-latency=200000000", "batched-push-timeout=40000 max-latency=100000000");
+  g_assert_cmpint (gst_element_get_state (p.pipe, NULL, NULL, 5 * GST_SECOND), !=, GST_STATE_CHANGE_FAILURE);
+  src = gst_element_get_static_pad (p.mux, "src");
+  g_assert_true (gst_pad_query (src, q));
+  gst_query_parse_latency (q, &live, &min, &max);
+  g_assert_true (live);
+  g_assert_cmpuint (min, ==, 340 * GST_MSECOND);
+  gst_query_unref (q);
+  gst_object_unref (src);
+  app_pipe_stop (&p);
+}
+
+static void
+check_bool (GstElement * e, const gchar * name, gboolean def)
+{
+  g_assert_cmpint (G_PARAM_SPEC_BOOLEAN (find_prop (e, name, G_TYPE_PARAM_BOOLEAN))->default_value, ==, def);
+}
+
+static void
+check_int (GstElement * e, const gchar * name, gint def, gint lo, gint hi)
+{
+  GParamSpecInt *p = G_PARAM_SPEC_INT (find_prop (e, name, G_TYPE_PARAM_INT));
+
+  g_assert_cmpint (p->default_value, ==, def);
+  g_assert_cmpint (p->minimum, ==, lo);
+  g_assert_cmpint (p->maximum, ==, hi);
+}
+
+static void
+test_more_properties (void)
+{
+  GstElement *e = gst_element_factory_make ("rdsstreammux", NULL);
+  GParamSpecUInt64 *p64;
+  GError *err = NULL;
+  GstElement *bad;
+
+  check_bool (e, "live-source", FALSE);
+  check_bool (e, "sync-inputs", FALSE);
+  check_bool (e, "sort-batch", FALSE);
+  check_bool (e, "attach-sys-ts", TRUE);
+  check_bool (e, "drop-pipeline-eos", FALSE);
+  check_bool (e, "frame-num-reset-on-eos", FALSE);
+  check_bool (e, "frame-num-reset-on-stream-reset", FALSE);
+  check_uint (e, "max-latency", 0, 0, G_MAXUINT);
+  /* accepted, no effect */
+  check_bool (e, "align-first-buffer", FALSE);
+  check_bool (e, "align-inputs", FALSE);
+  check_bool (e, "cache-buffer", FALSE);
+  check_bool (e, "extract-sei-sim-time", FALSE);
+  check_bool (e, "extract-sei-type5-data", FALSE);
+  check_bool (e, "drop-backward-sei", FALSE);
+  check_bool (e, "async-process", FALSE);
+  check_int (e, "cache-buffer-timeout", -1, -1, G_MAXINT);
+  check_int (e, "sync-inputs-ntp", 0, 0, G_MAXINT);
+  check_uint (e, "failsafe-flush-count", 10, 1, 1024);
+  p64 = G_PARAM_SPEC_UINT64 (find_prop (e, "frame-duration", G_TYPE_PARAM_UINT64));
+  g_assert_cmpuint (p64->default_value, ==, 0);
+  g_assert_cmpuint (p64->maximum, ==, G_MAXUINT64);
+  gst_object_unref (e);
+
+  /* surface-array memory (4) is not a value of the enum */
+  bad = gst_parse_launch ("rdsstreammux nvbuf-memory-type=4", &err);
+  g_assert_nonnull (err);
+  g_clear_error (&err);
+  gst_clear_object (&bad);
+}
+
+static gint noop_logs;
+
+static void
+count_noop_log (G_GNUC_UNUSED GstDebugCategory * category, GstDebugLevel level, G_GNUC_UNUSED const gchar * file,
+    G_GNUC_UNUSED const gchar * function, G_GNUC_UNUSED gint line, G_GNUC_UNUSED GObject * object,
+    GstDebugMessage * message, G_GNUC_UNUSED gpointer user_data)
+{
+  if (level == GST_LEVEL_INFO && strstr (gst_debug_message_get (message), "no effect") != NULL)
+    g_atomic_int_inc (&noop_logs);
+}
+
+/* Setting accepted no-op properties logs once per element. */
+static void
+test_noop_log_once (void)
+{
+  GstElement *e[2];
+
+  gst_debug_set_threshold_for_name ("rdsstreammux", GST_LEVEL_INFO);
+  gst_debug_add_log_function (count_noop_log, NULL, NULL);
+  for (guint i = 0; i < 2; i++) {
+    e[i] = gst_element_factory_make ("rdsstreammux", NULL);
+    g_object_set (e[i], "align-inputs", TRUE, "cache-buffer-timeout", 100, "async-process", TRUE, NULL);
+    g_assert_cmpint (g_atomic_int_get (&noop_logs), ==, (gint) i + 1);
+  }
+  gst_debug_remove_log_function (count_noop_log);
+  gst_debug_set_threshold_for_name ("rdsstreammux", GST_LEVEL_NONE);
+  for (guint i = 0; i < 2; i++)
+    gst_object_unref (e[i]);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1685,6 +2478,9 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/mux/no-size", test_no_size);
   g_test_add_func ("/cpu/mux/unsupported-settings", test_unsupported_settings);
   g_test_add_func ("/cpu/mux/latency-on-restart", test_latency_on_restart);
+  g_test_add_func ("/cpu/mux/max-latency", test_max_latency);
+  g_test_add_func ("/cpu/mux/more-properties", test_more_properties);
+  g_test_add_func ("/cpu/mux/noop-log-once", test_noop_log_once);
 
   g_test_add_func ("/gpu/mux/batch-scaling", test_batch_scaling);
   g_test_add_func ("/gpu/mux/padding", test_padding);
@@ -1705,5 +2501,17 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/mux/flush-while-blocked", test_flush_while_blocked);
   g_test_add_func ("/gpu/mux/flush-one-pad-blocked", test_flush_one_pad_blocked);
   g_test_add_func ("/gpu/mux/pts-monotonic", test_pts_monotonic);
+  g_test_add_func ("/gpu/mux/stream-events", test_stream_events);
+  g_test_add_func ("/gpu/mux/stream-eos", test_stream_eos);
+  g_test_add_func ("/gpu/mux/drop-pipeline-eos", test_drop_pipeline_eos);
+  g_test_add_func ("/gpu/mux/dynamic-pads", test_dynamic_pads);
+  g_test_add_func ("/gpu/mux/frame-num", test_frame_num);
+  g_test_add_func ("/gpu/mux/attach-sys-ts-off", test_attach_sys_ts_off);
+  g_test_add_func ("/gpu/mux/live-pts", test_live_pts);
+  g_test_add_func ("/gpu/mux/sort-batch", test_sort_batch);
+  g_test_add_func ("/gpu/mux/stall-no-timeout", test_stall_no_timeout);
+  g_test_add_func ("/gpu/mux/stall-timeout", test_stall_timeout);
+  g_test_add_func ("/gpu/mux/timeout-live-upstream", test_timeout_live_upstream);
+  g_test_add_func ("/gpu/mux/sync-inputs", test_sync_inputs);
   return g_test_run ();
 }
