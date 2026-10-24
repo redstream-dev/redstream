@@ -620,8 +620,13 @@ input_base_rect (GstRdsVideoConvert * self, GstBuffer * inbuf, RdsBufSurfTransfo
   rect->left = rect->top = 0;
   rect->width = w;
   rect->height = h;
-  if (crop == NULL || crop->x >= w || crop->y >= h || crop->width == 0 || crop->height == 0)
+  if (crop == NULL)
     return FALSE;
+  if (crop->x >= w || crop->y >= h || crop->width == 0 || crop->height == 0) {
+    GST_DEBUG_OBJECT (self, "ignoring crop meta %ux%u at %u,%u: nothing of it lies in the %ux%u frame",
+        crop->width, crop->height, crop->x, crop->y, w, h);
+    return FALSE;
+  }
   rect->left = crop->x;
   rect->top = crop->y;
   rect->width = MIN (crop->width, w - crop->x);
@@ -679,44 +684,6 @@ ensure_stage (GstRdsVideoConvert * self, RdsBufSurface ** stage, const GstVideoI
     return FALSE;
   }
   return TRUE;
-}
-
-/* Copies a mapped system frame into @stage (upload) or @stage into it. A frame whose planes the hand-built surface
- * cannot describe (out of order, see rds_video_frame_wrap_surface) goes through a frame in the default layout. */
-static gboolean
-copy_frame (GstVideoFrame * frame, RdsBufSurface * stage, gboolean upload)
-{
-  RdsBufSurface wrap;
-  RdsBufSurfaceParams wrap_params;
-  GstVideoFrame tmp;
-  GstBuffer *tmpbuf = NULL;
-  gboolean ok;
-
-  if (!rds_video_frame_wrap_surface (frame, &wrap, &wrap_params)) {
-    GstVideoInfo info;
-
-    gst_video_info_set_format (&info, GST_VIDEO_FRAME_FORMAT (frame), GST_VIDEO_FRAME_WIDTH (frame),
-        GST_VIDEO_FRAME_HEIGHT (frame));
-    tmpbuf = gst_buffer_new_allocate (NULL, GST_VIDEO_INFO_SIZE (&info), NULL);
-    if (tmpbuf == NULL || !gst_video_frame_map (&tmp, &info, tmpbuf, GST_MAP_READWRITE)) {
-      gst_clear_buffer (&tmpbuf);
-      return FALSE;
-    }
-    if ((upload && !gst_video_frame_copy (&tmp, frame)) || !rds_video_frame_wrap_surface (&tmp, &wrap,
-            &wrap_params)) {
-      gst_video_frame_unmap (&tmp);
-      gst_buffer_unref (tmpbuf);
-      return FALSE;
-    }
-  }
-  ok = upload ? rds_buf_surface_copy (&wrap, stage) == 0 : rds_buf_surface_copy (stage, &wrap) == 0;
-  if (tmpbuf != NULL) {
-    if (ok && !upload)
-      ok = gst_video_frame_copy (frame, &tmp);
-    gst_video_frame_unmap (&tmp);
-    gst_buffer_unref (tmpbuf);
-  }
-  return ok;
 }
 
 static GstFlowReturn
@@ -779,7 +746,7 @@ gst_rds_video_convert_transform (GstBaseTransform * trans, GstBuffer * inbuf, Gs
       goto stage_failed;
     if (!gst_video_frame_map (&frame, &self->in_info, inbuf, GST_MAP_READ))
       goto map_failed;
-    ok = copy_frame (&frame, self->in_stage, TRUE);
+    ok = rds_video_frame_copy_surface (&frame, self->in_stage, TRUE);
     gst_video_frame_unmap (&frame);
     if (!ok)
       goto copy_failed;
@@ -840,7 +807,7 @@ gst_rds_video_convert_transform (GstBaseTransform * trans, GstBuffer * inbuf, Gs
 
     if (!gst_video_frame_map (&frame, &self->out_info, outbuf, GST_MAP_WRITE))
       goto map_failed;
-    ok = copy_frame (&frame, self->out_stage, FALSE);
+    ok = rds_video_frame_copy_surface (&frame, self->out_stage, FALSE);
     gst_video_frame_unmap (&frame);
     if (!ok)
       goto copy_failed;

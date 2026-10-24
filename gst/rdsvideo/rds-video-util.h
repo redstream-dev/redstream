@@ -16,6 +16,12 @@ G_BEGIN_DECLS
 G_GNUC_INTERNAL gboolean rds_video_frame_wrap_surface (GstVideoFrame * frame, RdsBufSurface * surf,
     RdsBufSurfaceParams * params);
 
+/* Copies the mapped system frame @frame into surface 0 of @stage (@upload TRUE) or from it into @frame. Sizes and
+ * formats must match. A frame that rds_video_frame_wrap_surface cannot describe (planes out of order) goes through
+ * a temporary frame in the default layout. FALSE on failure. */
+G_GNUC_INTERNAL gboolean rds_video_frame_copy_surface (GstVideoFrame * frame, RdsBufSurface * stage,
+    gboolean upload);
+
 /* Parses "left:top:width:height" (exactly four non-negative decimal integers, each at most G_MAXUINT32).
  * NULL or "" means the whole frame: TRUE with every field 0. On failure @rect is left untouched. */
 G_GNUC_INTERNAL gboolean rds_video_parse_rect (const gchar * str, RdsBufSurfTransformRect * rect);

@@ -103,3 +103,41 @@ rds_video_parse_rect (const gchar * str, RdsBufSurfTransformRect * rect)
   rect->height = (guint32) v[3];
   return TRUE;
 }
+
+gboolean
+rds_video_frame_copy_surface (GstVideoFrame * frame, RdsBufSurface * stage, gboolean upload)
+{
+  RdsBufSurface wrap;
+  RdsBufSurfaceParams wrap_params;
+  GstVideoFrame tmp;
+  GstBuffer *tmpbuf = NULL;
+  gboolean ok;
+
+  g_return_val_if_fail (frame != NULL && stage != NULL, FALSE);
+
+  if (!rds_video_frame_wrap_surface (frame, &wrap, &wrap_params)) {
+    GstVideoInfo info;
+
+    gst_video_info_set_format (&info, GST_VIDEO_FRAME_FORMAT (frame), GST_VIDEO_FRAME_WIDTH (frame),
+        GST_VIDEO_FRAME_HEIGHT (frame));
+    tmpbuf = gst_buffer_new_allocate (NULL, GST_VIDEO_INFO_SIZE (&info), NULL);
+    if (tmpbuf == NULL || !gst_video_frame_map (&tmp, &info, tmpbuf, GST_MAP_READWRITE)) {
+      gst_clear_buffer (&tmpbuf);
+      return FALSE;
+    }
+    if ((upload && !gst_video_frame_copy (&tmp, frame)) || !rds_video_frame_wrap_surface (&tmp, &wrap,
+            &wrap_params)) {
+      gst_video_frame_unmap (&tmp);
+      gst_buffer_unref (tmpbuf);
+      return FALSE;
+    }
+  }
+  ok = upload ? rds_buf_surface_copy (&wrap, stage) == 0 : rds_buf_surface_copy (stage, &wrap) == 0;
+  if (tmpbuf != NULL) {
+    if (ok && !upload)
+      ok = gst_video_frame_copy (frame, &tmp);
+    gst_video_frame_unmap (&tmp);
+    gst_buffer_unref (tmpbuf);
+  }
+  return ok;
+}

@@ -44,12 +44,12 @@ Names and integers as on NVIDIA's [nvvideoconvert page](https://docs.nvidia.com/
 
 | Property | Status | Notes |
 |---|---|---|
-| `src-crop` | supported | clamped to the frame; when the input buffer has a `GstVideoCropMeta`, relative to that crop (offset by its x/y, clamped to its size) |
-| `dest-crop` | supported | clamped to the frame; the rest of the output is filled with black: Y 16, U/V 128 for YUV, every byte 0 for GRAY8 and RGB formats, so **alpha is 0** outside the rect on RGBA/BGRA |
-| `allow-odd-crop` | supported | odd 4:2:0 destination rects are widened to even coordinates; without it they are an error |
+| `src-crop` | supported | clamped to the frame (a crop that is empty after clamping is an error); when the input buffer has a `GstVideoCropMeta`, relative to that crop (offset by its x/y, clamped to its size) |
+| `dest-crop` | supported | clamped to the frame (a crop that is empty after clamping is an error); the rest of the output is filled with black: Y 16, U/V 128 for YUV, every byte 0 for GRAY8 and RGB formats, so **alpha is 0** outside the rect on RGBA/BGRA |
+| `allow-odd-crop` | supported | odd 4:2:0 destination rects are widened to even coordinates; without it they are an error. Source rects may always be odd |
 | `interpolation-method` | supported | filters as in "Transform semantics" (`Algo1`-`Algo3` run bilinear, `Algo4` nearest) |
-| `compute-hw` | supported | `2` (VIC) fails at start |
-| `flip-method` | unsupported | any value but `0` fails at start |
+| `compute-hw` | supported | `2` (VIC) fails at start; set while playing, it fails on the next frame that is converted (not while in passthrough) |
+| `flip-method` | unsupported | any value but `0` fails at start; set while playing, it fails on the next frame (a flip turns passthrough off) |
 | `contiguous-buffers`, `copy-hw`, `bl-output` | accepted no-op | batches are always contiguous, copies run on the GPU, output is pitch-linear |
 | `gpu-id`, `nvbuf-memory-type`, `output-buffers` | supported | changeable only in NULL or READY |
 | `disable-passthrough`, `silent` | supported | `silent` has no effect |

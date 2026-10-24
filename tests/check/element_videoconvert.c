@@ -342,6 +342,75 @@ test_wrap_surface (void)
 }
 
 
+/* Fills @n bytes from the test RNG. */
+static void
+fill_bytes (guint8 * p, gsize n, guint32 seed)
+{
+  rng_state = seed * 2654435761u + 1;
+  for (gsize i = 0; i < n; i++)
+    p[i] = rng_next ();
+}
+
+/* Every pixel row of @frame equals the matching row of surface 0 of @surf (host memory). */
+static void
+assert_frame_equals_surface (GstVideoFrame * frame, RdsBufSurface * surf)
+{
+  RdsBufSurfaceParams *sp = &surf->surfaceList[0];
+
+  for (guint p = 0; p < GST_VIDEO_FRAME_N_PLANES (frame); p++) {
+    for (guint y = 0; y < sp->planeParams.height[p]; y++) {
+      const guint8 *a = (const guint8 *) GST_VIDEO_FRAME_PLANE_DATA (frame, p)
+          + (gsize) y * GST_VIDEO_FRAME_PLANE_STRIDE (frame, p);
+      const guint8 *b = (const guint8 *) sp->dataPtr + sp->planeParams.offset[p] + (gsize) y * sp->planeParams.pitch[p];
+
+      g_assert_cmpmem (a, sp->planeParams.width[p] * sp->planeParams.bytesPerPix[p], b,
+          sp->planeParams.width[p] * sp->planeParams.bytesPerPix[p]);
+    }
+  }
+}
+
+/* A frame whose UV plane comes before Y (via GstVideoMeta) cannot be wrapped; copying still works both ways. */
+static void
+test_copy_surface_foreign_layout (void)
+{
+  RdsBufSurfaceCreateParams cp = {.width = 64,.height = 48,.colorFormat = RDS_BUF_COLOR_FORMAT_NV12,
+    .layout = RDS_BUF_LAYOUT_PITCH,.memType = RDS_BUF_MEM_SYSTEM
+  };
+  gsize offset[GST_VIDEO_MAX_PLANES] = { 0 };
+  gint stride[GST_VIDEO_MAX_PLANES] = { 80, 72 };
+  RdsBufSurface *stage = NULL, wrap;
+  RdsBufSurfaceParams wrap_params;
+  GstVideoInfo info;
+  GstVideoFrame frame;
+  GstBuffer *buf;
+  GstMapInfo map;
+
+  offset[0] = (gsize) stride[1] * 24 + 16;      /* Y after UV */
+  buf = gst_buffer_new_allocate (NULL, offset[0] + (gsize) stride[0] * 48, NULL);
+  g_assert_true (gst_buffer_map (buf, &map, GST_MAP_WRITE));
+  fill_bytes (map.data, map.size, 7);
+  gst_buffer_unmap (buf, &map);
+  gst_buffer_add_video_meta_full (buf, GST_VIDEO_FRAME_FLAG_NONE, GST_VIDEO_FORMAT_NV12, 64, 48, 2, offset, stride);
+  g_assert_true (gst_video_info_set_format (&info, GST_VIDEO_FORMAT_NV12, 64, 48));
+  g_assert_true (gst_video_frame_map (&frame, &info, buf, GST_MAP_READWRITE));
+  g_assert_false (rds_video_frame_wrap_surface (&frame, &wrap, &wrap_params));
+  g_assert_cmpint (rds_buf_surface_create (&stage, 1, &cp), ==, 0);
+
+  /* upload */
+  g_assert_true (rds_video_frame_copy_surface (&frame, stage, TRUE));
+  g_assert_cmpuint (stage->numFilled, ==, 1);
+  assert_frame_equals_surface (&frame, stage);
+
+  /* download: new contents in the surface end up in the frame's own (reversed) planes */
+  fill_bytes (stage->surfaceList[0].dataPtr, stage->surfaceList[0].dataSize, 8);
+  g_assert_true (rds_video_frame_copy_surface (&frame, stage, FALSE));
+  assert_frame_equals_surface (&frame, stage);
+
+  gst_video_frame_unmap (&frame);
+  gst_buffer_unref (buf);
+  rds_buf_surface_destroy (stage);
+}
+
 /* ---- cpu: caps transform and fixation, through the class vfuncs ---- */
 
 static GstCaps *
@@ -1368,39 +1437,26 @@ test_sys_round_trip (void)
     host_of (gst_sample_get_buffer (sout), gst_sample_get_caps (sout), &hout);
     g_assert_cmpint (hout.im.format, ==, RDS_BUF_COLOR_FORMAT_NV12);
     g_assert_cmpuint (hout.im.width, ==, 320);
-    /* Luma within +-2 wherever chroma is flat around the pixel. At a colour edge, nearest chroma sampling pairs
-     * a luma value with its neighbour's chroma; the RGB result can leave the gamut and clip, which no round trip
-     * survives, so colours outside the RGB gamut (parts of the smpte pattern's bottom rows) are skipped too. */
+    /* Luma survives within +-2 wherever the YUV colour lies inside the RGB gamut. Outside it (the smpte
+     * pattern's sub-black and -I/+Q patches) the RGB values clip, which no round trip can undo. */
     {
       guint checked = 0;
 
       for (guint y = 0; y < 240; y++) {
         for (guint x = 0; x < 320; x++) {
-          gint cx = x / 2, cy = y / 2, a = hin.im.plane[0][y * hin.im.pitch[0] + x];
-          gint b = hout.im.plane[0][y * hout.im.pitch[0] + x];
-          const guint8 *uv = hin.im.plane[1];
-          gboolean flat = TRUE;
+          const guint8 *uv = hin.im.plane[1] + (y / 2) * hin.im.pitch[1] + 2 * (x / 2);
+          gint a = hin.im.plane[0][y * hin.im.pitch[0] + x], b = hout.im.plane[0][y * hout.im.pitch[0] + x];
+          double rgb[3];
 
-          for (gint dy = -1; dy <= 1; dy++)
-            for (gint dx = -1; dx <= 1; dx++) {
-              gint nx = CLAMP (cx + dx, 0, 159), ny = CLAMP (cy + dy, 0, 119);
-              flat &= memcmp (uv + cy * hin.im.pitch[1] + 2 * cx, uv + ny * hin.im.pitch[1] + 2 * nx, 2) == 0;
-            }
-          if (!flat)
+          ref_yuv_to_rgb (a, uv[0], uv[1], rgb);
+          if (MIN (rgb[0], MIN (rgb[1], rgb[2])) < -2.0 || MAX (rgb[0], MAX (rgb[1], rgb[2])) > 257.0)
             continue;
-          {
-            double rgb[3];
-
-            ref_yuv_to_rgb (a, uv[cy * hin.im.pitch[1] + 2 * cx], uv[cy * hin.im.pitch[1] + 2 * cx + 1], rgb);
-            if (MIN (rgb[0], MIN (rgb[1], rgb[2])) < -2.0 || MAX (rgb[0], MAX (rgb[1], rgb[2])) > 257.0)
-              continue;
-          }
           if (ABS (a - b) > 2)
             g_error ("luma at %u,%u: %d in, %d out", x, y, a, b);
           checked++;
         }
       }
-      g_assert_cmpuint (checked, >, 320 * 240 / 2);
+      g_assert_cmpuint (checked, >=, 320 * 240 * 85 / 100);
     }
     host_image_clear (&hout);
     host_image_clear (&hin);
@@ -1521,6 +1577,40 @@ test_sys_caps_change (void)
   gst_harness_teardown (h);
 }
 
+/* New output geometry mid-stream (downstream changes its caps): the output staging surface follows. */
+static void
+test_sys_out_caps_change (void)
+{
+  GstHarness *h;
+  static const gchar *outs[] = { SYS_RGBA_160, "video/x-raw,format=I420,width=176,height=144,framerate=30/1" };
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = make_harness_props ("", SYS_NV12_320, outs[0], NULL);
+  for (guint i = 0; i < G_N_ELEMENTS (outs); i++) {
+    GstBuffer *in, *out;
+    HostImage hin, hout;
+    GstCaps *caps;
+    RefRect s = { 0, 0, 320, 240 };
+    RefRect d = { 0, 0, i == 0 ? 160 : 176, i == 0 ? 120 : 144 };
+
+    gst_harness_set_sink_caps_str (h, outs[i]);
+    in = sys_frame (SYS_NV12_320, 95 + i);
+    host_of_str (in, SYS_NV12_320, &hin);
+    out = gst_harness_push_and_pull (h, in);
+    g_assert_nonnull (out);
+    caps = gst_pad_get_current_caps (h->sinkpad);
+    host_of (out, caps, &hout);
+    gst_caps_unref (caps);
+    g_assert_cmpuint (hout.im.width, ==, d.width);
+    g_assert_cmpint (hout.im.format, ==, i == 0 ? RDS_BUF_COLOR_FORMAT_RGBA : RDS_BUF_COLOR_FORMAT_YUV420);
+    assert_matches_ref (&hin, &hout, s, d, FALSE);
+    host_image_clear (&hout);
+    host_image_clear (&hin);
+    gst_buffer_unref (out);
+  }
+  gst_harness_teardown (h);
+}
+
 static void
 test_src_crop (void)
 {
@@ -1569,17 +1659,23 @@ test_dest_crop_rds (void)
   GstBuffer *in = NULL, *out;
   HostImage hin, hout;
   RefRect s = { 0, 0, 320, 240 }, d = { 10, 10, 100, 100 };
+  gpointer first = NULL;
 
   RDS_TEST_REQUIRE_GPU ();
-  h = make_harness_props ("dest-crop=10:10:100:100", NV12_320,
+  /* one output buffer, so the second frame is converted into the first (recycled) output buffer */
+  h = make_harness_props ("dest-crop=10:10:100:100 output-buffers=1", NV12_320,
       "video/x-raw(memory:RDS),format=RGBA,width=320,height=240,framerate=30/1", NULL);
   pool = make_pool (NV12_320, 1);
-  for (guint i = 0; i < 2; i++) {       /* the second output buffer is a recycled one */
+  for (guint i = 0; i < 2; i++) {
     g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &in, NULL), ==, GST_FLOW_OK);
     fill_buffer (in, 121 + i);
     snapshot_buffer (in, &hin);
     out = gst_harness_push_and_pull (h, in);
     g_assert_nonnull (out);
+    if (i == 0)
+      first = rds_buffer_get_surface (out);
+    else
+      g_assert_true (rds_buffer_get_surface (out) == first);
     snapshot_buffer (out, &hout);
     assert_matches_ref (&hin, &hout, s, d, FALSE);
     assert_black_outside (&hout, d);
@@ -1630,9 +1726,9 @@ test_src_crop_with_meta (void)
   }
 }
 
-/* Pushes one frame through a converter expected to fail; returns the error. */
+/* Pushes one frame through a converter expected to fail; returns the error (and its debug string, if asked). */
 static GError *
-push_error (const gchar * props, const gchar * in_caps, const gchar * out_caps)
+push_error (const gchar * props, const gchar * in_caps, const gchar * out_caps, gchar ** debug)
 {
   GstBus *bus = gst_bus_new ();
   GstHarness *h = make_harness_props (props, in_caps, out_caps, bus);
@@ -1642,7 +1738,7 @@ push_error (const gchar * props, const gchar * in_caps, const gchar * out_caps)
   g_assert_cmpint (gst_harness_push (h, sys_frame (in_caps, 140)), ==, GST_FLOW_ERROR);
   msg = gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR);
   g_assert_nonnull (msg);
-  gst_message_parse_error (msg, &err, NULL);
+  gst_message_parse_error (msg, &err, debug);
   gst_message_unref (msg);
   gst_element_set_bus (h->element, NULL);
   gst_harness_teardown (h);
@@ -1657,11 +1753,11 @@ test_crop_empty_after_clamp (void)
 
   RDS_TEST_REQUIRE_GPU ();
   /* reported by the element as an empty crop, before the transform would reject it */
-  err = push_error ("src-crop=400:0:10:10", SYS_NV12_320, SYS_RGBA_160);
+  err = push_error ("src-crop=400:0:10:10", SYS_NV12_320, SYS_RGBA_160, NULL);
   g_assert_error (err, GST_STREAM_ERROR, GST_STREAM_ERROR_FAILED);
   g_assert_nonnull (strstr (err->message, "empty"));
   g_clear_error (&err);
-  err = push_error ("dest-crop=0:240:10:10", SYS_NV12_320, SYS_RGBA_320);
+  err = push_error ("dest-crop=0:240:10:10", SYS_NV12_320, SYS_RGBA_320, NULL);
   g_assert_error (err, GST_STREAM_ERROR, GST_STREAM_ERROR_FAILED);
   g_assert_nonnull (strstr (err->message, "empty"));
   g_clear_error (&err);
@@ -1671,11 +1767,16 @@ static void
 test_odd_dest_crop (void)
 {
   GError *err;
+  gchar *debug = NULL;
   RefRect s = { 0, 0, 320, 240 };
 
   RDS_TEST_REQUIRE_GPU ();
-  err = push_error ("dest-crop=1:1:101:51 allow-odd-crop=false", SYS_NV12_320, SYS_NV12_320);
+  /* the transform rejects it */
+  err = push_error ("dest-crop=1:1:101:51 allow-odd-crop=false", SYS_NV12_320, SYS_NV12_320, &debug);
   g_assert_error (err, GST_STREAM_ERROR, GST_STREAM_ERROR_FAILED);
+  g_assert_nonnull (debug);
+  g_assert_nonnull (strstr (debug, "Invalid_Params"));
+  g_free (debug);
   g_clear_error (&err);
   /* allowed: aligned outward to 0:0:102:52 */
   check_sys_conversion ("dest-crop=1:1:101:51", SYS_NV12_320, SYS_NV12_320, s, (RefRect) {
@@ -1739,6 +1840,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/videoconvert/unsupported-settings", test_unsupported_settings);
   g_test_add_func ("/cpu/videoconvert/parse-rect", test_parse_rect);
   g_test_add_func ("/cpu/videoconvert/wrap-surface", test_wrap_surface);
+  g_test_add_func ("/cpu/videoconvert/copy-surface-foreign-layout", test_copy_surface_foreign_layout);
   g_test_add_func ("/cpu/videoconvert/transform-caps", test_transform_caps);
   g_test_add_func ("/cpu/videoconvert/fixate", test_fixate);
   g_test_add_func ("/cpu/videoconvert/propose-allocation-gpu-id", test_propose_allocation_gpu_id);
@@ -1761,6 +1863,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/videoconvert/mixed-memory", test_mixed_memory);
   g_test_add_func ("/gpu/videoconvert/sys-foreign-layout", test_sys_foreign_layout);
   g_test_add_func ("/gpu/videoconvert/sys-caps-change", test_sys_caps_change);
+  g_test_add_func ("/gpu/videoconvert/sys-out-caps-change", test_sys_out_caps_change);
   g_test_add_func ("/gpu/videoconvert/src-crop", test_src_crop);
   g_test_add_func ("/gpu/videoconvert/dest-crop", test_dest_crop);
   g_test_add_func ("/gpu/videoconvert/dest-crop-rds", test_dest_crop_rds);
