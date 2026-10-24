@@ -609,13 +609,14 @@ gst_rds_video_convert_stop (GstBaseTransform * trans)
   return TRUE;
 }
 
-/* The part of the input frame the conversion reads before src-crop: the input's crop meta clamped to the frame,
- * else the whole frame. TRUE if a crop meta narrowed it. */
+/* The part of the source surface (@w x @h) the conversion reads before src-crop: the input's crop meta clamped to
+ * the surface, else the whole surface. The surface, not the caps: an element cropping in passthrough (videocrop)
+ * announces the cropped size in its caps but forwards the full surface with a crop meta. TRUE if a crop meta
+ * narrowed it. */
 static gboolean
-input_base_rect (GstRdsVideoConvert * self, GstBuffer * inbuf, RdsBufSurfTransformRect * rect)
+input_base_rect (GstRdsVideoConvert * self, GstBuffer * inbuf, guint w, guint h, RdsBufSurfTransformRect * rect)
 {
   GstVideoCropMeta *crop = gst_buffer_get_video_crop_meta (inbuf);
-  guint w = GST_VIDEO_INFO_WIDTH (&self->in_info), h = GST_VIDEO_INFO_HEIGHT (&self->in_info);
 
   rect->left = rect->top = 0;
   rect->width = w;
@@ -715,25 +716,6 @@ gst_rds_video_convert_transform (GstBaseTransform * trans, GstBuffer * inbuf, Gs
   session.compute_mode = (RdsBufSurfTransform_Compute) self->compute_hw;
   GST_OBJECT_UNLOCK (self);
 
-  /* Rects first: nvvideoconvert clamps crops to the frame. src-crop is relative to the input's crop meta. */
-  meta_crop = input_base_rect (self, inbuf, &base);
-  src_rect = rect_is_set (&src_crop) ? clamp_rect (&base, &src_crop) : base;
-  if (rect_is_set (&dest_crop)) {
-    RdsBufSurfTransformRect frame_rect = { 0, 0, GST_VIDEO_INFO_WIDTH (&self->out_info),
-      GST_VIDEO_INFO_HEIGHT (&self->out_info)
-    };
-    dst_rect = clamp_rect (&frame_rect, &dest_crop);
-  } else {
-    dst_rect = (RdsBufSurfTransformRect) {
-    0, 0, GST_VIDEO_INFO_WIDTH (&self->out_info), GST_VIDEO_INFO_HEIGHT (&self->out_info)};
-  }
-  if (src_rect.width == 0 || src_rect.height == 0 || dst_rect.width == 0 || dst_rect.height == 0) {
-    GST_ELEMENT_ERROR (self, STREAM, FAILED, ("The crop rectangle is empty after clamping it to the frame"),
-        ("source %ux%u at %u,%u, destination %ux%u at %u,%u", src_rect.width, src_rect.height, src_rect.left,
-            src_rect.top, dst_rect.width, dst_rect.height, dst_rect.left, dst_rect.top));
-    return GST_FLOW_ERROR;
-  }
-
   /* Source: the memory:RDS surface itself, or the system frame uploaded into the staging surface. */
   if (self->in_rds) {
     if (rds_buffer_get_surface (inbuf) == NULL || !gst_buffer_map (inbuf, &in_map, GST_MAP_READ))
@@ -752,6 +734,25 @@ gst_rds_video_convert_transform (GstBaseTransform * trans, GstBuffer * inbuf, Gs
     if (!ok)
       goto copy_failed;
     src = self->in_stage;
+  }
+
+  /* Rects: nvvideoconvert clamps crops to the frame. src-crop is relative to the input's crop meta. */
+  meta_crop = input_base_rect (self, inbuf, src->surfaceList[0].width, src->surfaceList[0].height, &base);
+  src_rect = rect_is_set (&src_crop) ? clamp_rect (&base, &src_crop) : base;
+  if (rect_is_set (&dest_crop)) {
+    RdsBufSurfTransformRect frame_rect = { 0, 0, GST_VIDEO_INFO_WIDTH (&self->out_info),
+      GST_VIDEO_INFO_HEIGHT (&self->out_info)
+    };
+    dst_rect = clamp_rect (&frame_rect, &dest_crop);
+  } else {
+    dst_rect = (RdsBufSurfTransformRect) {
+    0, 0, GST_VIDEO_INFO_WIDTH (&self->out_info), GST_VIDEO_INFO_HEIGHT (&self->out_info)};
+  }
+  if (src_rect.width == 0 || src_rect.height == 0 || dst_rect.width == 0 || dst_rect.height == 0) {
+    GST_ELEMENT_ERROR (self, STREAM, FAILED, ("The crop rectangle is empty after clamping it to the frame"),
+        ("source %ux%u at %u,%u, destination %ux%u at %u,%u", src_rect.width, src_rect.height, src_rect.left,
+            src_rect.top, dst_rect.width, dst_rect.height, dst_rect.left, dst_rect.top));
+    goto done;
   }
 
   /* Destination: the output surface (a WRITE map makes it ours alone), or the staging surface downloaded after. */

@@ -1100,6 +1100,50 @@ test_crop_meta (void)
   gst_object_unref (pool);
 }
 
+/* A cropping element in passthrough (videocrop) announces the cropped size in its caps and forwards the full
+ * surface with a crop meta: the crop applies to the surface, whatever the caps say. */
+static void
+test_crop_meta_surface (void)
+{
+  static const RefRect crops[] = { {0, 0, 160, 120}, {160, 120, 160, 120}, {100, 60, 160, 120} };
+
+  RDS_TEST_REQUIRE_GPU ();
+  for (guint i = 0; i < G_N_ELEMENTS (crops); i++) {
+    GstHarness *h = make_harness ("video/x-raw(memory:RDS),format=NV12,width=160,height=120,framerate=30/1",
+        RGBA_160);
+    GstBufferPool *pool = make_pool (NV12_320, 1);
+    GstBuffer *in = NULL, *out;
+    GstVideoCropMeta *crop;
+    HostImage hin, hout, href;
+    RefRect d = { 0, 0, 160, 120 };
+
+    g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &in, NULL), ==, GST_FLOW_OK);
+    fill_buffer (in, 90 + i);
+    crop = gst_buffer_add_video_crop_meta (in);
+    crop->x = crops[i].left;
+    crop->y = crops[i].top;
+    crop->width = crops[i].width;
+    crop->height = crops[i].height;
+    snapshot_buffer (in, &hin);
+
+    out = gst_harness_push_and_pull (h, in);
+    g_assert_nonnull (out);
+    snapshot_buffer (out, &hout);
+    href = hout;
+    href.im.plane[0] = g_malloc0 ((gsize) hout.im.pitch[0] * hout.rows[0]);
+    ref_transform (&hin.im, &href.im, crops[i], d, FALSE);
+    g_assert_cmpuint (max_diff (&hout, &href, TRUE), <=, 1);
+
+    host_image_clear (&href);
+    host_image_clear (&hout);
+    host_image_clear (&hin);
+    gst_buffer_unref (out);
+    gst_harness_teardown (h);
+    gst_buffer_pool_set_active (pool, FALSE);
+    gst_object_unref (pool);
+  }
+}
+
 static void
 test_caps_query (void)
 {
@@ -1884,6 +1928,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/videoconvert/passthrough-toggle", test_passthrough_toggle);
   g_test_add_func ("/gpu/videoconvert/passthrough-reset-on-stop", test_passthrough_reset_on_stop);
   g_test_add_func ("/gpu/videoconvert/crop-meta", test_crop_meta);
+  g_test_add_func ("/gpu/videoconvert/crop-meta-surface", test_crop_meta_surface);
   g_test_add_func ("/gpu/videoconvert/caps-query", test_caps_query);
   g_test_add_func ("/gpu/videoconvert/propose-allocation", test_propose_allocation);
   g_test_add_func ("/gpu/videoconvert/decide-allocation", test_decide_allocation);
