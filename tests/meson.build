@@ -61,6 +61,16 @@ foreach t : internal_gpu_tests
     suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 endforeach
 
+# Element tests that also exercise plugin-internal helpers (compiled in; they hold no GTypes, so linking the shared
+# libgstrds next to the loaded plugin is fine). One executable, split by GLib test path into the two suites.
+element_videoconvert_exe = executable('element_videoconvert',
+  'check' / 'element_videoconvert.c', rdsvideo_util_src,
+  dependencies : test_deps + [gst_base_dep, gst_video_dep, cc.find_library('m', required : false)])
+test('element_videoconvert_cpu', element_videoconvert_exe, args : ['-p', '/cpu/videoconvert'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_videoconvert', element_videoconvert_exe, args : ['-p', '/gpu/videoconvert'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+
 test('rds_test3_dry_run',
   find_program('samples/rds_test3_dry_run.sh'),
   args : [rds_test3_exe], suite : 'cpu', env : test_env)
