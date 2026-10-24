@@ -63,6 +63,8 @@ struct _GstRdsStreamMuxPad
   GstAggregatorPad parent;
 
   guint index;                  /* the N of sink_N: source_id and pad_index in the frame meta */
+  guint32 flush_seqnum;         /* seqnum of the FLUSH_START in progress, else GST_SEQNUM_INVALID (object lock
+                                 * of the element) */
 
   /* streaming state (aggregator source thread, which also handles the serialized events) */
   GstVideoInfo info;
@@ -96,6 +98,7 @@ struct _GstRdsStreamMux
   gboolean timeout_enabled;     /* fixed at start */
   GstClockTime batch_start;     /* running time the pending batch's first buffer was seen, or NONE */
   guint rr_next;                /* position (in pad-index order) of the pad visited first in the next batch */
+  GstClockTime last_pts;        /* of the last batch pushed: batch timestamps never go backwards */
   GstVideoInfo out_info;
   gboolean have_out_info;
   gint fps_n, fps_d;            /* the framerate of the negotiated output (object lock) */
@@ -432,9 +435,27 @@ gst_rds_stream_mux_sink_event (GstAggregator * agg, GstAggregatorPad * aggpad, G
         gst_pad_mark_reconfigure (GST_AGGREGATOR_SRC_PAD (agg));
       break;
     }
-    case GST_EVENT_FLUSH_START:
-      /* a batch waiting for a pool buffer must give up */
-      set_pool_flushing (self, TRUE);
+    case GST_EVENT_FLUSH_START:{
+      guint32 seqnum = gst_event_get_seqnum (event);
+      gboolean all = TRUE;
+
+      /* Only an element-wide flush (the same FLUSH_START on every sink pad, as GstAggregator counts it) stops the
+       * source task, and only that one ends with flush () clearing the pool's flushing state again. A flush of
+       * one source (a reconnect, a single-source seek) leaves batching running and the pool alone. */
+      GST_OBJECT_LOCK (self);
+      pad->flush_seqnum = seqnum;
+      for (GList * l = GST_ELEMENT (self)->sinkpads; l != NULL && all; l = l->next)
+        all = GST_RDS_STREAM_MUX_PAD (l->data)->flush_seqnum == seqnum;
+      GST_OBJECT_UNLOCK (self);
+      /* a batch waiting for a pool buffer must give up so the source task can stop */
+      if (all)
+        set_pool_flushing (self, TRUE);
+      break;
+    }
+    case GST_EVENT_FLUSH_STOP:
+      GST_OBJECT_LOCK (self);
+      pad->flush_seqnum = GST_SEQNUM_INVALID;
+      GST_OBJECT_UNLOCK (self);
       break;
     default:
       break;
@@ -449,6 +470,7 @@ gst_rds_stream_mux_flush (GstAggregator * agg)
 
   set_pool_flushing (self, FALSE);
   self->batch_start = GST_CLOCK_TIME_NONE;
+  self->last_pts = GST_CLOCK_TIME_NONE;
   return GST_FLOW_OK;
 }
 
@@ -519,10 +541,12 @@ gst_rds_stream_mux_start (GstAggregator * agg)
   self->timeout_enabled = timeout >= 0;
   self->batch_start = GST_CLOCK_TIME_NONE;
   self->rr_next = 0;
+  self->last_pts = GST_CLOCK_TIME_NONE;
   self->have_out_info = FALSE;
+  /* batched-push-timeout owns the aggregator's "latency" property: set on every start (the timeout, or 0 without
+   * one), so a value set directly, or left over from an earlier run with a timeout, never applies. */
   gst_aggregator_set_force_live (agg, self->timeout_enabled);
-  if (self->timeout_enabled)
-    g_object_set (self, "latency", (guint64) timeout * GST_USECOND, NULL);
+  g_object_set (self, "latency", self->timeout_enabled ? (guint64) timeout * GST_USECOND : (guint64) 0, NULL);
   return TRUE;
 }
 
@@ -530,17 +554,24 @@ static gboolean
 gst_rds_stream_mux_stop (GstAggregator * agg)
 {
   GstRdsStreamMux *self = GST_RDS_STREAM_MUX (agg);
+  GPtrArray *stages = g_ptr_array_new ();
 
+  /* the staging surfaces are freed outside the object lock (freeing synchronizes with the GPU) */
   GST_OBJECT_LOCK (self);
   for (GList * l = GST_ELEMENT (self)->sinkpads; l != NULL; l = l->next) {
     GstRdsStreamMuxPad *pad = l->data;
 
-    pad_free_stage (pad);
+    if (pad->stage != NULL)
+      g_ptr_array_add (stages, pad->stage);
+    pad->stage = NULL;
     pad->frame_num = 0;
   }
   self->fps_n = 0;
   self->fps_d = 1;
   GST_OBJECT_UNLOCK (self);
+  for (guint i = 0; i < stages->len; i++)
+    rds_buf_surface_destroy (g_ptr_array_index (stages, i));
+  g_ptr_array_unref (stages);
 
   if (self->stream != NULL) {
     if (hipStreamDestroy (self->stream) != hipSuccess)
@@ -650,7 +681,32 @@ typedef struct
 {
   GstRdsStreamMuxPad *pad;
   GstBuffer *buf;
+  RdsBufSurfTransformRect src_rect;     /* the part of the frame that goes into the slot */
+  gboolean cropped;             /* src_rect is narrower than the frame (a crop meta) */
 } MuxEntry;
+
+/* The part of the input frame the mux reads: the buffer's crop meta clamped to the frame, else the whole frame. */
+static void
+entry_set_src_rect (GstRdsStreamMux * self, MuxEntry * e)
+{
+  GstVideoCropMeta *crop = gst_buffer_get_video_crop_meta (e->buf);
+  guint w = GST_VIDEO_INFO_WIDTH (&e->pad->info), h = GST_VIDEO_INFO_HEIGHT (&e->pad->info);
+
+  e->src_rect = (RdsBufSurfTransformRect) {.left = 0,.top = 0,.width = w,.height = h };
+  e->cropped = FALSE;
+  if (crop == NULL)
+    return;
+  if (crop->x >= w || crop->y >= h || crop->width == 0 || crop->height == 0) {
+    GST_DEBUG_OBJECT (self, "ignoring crop meta %ux%u at %u,%u: nothing of it lies in the %ux%u frame",
+        crop->width, crop->height, crop->x, crop->y, w, h);
+    return;
+  }
+  e->src_rect.left = crop->x;
+  e->src_rect.top = crop->y;
+  e->src_rect.width = MIN (crop->width, w - crop->x);
+  e->src_rect.height = MIN (crop->height, h - crop->y);
+  e->cropped = e->src_rect.left != 0 || e->src_rect.top != 0 || e->src_rect.width != w || e->src_rect.height != h;
+}
 
 static gint
 compare_entries (gconstpointer a, gconstpointer b)
@@ -741,11 +797,15 @@ fill_slot (GstRdsStreamMux * self, MuxEntry * e, RdsBufSurface * batch, guint sl
 
   params.transform_flag = RDS_BUFSURF_TRANSFORM_FILTER;
   params.transform_filter = (RdsBufSurfTransform_Inter) filter;
+  if (e->cropped) {
+    params.transform_flag |= RDS_BUFSURF_TRANSFORM_CROP_SRC;
+    params.src_rect = &e->src_rect;
+  }
   if (padding) {
     gboolean even = GST_VIDEO_INFO_FORMAT (&self->out_info) == GST_VIDEO_FORMAT_NV12
         || GST_VIDEO_INFO_FORMAT (&self->out_info) == GST_VIDEO_FORMAT_I420;
 
-    dst_rect = padded_rect (src->surfaceList[0].width, src->surfaceList[0].height, out_w, out_h, even);
+    dst_rect = padded_rect (e->src_rect.width, e->src_rect.height, out_w, out_h, even);
     if (dst_rect.width != out_w || dst_rect.height != out_h) {
       /* the transform leaves pixels outside the rect alone: black the slot first (synchronous memset) */
       if (!fill_slot_black (batch, slot)) {
@@ -791,8 +851,9 @@ fill_frame_meta (GstRdsStreamMux * self, RdsBatchMeta * bm, MuxEntry * e, guint 
   fm->frame_num = e->pad->frame_num++;
   fm->buf_pts = GST_BUFFER_PTS (e->buf);
   fm->ntp_timestamp = attach_sys_ts ? (guint64) g_get_real_time () * 1000 : 0;
-  fm->source_frame_width = GST_VIDEO_INFO_WIDTH (&e->pad->info);
-  fm->source_frame_height = GST_VIDEO_INFO_HEIGHT (&e->pad->info);
+  /* the size of what was scaled into the slot (the crop, when the frame carries one) */
+  fm->source_frame_width = e->src_rect.width;
+  fm->source_frame_height = e->src_rect.height;
   fm->pipeline_width = GST_VIDEO_INFO_WIDTH (&self->out_info);
   fm->pipeline_height = GST_VIDEO_INFO_HEIGHT (&self->out_info);
   fm->num_surfaces_per_frame = 1;
@@ -837,10 +898,13 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
   n = pads->len;
   for (guint k = 0; k < n && entries->len < batch_size; k++) {
     GstRdsStreamMuxPad *pad = g_ptr_array_index (pads, (self->rr_next + k) % n);
-    MuxEntry e = { pad, gst_aggregator_pad_pop_buffer (GST_AGGREGATOR_PAD (pad)) };
+    MuxEntry e = {.pad = pad,.buf = gst_aggregator_pad_pop_buffer (GST_AGGREGATOR_PAD (pad)) };
 
-    if (e.buf != NULL)
+    if (e.buf != NULL) {
+      if (pad->have_info)
+        entry_set_src_rect (self, &e);
       g_array_append_val (entries, e);
+    }
   }
   if (n > 0)
     self->rr_next = (self->rr_next + 1) % n;
@@ -911,7 +975,12 @@ gst_rds_stream_mux_aggregate (GstAggregator * agg, gboolean timeout)
   gst_buffer_unmap (outbuf, &map);
   rds_buffer_add_batch_meta (outbuf, bm);
 
-  /* the output segment is TIME from 0: running time is the output timestamp */
+  /* The output segment is TIME from 0: running time is the output timestamp. Sources joining late or with other
+   * segments can make the earliest frame older than the previous batch: keep batch timestamps monotonic. */
+  if (GST_CLOCK_TIME_IS_VALID (pts) && GST_CLOCK_TIME_IS_VALID (self->last_pts) && pts < self->last_pts)
+    pts = self->last_pts;
+  if (GST_CLOCK_TIME_IS_VALID (pts))
+    self->last_pts = pts;
   GST_BUFFER_PTS (outbuf) = pts;
   GST_BUFFER_DTS (outbuf) = GST_CLOCK_TIME_NONE;
   GST_BUFFER_DURATION (outbuf) = GST_CLOCK_TIME_NONE;
@@ -1148,6 +1217,7 @@ gst_rds_stream_mux_init (GstRdsStreamMux * self)
   self->sort_batch = DEFAULT_SORT_BATCH;
   self->attach_sys_ts = DEFAULT_ATTACH_SYS_TS;
   self->batch_start = GST_CLOCK_TIME_NONE;
+  self->last_pts = GST_CLOCK_TIME_NONE;
   self->fps_n = 0;
   self->fps_d = 1;
   gst_video_info_init (&self->out_info);

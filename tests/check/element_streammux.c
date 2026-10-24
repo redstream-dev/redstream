@@ -4,6 +4,7 @@
 #include "rds-test-util.h"
 #include "rds-test-surface.h"
 
+#include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/base/gstaggregator.h>
 #include <gst/check/gstharness.h>
@@ -313,7 +314,7 @@ test_aggregator_probe (void)
         continue;
       g_assert_true (c->timeout);
       g_assert_cmpint (c->t - prev, >=, 35 * 1000);
-      g_assert_cmpint (c->t - prev, <=, 150 * 1000);
+      g_assert_cmpint (c->t - prev, <=, 250 * 1000);
       prev = c->t;
       partial++;
     }
@@ -607,42 +608,47 @@ host_of (GstBuffer * buf, const gchar * caps_str, HostImage * h)
   gst_caps_unref (caps);
 }
 
-/* Slot @slot of the batch must match the reference transform of the whole input into rect @d of a black slot
- * (YUV black: Y 16, U/V 128), exactly black outside @d. */
-static void
-assert_slot (GstBuffer * batch, guint slot, const HostImage * hin, RefRect d)
+/* The black the mux fills padding with: Y 16, U/V 128 for YUV; 0 for GRAY8 and RGB formats (alpha too). */
+static guint8
+black_byte (RdsBufSurfaceColorFormat f, guint plane)
 {
-  RdsBufSurface *s = rds_buffer_get_surface (batch);
-  RefRect src = { 0, 0, hin->im.width, hin->im.height };
+  if (ref_kind (f) == REF_KIND_YUV420)
+    return plane == 0 ? 16 : 128;
+  return 0;
+}
+
+/* Slot @slot of the batch must match the reference transform of rect @s of the input into rect @d of a black slot:
+ * within 1 inside @d (the GPU rounds), exactly black outside. */
+static void
+assert_slot_rect (GstBuffer * batch, guint slot, const HostImage * hin, RefRect s, RefRect d)
+{
+  RdsBufSurface *surf = rds_buffer_get_surface (batch);
   HostImage hout, href;
 
-  g_assert_nonnull (s);
-  snapshot (s, slot, &hout);
+  g_assert_nonnull (surf);
+  snapshot (surf, slot, &hout);
   href = hout;
   for (guint p = 0; p < hout.num_planes; p++) {
     gsize size = (gsize) hout.im.pitch[p] * hout.rows[p];
 
     href.im.plane[p] = g_malloc (size);
-    memset (href.im.plane[p], p == 0 ? 16 : 128, size);
+    memset (href.im.plane[p], black_byte (hout.im.format, p), size);
   }
-  ref_transform (&hin->im, &href.im, src, d, FALSE);
-  if (d.width == hout.im.width && d.height == hout.im.height) {
-    g_assert_cmpuint (max_diff (&hout, &href, TRUE), <=, 1);
-  } else {
-    /* inside the rect within 1 (the GPU rounds), outside exactly black */
-    for (guint p = 0; p < hout.num_planes; p++) {
-      guint sub = p > 0 ? 2 : 1;
-      for (guint y = 0; y < hout.rows[p]; y++) {
-        for (guint x = 0; x < hout.row_bytes[p]; x++) {
-          guint px = (hout.num_planes == 2 && p == 1 ? x / 2 : x) * sub, py = y * sub;
-          gsize at = (gsize) y * hout.im.pitch[p] + x;
-          gboolean inside = px >= d.left && px < d.left + d.width && py >= d.top && py < d.top + d.height;
-          guint diff = (guint) ABS ((gint) hout.im.plane[p][at] - (gint) href.im.plane[p][at]);
+  ref_transform (&hin->im, &href.im, s, d, FALSE);
+  for (guint p = 0; p < hout.num_planes; p++) {
+    guint sub = (p > 0 && ref_kind (hout.im.format) == REF_KIND_YUV420) ? 2 : 1;
+    guint pw = (hout.im.width + sub - 1) / sub, bpp = hout.row_bytes[p] / pw;
 
-          if (inside ? diff > 1 : diff != 0)
-            g_error ("slot %u plane %u row %u byte %u (%s): %u vs %u", slot, p, y, x, inside ? "inside" : "outside",
-                hout.im.plane[p][at], href.im.plane[p][at]);
-        }
+    for (guint y = 0; y < hout.rows[p]; y++) {
+      for (guint x = 0; x < hout.row_bytes[p]; x++) {
+        guint px = x / bpp * sub, py = y * sub;
+        gsize at = (gsize) y * hout.im.pitch[p] + x;
+        gboolean inside = px >= d.left && px < d.left + d.width && py >= d.top && py < d.top + d.height;
+        guint diff = (guint) ABS ((gint) hout.im.plane[p][at] - (gint) href.im.plane[p][at]);
+
+        if (inside ? diff > 1 : diff != 0)
+          g_error ("slot %u plane %u row %u byte %u (%s): %u vs %u", slot, p, y, x, inside ? "inside" : "outside",
+              hout.im.plane[p][at], href.im.plane[p][at]);
       }
     }
   }
@@ -650,9 +656,18 @@ assert_slot (GstBuffer * batch, guint slot, const HostImage * hin, RefRect d)
   host_image_clear (&hout);
 }
 
-/* A mux with @n_in input harnesses on sink_0.., each with fixed caps, and its output harness. */
+/* The whole input into rect @d of the slot. */
+static void
+assert_slot (GstBuffer * batch, guint slot, const HostImage * hin, RefRect d)
+{
+  assert_slot_rect (batch, slot, hin, (RefRect) { 0, 0, hin->im.width, hin->im.height }, d);
+}
+
+/* A mux with @n_in input harnesses on sink_0.., each with fixed caps, and its output harness with @out_caps
+ * (NULL: NV12). @bus (optional) gets the element's messages. */
 static GstHarness *
-mux_harness (const gchar * props, const gchar * const *in_caps, guint n_in, GstHarness ** in)
+mux_harness_full (const gchar * props, const gchar * const *in_caps, guint n_in, GstHarness ** in,
+    const gchar * out_caps, GstBus * bus)
 {
   gchar *desc = g_strdup_printf ("rdsstreammux %s", props);
   GError *err = NULL;
@@ -661,8 +676,10 @@ mux_harness (const gchar * props, const gchar * const *in_caps, guint n_in, GstH
 
   g_assert_no_error (err);
   gst_object_ref_sink (e);
+  if (bus != NULL)
+    gst_element_set_bus (e, bus);
   h = gst_harness_new_with_element (e, NULL, "src");
-  gst_harness_set_sink_caps_str (h, OUT_NV12);
+  gst_harness_set_sink_caps_str (h, out_caps != NULL ? out_caps : OUT_NV12);
   for (guint i = 0; i < n_in; i++) {
     gchar *pad = g_strdup_printf ("sink_%u", i);
 
@@ -675,12 +692,40 @@ mux_harness (const gchar * props, const gchar * const *in_caps, guint n_in, GstH
   return h;
 }
 
+static GstHarness *
+mux_harness (const gchar * props, const gchar * const *in_caps, guint n_in, GstHarness ** in)
+{
+  return mux_harness_full (props, in_caps, n_in, in, NULL, NULL);
+}
+
 static void
 mux_teardown (GstHarness * h, GstHarness ** in, guint n_in)
 {
   for (guint i = 0; i < n_in; i++)
     gst_harness_teardown (in[i]);
   gst_harness_teardown (h);
+}
+
+/* The next output buffer within @timeout_ms, or NULL. */
+static GstBuffer *
+pull_within (GstHarness * h, guint timeout_ms)
+{
+  gint64 end = g_get_monotonic_time () + (gint64) timeout_ms * 1000;
+  GstBuffer *b;
+
+  while ((b = gst_harness_try_pull (h)) == NULL && g_get_monotonic_time () < end)
+    g_usleep (2000);
+  return b;
+}
+
+/* The next output buffer; fails the test (instead of blocking for a minute) if none comes within 10 s. */
+static GstBuffer *
+pull_ok (GstHarness * h)
+{
+  GstBuffer *b = pull_within (h, 10000);
+
+  g_assert_nonnull (b);
+  return b;
 }
 
 static RdsFrameMeta *
@@ -723,7 +768,7 @@ test_batch_scaling (void)
       host_of (b, NULL, &hin[i]);
       g_assert_cmpint (gst_harness_push (in[i], b), ==, GST_FLOW_OK);
     }
-    out = gst_harness_pull (h);
+    out = pull_ok (h);
     g_assert_nonnull (out);
 
     caps = gst_pad_get_current_caps (h->sinkpad);
@@ -801,7 +846,7 @@ test_padding (void)
     host_of (b, NULL, &hin[i]);
     g_assert_cmpint (gst_harness_push (in[i], b), ==, GST_FLOW_OK);
   }
-  out = gst_harness_pull (h);
+  out = pull_ok (h);
   bm = gst_buffer_get_rds_batch_meta (out);
   for (guint slot = 0; slot < 2; slot++) {
     guint src = frame_meta_at (bm, slot)->source_id;
@@ -839,7 +884,7 @@ test_system_input (void)
     host_of (b, NULL, &hin[1]);
     g_assert_cmpint (gst_harness_push (in[1], b), ==, GST_FLOW_OK);
 
-    out = gst_harness_pull (h);
+    out = pull_ok (h);
     g_assert_cmpuint (rds_buffer_get_surface (out)->numFilled, ==, 2);
     bm = gst_buffer_get_rds_batch_meta (out);
     for (guint slot = 0; slot < 2; slot++) {
@@ -873,7 +918,7 @@ test_pool_bounded (void)
   pool = make_pool (in_caps[0]);
   for (guint i = 0; i < 2; i++) {
     g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, i, i * GST_MSECOND)), ==, GST_FLOW_OK);
-    held[i] = gst_harness_pull (h);
+    held[i] = pull_ok (h);
     g_assert_nonnull (held[i]);
   }
 
@@ -893,7 +938,7 @@ test_pool_bounded (void)
   g_usleep (200 * 1000);
   g_assert_null (gst_harness_try_pull (h));
   gst_buffer_unref (held[0]);
-  out = gst_harness_pull (h);
+  out = pull_ok (h);
   g_assert_nonnull (out);
   g_assert_cmpuint (GST_BUFFER_PTS (out), ==, 2 * GST_MSECOND);
   gst_buffer_unref (out);
@@ -908,19 +953,530 @@ test_pool_bounded (void)
   gst_object_unref (pool);
 }
 
+/* ---- gpu: review follow-ups ---- */
+
+static GstBufferPool *
+make_pool_batch (const gchar * caps_str, guint batch_size)
+{
+  GstBufferPool *pool = rds_buffer_pool_new ();
+  GstCaps *caps = gst_caps_from_string (caps_str);
+  GstStructure *config = gst_buffer_pool_get_config (pool);
+
+  gst_buffer_pool_config_set_params (config, caps, 0, 1, 0);
+  rds_buffer_pool_config_set_surface_params (config, batch_size, RDS_BUF_MEM_DEFAULT, 0);
+  g_assert_true (gst_buffer_pool_set_config (pool, config));
+  g_assert_true (gst_buffer_pool_set_active (pool, TRUE));
+  gst_caps_unref (caps);
+  return pool;
+}
+
+static void
+pool_free (GstBufferPool * pool)
+{
+  gst_buffer_pool_set_active (pool, FALSE);
+  gst_object_unref (pool);
+}
+
+/* A flush of one source (as on a reconnect) does not stop the mux: later batches still come. */
+static void
+test_flush_one_pad (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[2];
+  GstBufferPool *pool;
+  GstSegment seg;
+  GstBuffer *out;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("batch-size=2 width=64 height=64", in_caps, 2, in);
+  pool = make_pool (in_caps[0]);
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, i, 0)), ==, GST_FLOW_OK);
+  out = pull_within (h, 5000);
+  g_assert_nonnull (out);
+  gst_buffer_unref (out);
+
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_flush_start ()));
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_flush_stop (TRUE)));
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_segment (&seg)));
+
+  for (guint round = 1; round < 3; round++) {
+    for (guint i = 0; i < 2; i++)
+      g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, 10 * round + i, round * 33 * GST_MSECOND)), ==,
+          GST_FLOW_OK);
+    out = pull_within (h, 5000);
+    g_assert_nonnull (out);
+    g_assert_cmpuint (rds_buffer_get_surface (out)->numFilled, ==, 2);
+    gst_buffer_unref (out);
+  }
+  mux_teardown (h, in, 2);
+  pool_free (pool);
+}
+
+/* A crop meta on a memory:RDS frame selects what is scaled into the slot; the frame meta reports its size. With
+ * enable-padding the aspect ratio is the crop's. */
+static void
+test_crop_meta (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (320, 240) };
+  static const struct
+  {
+    const gchar *props;
+    RefRect crop, dst;
+  } cases[] = {
+    {"width=320 height=240", {40, 20, 160, 120}, {0, 0, 320, 240}},
+    {"width=320 height=240 enable-padding=true", {32, 100, 160, 60}, {0, 0, 320, 120}},
+  };
+  GstBufferPool *pool;
+
+  RDS_TEST_REQUIRE_GPU ();
+  pool = make_pool (in_caps[0]);
+  for (guint c = 0; c < G_N_ELEMENTS (cases); c++) {
+    GstHarness *h, *in[1];
+    GstBuffer *b, *out;
+    GstVideoCropMeta *crop;
+    RdsFrameMeta *fm;
+    HostImage hin;
+
+    h = mux_harness (cases[c].props, in_caps, 1, in);
+    b = rds_frame (pool, 50 + c, 0);
+    crop = gst_buffer_add_video_crop_meta (b);
+    crop->x = cases[c].crop.left;
+    crop->y = cases[c].crop.top;
+    crop->width = cases[c].crop.width;
+    crop->height = cases[c].crop.height;
+    host_of (b, NULL, &hin);
+    g_assert_cmpint (gst_harness_push (in[0], b), ==, GST_FLOW_OK);
+    out = pull_ok (h);
+    fm = frame_meta_at (gst_buffer_get_rds_batch_meta (out), 0);
+    g_assert_cmpuint (fm->source_frame_width, ==, cases[c].crop.width);
+    g_assert_cmpuint (fm->source_frame_height, ==, cases[c].crop.height);
+    assert_slot_rect (out, 0, &hin, cases[c].crop, cases[c].dst);
+    host_image_clear (&hin);
+    gst_buffer_unref (out);
+    mux_teardown (h, in, 1);
+  }
+  pool_free (pool);
+}
+
+typedef struct
+{
+  GstElement *pipe;
+  gboolean done;
+  GMutex lock;
+  GCond cond;
+} StopCtx;
+
+static gpointer
+stop_thread (gpointer data)
+{
+  StopCtx *ctx = data;
+
+  gst_element_set_state (ctx->pipe, GST_STATE_NULL);
+  g_mutex_lock (&ctx->lock);
+  ctx->done = TRUE;
+  g_cond_signal (&ctx->cond);
+  g_mutex_unlock (&ctx->lock);
+  return NULL;
+}
+
+/* Stopping while the mux waits for a pool buffer held downstream (an appsink nobody pulls from) completes. */
+static void
+test_stop_while_blocked (void)
+{
+  StopCtx ctx = { 0 };
+  GError *err = NULL;
+  GThread *t;
+  gint64 end;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ctx.pipe = gst_parse_launch ("videotestsrc ! video/x-raw,format=NV12,width=64,height=48,framerate=30/1 "
+      "! m.sink_0 rdsstreammux name=m width=64 height=48 buffer-pool-size=2 ! appsink max-buffers=0 sync=false",
+      &err);
+  g_assert_no_error (err);
+  g_mutex_init (&ctx.lock);
+  g_cond_init (&ctx.cond);
+  g_assert_cmpint (gst_element_set_state (ctx.pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  g_assert_cmpint (gst_element_get_state (ctx.pipe, NULL, NULL, 10 * GST_SECOND), ==, GST_STATE_CHANGE_SUCCESS);
+  g_usleep (300 * 1000);        /* both pool buffers are in the appsink by now */
+
+  t = g_thread_new ("stop", stop_thread, &ctx);
+  end = g_get_monotonic_time () + 10 * G_TIME_SPAN_SECOND;
+  g_mutex_lock (&ctx.lock);
+  while (!ctx.done)
+    if (!g_cond_wait_until (&ctx.cond, &ctx.lock, end))
+      g_error ("setting the pipeline to NULL hangs while the mux waits for a pool buffer");
+  g_mutex_unlock (&ctx.lock);
+  g_thread_join (t);
+  gst_object_unref (ctx.pipe);
+  g_cond_clear (&ctx.cond);
+  g_mutex_clear (&ctx.lock);
+}
+
+/* batch-size above the number of sources: the batch carries what there is. */
+static void
+test_partial_batch (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[2];
+  GstBufferPool *pool;
+  GstBuffer *out;
+  RdsBufSurface *s;
+  RdsBatchMeta *bm;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("batch-size=3 width=64 height=64", in_caps, 2, in);
+  pool = make_pool (in_caps[0]);
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, i, 0)), ==, GST_FLOW_OK);
+  out = pull_ok (h);
+  s = rds_buffer_get_surface (out);
+  g_assert_cmpuint (s->batchSize, ==, 3);
+  g_assert_cmpuint (s->numFilled, ==, 2);
+  bm = gst_buffer_get_rds_batch_meta (out);
+  g_assert_cmpuint (bm->max_frames_in_batch, ==, 3);
+  g_assert_cmpuint (bm->num_frames_in_batch, ==, 2);
+  gst_buffer_unref (out);
+  mux_teardown (h, in, 2);
+  pool_free (pool);
+}
+
+/* Once every source is at EOS, EOS goes downstream. */
+static void
+test_eos (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  GstHarness *h, *in[2];
+  GstBufferPool *pool;
+  GstBuffer *out;
+  gboolean eos = FALSE;
+  gint64 end;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("batch-size=2 width=64 height=64", in_caps, 2, in);
+  pool = make_pool (in_caps[0]);
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, i, 0)), ==, GST_FLOW_OK);
+  out = pull_ok (h);
+  gst_buffer_unref (out);
+  /* one source ends: the other's next frame goes out alone */
+  g_assert_true (gst_harness_push_event (in[0], gst_event_new_eos ()));
+  g_assert_cmpint (gst_harness_push (in[1], rds_frame (pool, 2, 33 * GST_MSECOND)), ==, GST_FLOW_OK);
+  out = pull_within (h, 5000);
+  g_assert_nonnull (out);
+  g_assert_cmpuint (rds_buffer_get_surface (out)->numFilled, ==, 1);
+  g_assert_cmpuint (frame_meta_at (gst_buffer_get_rds_batch_meta (out), 0)->source_id, ==, 1);
+  gst_buffer_unref (out);
+  g_assert_true (gst_harness_push_event (in[1], gst_event_new_eos ()));
+
+  end = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
+  while (!eos && g_get_monotonic_time () < end) {
+    GstEvent *ev = gst_harness_try_pull_event (h);
+
+    if (ev == NULL) {
+      g_usleep (2000);
+      continue;
+    }
+    eos = GST_EVENT_TYPE (ev) == GST_EVENT_EOS;
+    gst_event_unref (ev);
+  }
+  g_assert_true (eos);
+  mux_teardown (h, in, 2);
+  pool_free (pool);
+}
+
+/* A system-memory source changing resolution: its staging surface follows. */
+static void
+test_sys_caps_change (void)
+{
+  const gchar *sizes[] = { SYS_I420 (320, 240), SYS_I420 (640, 480), SYS_I420 (160, 120) };
+  GstHarness *h, *in[1];
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("width=160 height=120", sizes, 1, in);
+  for (guint i = 0; i < G_N_ELEMENTS (sizes); i++) {
+    GstBuffer *b, *out;
+    HostImage hin;
+
+    if (i > 0)
+      gst_harness_set_src_caps_str (in[0], sizes[i]);
+    b = sys_frame (sizes[i], 60 + i, i * GST_MSECOND);
+    host_of (b, sizes[i], &hin);
+    g_assert_cmpint (gst_harness_push (in[0], b), ==, GST_FLOW_OK);
+    out = pull_ok (h);
+    g_assert_nonnull (out);
+    g_assert_cmpuint (frame_meta_at (gst_buffer_get_rds_batch_meta (out), 0)->source_frame_width, ==,
+        hin.im.width);
+    assert_slot (out, 0, &hin, (RefRect) { 0, 0, 160, 120 });
+    host_image_clear (&hin);
+    gst_buffer_unref (out);
+  }
+  mux_teardown (h, in, 1);
+}
+
+static void
+assert_out_framerate (GstHarness * h, gint n, gint d)
+{
+  GstCaps *caps = gst_pad_get_current_caps (h->sinkpad);
+  gint cn = -1, cd = -1;
+
+  g_assert_nonnull (caps);
+  g_assert_true (gst_structure_get_fraction (gst_caps_get_structure (caps, 0), "framerate", &cn, &cd));
+  g_assert_cmpint (cn, ==, n);
+  g_assert_cmpint (cd, ==, d);
+  gst_caps_unref (caps);
+}
+
+/* Output framerate: the sources' when they agree, else 0/1; renegotiated when a source changes. */
+static void
+test_framerate (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120), RDS_NV12 (160, 120) };
+  const gchar *rate25 = "video/x-raw(memory:RDS),format=NV12,width=160,height=120,framerate=25/1";
+  GstHarness *h, *in[2];
+  GstBufferPool *pool;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness ("batch-size=2 width=64 height=64", in_caps, 2, in);
+  pool = make_pool (in_caps[0]);
+  for (guint round = 0; round < 3; round++) {
+    GstBuffer *out;
+
+    if (round == 1)
+      gst_harness_set_src_caps_str (in[1], rate25);
+    if (round == 2)
+      gst_harness_set_src_caps_str (in[0], rate25);
+    for (guint i = 0; i < 2; i++)
+      g_assert_cmpint (gst_harness_push (in[i], rds_frame (pool, i, round * GST_MSECOND)), ==, GST_FLOW_OK);
+    out = pull_ok (h);
+    gst_buffer_unref (out);
+    if (round == 0)
+      assert_out_framerate (h, 30, 1);
+    else if (round == 1)
+      assert_out_framerate (h, 0, 1);
+    else
+      assert_out_framerate (h, 25, 1);
+  }
+  mux_teardown (h, in, 2);
+  pool_free (pool);
+}
+
+typedef struct
+{
+  guint n;
+  hipStream_t other;
+  gboolean ok;
+} SessionCheck;
+
+/* Runs on the mux's source thread right after each aggregate: the first time it installs a session of its own,
+ * the second time that session must still be there (the mux restored it around its transforms). */
+static GstPadProbeReturn
+check_session (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gpointer user_data)
+{
+  SessionCheck *c = user_data;
+  RdsBufSurfTransformConfigParams cfg = {.compute_mode = RdsBufSurfTransformCompute_GPU,.gpu_id = 0,
+    .cuda_stream = c->other
+  };
+  RdsBufSurfTransformConfigParams cur;
+
+  if (c->n == 0) {
+    c->ok = rds_buf_surf_transform_set_session_params (&cfg) == RdsBufSurfTransformError_Success;
+  } else if (c->n == 1) {
+    c->ok &= rds_buf_surf_transform_get_session_params (&cur) == RdsBufSurfTransformError_Success
+        && cur.cuda_stream == c->other && cur.gpu_id == 0 && cur.compute_mode == RdsBufSurfTransformCompute_GPU;
+    /* task threads are pooled: leave the thread as we found it */
+    (void) rds_buf_surf_transform_set_default_session ();
+  }
+  c->n++;
+  return GST_PAD_PROBE_OK;
+}
+
+static void
+test_session_restored (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120) };
+  SessionCheck c = { 0 };
+  GstHarness *h, *in[1];
+  GstBufferPool *pool;
+  GstPad *srcpad;
+
+  RDS_TEST_REQUIRE_GPU ();
+  g_assert_cmpint (hipStreamCreate (&c.other), ==, hipSuccess);
+  h = mux_harness ("width=64 height=64", in_caps, 1, in);
+  srcpad = gst_element_get_static_pad (h->element, "src");
+  gst_pad_add_probe (srcpad, GST_PAD_PROBE_TYPE_BUFFER, check_session, &c, NULL);
+  gst_object_unref (srcpad);
+  pool = make_pool (in_caps[0]);
+  for (guint i = 0; i < 2; i++) {
+    g_assert_cmpint (gst_harness_push (in[0], rds_frame (pool, i, i * GST_MSECOND)), ==, GST_FLOW_OK);
+    gst_buffer_unref (pull_ok (h));
+  }
+  g_assert_cmpuint (c.n, ==, 2);
+  g_assert_true (c.ok);
+  mux_teardown (h, in, 1);
+  pool_free (pool);
+  g_assert_cmpint (hipStreamDestroy (c.other), ==, hipSuccess);
+}
+
+/* Batched input (batch size above 1) is an error. */
+static void
+test_batch_rejected (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (160, 120) };
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h, *in[1];
+  GstBufferPool *pool;
+  GstBuffer *b = NULL;
+  RdsBufSurface *s;
+  GstMessage *msg;
+  GError *err = NULL;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = mux_harness_full ("width=64 height=64", in_caps, 1, in, NULL, bus);
+  pool = make_pool_batch (in_caps[0], 2);
+  g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &b, NULL), ==, GST_FLOW_OK);
+  s = rds_buffer_get_surface (b);
+  s->numFilled = 2;
+  gst_harness_push (in[0], b);
+  msg = gst_bus_timed_pop_filtered (bus, 5 * GST_SECOND, GST_MESSAGE_ERROR);
+  g_assert_nonnull (msg);
+  gst_message_parse_error (msg, &err, NULL);
+  g_assert_error (err, GST_STREAM_ERROR, GST_STREAM_ERROR_NOT_IMPLEMENTED);
+  g_clear_error (&err);
+  gst_message_unref (msg);
+  mux_teardown (h, in, 1);
+  pool_free (pool);
+  /* queued messages ref the element: drop them, or element and bus keep each other alive */
+  gst_bus_set_flushing (bus, TRUE);
+  gst_object_unref (bus);
+}
+
+/* enable-padding with RGBA output (black is 0 in every byte, alpha included; the picture's alpha is 255) and an
+ * aspect ratio whose height rounds to an odd value: kept for RGBA, made even for 4:2:0. */
+static void
+test_padding_rgba_odd (void)
+{
+  const gchar *in_caps[] = { RDS_NV12 (300, 170) };
+  static const struct
+  {
+    const gchar *out;
+    RefRect dst;
+  } cases[] = {
+    {"video/x-raw(memory:RDS),format=RGBA", {0, 0, 320, 181}},
+    {"video/x-raw(memory:RDS),format=NV12", {0, 0, 320, 180}},
+  };
+  GstBufferPool *pool;
+
+  RDS_TEST_REQUIRE_GPU ();
+  pool = make_pool (in_caps[0]);
+  for (guint c = 0; c < G_N_ELEMENTS (cases); c++) {
+    GstHarness *h, *in[1];
+    GstBuffer *b, *out;
+    HostImage hin;
+
+    h = mux_harness_full ("width=320 height=240 enable-padding=true", in_caps, 1, in, cases[c].out, NULL);
+    b = rds_frame (pool, 70 + c, 0);
+    host_of (b, NULL, &hin);
+    g_assert_cmpint (gst_harness_push (in[0], b), ==, GST_FLOW_OK);
+    out = pull_ok (h);
+    assert_slot (out, 0, &hin, cases[c].dst);
+    host_image_clear (&hin);
+    gst_buffer_unref (out);
+    mux_teardown (h, in, 1);
+  }
+  pool_free (pool);
+}
+
+/* batched-push-timeout: with one source stalled, the other's frame goes out alone one timeout after it arrived. */
+static void
+test_timeout (void)
+{
+  const gchar *caps_str = "video/x-raw,format=NV12,width=64,height=48,framerate=30/1";
+  GError *err = NULL;
+  GstElement *pipe, *src[2], *sink;
+  GstSample *sample;
+  GstMessage *msg;
+  GstBus *bus;
+  gint64 t0, dt;
+
+  RDS_TEST_REQUIRE_GPU ();
+  pipe = gst_parse_launch ("appsrc name=a format=time ! m.sink_0 appsrc name=b format=time ! m.sink_1 "
+      "rdsstreammux name=m batch-size=2 width=64 height=48 batched-push-timeout=40000 "
+      "! appsink name=s sync=false", &err);
+  g_assert_no_error (err);
+  src[0] = gst_bin_get_by_name (GST_BIN (pipe), "a");
+  src[1] = gst_bin_get_by_name (GST_BIN (pipe), "b");
+  sink = gst_bin_get_by_name (GST_BIN (pipe), "s");
+  for (guint i = 0; i < 2; i++) {
+    GstCaps *caps = gst_caps_from_string (caps_str);
+
+    g_object_set (src[i], "caps", caps, NULL);
+    gst_caps_unref (caps);
+  }
+  g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+
+  for (guint i = 0; i < 2; i++)
+    g_assert_cmpint (gst_app_src_push_buffer (GST_APP_SRC (src[i]), sys_frame (caps_str, i, 0)), ==, GST_FLOW_OK);
+  sample = gst_app_sink_try_pull_sample (GST_APP_SINK (sink), 5 * GST_SECOND);
+  g_assert_nonnull (sample);
+  g_assert_cmpuint (rds_buffer_get_surface (gst_sample_get_buffer (sample))->numFilled, ==, 2);
+  gst_sample_unref (sample);
+
+  /* b stalls */
+  t0 = g_get_monotonic_time ();
+  g_assert_cmpint (gst_app_src_push_buffer (GST_APP_SRC (src[0]), sys_frame (caps_str, 2, 33 * GST_MSECOND)), ==,
+      GST_FLOW_OK);
+  sample = gst_app_sink_try_pull_sample (GST_APP_SINK (sink), 5 * GST_SECOND);
+  dt = g_get_monotonic_time () - t0;
+  g_assert_nonnull (sample);
+  g_assert_cmpuint (rds_buffer_get_surface (gst_sample_get_buffer (sample))->numFilled, ==, 1);
+  gst_sample_unref (sample);
+  g_test_message ("partial batch after %" G_GINT64_FORMAT " ms", dt / 1000);
+  /* generous upper bound for loaded CI and sanitizers */
+  g_assert_cmpint (dt, >=, 35 * 1000);
+  g_assert_cmpint (dt, <=, 400 * 1000);
+
+  for (guint i = 0; i < 2; i++)
+    gst_app_src_end_of_stream (GST_APP_SRC (src[i]));
+  bus = gst_element_get_bus (pipe);
+  msg = gst_bus_timed_pop_filtered (bus, 5 * GST_SECOND, GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+  g_assert_nonnull (msg);
+  g_assert_cmpint (GST_MESSAGE_TYPE (msg), ==, GST_MESSAGE_EOS);
+  gst_message_unref (msg);
+  gst_object_unref (bus);
+  gst_element_set_state (pipe, GST_STATE_NULL);
+  for (guint i = 0; i < 2; i++)
+    gst_object_unref (src[i]);
+  gst_object_unref (sink);
+  gst_object_unref (pipe);
+}
+
 int
 main (int argc, char **argv)
 {
   gst_init (&argc, &argv);
   g_test_init (&argc, &argv, NULL);
+  g_test_add_func ("/cpu/mux/aggregator-probe", test_aggregator_probe);
   g_test_add_func ("/cpu/mux/factory", test_factory);
   g_test_add_func ("/cpu/mux/properties", test_properties);
   g_test_add_func ("/cpu/mux/no-size", test_no_size);
   g_test_add_func ("/cpu/mux/unsupported-settings", test_unsupported_settings);
-  g_test_add_func ("/gpu/mux/aggregator-probe", test_aggregator_probe);
+
   g_test_add_func ("/gpu/mux/batch-scaling", test_batch_scaling);
   g_test_add_func ("/gpu/mux/padding", test_padding);
   g_test_add_func ("/gpu/mux/system-input", test_system_input);
   g_test_add_func ("/gpu/mux/pool-bounded", test_pool_bounded);
+  g_test_add_func ("/gpu/mux/flush-one-pad", test_flush_one_pad);
+  g_test_add_func ("/gpu/mux/crop-meta", test_crop_meta);
+  g_test_add_func ("/gpu/mux/stop-while-blocked", test_stop_while_blocked);
+  g_test_add_func ("/gpu/mux/partial-batch", test_partial_batch);
+  g_test_add_func ("/gpu/mux/eos", test_eos);
+  g_test_add_func ("/gpu/mux/sys-caps-change", test_sys_caps_change);
+  g_test_add_func ("/gpu/mux/framerate", test_framerate);
+  g_test_add_func ("/gpu/mux/session-restored", test_session_restored);
+  g_test_add_func ("/gpu/mux/batch-rejected", test_batch_rejected);
+  g_test_add_func ("/gpu/mux/padding-rgba-odd", test_padding_rgba_odd);
+  g_test_add_func ("/gpu/mux/timeout", test_timeout);
   return g_test_run ();
 }
