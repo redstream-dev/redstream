@@ -4,7 +4,8 @@ What `rds/rds_compat.h` maps, and how well. Every DeepStream name here was check
 online documentation (the Source column links the page); Redstream's implementation is independent.
 
 Status values: **supported** (same meaning), **accepted no-op** (compiles and is ignored), **unsupported**
-(compiles, then fails at run time), **planned** (aliased, element not written yet). Names Redstream does not
+(compiles, then fails at run time), **different default** (supported, but the default value differs), **planned**
+(aliased, element not written yet). Names Redstream does not
 alias at all are listed under "Not aliased" in each section: code using them does not compile.
 
 Functions are aliased with object-like macros, so calls and `&function` work. Where a Redstream signature differs
@@ -22,8 +23,8 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | DeepStream name | Redstream name | Status | Notes | Source |
 |---|---|---|---|---|
 | `nvurisrcbin` | `rdsurisrcbin` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin) |
-| `nvv4l2decoder` | `rdsvideodec` | planned | rocDecode-backed | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideo4linux2), [name](https://docs.nvidia.com/deepstream/text/DS_FAQ) |
-| `nvvideoconvert` | `rdsvideoconvert` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideoconvert) |
+| `nvv4l2decoder` | `rdsvideodec` | supported | rocDecode: H.264/H.265 8-bit 4:2:0 to NV12; rank primary+10, so `uridecodebin` picks it over the VA decoders; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideo4linux2), [name](https://docs.nvidia.com/deepstream/text/DS_FAQ) |
+| `nvvideoconvert` | `rdsvideoconvert` | supported | single frames (batch size 1); `memory:RDS` and system memory on either side; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideoconvert) |
 | `nvstreammux` | `rdsstreammux` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreammux) |
 | `nvstreamdemux` | `rdsstreamdemux` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreamdemux) |
 | `nvinfer` | `rdsinfer` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
@@ -51,10 +52,18 @@ Names and integers as on NVIDIA's [nvvideoconvert page](https://docs.nvidia.com/
 | `compute-hw` | supported | `2` (VIC) fails at start; set while playing, it fails on the next frame that is converted (not while in passthrough) |
 | `flip-method` | unsupported | any value but `0` fails at start; set while playing, it fails on the next frame (a flip turns passthrough off) |
 | `contiguous-buffers`, `copy-hw`, `bl-output` | accepted no-op | batches are always contiguous, copies run on the GPU, output is pitch-linear |
-| `gpu-id`, `nvbuf-memory-type`, `output-buffers` | supported | changeable only in NULL or READY |
-| `disable-passthrough`, `silent` | supported | `silent` has no effect |
+| `gpu-id` | supported | default `0`; changeable only in NULL or READY |
+| `nvbuf-memory-type` | supported | memory of the `memory:RDS` output buffers: `0` `nvbuf-mem-default` (HIP device memory, the default), `1` `nvbuf-mem-cuda-pinned`, `2` `nvbuf-mem-cuda-device`, `3` `nvbuf-mem-cuda-unified`; changeable only in NULL or READY |
+| `output-buffers` | supported | minimum buffers in the output pool, default `4`; changeable only in NULL or READY |
+| `disable-passthrough` | supported | passthrough happens when input and output caps are equal (memory type included) and no crop or flip is set |
+| `silent` | accepted no-op |  |
 
 System-memory input or output is converted through device staging surfaces (upload, transform, download).
+
+Known limits: a batch (batch size above 1) is an element error; when downstream fixes only the width or only the
+height, the other dimension keeps the input's value (no aspect-ratio-preserving fixation); metas tagged with
+anything but `video` (for example size- or orientation-dependent ones) are dropped, as are `GstVideoMeta` (the
+output pool adds its own) and `GstVideoCropMeta` (the crop is applied).
 
 ### `rdsvideodec` (`nvv4l2decoder`) properties
 
@@ -201,8 +210,9 @@ tests compare the kernels with an independent CPU implementation of these rules.
 
 - Session parameters belong to the calling thread. A thread that never set them, or called
   `NvBufSurfTransformSetDefaultSession`, uses GPU 0 and the default (null) stream. `SetSessionParams` rejects
-  `VIC` (`Unsupported`), an unknown compute mode, a negative `gpu_id` or one past the last visible device
-  (`Invalid_Params`).
+  `VIC` (`Unsupported`), an unknown compute mode, a negative `gpu_id` or one at or beyond the number of visible
+  devices (`Invalid_Params`). With no visible device at all, any non-negative `gpu_id` is stored and the transform
+  itself then returns `Execution_Error`.
 - The call is synchronous: the work is queued on the session stream of the session GPU, and the stream is
   synchronized before the call returns, so the destination is ready to use (or push downstream) immediately.
 - Same-format, same-size copies may run as plain 2D memory copies instead of the kernel; the bytes are identical.
@@ -224,10 +234,15 @@ tests compare the kernels with an independent CPU implementation of these rules.
   (`CROP_SRC`, `CROP_DST`) is set; without the flag the whole surface is used. A flag with a NULL array is
   `Invalid_Params`. A rectangle that is empty or reaches past its surface is `ROI_Error`: the transform never clamps
   (`rdsvideoconvert` clamps its `src-crop`/`dest-crop` properties itself, as `nvvideoconvert` documents).
-- Destination pixels outside the destination rectangle are never written.
+- Destination pixels outside the destination rectangle (after the 4:2:0 widening described under "Odd crops") are
+  never written.
 - `transform_flip` is read only when `FLIP` is set, and must then be `None`. `transform_filter` is read only when
   `FILTER` is set (an out-of-range value is then `Invalid_Params`); without the flag the filter is nearest.
 - `NORMALIZE` is `Unsupported`.
+- When several problems apply, the first in this order is reported: batch counts; VIC, `NORMALIZE`, a flip; memory
+  types; the GPU of device memory; formats and layouts; sizes and plane geometry; source then destination
+  rectangles; odd 4:2:0 destination rectangles; the filter value. For example, system memory with an odd
+  destination rectangle is `Unsupported`, not `Invalid_Params`.
 
 **Sampling (filters)**
 
@@ -239,7 +254,9 @@ tests compare the kernels with an independent CPU implementation of these rules.
 - Nearest takes pixel `floor(xs)`, computed in exact integer arithmetic (`sl + ((2k + 1) * sw) / (2 * dw)` with
   `k = xd - dl`), so the choice never depends on floating-point rounding.
 - Bilinear interpolates between the two pixels around `xs - 0.5`, in `float`.
-- Every sample index is clamped to the source rectangle: pixels outside it are never read, even at its edges.
+- Every full-resolution sample index (luma, RGB, GRAY8) is clamped to the source rectangle, so those pixels are
+  never read outside it, even at its edges. Subsampled chroma has its own clamp range (see "Colour"): with an odd
+  source rectangle, the edge chroma samples also cover a luma pixel just outside it.
 
 **Colour**
 
@@ -264,14 +281,15 @@ tests compare the kernels with an independent CPU implementation of these rules.
 - GRAY8 is the luma plane when the other side is YUV: GRAY8 to YUV copies Y and sets U = V = 128, YUV to GRAY8 keeps
   Y. When the other side is RGB, GRAY8 is full-range intensity: GRAY8 to RGB sets R = G = B = gray, RGB to GRAY8
   writes `0.299 R + 0.587 G + 0.114 B`.
-- Alpha is copied only from RGBA/BGRA to RGBA/BGRA; any other source writes alpha 255. The padding byte of RGBx and
+- Alpha is sampled (and, with bilinear, interpolated) like the colour channels only from RGBA/BGRA to RGBA/BGRA;
+  any other source writes alpha 255. The padding byte of RGBx and
   BGRx is always written as 255.
 
 **Odd crops on 4:2:0 destinations**
 
 - A 2x2 chroma block can't be half-written, so a destination rectangle on an NV12 or I420 surface is widened to
-  even coordinates: its left and top edges move down to the next even value, its right and bottom edges up, clamped
-  to the surface. The source is scaled onto the widened rectangle.
+  even coordinates: its left and top edges are rounded down to even, its right and bottom edges rounded up to even
+  and clamped to the surface. The source is scaled onto the widened rectangle.
 - Without `ALLOW_ODD_CROP`, a destination rectangle with an odd edge on a 4:2:0 surface is `Invalid_Params`, except
   a right or bottom edge that lies on the surface's own odd edge, which counts as even. With the flag, any rectangle
   is widened as above. Source rectangles may always be odd: sampling is continuous.

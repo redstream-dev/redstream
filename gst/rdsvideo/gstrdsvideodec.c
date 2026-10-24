@@ -390,7 +390,9 @@ gst_rds_video_dec_negotiate (GstVideoDecoder * dec)
 
   if (self->finishing) {
     /* finish_frame saw a RECONFIGURE after on_display checked for one: the buffer it is about to push was filled
-     * for the current caps, so keep them, and let the next allocation choose again */
+     * for the current caps, so keep them, and let the next allocation choose again. Safe because only a
+     * RECONFIGURE can bring us here: the base class's output_state_changed is never set at this point, since
+     * set_output_state always negotiates right away and a failure there never reaches finish_frame. */
     GST_DEBUG_OBJECT (self, "RECONFIGURE while finishing a frame: renegotiating with the next frame");
     gst_pad_mark_reconfigure (GST_VIDEO_DECODER_SRC_PAD (dec));
     return TRUE;
@@ -430,7 +432,10 @@ gst_rds_video_dec_negotiate (GstVideoDecoder * dec)
     gst_clear_caps (&prev_caps);
     gst_clear_caps (&prev_allocation_caps);
   } else {
-    /* keep describing what was last negotiated (the pad's caps): buffers in flight were filled for it */
+    /* Restore the caps the output state had before this attempt: buffers in flight were filled for them. They are
+     * usually the pad's current caps too, but not always: if the memory:RDS caps event went through, its pool
+     * failed, and the system-memory retry failed at its pool step as well, the pad already holds the newer caps.
+     * A later successful negotiation sets the pad's caps again. */
     gst_clear_caps (&state->caps);
     gst_clear_caps (&state->allocation_caps);
     state->caps = prev_caps;

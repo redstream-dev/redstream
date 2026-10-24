@@ -11,7 +11,8 @@ mechanical changes: element factory names behind an `#ifdef`, the same config fi
 metadata-traversal code via a compatibility header.
 
 Status: **pre-alpha.** Phase 0 spikes and the walking skeleton are done; the libgstrds core is in place (surfaces,
-`memory:RDS`, pools, metadata, events). No elements yet. Nothing here is stable.
+`memory:RDS`, pools, metadata, events, the `rds_buf_surf_transform` GPU transform). The first elements exist:
+`rdsvideodec` (rocDecode H.264/H.265 decode) and `rdsvideoconvert` (convert, scale, crop). Nothing here is stable.
 
 ## Architecture principles
 
@@ -97,7 +98,10 @@ Known gotchas:
 - Build HIP code with the GPU attached, or pass `--offload-arch` explicitly. Otherwise hipcc targets the wrong arch
   and kernels fail with "device kernel image is invalid".
 - rocDecode must be fed whole NAL units or access units (`h264parse ! ...,alignment=au`). Split NAL units decode
-  incorrectly.
+  incorrectly. `rdsvideodec`'s sink caps require `alignment=au`, so a parser in front negotiates it.
+- rocDecode decode surfaces of 1 MiB or less (Mesa slab-allocates them) lose their first decoded picture unless they
+  are exported to HIP before the first decode. `rdsvideodec` maps every surface right after creating the decoder
+  and again after `rocDecReconfigureDecoder`; keep that if you touch decoder setup.
 - Stock `vah26xdec` exports tiled NV12 DMABufs (AMD modifier `0x0200000000401b03`). Never read them as linear.
 - Run docker with `--user $(id -u):$(id -g)` so build outputs aren't root-owned. From zsh, wrap `$RUN`-style
   variables in `bash -c` (zsh doesn't word-split them).
@@ -126,12 +130,15 @@ gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
   rds-gst-meta       RdsMeta GstMeta on buffers (gst_buffer_get_rds_batch_meta)
   rds-event          stream events (pad added/deleted, stream start/EOS/segment/reset)
   rds_compat.h       DeepStream compat header (+ rds-compat-aliases.h, rds-compat-remap.c)
-  rds-transform-kernels.hip  HIP kernels (amdclang++, linked in as an object)
+  rds-transform      rds_buf_surf_transform: batched crop/scale/colour conversion (NvBufSurfTransform-shaped)
+  rds-transform-kernels.hip  its HIP kernels (amdclang++, linked in as an object)
   *-private.h        internal headers, not installed (rds-hip-private.h is the only HIP include)
-gst/rdsvideo/      libgstrdsvideo plugin (rocDecode decode, memory:RDS conversion; skeleton, no elements yet)
-docs/              compat-matrix.md: what the compat header maps, with status and sources
+gst/rdsvideo/      libgstrdsvideo plugin: rdsvideodec (rocDecode, gstrdsvideodec.c), rdsvideoconvert
+                   (gstrdsvideoconvert.c), shared helpers in rds-video-util
+docs/              compat-matrix.md: what the compat header and the elements map, with status and sources
 samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
-tests/check/       GLib unit tests (suites cpu/gpu)       tests/samples/  sample-level tests
+tests/check/       GLib unit and element tests (suites cpu/gpu); test clips are encoded in-process
+                   (rds-test-media.h, needs the VA encoder)      tests/samples/  sample-level tests
 tests/media/       make-test-media.sh: generated H.264 clips (into git-ignored .cache/)
 spikes/            Phase 0 experiments (rocdec-hip, migraphx-devptr); reference code, not built by meson
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
@@ -148,7 +155,11 @@ meson setup build          # once; then `meson setup build --reconfigure` after 
 meson test -C build --print-errorlogs
 meson test -C build --suite cpu  # GPU-free subset (gpu tests also skip themselves without a device);
                                  # building still needs the ROCm headers and libamdhip64
-tests/media/make-test-media.sh   # generates .cache/media/*.h264 for pipeline tests and spikes
+tests/media/make-test-media.sh   # generates .cache/media/*.h264 for manual runs, benchmarks and spikes
+                                 # (the tests encode their own clips)
+# run our elements from the build tree
+GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-720p.h264 ! h264parse \
+  ! rdsvideodec ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA,width=640,height=640" ! fakesink sync=false
 
 # ASan + UBSan build; tests/lsan.supp hides HIP runtime leaks
 meson setup build-asan -Db_sanitize=address,undefined -Db_lundef=false
@@ -163,7 +174,9 @@ meson test -C build-asan --print-errorlogs
   `/opt/rocm/lib` is expected to be on the system linker path.
 - Element tests load plugins from `build/gst` (`GST_PLUGIN_PATH_1_0`) next to the system plugins, with a private
   registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
-  `gst-plugin-scanner` can't load sanitized plugins. Tests that need private symbols link `rds_internal_dep`, a
+  `gst-plugin-scanner` can't load sanitized plugins. ASan runs with `use_sigaltstack=0` (Mesa's LLVM, loaded by the
+  VA driver, installs its own alternate signal stack), and only the soak test (`pipeline_soak`, its own build of
+  `pipeline_decode_convert.c`) shrinks the ASan quarantine so its VmRSS check stays meaningful. Tests that need private symbols link `rds_internal_dep`, a
   static copy of libgstrds. Such a test must never also link `rds_dep` or load one of our plugins in-process
   (the plugin pulls in the shared libgstrds): two copies of the library register the same GTypes twice.
 - Library symbols are hidden by default. Mark public API with `RDS_API` (from `rds/rds-prelude.h`).

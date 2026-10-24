@@ -87,6 +87,9 @@ test_transform_structs (void)
   g_assert_cmpuint (G_STRUCT_OFFSET (NvBufSurfTransformRect, height), ==, 12);
   g_assert_cmpuint (sizeof (params.transform_flag), ==, sizeof (guint32));
   g_assert_cmpuint (sizeof (config.gpu_id), ==, sizeof (gint32));
+  /* signed, as documented: a negative id is representable (and rejected by SetSessionParams) */
+  config.gpu_id = -1;
+  g_assert_cmpint (config.gpu_id, <, 0);
   g_assert_cmpuint (sizeof (config.cuda_stream), ==, sizeof (gpointer));
   g_assert_true (params.src_rect->left == 2 && params.dst_rect == NULL);
   g_assert_cmpint (config.compute_mode, ==, RdsBufSurfTransformCompute_GPU);
