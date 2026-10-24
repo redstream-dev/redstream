@@ -1,6 +1,6 @@
 /* Private declarations shared by the C side of libgstrds and its HIP kernel file (rds-transform-kernels.hip).
- * Plain C, no GLib and no HIP types (streams are void *), so both compilers can include it.
- * Not installed, not exported.
+ * The shared part is plain C, no GLib and no HIP types (streams are void *), so both compilers can include it;
+ * the C-only part at the end is hidden from the HIP compiler. Not installed, not exported.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_TRANSFORM_PRIVATE_H
 #define RDS_TRANSFORM_PRIVATE_H
@@ -18,6 +18,16 @@ RDS_TRANSFORM_INTERNAL int rds_transform_kernel_smoke (void *dev, unsigned n, un
 
 #ifdef __cplusplus
 }
+#endif
+
+#ifndef __HIP__
+#include "rds-transform.h"
+
+/* Checks the arguments of rds_buf_surf_transform () against the calling thread's session, in the documented
+ * order, without touching pixels or HIP. Returns Success when the call may go ahead, else the error the
+ * transform reports. Tests reach it through the static internal library. */
+RDS_TRANSFORM_INTERNAL RdsBufSurfTransform_Error rds_transform_validate (const RdsBufSurface * src,
+    const RdsBufSurface * dst, const RdsBufSurfTransformParams * transform_params);
 #endif
 
 #endif /* RDS_TRANSFORM_PRIVATE_H */

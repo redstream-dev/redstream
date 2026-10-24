@@ -28,6 +28,14 @@ foreach t : cpu_tests
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 endforeach
 
+# GPU-free tests that call private library symbols: they link only the static internal copy of libgstrds
+# (never rds_dep too, see internal_gpu_tests below).
+internal_cpu_tests = ['transform_validate']
+foreach t : internal_cpu_tests
+  test(t, executable(t, 'check' / (t + '.c'), dependencies : [rds_internal_dep]),
+    suite : 'cpu', env : test_env, protocol : 'tap')
+endforeach
+
 # DeepStream apps are often C++: check that the compat header builds and works there too.
 if add_languages('cpp', required : false, native : false)
   test('compat_cpp', executable('compat_cpp', 'check' / 'compat_cpp.cpp', dependencies : [rds_dep],

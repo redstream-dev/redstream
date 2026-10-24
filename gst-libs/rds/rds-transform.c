@@ -172,14 +172,20 @@ check_rects (const RdsBufSurface * surf, const RdsBufSurfTransformRect * rects, 
   return RdsBufSurfTransformError_Success;
 }
 
-/* Rule 7: without ALLOW_ODD_CROP, a destination rect on a 4:2:0 surface must be even in every coordinate. */
+/* Rule 7: without ALLOW_ODD_CROP, every edge of a destination rect on a 4:2:0 surface must be even. A right or
+ * bottom edge on the surface's own (odd) edge counts as even: the last chroma sample is a whole one there. */
 static gboolean
 check_even_dst_rects (const RdsBufSurface * dst, const RdsBufSurfTransformRect * rects, guint n)
 {
   for (guint i = 0; i < n; i++) {
     const RdsBufSurfTransformRect *r = &rects[i];
+    const RdsBufSurfaceParams *p = &dst->surfaceList[i];
+    guint64 right = (guint64) r->left + r->width;
+    guint64 bottom = (guint64) r->top + r->height;
+    gboolean odd = (r->left & 1) || (r->top & 1) || ((right & 1) && right != p->width)
+        || ((bottom & 1) && bottom != p->height);
 
-    if (is_yuv420 (dst->surfaceList[i].colorFormat) && ((r->left | r->top | r->width | r->height) & 1)) {
+    if (is_yuv420 (p->colorFormat) && odd) {
       GST_ERROR ("dst rect %u (left %u, top %u, %ux%u) is odd on a 4:2:0 surface and ALLOW_ODD_CROP is not set",
           i, r->left, r->top, r->width, r->height);
       return FALSE;
@@ -189,14 +195,15 @@ check_even_dst_rects (const RdsBufSurface * dst, const RdsBufSurfTransformRect *
 }
 
 RdsBufSurfTransform_Error
-rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst, RdsBufSurfTransformParams * transform_params)
+rds_transform_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
+    const RdsBufSurfTransformParams * transform_params)
 {
   const RdsBufSurfTransformConfigParams *session;
-  RdsBufSurfTransformParams *tp = transform_params;
+  const RdsBufSurfTransformParams *tp = transform_params;
   RdsBufSurfTransform_Error ret;
   guint n;
-  int prev_dev;
 
+  /* 1. NULL arguments */
   g_return_val_if_fail (src != NULL, RdsBufSurfTransformError_Invalid_Params);
   g_return_val_if_fail (dst != NULL, RdsBufSurfTransformError_Invalid_Params);
   g_return_val_if_fail (transform_params != NULL, RdsBufSurfTransformError_Invalid_Params);
@@ -261,6 +268,21 @@ rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst, RdsBufSurfTran
     GST_ERROR ("invalid filter %d", (gint) tp->transform_filter);
     return RdsBufSurfTransformError_Invalid_Params;
   }
+
+  return RdsBufSurfTransformError_Success;
+}
+
+RdsBufSurfTransform_Error
+rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst, RdsBufSurfTransformParams * transform_params)
+{
+  const RdsBufSurfTransformConfigParams *session;
+  RdsBufSurfTransform_Error ret;
+  int prev_dev;
+
+  ret = rds_transform_validate (src, dst, transform_params);
+  if (ret != RdsBufSurfTransformError_Success)
+    return ret;
+  session = current_session ();
 
   if (!rds_device_enter ((guint32) session->gpu_id, &prev_dev)) {
     GST_ERROR ("cannot select GPU %d", session->gpu_id);

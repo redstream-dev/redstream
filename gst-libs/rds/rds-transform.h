@@ -40,7 +40,7 @@ typedef enum
 
 typedef enum
 {
-  RdsBufSurfTransformError_ROI_Error = -4,
+  RdsBufSurfTransformError_ROI_Error = -4,     /* a rect is empty or not inside its surface (never clamped) */
   RdsBufSurfTransformError_Invalid_Params = -3,
   RdsBufSurfTransformError_Execution_Error = -2,
   RdsBufSurfTransformError_Unsupported = -1,
@@ -56,7 +56,12 @@ typedef enum
   RDS_BUFSURF_TRANSFORM_NORMALIZE = 1 << 4,     /* rejected */
   RDS_BUFSURF_TRANSFORM_ALLOW_ODD_CROP = 1 << 5,
 } RdsBufSurfTransform_Transform_Flag;
+/* ALLOW_ODD_CROP: a 4:2:0 (NV12, YUV420) destination rect with an odd edge is aligned outward to even coordinates
+ * (clamped to the surface). Without it such a rect is Invalid_Params; a right or bottom edge on the surface's own
+ * edge always counts as even. Source rects may always be odd. */
 
+/* A rectangle in pixels of its surface: top-left corner (top, left) and size (width, height). It must be
+ * non-empty and lie inside the surface, or the transform returns ROI_Error; it is never clamped. */
 typedef struct
 {
   guint32 top;
@@ -82,13 +87,14 @@ typedef struct
                                                  * DeepStream so ported assignments compile unchanged. */
 } RdsBufSurfTransformConfigParams;
 
-/* Session parameters are per thread. The default session is GPU 0 on the default stream. */
+/* Session parameters are per thread: they apply to every transform called on that thread, by any caller, until
+ * changed. A thread that never set them (or called set_default_session) gets GPU 0 on the default stream. */
 RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_set_session_params (RdsBufSurfTransformConfigParams * config_params);
 RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_get_session_params (RdsBufSurfTransformConfigParams * config_params);
 RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_set_default_session (void);
 
-/* Transforms the first src->numFilled surfaces into dst (crop, scale, colour conversion) and sets dst->numFilled.
- * Synchronous: returns after the GPU work is complete. Both surfaces must be device-accessible (not
+/* Transforms the first src->numFilled surfaces into dst (crop, scale, colour conversion). dst->numFilled is set
+ * only on success; on error dst is not modified, apart from pixels if the GPU work itself fails. Synchronous: returns after the GPU work is complete. Both surfaces must be device-accessible (not
  * RDS_BUF_MEM_SYSTEM). Destination pixels outside dst_rect are not written. The exact sampling and colour rules
  * are documented in docs/compat-matrix.md. */
 RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst,
