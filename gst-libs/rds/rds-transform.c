@@ -5,6 +5,8 @@
 #include "rds-hip-private.h"
 #include "rds-transform-private.h"
 
+#include <string.h>
+
 GST_DEBUG_CATEGORY_STATIC (rds_transform_debug);
 #define GST_CAT_DEFAULT rds_transform_debug
 
@@ -131,6 +133,19 @@ is_yuv420 (RdsBufSurfaceColorFormat fmt)
   return fmt == RDS_BUF_COLOR_FORMAT_NV12 || fmt == RDS_BUF_COLOR_FORMAT_YUV420;
 }
 
+/* Rule 4b */
+static gboolean
+check_gpu (const RdsBufSurface * surf, const RdsBufSurfTransformConfigParams * session, const gchar * side)
+{
+  if ((surf->memType == RDS_BUF_MEM_DEFAULT || surf->memType == RDS_BUF_MEM_HIP_DEVICE)
+      && surf->gpuId != (guint32) session->gpu_id) {
+    GST_ERROR ("%s surface is device memory on GPU %u but the session uses GPU %d", side, surf->gpuId,
+        session->gpu_id);
+    return FALSE;
+  }
+  return TRUE;
+}
+
 /* Rule 5: every filled surface of @surf has a supported format and pitch layout. */
 static gboolean
 check_formats (const RdsBufSurface * surf, guint n, const gchar * side)
@@ -239,6 +254,10 @@ rds_transform_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
     return RdsBufSurfTransformError_Unsupported;
   }
 
+  /* 4b. device memory must be on the session's GPU (pinned and unified memory is reachable from any GPU) */
+  if (!check_gpu (src, session, "src") || !check_gpu (dst, session, "dst"))
+    return RdsBufSurfTransformError_Invalid_Params;
+
   /* 5. formats and layouts */
   if (!check_formats (src, n, "src") || !check_formats (dst, n, "dst"))
     return RdsBufSurfTransformError_Unsupported;
@@ -272,11 +291,143 @@ rds_transform_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
   return RdsBufSurfTransformError_Success;
 }
 
+G_STATIC_ASSERT ((gint) RDS_KFMT_GRAY8 == (gint) RDS_BUF_COLOR_FORMAT_GRAY8);
+G_STATIC_ASSERT ((gint) RDS_KFMT_YUV420 == (gint) RDS_BUF_COLOR_FORMAT_YUV420);
+G_STATIC_ASSERT ((gint) RDS_KFMT_NV12 == (gint) RDS_BUF_COLOR_FORMAT_NV12);
+G_STATIC_ASSERT ((gint) RDS_KFMT_RGBA == (gint) RDS_BUF_COLOR_FORMAT_RGBA);
+G_STATIC_ASSERT ((gint) RDS_KFMT_BGRA == (gint) RDS_BUF_COLOR_FORMAT_BGRA);
+G_STATIC_ASSERT ((gint) RDS_KFMT_RGBx == (gint) RDS_BUF_COLOR_FORMAT_RGBx);
+G_STATIC_ASSERT ((gint) RDS_KFMT_BGRx == (gint) RDS_BUF_COLOR_FORMAT_BGRx);
+G_STATIC_ASSERT ((gint) RDS_KFMT_RGB == (gint) RDS_BUF_COLOR_FORMAT_RGB);
+G_STATIC_ASSERT ((gint) RDS_KFMT_BGR == (gint) RDS_BUF_COLOR_FORMAT_BGR);
+
+static gint force_kernel = 0;
+
+void
+rds_transform_force_kernel (gboolean force)
+{
+  g_atomic_int_set (&force_kernel, force ? 1 : 0);
+}
+
+/* The filter mapping: Bilinear and Algo1-3 run as bilinear, everything else (and no FILTER flag) as nearest. */
+static gboolean
+use_bilinear (const RdsBufSurfTransformParams * tp)
+{
+  static gint warned = 0;
+
+  if (!(tp->transform_flag & RDS_BUFSURF_TRANSFORM_FILTER))
+    return FALSE;
+  switch (tp->transform_filter) {
+    case RdsBufSurfTransformInter_Bilinear:
+      return TRUE;
+    case RdsBufSurfTransformInter_Algo1:
+    case RdsBufSurfTransformInter_Algo2:
+    case RdsBufSurfTransformInter_Algo3:
+      if (g_atomic_int_compare_and_exchange (&warned, 0, 1))
+        GST_WARNING ("filters Algo1-Algo3 run as bilinear on this implementation");
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+
+static void
+kernel_surface (const RdsBufSurfaceParams * p, RdsKernelSurface * k)
+{
+  k->data = p->dataPtr;
+  k->width = p->width;
+  k->height = p->height;
+  k->format = p->colorFormat;
+  for (guint i = 0; i < 3; i++) {
+    gboolean has = i < p->planeParams.num_planes;
+
+    k->pitch[i] = has ? p->planeParams.pitch[i] : 0;
+    k->offset[i] = has ? p->planeParams.offset[i] : 0;
+  }
+}
+
+/* Builds the job for surface @i: rects default to the whole surface; a 4:2:0 destination rect is aligned outward
+ * to even coordinates, clamped to the surface (ALLOW_ODD_CROP; validation already refused odd rects without it). */
+static void
+build_job (const RdsBufSurface * src, const RdsBufSurface * dst, const RdsBufSurfTransformParams * tp, guint i,
+    gboolean bilinear, RdsKernelJob * job)
+{
+  const RdsBufSurfaceParams *sp = &src->surfaceList[i], *dp = &dst->surfaceList[i];
+
+  memset (job, 0, sizeof (*job));
+  kernel_surface (sp, &job->src);
+  kernel_surface (dp, &job->dst);
+  job->bilinear = bilinear;
+
+  if (tp->transform_flag & RDS_BUFSURF_TRANSFORM_CROP_SRC) {
+    const RdsBufSurfTransformRect *r = &tp->src_rect[i];
+    job->sl = r->left, job->st = r->top, job->sw = r->width, job->sh = r->height;
+  } else {
+    job->sl = 0, job->st = 0, job->sw = sp->width, job->sh = sp->height;
+  }
+  if (tp->transform_flag & RDS_BUFSURF_TRANSFORM_CROP_DST) {
+    const RdsBufSurfTransformRect *r = &tp->dst_rect[i];
+    job->dl = r->left, job->dt = r->top, job->dw = r->width, job->dh = r->height;
+  } else {
+    job->dl = 0, job->dt = 0, job->dw = dp->width, job->dh = dp->height;
+  }
+  if (is_yuv420 (dp->colorFormat)) {
+    guint right = MIN (GST_ROUND_UP_2 (job->dl + job->dw), dp->width);
+    guint bottom = MIN (GST_ROUND_UP_2 (job->dt + job->dh), dp->height);
+
+    job->dl &= ~1u;
+    job->dt &= ~1u;
+    job->dw = right - job->dl;
+    job->dh = bottom - job->dt;
+  }
+}
+
+/* A same-format, same-size job whose result is a plain copy of the source rect: hipMemcpy2DAsync per plane gives
+ * the bytes the kernel would write. Not for x formats (the kernel writes 255 there), and on 4:2:0 only from an
+ * even source corner, so the chroma rect is a whole-sample copy too. */
+static gboolean
+is_plain_copy (const RdsKernelJob * job)
+{
+  if (g_atomic_int_get (&force_kernel) || job->src.format != job->dst.format
+      || job->sw != job->dw || job->sh != job->dh)
+    return FALSE;
+  switch (job->dst.format) {
+    case RDS_BUF_COLOR_FORMAT_RGBx:
+    case RDS_BUF_COLOR_FORMAT_BGRx:
+      return FALSE;
+    case RDS_BUF_COLOR_FORMAT_NV12:
+    case RDS_BUF_COLOR_FORMAT_YUV420:
+      return (job->sl & 1) == 0 && (job->st & 1) == 0;
+    default:
+      return TRUE;
+  }
+}
+
+static gboolean
+copy_rect (const RdsKernelJob * job, const RdsBufSurfaceParams * dp, hipStream_t stream)
+{
+  for (guint p = 0; p < dp->planeParams.num_planes; p++) {
+    guint div = p == 0 ? 1 : 2;     /* only 4:2:0 formats have more than one plane */
+    guint bpp = dp->planeParams.bytesPerPix[p];
+    const guint8 *s = job->src.data + job->src.offset[p] + (gsize) (job->st / div) * job->src.pitch[p]
+        + (gsize) (job->sl / div) * bpp;
+    guint8 *d = job->dst.data + job->dst.offset[p] + (gsize) (job->dt / div) * job->dst.pitch[p]
+        + (gsize) (job->dl / div) * bpp;
+
+    if (!RDS_HIP_CHECK (hipMemcpy2DAsync (d, job->dst.pitch[p], s, job->src.pitch[p],
+                (gsize) ((job->dw + div - 1) / div) * bpp, (job->dh + div - 1) / div, hipMemcpyDefault, stream)))
+      return FALSE;
+  }
+  return TRUE;
+}
+
 RdsBufSurfTransform_Error
 rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst, RdsBufSurfTransformParams * transform_params)
 {
   const RdsBufSurfTransformConfigParams *session;
   RdsBufSurfTransform_Error ret;
+  hipStream_t stream;
+  gboolean bilinear;
   int prev_dev;
 
   ret = rds_transform_validate (src, dst, transform_params);
@@ -284,13 +435,37 @@ rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst, RdsBufSurfTran
     return ret;
   session = current_session ();
 
+  for (guint i = 0; i < src->numFilled; i++) {
+    if (src->surfaceList[i].dataPtr == NULL || dst->surfaceList[i].dataPtr == NULL) {
+      GST_ERROR ("surface %u has no pixel memory (dataPtr is NULL)", i);
+      return RdsBufSurfTransformError_Invalid_Params;
+    }
+  }
+  bilinear = use_bilinear (transform_params);
+  stream = (hipStream_t) session->cuda_stream;
+
   if (!rds_device_enter ((guint32) session->gpu_id, &prev_dev)) {
     GST_ERROR ("cannot select GPU %d", session->gpu_id);
     return RdsBufSurfTransformError_Execution_Error;
   }
-  /* The kernel launch, the stream sync and dst->numFilled come with the kernels. */
-  GST_ERROR ("no kernel yet");
-  ret = RdsBufSurfTransformError_Unsupported;
+  for (guint i = 0; i < src->numFilled && ret == RdsBufSurfTransformError_Success; i++) {
+    RdsKernelJob job;
+
+    build_job (src, dst, transform_params, i, bilinear, &job);
+    if (is_plain_copy (&job)) {
+      if (!copy_rect (&job, &dst->surfaceList[i], stream))
+        ret = RdsBufSurfTransformError_Execution_Error;
+    } else if (rds_transform_launch (&job, stream) != 0) {
+      GST_ERROR ("kernel launch failed for surface %u (library built for another GPU architecture?)", i);
+      ret = RdsBufSurfTransformError_Execution_Error;
+    }
+  }
+  /* Synchronize even after a failed launch, so no work is left running on the caller's surfaces. */
+  if (!RDS_HIP_CHECK (hipStreamSynchronize (stream)))
+    ret = RdsBufSurfTransformError_Execution_Error;
   rds_device_leave ((guint32) session->gpu_id, prev_dev);
+
+  if (ret == RdsBufSurfTransformError_Success)
+    dst->numFilled = src->numFilled;
   return ret;
 }

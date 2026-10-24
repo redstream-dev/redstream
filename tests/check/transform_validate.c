@@ -183,6 +183,36 @@ test_mem_types (void)
   }
 }
 
+/* Rule 4b: device memory (default, device) must live on the session's GPU (GPU 0 here, the default session);
+ * pinned and unified memory is reachable from any GPU. */
+static void
+test_gpu_id (void)
+{
+  static const RdsBufSurfaceMemType device[] = { RDS_BUF_MEM_DEFAULT, RDS_BUF_MEM_HIP_DEVICE };
+  static const RdsBufSurfaceMemType host[] = { RDS_BUF_MEM_HIP_PINNED, RDS_BUF_MEM_HIP_UNIFIED };
+  HandSurface src, dst;
+  RdsBufSurfTransformParams tp = { 0 };
+
+  for (guint i = 0; i < G_N_ELEMENTS (device); i++) {
+    make_pair (&src, &dst);
+    src.surf.memType = device[i];
+    src.surf.gpuId = 1;
+    g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+    make_pair (&src, &dst);
+    dst.surf.memType = device[i];
+    dst.surf.gpuId = 1;
+    g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+  }
+  for (guint i = 0; i < G_N_ELEMENTS (host); i++) {
+    make_pair (&src, &dst);
+    src.surf.memType = host[i];
+    src.surf.gpuId = 1;
+    dst.surf.memType = host[i];
+    dst.surf.gpuId = 1;
+    g_assert_cmpint (validate (&src, &dst, &tp), ==, OK);
+  }
+}
+
 /* Rule 5: colour format and layout, on any filled surface of either side. */
 static void
 test_formats (void)
@@ -393,6 +423,7 @@ main (int argc, char **argv)
   g_test_add_func ("/transform/validate/2-batch-counts", test_batch_counts);
   g_test_add_func ("/transform/validate/3-unsupported-modes", test_unsupported_modes);
   g_test_add_func ("/transform/validate/4-mem-types", test_mem_types);
+  g_test_add_func ("/transform/validate/4b-gpu-id", test_gpu_id);
   g_test_add_func ("/transform/validate/5-formats", test_formats);
   g_test_add_func ("/transform/validate/6-rects", test_rects);
   g_test_add_func ("/transform/validate/7-odd-crop", test_odd_crop);

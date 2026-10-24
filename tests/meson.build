@@ -53,9 +53,11 @@ endforeach
 # GPU tests that call private library symbols link the static internal copy of libgstrds instead.
 # Such a test must never also link rds_dep, nor load one of our plugins in-process (the plugin pulls in the
 # shared libgstrds): two copies of the library register the same GTypes twice.
-internal_gpu_tests = ['kernel_smoke']
+# transform_hip's CPU reference (transform-ref.h) needs libm.
+internal_gpu_tests = ['kernel_smoke', 'transform_hip']
 foreach t : internal_gpu_tests
-  test(t, executable(t, 'check' / (t + '.c'), dependencies : [rds_internal_dep, gst_check_dep, hip_dep]),
+  test(t, executable(t, 'check' / (t + '.c'),
+      dependencies : [rds_internal_dep, gst_check_dep, hip_dep, cc.find_library('m', required : false)]),
     suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 endforeach
 

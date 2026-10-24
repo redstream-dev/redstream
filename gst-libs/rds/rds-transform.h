@@ -54,11 +54,11 @@ typedef enum
   RDS_BUFSURF_TRANSFORM_FILTER = 1 << 2,
   RDS_BUFSURF_TRANSFORM_FLIP = 1 << 3,
   RDS_BUFSURF_TRANSFORM_NORMALIZE = 1 << 4,     /* rejected */
+  /* A 4:2:0 (NV12, YUV420) destination rect with an odd edge is aligned outward to even coordinates (clamped to
+   * the surface). Without it such a rect is Invalid_Params; a right or bottom edge on the surface's own edge always
+   * counts as even. Source rects may always be odd. */
   RDS_BUFSURF_TRANSFORM_ALLOW_ODD_CROP = 1 << 5,
 } RdsBufSurfTransform_Transform_Flag;
-/* ALLOW_ODD_CROP: a 4:2:0 (NV12, YUV420) destination rect with an odd edge is aligned outward to even coordinates
- * (clamped to the surface). Without it such a rect is Invalid_Params; a right or bottom edge on the surface's own
- * edge always counts as even. Source rects may always be odd. */
 
 /* A rectangle in pixels of its surface: top-left corner (top, left) and size (width, height). It must be
  * non-empty and lie inside the surface, or the transform returns ROI_Error; it is never clamped. */
@@ -89,14 +89,17 @@ typedef struct
 
 /* Session parameters are per thread: they apply to every transform called on that thread, by any caller, until
  * changed. A thread that never set them (or called set_default_session) gets GPU 0 on the default stream. */
-RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_set_session_params (RdsBufSurfTransformConfigParams * config_params);
-RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_get_session_params (RdsBufSurfTransformConfigParams * config_params);
+RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_set_session_params (
+    RdsBufSurfTransformConfigParams * config_params);
+RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_get_session_params (
+    RdsBufSurfTransformConfigParams * config_params);
 RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_set_default_session (void);
 
-/* Transforms the first src->numFilled surfaces into dst (crop, scale, colour conversion). dst->numFilled is set
- * only on success; on error dst is not modified, apart from pixels if the GPU work itself fails. Synchronous: returns after the GPU work is complete. Both surfaces must be device-accessible (not
- * RDS_BUF_MEM_SYSTEM). Destination pixels outside dst_rect are not written. The exact sampling and colour rules
- * are documented in docs/compat-matrix.md. */
+/* Transforms the first src->numFilled surfaces into dst (crop, scale, colour conversion). Synchronous: returns
+ * after the GPU work is complete. Both surfaces must be device-accessible (not RDS_BUF_MEM_SYSTEM), and device
+ * memory (default, device) must be on the session's GPU. Destination pixels outside dst_rect are not written.
+ * dst->numFilled is set only on success; on error dst is not modified, apart from pixels if the GPU work itself
+ * fails. The exact sampling and colour rules are documented in docs/compat-matrix.md. */
 RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst,
     RdsBufSurfTransformParams * transform_params);
 
