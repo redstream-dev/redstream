@@ -2,8 +2,9 @@
 
 **GStreamer video and audio analytics on AMD GPUs: an open-source, ROCm-based functional equivalent of NVIDIA DeepStream.**
 
-> Status: **pre-alpha.** The core library `libgstrds` and the first two elements, `rdsvideodec` and
-> `rdsvideoconvert`, are in place (see "What works" below). APIs and element names will change.
+> Status: **pre-alpha.** The core library `libgstrds` and the first four elements, `rdsvideodec`,
+> `rdsvideoconvert`, `rdsstreammux` and `rdsstreamdemux`, are in place (see "What works" below). APIs and element
+> names will change.
 
 ## Why
 
@@ -41,16 +42,34 @@ Jetson-specific hardware blocks.
   memory for ordinary sinks.
 - **`rdsvideoconvert`** (`nvvideoconvert`): conversion, scaling and cropping between `memory:RDS` and system memory,
   with `nvvideoconvert`'s property names.
+- **`rdsstreammux`** (`nvstreammux`, the default mux): batches frames from any number of sources into one
+  `memory:RDS` buffer, each frame scaled into a fixed `width`×`height` slot (optionally with aspect-ratio padding),
+  with per-frame metadata, `batched-push-timeout`, live sources, DeepStream's stream events (pad added/deleted,
+  per-stream EOS, …) and sources added or removed while playing. The zero-copy "new" mux and its config file are not
+  implemented yet.
+- **`rdsstreamdemux`** (`nvstreamdemux`): splits a batch back into per-source streams without copying: each output
+  buffer is a read-only view of its slot (a writer gets its own copy), with the source's own timestamps, segment and
+  stream events.
 - **Compat header** `rds/rds_compat.h`: DeepStream names for the above, plus runtime remapping of element names
-  (`nvv4l2decoder` → `rdsvideodec`, …).
+  (`nvv4l2decoder` → `rdsvideodec`, `nvstreammux` → `rdsstreammux`, …).
 
 [`docs/compat-matrix.md`](docs/compat-matrix.md) lists every mapped name and property with its status. Built from
-this repository (see "Getting started"; `tests/media/make-test-media.sh` generates the clip), a decode and convert
+this repository (see "Getting started"; `tests/media/make-test-media.sh` generates the clips), a decode and convert
 pipeline looks like this:
 
 ```bash
 GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec \
   ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA,width=640,height=640" ! fakesink sync=false
+```
+
+Two sources batched on the GPU and split again, one `queue` per output branch:
+
+```bash
+GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 rdsstreammux name=m batch-size=2 width=1280 height=720 \
+  ! rdsstreamdemux name=d \
+  filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
+  filesrc location=.cache/media/smpte-1366x768.h264 ! h264parse ! rdsvideodec ! m.sink_1 \
+  d.src_0 ! queue ! fakesink sync=false  d.src_1 ! queue ! fakesink sync=false
 ```
 
 ## How it maps to DeepStream

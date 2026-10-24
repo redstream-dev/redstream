@@ -59,6 +59,12 @@ $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cac
 $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-1080p.h264 ! h264parse \
   ! rdsvideodec ! rdsvideoconvert interpolation-method=1 ! video/x-raw,format=RGBA,width=640,height=360 \
   ! fakesink sync=false'
+# two sources -> rdsstreammux (1280x720 slots, batch of 2) -> rdsstreamdemux, a queue per branch
+$RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 rdsstreammux name=m batch-size=2 width=1280 height=720 \
+  ! rdsstreamdemux name=d \
+  filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
+  filesrc location=.cache/media/smpte-1366x768.h264 ! h264parse ! rdsvideodec ! m.sink_1 \
+  d.src_0 ! queue ! fakesink sync=false  d.src_1 ! queue ! fakesink sync=false'
 # autoplugging: -v shows GstRdsVideoDec inside the decodebin
 $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 -v uridecodebin uri=file:///src/.cache/media/ball-720p.h264 \
   ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA" ! fakesink sync=false | grep -o "GstRdsVideoDec:[a-z0-9]*"'
@@ -76,6 +82,8 @@ $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 -v uridecodebin uri=f
 | `pci id for fd N: 10de:...` spam | harmless, VA probing the NVIDIA card on mixed-GPU hosts |
 | `device kernel image is invalid` | HIP binary was built without the GPU attached → build inside a GPU container or pass `--offload-arch=gfx1030` |
 | rocDecode wrong frames / `ROCDEC_RUNTIME_ERROR` mid-stream | feed whole NAL units or access units, not byte chunks |
-| `rdsvideodec`/`rdsvideoconvert`: `no element` | set `GST_PLUGIN_PATH_1_0=build/gst` (the build tree's plugins) |
+| `rdsvideodec`/`rdsvideoconvert`/`rdsstreammux`: `no element` | set `GST_PLUGIN_PATH_1_0=build/gst` (the build tree's plugins) |
 | first frame of each rocDecode surface all zeros (small clips) | surfaces ≤ 1 MiB must be mapped before the first decode; `rdsvideodec` does it, a bare rocDecode program must too |
+| mux/demux pipeline hangs (in preroll or after a few frames), no error | a demux branch without a `queue`, or more branches pinning batches than `rdsstreammux`'s `buffer-pool-size` (leave it unset) |
+| test process crashes at exit in libamdhip64 TLS destructors | the test `main()` must end with `gst_deinit ()` |
 | VA plugin has no `vah264dec` on the host (Fedora) | host Mesa lacks patented codecs → `mesa-va-drivers-freeworld`; the container is fine |

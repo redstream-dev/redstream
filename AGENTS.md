@@ -11,8 +11,10 @@ mechanical changes: element factory names behind an `#ifdef`, the same config fi
 metadata-traversal code via a compatibility header.
 
 Status: **pre-alpha.** Phase 0 spikes and the walking skeleton are done; the libgstrds core is in place (surfaces,
-`memory:RDS`, pools, metadata, events, the `rds_buf_surf_transform` GPU transform). The first elements exist:
-`rdsvideodec` (rocDecode H.264/H.265 decode) and `rdsvideoconvert` (convert, scale, crop). Nothing here is stable.
+`memory:RDS`, pools, metadata, events, read-only surface views, the `rds_buf_surf_transform` GPU transform). The
+elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
+`rdsstreammux` (the default scaling mux: batches of fixed-size slots) and `rdsstreamdemux` (zero-copy per-source
+views of the batch). Nothing here is stable.
 
 ## Architecture principles
 
@@ -37,7 +39,7 @@ Status: **pre-alpha.** Phase 0 spikes and the walking skeleton are done; the lib
 | `nvv4l2decoder` | `rdsvideodec` | rocDecode-backed: stock VA output is tiled on AMD, so it is not used for analytics |
 | `nvvideoconvert` | `rdsvideoconvert` | convert, scale and crop on `memory:RDS`; copies stock VA input via a linear path |
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | |
-| `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` | reads new-mux config file |
+| `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` | default (scaling) mux done; the zero-copy new mux and its config file come later |
 | `nvinfer` | `rdsinfer` | primary + secondary, custom parser ABI, tensor meta |
 | `nvtracker` | `rdstracker` | IOU/SORT-class first |
 | `nvdsosd` | `rdsosd` | bbox, text, lines, circles |
@@ -124,7 +126,8 @@ migraphx-driver perf model.onnx --input-dim @images 1 3 640 640 --fp16
 docker/            dev image (Dockerfile.dev)
 gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
   rds-buf-surface    RdsBufSurface: system/device/pinned/unified memory, pinned staging mirror for CPU access
-  rds-memory         memory:RDS allocator (map returns the RdsBufSurface)
+  rds-memory         memory:RDS allocator (map returns the RdsBufSurface); read-only surface views of one batch
+                     slot (rds_buffer_new_surface_view)
   rds-buffer-pool    RdsBufferPool, rds_propose_allocation / rds_decide_allocation
   rds-meta*, rds-osd-types  batch/frame/object/user/display meta, pools, deep copy
   rds-gst-meta       RdsMeta GstMeta on buffers (gst_buffer_get_rds_batch_meta)
@@ -135,10 +138,13 @@ gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
   *-private.h        internal headers, not installed (rds-hip-private.h is the only HIP include)
 gst/rdsvideo/      libgstrdsvideo plugin: rdsvideodec (rocDecode, gstrdsvideodec.c), rdsvideoconvert
                    (gstrdsvideoconvert.c), shared helpers in rds-video-util
+gst/rdsmux/        libgstrdsmux plugin: rdsstreammux (GstAggregator, gstrdsstreammux.c) and rdsstreamdemux
+                   (gstrdsstreamdemux.c)
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources
 samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
-tests/check/       GLib unit and element tests (suites cpu/gpu); test clips are encoded in-process
-                   (rds-test-media.h, needs the VA encoder)      tests/samples/  sample-level tests
+tests/check/       GLib unit, element and pipeline tests (suites cpu/gpu); test clips are encoded in-process
+                   (rds-test-media.h, needs the VA encoder); soak memory probes in rds-test-soak.h
+tests/samples/     sample-level tests
 tests/media/       make-test-media.sh: generated H.264 clips (into git-ignored .cache/)
 spikes/            Phase 0 experiments (rocdec-hip, migraphx-devptr); reference code, not built by meson
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
@@ -160,6 +166,12 @@ tests/media/make-test-media.sh   # generates .cache/media/*.h264 for manual runs
 # run our elements from the build tree
 GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-720p.h264 ! h264parse \
   ! rdsvideodec ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA,width=640,height=640" ! fakesink sync=false
+# two sources batched by rdsstreammux and split again by rdsstreamdemux (a queue per branch)
+GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 rdsstreammux name=m batch-size=2 width=1280 height=720 \
+  ! rdsstreamdemux name=d \
+  filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
+  filesrc location=.cache/media/smpte-1366x768.h264 ! h264parse ! rdsvideodec ! m.sink_1 \
+  d.src_0 ! queue ! fakesink sync=false  d.src_1 ! queue ! fakesink sync=false
 
 # ASan + UBSan build; tests/lsan.supp hides HIP runtime leaks
 meson setup build-asan -Db_sanitize=address,undefined -Db_lundef=false
@@ -175,25 +187,45 @@ meson test -C build-asan --print-errorlogs
 - Element tests load plugins from `build/gst` (`GST_PLUGIN_PATH_1_0`) next to the system plugins, with a private
   registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
   `gst-plugin-scanner` can't load sanitized plugins. ASan runs with `use_sigaltstack=0` (Mesa's LLVM, loaded by the
-  VA driver, installs its own alternate signal stack), and only the soak test (`pipeline_soak`, its own build of
-  `pipeline_decode_convert.c`) shrinks the ASan quarantine so its VmRSS check stays meaningful. Its GPU memory check reads
-  this process's DRM fdinfo (`drm-total-vram` + `drm-total-gtt` of its render-node fds, where HIP allocations are
-  accounted), so other processes on the GPU don't skew it; `hipMemGetInfo` is device-wide. Tests that need private symbols link `rds_internal_dep`, a
-  static copy of libgstrds. Such a test must never also link `rds_dep` or load one of our plugins in-process
-  (the plugin pulls in the shared libgstrds): two copies of the library register the same GTypes twice. They run
-  with `internal_test_env`: no plugin paths and their own registry, so even an in-process scan loads no plugin.
+  VA driver, installs its own alternate signal stack), and only the soak tests shrink the ASan quarantine so their
+  VmRSS checks stay meaningful: `pipeline_soak` and `pipeline_mux_soak`, each its own build of
+  `pipeline_decode_convert.c` / `pipeline_mux.c` with `RDS_TEST_SMALL_QUARANTINE`. Their memory probes live in
+  `tests/check/rds-test-soak.h`: VmRSS, and GPU memory from this process's DRM fdinfo (`drm-total-vram` +
+  `drm-total-gtt` of its render-node fds, where HIP allocations are accounted), so other processes on the GPU don't
+  skew it; `hipMemGetInfo` is device-wide.
+- Element and pipeline test `main()`s end with `gst_deinit ()` after `g_test_run ()`. Without it, a test process can
+  crash at exit in libamdhip64's thread-local destructors on a GStreamer task-pool thread (seen under parallel ASan
+  load).
+- Tests that need private symbols link `rds_internal_dep`, a static copy of libgstrds. Such a test must never also
+  link `rds_dep` or load one of our plugins in-process (the plugin pulls in the shared libgstrds): two copies of the
+  library register the same GTypes twice. They run with `internal_test_env`: no plugin paths and their own
+  registry, so even an in-process scan loads no plugin.
 - Library symbols are hidden by default. Mark public API with `RDS_API` (from `rds/rds-prelude.h`).
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
 - **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never
-  waits on a stream. Library copies and memsets are synchronous, on the calling thread's per-thread stream
-  (`hipStreamPerThread`), so they don't wait for other streams' work (the per-thread stream still synchronizes with
-  the legacy null stream: elements use non-blocking streams). The default transform session (`cuda_stream` NULL)
-  runs on the legacy null stream; elements set their own non-blocking stream.
+  waits on a stream. Library copies, memsets and staging syncs (`sync_for_cpu`/`sync_for_device`) are synchronous,
+  on the calling thread's per-thread stream (`hipStreamPerThread`), so they don't wait for other streams' work. The
+  per-thread stream is still a blocking stream: it synchronizes with the legacy null stream, and so does the default
+  transform session (`cuda_stream` NULL, which runs on the null stream). Elements create their own non-blocking
+  stream (`hipStreamNonBlocking`) and set it in their transform session; never queue element work on the null
+  stream.
 - Transform sessions are per thread and streaming threads are shared: elements set the transform session before
   each call and restore the previous one after (`rds_buf_surf_transform_get_session_params` first).
 - `memory:RDS` is not `NO_SHARE`: shallow buffer copies share the surface. Pixel writers must own the memory
-  exclusively (a WRITE map of shared memory gets a private deep copy). Surface views (`rds_buffer_new_surface_view`,
-  one slot of a batch) are read-only memory: `gst_buffer_make_writable` then a WRITE map swaps in an owned copy.
+  exclusively (a WRITE map of shared memory gets a private deep copy).
+- **Surface views are read-only.** `rds_buffer_new_surface_view` (one slot of a batch, what `rdsstreamdemux` pushes)
+  makes `GST_MEMORY_FLAG_READONLY` memory that refs the batch buffer. A writer (an OSD, say) calls
+  `gst_buffer_make_writable`, then `gst_buffer_map (GST_MAP_WRITE)`: GStreamer swaps in `gst_memory_copy` of the
+  view, an owned single surface, and the shared batch stays untouched. `gst_memory_map (WRITE)` on the view itself
+  fails. Never replace or remove the memory of a buffer that has views. Views of one batch slot share the batch's
+  staging mirror: map and sync a slot from one thread at a time.
+- **Demux branches:** every `rdsstreamdemux` branch needs its own `queue` (the branches share the demux's streaming
+  thread; the first sink to preroll blocks the rest). Each demuxed view pins its whole batch until released, and
+  sinks keep their last buffer, so N branches can pin N batches: leave `rdsstreammux`'s `buffer-pool-size` unset
+  (default `batch-size + 2`, at least 4) or larger than the number of branches, or the mux stalls. As with `tee`,
+  FLUSHING from one branch stops all of them: block or unlink a branch before setting it to NULL. To remove a source,
+  wait for its `rds-stream-eos` downstream before releasing its mux pad (releasing right after sending EOS into the
+  pad drops that stream-eos). A sink added while PLAYING needs `async=false`.
 - Dispatch our stream events on the cast type: `switch ((RdsEventType) GST_EVENT_TYPE (ev))`. An uncast switch
   triggers `-Wswitch`, as on DeepStream.
 - Use TDD: write the failing test first.

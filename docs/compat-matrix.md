@@ -191,6 +191,10 @@ Releasing a sink pad sends `pad-deleted` from the releasing thread. If a preroll
 pipeline is PAUSED and the mux idle), that push, and so the release, blocks until the pipeline goes to PLAYING:
 release pads while PLAYING, or from a thread that may wait.
 
+To remove a source cleanly, send EOS into its sink pad and wait for its `stream-eos (N)` downstream before releasing
+the pad: the EOS reaches the mux's batching thread only after the frames queued in front of it, and a pad released
+before that loses the frames still queued and its `stream-eos` (only `pad-deleted` goes out).
+
 ### `rdsstreamdemux` (`nvstreamdemux`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvstreamdemux.html))
 
 | Property | Type | Default | Status | Notes |
