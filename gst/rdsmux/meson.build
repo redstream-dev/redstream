@@ -1,6 +1,6 @@
 # The scaling mux compiles in the rdsvideo helpers (system-memory upload); they hold no GTypes.
 gstrdsmux = library('gstrdsmux',
-  files('plugin.c', 'gstrdsstreammux.c') + rdsvideo_util_src,
+  files('plugin.c', 'gstrdsstreammux.c', 'gstrdsstreamdemux.c') + rdsvideo_util_src,
   c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdsmux"'],
   dependencies : [rds_dep, gst_dep, gst_base_dep, gst_video_dep, hip_dep],
   gnu_symbol_visibility : 'hidden',
