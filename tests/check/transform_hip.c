@@ -482,7 +482,7 @@ test_session_stream (void)
   RdsBufSurfTransformParams tp = {.transform_flag = RDS_BUFSURF_TRANSFORM_FILTER,
     .transform_filter = RdsBufSurfTransformInter_Bilinear
   };
-  RdsBufSurface *src, *pattern, *dst;
+  RdsBufSurface *src, *pattern, *dst, *dst2;
   HostImage hpat, href, hgot;
   RefRect s = { 0, 0, 64, 48 }, d = { 0, 0, 130, 98 };
   void *scratch = NULL;
@@ -514,6 +514,22 @@ test_session_stream (void)
   snapshot (dst, 0, &hgot);
   ref_transform (&hpat.im, &href.im, s, d, TRUE);
   g_assert_cmpuint (max_diff (&hgot, &href, TRUE), <=, 1);
+  host_image_clear (&hgot);
+
+  /* Same again through the same-format, same-size fast path (a 2D copy instead of a kernel): it must be queued
+   * on the session stream too, behind the source copy. */
+  dst2 = create_surf (RDS_BUF_MEM_DEFAULT, RDS_BUF_COLOR_FORMAT_NV12, 64, 48, 1, 0);
+  fill_random (src, 0, 14);     /* stale again */
+  fill_random (dst2, 0, 15);
+  for (guint i = 0; i < 200; i++)
+    g_assert_cmpint (rds_transform_kernel_smoke (scratch, scratch_size, (guint8) i, stream), ==, 0);
+  g_assert_cmpint (hipMemcpyAsync (src->surfaceList[0].dataPtr, pattern->surfaceList[0].dataPtr,
+          src->surfaceList[0].dataSize, hipMemcpyDeviceToDevice, stream), ==, hipSuccess);
+  g_assert_cmpint (rds_buf_surf_transform (src, dst2, &tp), ==, RdsBufSurfTransformError_Success);
+  g_assert_cmpint (hipStreamQuery (stream), ==, hipSuccess);
+  snapshot (dst2, 0, &hgot);
+  g_assert_cmpuint (max_diff (&hgot, &hpat, TRUE), ==, 0);
+  g_assert_cmpint (rds_buf_surface_destroy (dst2), ==, 0);
 
   g_assert_cmpint (rds_buf_surf_transform_set_default_session (), ==, RdsBufSurfTransformError_Success);
   g_assert_cmpint (hipFree (scratch), ==, hipSuccess);
