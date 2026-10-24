@@ -5,15 +5,22 @@ install_headers(rds_headers, subdir : 'redstream-' + api_version / 'rds')
 
 hip_arch_args = []
 foreach a : get_option('offload_arch').split(',')
-  hip_arch_args += '--offload-arch=' + a.strip()
+  if a.strip() != ''
+    hip_arch_args += '--offload-arch=' + a.strip()
+  endif
 endforeach
+if hip_arch_args.length() == 0
+  error('offload_arch is empty; pass e.g. -Doffload_arch=gfx1030')
+endif
 # Not built with b_sanitize: a custom_target doesn't inherit it.
 rds_kernels_raw = custom_target('rds-transform-kernels-raw',
   input : 'rds-transform-kernels.hip',
   output : 'rds-transform-kernels-raw.o',
+  depfile : 'rds-transform-kernels-raw.d',
   depend_files : files('rds-transform-private.h'),
   command : [amdclang, '-x', 'hip', hip_arch_args, '-fPIC', '-O2', '-std=c++17', '-fvisibility=hidden',
-    '-D__HIP_PLATFORM_AMD__', '-I' + meson.current_source_dir(), '-c', '@INPUT@', '-o', '@OUTPUT@'])
+    '-D__HIP_PLATFORM_AMD__', '-I' + meson.current_source_dir(), '-MD', '-MF', '@DEPFILE@',
+    '-c', '@INPUT@', '-o', '@OUTPUT@'])
 # clang gives the HIP compilation-unit marker __hip_cuid_<hash> default visibility whatever -fvisibility says;
 # make it local so libgstrds exports only its public API.
 rds_kernels = custom_target('rds-transform-kernels',

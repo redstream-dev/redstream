@@ -164,7 +164,8 @@ meson test -C build-asan --print-errorlogs
 - Element tests load plugins from `build/gst` (`GST_PLUGIN_PATH_1_0`) next to the system plugins, with a private
   registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
   `gst-plugin-scanner` can't load sanitized plugins. Tests that need private symbols link `rds_internal_dep`, a
-  static copy of libgstrds.
+  static copy of libgstrds. Such a test must never also link `rds_dep` or load one of our plugins in-process
+  (the plugin pulls in the shared libgstrds): two copies of the library register the same GTypes twice.
 - Library symbols are hidden by default. Mark public API with `RDS_API` (from `rds/rds-prelude.h`).
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
 - **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never

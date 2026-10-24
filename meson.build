@@ -36,7 +36,8 @@ if not amdclang.found()
   error('amdclang++ not found in @0@/bin; pass -Drocm_path=/path/to/rocm'.format(rocm_path))
 endif
 
-objcopy = find_program('objcopy')
+# ROCm's llvm-objcopy understands the offload bundle sections; binutils objcopy is the fallback.
+objcopy = find_program(rocm_path / 'llvm/bin/llvm-objcopy', 'objcopy')
 
 rocdecode_lib = cc.find_library('rocdecode', dirs : [rocm_path / 'lib'], required : false)
 if not rocdecode_lib.found() or not fs.exists(rocm_path / 'include/rocdecode/rocdecode.h')
@@ -48,7 +49,8 @@ rocdecode_dep = declare_dependency(
   dependencies : rocdecode_lib)
 
 # The runtime linker finds ROCm in /opt/rocm/lib through ld.so.conf; other prefixes get an rpath.
-rds_install_rpath = rocm_path == '/opt/rocm' ? '' : rocm_path / 'lib'
+rocm_path_norm = rocm_path.endswith('/') and rocm_path != '/' ? rocm_path.substring(0, -1) : rocm_path
+rds_install_rpath = rocm_path_norm == '/opt/rocm' ? '' : rocm_path_norm / 'lib'
 
 # Plugin metadata. RDS_ORIGIN is a placeholder until the public repository exists (TODO before release).
 rds_origin = 'https://example.invalid/redstream'

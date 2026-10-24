@@ -9,7 +9,9 @@ test_env.set('UBSAN_OPTIONS', 'halt_on_error=1:abort_on_error=1:print_stacktrace
 test_env.set('GST_PLUGIN_PATH_1_0', meson.project_build_root() / 'gst')
 test_env.set('GST_REGISTRY_1_0', meson.current_build_dir() / 'registry.bin')
 # Sanitized plugins can't be loaded by gst-plugin-scanner (not linked with the ASan runtime): scan in-process.
-if get_option('b_sanitize') != 'none'
+# b_sanitize was a string option ('none', 'address,undefined') before meson 1.8 and is an array option since;
+# formatting it to a string and looking for 'address' works with both.
+if '@0@'.format(get_option('b_sanitize')).contains('address')
   test_env.set('GST_REGISTRY_FORK', 'no')
 endif
 
@@ -41,6 +43,8 @@ foreach t : gpu_tests
 endforeach
 
 # GPU tests that call private library symbols link the static internal copy of libgstrds instead.
+# Such a test must never also link rds_dep, nor load one of our plugins in-process (the plugin pulls in the
+# shared libgstrds): two copies of the library register the same GTypes twice.
 internal_gpu_tests = ['kernel_smoke']
 foreach t : internal_gpu_tests
   test(t, executable(t, 'check' / (t + '.c'), dependencies : [rds_internal_dep, gst_check_dep, hip_dep]),
