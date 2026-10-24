@@ -370,6 +370,17 @@ rds_transform_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
     return RdsBufSurfTransformError_Invalid_Params;
   }
 
+  /* 9. src and dst must not overlap: the cheap check is the same pixel memory on both sides of an entry (NULL
+   * pointers are rejected by the transform itself) */
+  for (guint i = 0; i < n; i++) {
+    gpointer sp = src->surfaceList[i].dataPtr;
+
+    if (sp != NULL && sp == dst->surfaceList[i].dataPtr) {
+      GST_ERROR ("surface %u: src and dst share the same pixel memory %p (they must not overlap)", i, sp);
+      return RdsBufSurfTransformError_Invalid_Params;
+    }
+  }
+
   return RdsBufSurfTransformError_Success;
 }
 

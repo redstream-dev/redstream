@@ -239,9 +239,12 @@ tests compare the kernels with an independent CPU implementation of these rules.
 - `transform_flip` is read only when `FLIP` is set, and must then be `None`. `transform_filter` is read only when
   `FILTER` is set (an out-of-range value is then `Invalid_Params`); without the flag the filter is nearest.
 - `NORMALIZE` is `Unsupported`.
+- Source and destination must not overlap: in-place transforms are not supported. A filled entry whose source and
+  destination share the same `dataPtr` is `Invalid_Params`; other overlaps are not detected and give undefined
+  output.
 - When several problems apply, the first in this order is reported: batch counts; VIC, `NORMALIZE`, a flip; memory
   types; the GPU of device memory; formats and layouts; sizes and plane geometry; source then destination
-  rectangles; odd 4:2:0 destination rectangles; the filter value. For example, system memory with an odd
+  rectangles; odd 4:2:0 destination rectangles; the filter value; overlapping source and destination. For example, system memory with an odd
   destination rectangle is `Unsupported`, not `Invalid_Params`.
 
 **Sampling (filters)**

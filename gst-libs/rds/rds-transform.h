@@ -97,7 +97,8 @@ RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_set_default_session (vo
 
 /* Transforms the first src->numFilled surfaces into dst (crop, scale, colour conversion). Synchronous: returns
  * after the GPU work is complete. Both surfaces must be device-accessible (not RDS_BUF_MEM_SYSTEM), and device
- * memory (default, device) must be on the session's GPU. Destination pixels outside dst_rect are not written.
+ * memory (default, device) must be on the session's GPU. src and dst must not overlap (the same pixel memory on
+ * both sides of an entry is Invalid_Params). Destination pixels outside dst_rect are not written.
  * dst->numFilled is set only on success; on error dst is not modified, apart from pixels if the GPU work itself
  * fails. The exact sampling and colour rules are documented in docs/compat-matrix.md. */
 RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst,

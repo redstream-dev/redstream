@@ -694,6 +694,7 @@ gst_rds_video_convert_transform (GstBaseTransform * trans, GstBuffer * inbuf, Gs
     .gpu_id = (gint32) self->stream_gpu,
     .cuda_stream = self->stream,
   };
+  RdsBufSurfTransformConfigParams prev_session;
   RdsBufSurfTransformParams params = { 0 };
   RdsBufSurfTransformRect src_crop, dest_crop, base, src_rect, dst_rect;
   RdsBufSurfTransform_Error err;
@@ -766,7 +767,7 @@ gst_rds_video_convert_transform (GstBaseTransform * trans, GstBuffer * inbuf, Gs
   }
 
   if (src->batchSize != 1 || dst->batchSize != 1) {
-    GST_ELEMENT_ERROR (self, STREAM, NOT_IMPLEMENTED, ("Batched input arrives in Phase 4"),
+    GST_ELEMENT_ERROR (self, STREAM, NOT_IMPLEMENTED, ("Batched input (batch size above 1) is not supported yet"),
         ("input batch size %u, output batch size %u; only 1 is supported", src->batchSize, dst->batchSize));
     goto done;
   }
@@ -791,10 +792,15 @@ gst_rds_video_convert_transform (GstBaseTransform * trans, GstBuffer * inbuf, Gs
   }
 
   /* Session parameters are per thread and shared by every element on this streaming thread: set ours before
-   * every call. */
+   * every call and restore the previous one right after, so later callers on this thread never inherit our
+   * stream (it is destroyed in stop ()). A failed set leaves the session unchanged. */
+  (void) rds_buf_surf_transform_get_session_params (&prev_session);
   err = rds_buf_surf_transform_set_session_params (&session);
-  if (err == RdsBufSurfTransformError_Success)
+  if (err == RdsBufSurfTransformError_Success) {
     err = rds_buf_surf_transform (src, dst, &params);
+    if (rds_buf_surf_transform_set_session_params (&prev_session) != RdsBufSurfTransformError_Success)
+      GST_WARNING_OBJECT (self, "cannot restore the thread's previous transform session");
+  }
   if (err != RdsBufSurfTransformError_Success) {
     GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Video conversion failed"),
         ("rds_buf_surf_transform: %s (%d)", transform_error_name (err), err));

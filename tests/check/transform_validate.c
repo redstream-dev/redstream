@@ -538,6 +538,47 @@ test_filter (void)
   g_assert_cmpint (validate (&src, &dst, &tp), ==, OK);
 }
 
+/* Rule 9: src and dst must not overlap. The same pixel memory on both sides of a filled entry is Invalid_Params;
+ * NULL pointers (as in every hand-built surface above) are left to the transform. */
+static void
+test_overlap (void)
+{
+  HandSurface src, dst;
+  RdsBufSurfTransformParams tp = { 0 };
+  guint8 pixels[4][1];
+
+  make_pair (&src, &dst);
+  src.params[0].dataPtr = pixels[0];
+  dst.params[0].dataPtr = pixels[1];
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, OK);
+  dst.params[0].dataPtr = pixels[0];
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+
+  /* the same surface passed as both src and dst */
+  hand_surface_init (&src, RDS_BUF_COLOR_FORMAT_RGBA, 64, 64, 1, 1);
+  src.params[0].dataPtr = pixels[0];
+  g_assert_cmpint (rds_transform_validate (&src.surf, &src.surf, &tp), ==, INVALID);
+
+  /* batch of 2: only the second entry overlaps */
+  make_pair_n (&src, &dst, 2);
+  src.params[0].dataPtr = pixels[0];
+  src.params[1].dataPtr = pixels[1];
+  dst.params[0].dataPtr = pixels[2];
+  dst.params[1].dataPtr = pixels[1];
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+  dst.params[1].dataPtr = pixels[3];
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, OK);
+
+  /* an unfilled dst entry past numFilled isn't looked at */
+  hand_surface_init (&src, RDS_BUF_COLOR_FORMAT_NV12, 640, 480, 2, 1);
+  hand_surface_init (&dst, RDS_BUF_COLOR_FORMAT_RGBA, 320, 240, 2, 0);
+  src.params[0].dataPtr = pixels[0];
+  src.params[1].dataPtr = pixels[1];
+  dst.params[0].dataPtr = pixels[2];
+  dst.params[1].dataPtr = pixels[1];
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, OK);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -554,5 +595,6 @@ main (int argc, char **argv)
   g_test_add_func ("/transform/validate/6-rects", test_rects);
   g_test_add_func ("/transform/validate/7-odd-crop", test_odd_crop);
   g_test_add_func ("/transform/validate/8-filter", test_filter);
+  g_test_add_func ("/transform/validate/9-overlap", test_overlap);
   return g_test_run ();
 }

@@ -178,11 +178,14 @@ meson test -C build-asan --print-errorlogs
   VA driver, installs its own alternate signal stack), and only the soak test (`pipeline_soak`, its own build of
   `pipeline_decode_convert.c`) shrinks the ASan quarantine so its VmRSS check stays meaningful. Tests that need private symbols link `rds_internal_dep`, a
   static copy of libgstrds. Such a test must never also link `rds_dep` or load one of our plugins in-process
-  (the plugin pulls in the shared libgstrds): two copies of the library register the same GTypes twice.
+  (the plugin pulls in the shared libgstrds): two copies of the library register the same GTypes twice. They run
+  with `internal_test_env`: no plugin paths and their own registry, so even an in-process scan loads no plugin.
 - Library symbols are hidden by default. Mark public API with `RDS_API` (from `rds/rds-prelude.h`).
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
 - **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never
   waits on a stream. Library copies and memsets are synchronous.
+- Transform sessions are per thread and streaming threads are shared: elements set the transform session before
+  each call and restore the previous one after (`rds_buf_surf_transform_get_session_params` first).
 - `memory:RDS` is not `NO_SHARE`: shallow buffer copies share the surface. Pixel writers must own the memory
   exclusively (a WRITE map of shared memory gets a private deep copy).
 - Dispatch our stream events on the cast type: `switch ((RdsEventType) GST_EVENT_TYPE (ev))`. An uncast switch

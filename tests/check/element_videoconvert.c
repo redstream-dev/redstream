@@ -722,45 +722,70 @@ test_convert_scale (void)
   gst_object_unref (pool);
 }
 
-/* The element sets its own session (GPU, stream) before every transform: the streaming thread (here the test
- * thread, since the harness pushes synchronously) is shared with whatever else ran there. */
+static GstPadProbeReturn
+record_thread (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gpointer user_data)
+{
+  *(GThread **) user_data = g_thread_self ();
+  return GST_PAD_PROBE_OK;
+}
+
 static void
-test_session_per_call (void)
+assert_session_equals (const RdsBufSurfTransformConfigParams * expected)
+{
+  RdsBufSurfTransformConfigParams cfg;
+
+  g_assert_cmpint (rds_buf_surf_transform_get_session_params (&cfg), ==, RdsBufSurfTransformError_Success);
+  g_assert_cmpint (cfg.compute_mode, ==, expected->compute_mode);
+  g_assert_cmpint (cfg.gpu_id, ==, expected->gpu_id);
+  g_assert_true (cfg.cuda_stream == expected->cuda_stream);
+}
+
+/* The element sets its own session (GPU, stream) before every transform and restores the streaming thread's
+ * previous one right after: that thread is shared with whatever else runs there, and the element's stream dies in
+ * stop (). GstHarness pushes synchronously, so the streaming thread is the test thread (checked with a probe). */
+static void
+test_session_restored (void)
 {
   GstHarness *h;
   GstBufferPool *pool;
   hipStream_t other = NULL;
-  gpointer element_stream = NULL;
+  GThread *streaming = NULL;
+  GstPad *srcpad;
+  const RdsBufSurfTransformConfigParams default_cfg = { 0 };
 
   RDS_TEST_REQUIRE_GPU ();
   h = make_harness (NV12_320, RGBA_160);
+  srcpad = gst_element_get_static_pad (h->element, "src");
+  gst_pad_add_probe (srcpad, GST_PAD_PROBE_TYPE_BUFFER, record_thread, &streaming, NULL);
+  gst_object_unref (srcpad);
   pool = make_pool (NV12_320, 1);
   g_assert_cmpint (hipStreamCreate (&other), ==, hipSuccess);
 
-  for (guint i = 0; i < 2; i++) {
+  for (guint i = 0; i < 3; i++) {
+    /* a caller's own session, then the default one (never set on this thread, or reset) */
     RdsBufSurfTransformConfigParams cfg = {.compute_mode = RdsBufSurfTransformCompute_GPU,.gpu_id = 0,
       .cuda_stream = other
     };
     GstBuffer *in = NULL, *out;
 
-    g_assert_cmpint (rds_buf_surf_transform_set_session_params (&cfg), ==, RdsBufSurfTransformError_Success);
+    if (i < 2)
+      g_assert_cmpint (rds_buf_surf_transform_set_session_params (&cfg), ==, RdsBufSurfTransformError_Success);
+    else
+      g_assert_cmpint (rds_buf_surf_transform_set_default_session (), ==, RdsBufSurfTransformError_Success);
     g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &in, NULL), ==, GST_FLOW_OK);
     fill_buffer (in, 20 + i);
+    streaming = NULL;
     out = gst_harness_push_and_pull (h, in);
     g_assert_nonnull (out);
-    g_assert_cmpint (rds_buf_surf_transform_get_session_params (&cfg), ==, RdsBufSurfTransformError_Success);
-    g_assert_nonnull (cfg.cuda_stream);
-    g_assert_true (cfg.cuda_stream != (gpointer) other);
-    if (i == 0)
-      element_stream = cfg.cuda_stream;
-    else
-      g_assert_true (cfg.cuda_stream == element_stream);
+    g_assert_true (streaming == g_thread_self ());
+    assert_session_equals (i < 2 ? &cfg : &default_cfg);
     gst_buffer_unref (out);
   }
 
+  gst_harness_teardown (h);
+
   g_assert_cmpint (rds_buf_surf_transform_set_default_session (), ==, RdsBufSurfTransformError_Success);
   g_assert_cmpint (hipStreamDestroy (other), ==, hipSuccess);
-  gst_harness_teardown (h);
   gst_buffer_pool_set_active (pool, FALSE);
   gst_object_unref (pool);
 }
@@ -1850,7 +1875,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/videoconvert/propose-allocation-gpu-id", test_propose_allocation_gpu_id);
   g_test_add_func ("/cpu/videoconvert/mutable-in-transition", test_mutable_in_transition);
   g_test_add_func ("/gpu/videoconvert/convert-scale", test_convert_scale);
-  g_test_add_func ("/gpu/videoconvert/session-per-call", test_session_per_call);
+  g_test_add_func ("/gpu/videoconvert/session-restored", test_session_restored);
   g_test_add_func ("/gpu/videoconvert/passthrough", test_passthrough);
   g_test_add_func ("/gpu/videoconvert/batch-rejected", test_batch_rejected);
   g_test_add_func ("/gpu/videoconvert/batch-meta-kept", test_batch_meta_kept);

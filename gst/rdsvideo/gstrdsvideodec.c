@@ -862,7 +862,9 @@ gst_rds_video_dec_start (GstVideoDecoder * dec)
     GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND, ("GPU %u is not available", gpu_id), (NULL));
     return FALSE;
   }
-  err = hipStreamCreateWithFlags (&self->stream, hipStreamDefault);
+  /* Non-blocking, as in rdsvideoconvert: decoders in one process must not serialize against the legacy null
+   * stream. The output copies synchronize this stream before the frame is finished (ready-on-push). */
+  err = hipStreamCreateWithFlags (&self->stream, hipStreamNonBlocking);
   (void) hipSetDevice (prev);
   if (err != hipSuccess) {
     self->stream = NULL;
