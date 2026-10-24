@@ -13,6 +13,46 @@ typedef struct
   RdsBufSurfaceParams params[2];
 } HandSurface;
 
+/* Plane geometry as rds_buf_surface_create () lays it out (validation checks it). */
+static void
+hand_planes (RdsBufSurfaceParams * p)
+{
+  guint n = 1, bpp0 = 4, cbpp = 1;
+  guint32 offset = 0;
+
+  switch (p->colorFormat) {
+    case RDS_BUF_COLOR_FORMAT_GRAY8:
+      bpp0 = 1;
+      break;
+    case RDS_BUF_COLOR_FORMAT_YUV420:
+      n = 3, bpp0 = 1, cbpp = 1;
+      break;
+    case RDS_BUF_COLOR_FORMAT_NV12:
+      n = 2, bpp0 = 1, cbpp = 2;
+      break;
+    case RDS_BUF_COLOR_FORMAT_RGB:
+    case RDS_BUF_COLOR_FORMAT_BGR:
+      bpp0 = 3;
+      break;
+    default:
+      break;
+  }
+  p->planeParams.num_planes = n;
+  for (guint pl = 0; pl < n; pl++) {
+    RdsBufSurfacePlaneParams *pp = &p->planeParams;
+
+    pp->width[pl] = pl == 0 ? p->width : (p->width + 1) / 2;
+    pp->height[pl] = pl == 0 ? p->height : (p->height + 1) / 2;
+    pp->bytesPerPix[pl] = pl == 0 ? bpp0 : cbpp;
+    pp->pitch[pl] = GST_ROUND_UP_N (pp->width[pl] * pp->bytesPerPix[pl], RDS_BUF_SURFACE_PITCH_ALIGN);
+    pp->psize[pl] = pp->pitch[pl] * pp->height[pl];
+    pp->offset[pl] = offset;
+    offset += pp->psize[pl];
+  }
+  p->pitch = p->planeParams.pitch[0];
+  p->dataSize = offset;
+}
+
 static void
 hand_surface_init (HandSurface * h, RdsBufSurfaceColorFormat fmt, guint32 w, guint32 h_, guint32 batch,
     guint32 filled)
@@ -29,10 +69,10 @@ hand_surface_init (HandSurface * h, RdsBufSurfaceColorFormat fmt, guint32 w, gui
 
     p->width = w;
     p->height = h_;
-    p->pitch = GST_ROUND_UP_N (w * 4, RDS_BUF_SURFACE_PITCH_ALIGN);
     p->colorFormat = fmt;
     p->layout = RDS_BUF_LAYOUT_PITCH;
     p->dataPtr = NULL;
+    hand_planes (p);
   }
 }
 

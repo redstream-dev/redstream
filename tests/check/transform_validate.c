@@ -18,6 +18,46 @@ typedef struct
   RdsBufSurfaceParams params[2];
 } HandSurface;
 
+/* Plane geometry as rds_buf_surface_create () lays it out (validation checks it). */
+static void
+hand_planes (RdsBufSurfaceParams * p)
+{
+  guint n = 1, bpp0 = 4, cbpp = 1;
+  guint32 offset = 0;
+
+  switch (p->colorFormat) {
+    case RDS_BUF_COLOR_FORMAT_GRAY8:
+      bpp0 = 1;
+      break;
+    case RDS_BUF_COLOR_FORMAT_YUV420:
+      n = 3, bpp0 = 1, cbpp = 1;
+      break;
+    case RDS_BUF_COLOR_FORMAT_NV12:
+      n = 2, bpp0 = 1, cbpp = 2;
+      break;
+    case RDS_BUF_COLOR_FORMAT_RGB:
+    case RDS_BUF_COLOR_FORMAT_BGR:
+      bpp0 = 3;
+      break;
+    default:
+      break;
+  }
+  p->planeParams.num_planes = n;
+  for (guint pl = 0; pl < n; pl++) {
+    RdsBufSurfacePlaneParams *pp = &p->planeParams;
+
+    pp->width[pl] = pl == 0 ? p->width : (p->width + 1) / 2;
+    pp->height[pl] = pl == 0 ? p->height : (p->height + 1) / 2;
+    pp->bytesPerPix[pl] = pl == 0 ? bpp0 : cbpp;
+    pp->pitch[pl] = GST_ROUND_UP_N (pp->width[pl] * pp->bytesPerPix[pl], RDS_BUF_SURFACE_PITCH_ALIGN);
+    pp->psize[pl] = pp->pitch[pl] * pp->height[pl];
+    pp->offset[pl] = offset;
+    offset += pp->psize[pl];
+  }
+  p->pitch = p->planeParams.pitch[0];
+  p->dataSize = offset;
+}
+
 static void
 hand_surface_init (HandSurface * h, RdsBufSurfaceColorFormat fmt, guint32 w, guint32 h_, guint32 batch,
     guint32 filled)
@@ -34,10 +74,10 @@ hand_surface_init (HandSurface * h, RdsBufSurfaceColorFormat fmt, guint32 w, gui
 
     p->width = w;
     p->height = h_;
-    p->pitch = GST_ROUND_UP_N (w * 4, RDS_BUF_SURFACE_PITCH_ALIGN);
     p->colorFormat = fmt;
     p->layout = RDS_BUF_LAYOUT_PITCH;
     p->dataPtr = NULL;
+    hand_planes (p);
   }
 }
 
@@ -263,6 +303,91 @@ test_formats (void)
   g_assert_cmpint (validate (&src, &dst, &tp), ==, OK);
 }
 
+/* Rule 5b: sizes up to RDS_BUF_SURFACE_MAX_DIM and plane geometry that holds the format; surfaces made by
+ * rds_buf_surface_create () always pass. */
+static void
+test_geometry (void)
+{
+  static const RdsBufSurfaceColorFormat all[] = {
+    RDS_BUF_COLOR_FORMAT_GRAY8, RDS_BUF_COLOR_FORMAT_YUV420, RDS_BUF_COLOR_FORMAT_NV12,
+    RDS_BUF_COLOR_FORMAT_RGBA, RDS_BUF_COLOR_FORMAT_BGRA, RDS_BUF_COLOR_FORMAT_RGBx,
+    RDS_BUF_COLOR_FORMAT_BGRx, RDS_BUF_COLOR_FORMAT_RGB, RDS_BUF_COLOR_FORMAT_BGR,
+  };
+  static const guint32 sizes[][2] = { {1, 1}, {37, 29}, {640, 480}, {RDS_BUF_SURFACE_MAX_DIM, 2} };
+  HandSurface src, dst;
+  RdsBufSurfTransformParams tp = { 0 };
+
+  /* system-memory surfaces from rds_buf_surface_create: only the geometry matters to validation */
+  for (guint f = 0; f < G_N_ELEMENTS (all); f++) {
+    for (guint z = 0; z < G_N_ELEMENTS (sizes); z++) {
+      RdsBufSurfaceCreateParams cp = {
+        .width = sizes[z][0], .height = sizes[z][1], .colorFormat = all[f],
+        .layout = RDS_BUF_LAYOUT_PITCH, .memType = RDS_BUF_MEM_SYSTEM,
+      };
+      RdsBufSurface *made = NULL;
+
+      g_assert_cmpint (rds_buf_surface_create (&made, 1, &cp), ==, 0);
+      made->numFilled = 1;
+      made->memType = RDS_BUF_MEM_DEFAULT;      /* passes rule 4; nothing is launched */
+      hand_surface_init (&dst, RDS_BUF_COLOR_FORMAT_RGBA, 32, 32, 1, 0);
+      g_assert_cmpint (rds_transform_validate (made, &dst.surf, &tp), ==, OK);
+      hand_surface_init (&src, RDS_BUF_COLOR_FORMAT_RGBA, 32, 32, 1, 1);
+      g_assert_cmpint (rds_transform_validate (&src.surf, made, &tp), ==, OK);
+      made->memType = RDS_BUF_MEM_SYSTEM;
+      g_assert_cmpint (rds_buf_surface_destroy (made), ==, 0);
+    }
+  }
+
+  /* too large, either side, either dimension */
+  hand_surface_init (&src, RDS_BUF_COLOR_FORMAT_GRAY8, RDS_BUF_SURFACE_MAX_DIM + 1, 2, 1, 1);
+  hand_surface_init (&dst, RDS_BUF_COLOR_FORMAT_RGBA, 32, 32, 1, 0);
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+  hand_surface_init (&src, RDS_BUF_COLOR_FORMAT_GRAY8, 2, RDS_BUF_SURFACE_MAX_DIM + 1, 1, 1);
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+  hand_surface_init (&src, RDS_BUF_COLOR_FORMAT_RGBA, 32, 32, 1, 1);
+  hand_surface_init (&dst, RDS_BUF_COLOR_FORMAT_NV12, RDS_BUF_SURFACE_MAX_DIM + 2, 2, 1, 0);
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+
+  /* plane count */
+  make_pair (&src, &dst);
+  src.params[0].planeParams.num_planes = 1;
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+  make_pair (&src, &dst);
+  src.params[0].planeParams.num_planes = 3;
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+  make_pair (&src, &dst);
+  dst.params[0].planeParams.num_planes = 0;
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+
+  /* pitch and height per plane (NV12: plane 1 rows are 2 * ceil (w / 2) bytes, ceil (h / 2) rows) */
+  hand_surface_init (&src, RDS_BUF_COLOR_FORMAT_NV12, 37, 29, 1, 1);
+  hand_surface_init (&dst, RDS_BUF_COLOR_FORMAT_RGB, 37, 29, 1, 0);
+  src.params[0].planeParams.pitch[1] = 37;
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+  src.params[0].planeParams.pitch[1] = 38;
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, OK);
+  src.params[0].planeParams.height[1] = 14;
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+  hand_surface_init (&src, RDS_BUF_COLOR_FORMAT_NV12, 37, 29, 1, 1);
+  src.params[0].planeParams.height[0] = 28;
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+  hand_surface_init (&src, RDS_BUF_COLOR_FORMAT_NV12, 37, 29, 1, 1);
+  dst.params[0].planeParams.pitch[0] = 110;     /* RGB needs 111 */
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+  dst.params[0].planeParams.pitch[0] = 111;
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, OK);
+  /* I420 chroma planes */
+  hand_surface_init (&src, RDS_BUF_COLOR_FORMAT_YUV420, 37, 29, 1, 1);
+  src.params[0].planeParams.pitch[2] = 18;
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, INVALID);
+  /* only filled surfaces are checked */
+  hand_surface_init (&src, RDS_BUF_COLOR_FORMAT_NV12, 640, 480, 2, 1);
+  hand_surface_init (&dst, RDS_BUF_COLOR_FORMAT_RGBA, 320, 240, 2, 0);
+  src.params[1].planeParams.num_planes = 0;
+  dst.params[1].planeParams.pitch[0] = 0;
+  g_assert_cmpint (validate (&src, &dst, &tp), ==, OK);
+}
+
 /* Rule 6: rect arrays and bounds. */
 static void
 test_rects (void)
@@ -425,6 +550,7 @@ main (int argc, char **argv)
   g_test_add_func ("/transform/validate/4-mem-types", test_mem_types);
   g_test_add_func ("/transform/validate/4b-gpu-id", test_gpu_id);
   g_test_add_func ("/transform/validate/5-formats", test_formats);
+  g_test_add_func ("/transform/validate/5b-geometry", test_geometry);
   g_test_add_func ("/transform/validate/6-rects", test_rects);
   g_test_add_func ("/transform/validate/7-odd-crop", test_odd_crop);
   g_test_add_func ("/transform/validate/8-filter", test_filter);

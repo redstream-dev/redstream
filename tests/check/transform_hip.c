@@ -365,6 +365,10 @@ test_crop (void)
       c.srect = (RefRect) { 10, 6, 34, 22 };
       c.drect = (RefRect) { 6, 2, 34, 22 };
       check_case (&c, pair_is_exact (c.sfmt, c.dfmt) && !bl ? 0 : 1, "same-size-crop");
+
+      /* same size from an odd source corner: on 4:2:0 this is not a plain plane copy (kernel path) */
+      c.srect = (RefRect) { 3, 5, 34, 22 };
+      check_case (&c, pair_is_exact (c.sfmt, c.dfmt) && !bl ? 0 : 1, "same-size-odd-corner");
     }
   }
 }
@@ -465,23 +469,61 @@ test_mem_types (void)
   }
 }
 
+/* The transform runs on the session stream, after work already queued there. The stream is non-blocking, so it
+ * doesn't synchronize with the null stream: a transform launched on the null stream (or synchronizing only that)
+ * would read the source before the queued copy lands, or return before its own work is done. The queue ahead of
+ * the copy is a long run of fill kernels on a scratch buffer, so the window is wide. */
 static void
 test_session_stream (void)
 {
+  const gsize scratch_size = 64 << 20;
   hipStream_t stream = NULL;
   RdsBufSurfTransformConfigParams cfg = {.compute_mode = RdsBufSurfTransformCompute_GPU,.gpu_id = 0 };
-  Case c;
+  RdsBufSurfTransformParams tp = {.transform_flag = RDS_BUFSURF_TRANSFORM_FILTER,
+    .transform_filter = RdsBufSurfTransformInter_Bilinear
+  };
+  RdsBufSurface *src, *pattern, *dst;
+  HostImage hpat, href, hgot;
+  RefRect s = { 0, 0, 64, 48 }, d = { 0, 0, 130, 98 };
+  void *scratch = NULL;
 
   RDS_TEST_REQUIRE_GPU ();
-  g_assert_cmpint (hipStreamCreate (&stream), ==, hipSuccess);
+  src = create_surf (RDS_BUF_MEM_DEFAULT, RDS_BUF_COLOR_FORMAT_NV12, 64, 48, 1, 0);
+  pattern = create_surf (RDS_BUF_MEM_DEFAULT, RDS_BUF_COLOR_FORMAT_NV12, 64, 48, 1, 0);
+  dst = create_surf (RDS_BUF_MEM_DEFAULT, RDS_BUF_COLOR_FORMAT_BGRA, 130, 98, 1, 0);
+  fill_random (src, 0, 11);     /* stale content the transform must not see */
+  fill_random (pattern, 0, 12);
+  fill_random (dst, 0, 13);
+  snapshot (pattern, 0, &hpat);
+  snapshot (dst, 0, &href);
+  src->numFilled = 1;
+
+  g_assert_cmpint (hipStreamCreateWithFlags (&stream, hipStreamNonBlocking), ==, hipSuccess);
+  g_assert_cmpint (hipMalloc (&scratch, scratch_size), ==, hipSuccess);
   cfg.cuda_stream = stream;
   g_assert_cmpint (rds_buf_surf_transform_set_session_params (&cfg), ==, RdsBufSurfTransformError_Success);
-  c = simple_case (RDS_BUF_COLOR_FORMAT_NV12, 64, 48, RDS_BUF_COLOR_FORMAT_BGRA, 130, 98, TRUE);
-  check_case (&c, 1, "stream");
-  c = simple_case (RDS_BUF_COLOR_FORMAT_RGBA, 64, 48, RDS_BUF_COLOR_FORMAT_RGBA, 64, 48, FALSE);
-  check_case (&c, 0, "stream-copy");
+
+  for (guint i = 0; i < 200; i++)
+    g_assert_cmpint (rds_transform_kernel_smoke (scratch, scratch_size, (guint8) i, stream), ==, 0);
+  g_assert_cmpint (hipMemcpyAsync (src->surfaceList[0].dataPtr, pattern->surfaceList[0].dataPtr,
+          src->surfaceList[0].dataSize, hipMemcpyDeviceToDevice, stream), ==, hipSuccess);
+  g_assert_cmpint (rds_buf_surf_transform (src, dst, &tp), ==, RdsBufSurfTransformError_Success);
+  /* no further synchronization: the transform has synchronized its stream */
+  g_assert_cmpint (hipStreamQuery (stream), ==, hipSuccess);
+
+  snapshot (dst, 0, &hgot);
+  ref_transform (&hpat.im, &href.im, s, d, TRUE);
+  g_assert_cmpuint (max_diff (&hgot, &href, TRUE), <=, 1);
+
   g_assert_cmpint (rds_buf_surf_transform_set_default_session (), ==, RdsBufSurfTransformError_Success);
+  g_assert_cmpint (hipFree (scratch), ==, hipSuccess);
   g_assert_cmpint (hipStreamDestroy (stream), ==, hipSuccess);
+  host_image_clear (&hgot);
+  host_image_clear (&href);
+  host_image_clear (&hpat);
+  g_assert_cmpint (rds_buf_surface_destroy (dst), ==, 0);
+  g_assert_cmpint (rds_buf_surface_destroy (pattern), ==, 0);
+  g_assert_cmpint (rds_buf_surface_destroy (src), ==, 0);
 }
 
 static void

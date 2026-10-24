@@ -165,6 +165,84 @@ check_formats (const RdsBufSurface * surf, guint n, const gchar * side)
   return TRUE;
 }
 
+/* The plane count of a supported format, and the minimum row bytes and rows of plane @pl at @w x @h. */
+static guint
+expected_planes (RdsBufSurfaceColorFormat fmt)
+{
+  switch (fmt) {
+    case RDS_BUF_COLOR_FORMAT_YUV420:
+      return 3;
+    case RDS_BUF_COLOR_FORMAT_NV12:
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+static void
+expected_plane_size (RdsBufSurfaceColorFormat fmt, guint pl, guint32 w, guint32 h, guint64 * row_bytes,
+    guint64 * rows)
+{
+  guint64 cw = ((guint64) w + 1) / 2, ch = ((guint64) h + 1) / 2;
+
+  switch (fmt) {
+    case RDS_BUF_COLOR_FORMAT_YUV420:
+      *row_bytes = pl == 0 ? w : cw;
+      *rows = pl == 0 ? h : ch;
+      return;
+    case RDS_BUF_COLOR_FORMAT_NV12:
+      *row_bytes = pl == 0 ? w : cw * 2;
+      *rows = pl == 0 ? h : ch;
+      return;
+    case RDS_BUF_COLOR_FORMAT_GRAY8:
+      *row_bytes = w;
+      break;
+    case RDS_BUF_COLOR_FORMAT_RGB:
+    case RDS_BUF_COLOR_FORMAT_BGR:
+      *row_bytes = (guint64) w * 3;
+      break;
+    default:                   /* 4 bytes per pixel */
+      *row_bytes = (guint64) w * 4;
+      break;
+  }
+  *rows = h;
+}
+
+/* Rule 5b: sizes within RDS_BUF_SURFACE_MAX_DIM (the kernel's index arithmetic is 32-bit and sized for it), and
+ * plane geometry that holds the format: the right plane count, and every plane's pitch and height large enough
+ * for its rows. Surfaces from rds_buf_surface_create () always pass; this catches hand-built ones. */
+static gboolean
+check_geometry (const RdsBufSurface * surf, guint n, const gchar * side)
+{
+  for (guint i = 0; i < n; i++) {
+    const RdsBufSurfaceParams *p = &surf->surfaceList[i];
+    const RdsBufSurfacePlaneParams *pp = &p->planeParams;
+
+    if (p->width == 0 || p->height == 0 || p->width > RDS_BUF_SURFACE_MAX_DIM
+        || p->height > RDS_BUF_SURFACE_MAX_DIM) {
+      GST_ERROR ("%s surface %u: size %ux%u is empty or larger than %u", side, i, p->width, p->height,
+          RDS_BUF_SURFACE_MAX_DIM);
+      return FALSE;
+    }
+    if (pp->num_planes != expected_planes (p->colorFormat)) {
+      GST_ERROR ("%s surface %u: %u planes, the format has %u", side, i, pp->num_planes,
+          expected_planes (p->colorFormat));
+      return FALSE;
+    }
+    for (guint pl = 0; pl < pp->num_planes; pl++) {
+      guint64 row_bytes, rows;
+
+      expected_plane_size (p->colorFormat, pl, p->width, p->height, &row_bytes, &rows);
+      if (pp->pitch[pl] < row_bytes || pp->height[pl] < rows) {
+        GST_ERROR ("%s surface %u plane %u: pitch %u / height %u too small for %" G_GUINT64_FORMAT
+            " bytes x %" G_GUINT64_FORMAT " rows", side, i, pl, pp->pitch[pl], pp->height[pl], row_bytes, rows);
+        return FALSE;
+      }
+    }
+  }
+  return TRUE;
+}
+
 /* Rule 6: rects present, non-empty and inside their surfaces (64-bit sums, so wrap-around can't pass). */
 static RdsBufSurfTransform_Error
 check_rects (const RdsBufSurface * surf, const RdsBufSurfTransformRect * rects, guint n, const gchar * side)
@@ -261,6 +339,10 @@ rds_transform_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
   /* 5. formats and layouts */
   if (!check_formats (src, n, "src") || !check_formats (dst, n, "dst"))
     return RdsBufSurfTransformError_Unsupported;
+
+  /* 5b. sizes and plane geometry */
+  if (!check_geometry (src, n, "src") || !check_geometry (dst, n, "dst"))
+    return RdsBufSurfTransformError_Invalid_Params;
 
   /* 6. rects */
   if (tp->transform_flag & RDS_BUFSURF_TRANSFORM_CROP_SRC) {
@@ -404,14 +486,21 @@ is_plain_copy (const RdsKernelJob * job)
 }
 
 static gboolean
-copy_rect (const RdsKernelJob * job, const RdsBufSurfaceParams * dp, hipStream_t stream)
+copy_rect (const RdsKernelJob * job, hipStream_t stream)
 {
-  for (guint p = 0; p < dp->planeParams.num_planes; p++) {
+  RdsBufSurfaceColorFormat fmt = (RdsBufSurfaceColorFormat) job->dst.format;
+
+  for (guint p = 0; p < expected_planes (fmt); p++) {
     guint div = p == 0 ? 1 : 2;     /* only 4:2:0 formats have more than one plane */
-    guint bpp = dp->planeParams.bytesPerPix[p];
-    const guint8 *s = job->src.data + job->src.offset[p] + (gsize) (job->st / div) * job->src.pitch[p]
+    guint64 bpp, rows;
+    const guint8 *s;
+    guint8 *d;
+
+    /* bytes per pixel from the format, not from the (unchecked) bytesPerPix of a hand-built surface */
+    expected_plane_size (fmt, p, 1, 1, &bpp, &rows);
+    s = job->src.data + job->src.offset[p] + (gsize) (job->st / div) * job->src.pitch[p]
         + (gsize) (job->sl / div) * bpp;
-    guint8 *d = job->dst.data + job->dst.offset[p] + (gsize) (job->dt / div) * job->dst.pitch[p]
+    d = job->dst.data + job->dst.offset[p] + (gsize) (job->dt / div) * job->dst.pitch[p]
         + (gsize) (job->dl / div) * bpp;
 
     if (!RDS_HIP_CHECK (hipMemcpy2DAsync (d, job->dst.pitch[p], s, job->src.pitch[p],
@@ -453,7 +542,7 @@ rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst, RdsBufSurfTran
 
     build_job (src, dst, transform_params, i, bilinear, &job);
     if (is_plain_copy (&job)) {
-      if (!copy_rect (&job, &dst->surfaceList[i], stream))
+      if (!copy_rect (&job, stream))
         ret = RdsBufSurfTransformError_Execution_Error;
     } else if (rds_transform_launch (&job, stream) != 0) {
       GST_ERROR ("kernel launch failed for surface %u (library built for another GPU architecture?)", i);
