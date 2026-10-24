@@ -11,7 +11,8 @@ test_env.set('GST_REGISTRY_1_0', meson.current_build_dir() / 'registry.bin')
 # Sanitized plugins can't be loaded by gst-plugin-scanner (not linked with the ASan runtime): scan in-process.
 # b_sanitize was a string option ('none', 'address,undefined') before meson 1.8 and is an array option since;
 # formatting it to a string and looking for 'address' works with both.
-if '@0@'.format(get_option('b_sanitize')).contains('address')
+asan = '@0@'.format(get_option('b_sanitize')).contains('address')
+if asan
   test_env.set('GST_REGISTRY_FORK', 'no')
 endif
 
@@ -78,6 +79,21 @@ test('element_videodec_cpu', element_videodec_exe, args : ['-p', '/cpu/videodec'
 test('element_videodec', element_videodec_exe, args : ['-p', '/gpu/videodec'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
+# Decode + convert integration: autoplugging, end to end against vah264dec + the CPU reference, and the soak.
+# The soak (3000 1280x720 frames, leak check) is its own test entry, `meson test -C build pipeline_soak`; it takes
+# about 9 s (also under ASan), so it stays in the gpu suite.
+pipeline_exe = executable('pipeline_decode_convert', 'check' / 'pipeline_decode_convert.c',
+  dependencies : test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)])
+test('pipeline_decode_convert', pipeline_exe, args : ['-p', '/gpu/pipeline'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+test('pipeline_soak', pipeline_exe, args : ['-p', '/gpu/soak'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
+
+# The dry run checks the compat mapping; gst-inspect-1.0 (when found) checks that the mapped decoder and
+# converter resolve to real elements from the build tree. Not in ASan builds: the uninstrumented gst-inspect-1.0
+# can't load sanitized plugins in-process (plugin_load covers loading there).
+gst_inspect = find_program('gst-inspect-1.0', required : false)
 test('rds_test3_dry_run',
   find_program('samples/rds_test3_dry_run.sh'),
-  args : [rds_test3_exe], suite : 'cpu', env : test_env)
+  args : [rds_test3_exe, gst_inspect.found() and not asan ? gst_inspect.full_path() : ''],
+  suite : 'cpu', env : test_env, depends : rds_plugins)

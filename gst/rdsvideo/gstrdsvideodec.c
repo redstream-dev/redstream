@@ -374,43 +374,65 @@ reconfigure_decoder (GstRdsVideoDec * self, const RocdecVideoFormat * fmt, guint
   return TRUE;
 }
 
-/* New output caps for a @width x @height display size: memory:RDS when downstream takes it, else system memory. */
+/* negotiate vfunc: picks the output memory again on every negotiation (memory:RDS when downstream takes it, else
+ * system memory), so a RECONFIGURE from a new downstream peer can move the output between the two. That happens
+ * under decodebin: it exposes and links the decoded pad only after the first caps, so the first choice was made
+ * against an unlinked pad that accepts anything. */
 static gboolean
-set_output_state (GstRdsVideoDec * self, guint width, guint height)
+gst_rds_video_dec_negotiate (GstVideoDecoder * dec)
 {
-  GstVideoDecoder *dec = GST_VIDEO_DECODER (self);
-  GstVideoCodecState *state;
+  GstVideoDecoderClass *parent = GST_VIDEO_DECODER_CLASS (gst_rds_video_dec_parent_class);
+  GstVideoCodecState *state = gst_video_decoder_get_output_state (dec);
   GstCaps *rds_caps, *peer;
   gboolean rds, ok;
 
-  state = gst_video_decoder_set_output_state (dec, GST_VIDEO_FORMAT_NV12, width, height, self->input_state);
   if (state == NULL)
-    return FALSE;
+    return parent->negotiate (dec);
+
   rds_caps = gst_video_info_to_caps (&state->info);
   gst_caps_set_features_simple (rds_caps, gst_caps_features_new_static_str (RDS_CAPS_FEATURE_MEMORY_RDS, NULL));
   peer = gst_pad_peer_query_caps (GST_VIDEO_DECODER_SRC_PAD (dec), rds_caps);
   rds = !gst_caps_is_empty (peer);
   gst_caps_unref (peer);
-  if (rds) {
+  gst_clear_caps (&state->caps);
+  gst_clear_caps (&state->allocation_caps);
+  if (rds)
     state->caps = rds_caps;
-  } else {
-    gst_caps_unref (rds_caps);
-    state->caps = gst_video_info_to_caps (&state->info);
+  else
+    gst_caps_unref (rds_caps);  /* the base class derives system-memory caps from the info */
+  ok = parent->negotiate (dec);
+  if (!ok && rds) {
+    /* downstream said it takes memory:RDS but then refused it (caps or allocation): fall back to system memory */
+    GST_INFO_OBJECT (dec, "memory:RDS output did not negotiate, retrying with system memory");
+    gst_clear_caps (&state->caps);
+    gst_clear_caps (&state->allocation_caps);
+    ok = parent->negotiate (dec);
   }
-  GST_DEBUG_OBJECT (self, "output caps %" GST_PTR_FORMAT, state->caps);
+  GST_DEBUG_OBJECT (dec, "output caps %" GST_PTR_FORMAT ": %s", state->caps, ok ? "negotiated" : "failed");
+  gst_video_codec_state_unref (state);
+  return ok;
+}
+
+/* New output state for a @width x @height display size, negotiated right away. */
+static gboolean
+set_output_state (GstRdsVideoDec * self, guint width, guint height)
+{
+  GstVideoDecoder *dec = GST_VIDEO_DECODER (self);
+  GstVideoCodecState *state;
+  gboolean ok;
+
+  state = gst_video_decoder_set_output_state (dec, GST_VIDEO_FORMAT_NV12, width, height, self->input_state);
+  if (state == NULL)
+    return FALSE;
+  gst_video_codec_state_unref (state);
   self->out_width = width;
   self->out_height = height;
   self->output_dirty = FALSE;
   ok = gst_video_decoder_negotiate (dec);
-  if (!ok && rds) {
-    /* downstream said it takes memory:RDS but then refused it (caps or allocation): fall back to system memory */
-    GST_INFO_OBJECT (self, "memory:RDS output did not negotiate, retrying with system memory");
-    gst_clear_caps (&state->caps);
-    gst_clear_caps (&state->allocation_caps);
-    state->caps = gst_video_info_to_caps (&state->info);
+  /* Pushing the caps can get the pad linked to a new peer (decodebin exposes it then), which sends RECONFIGURE:
+   * choose again now, before a buffer is allocated in the first choice's memory. */
+  if (ok && gst_pad_check_reconfigure (GST_VIDEO_DECODER_SRC_PAD (dec)))
     ok = gst_video_decoder_negotiate (dec);
-  }
-  gst_video_codec_state_unref (state);
   return ok;
 }
 
@@ -1019,6 +1041,7 @@ gst_rds_video_dec_class_init (GstRdsVideoDecClass * klass)
   dec_class->finish = GST_DEBUG_FUNCPTR (gst_rds_video_dec_finish);
   dec_class->flush = GST_DEBUG_FUNCPTR (gst_rds_video_dec_flush);
   dec_class->decide_allocation = GST_DEBUG_FUNCPTR (gst_rds_video_dec_decide_allocation);
+  dec_class->negotiate = GST_DEBUG_FUNCPTR (gst_rds_video_dec_negotiate);
 }
 
 static void

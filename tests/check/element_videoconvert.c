@@ -814,11 +814,12 @@ test_batch_rejected (void)
   GstHarness *h;
   GstBufferPool *pool;
   GstBuffer *in = NULL;
-  GstBus *bus = gst_bus_new ();
+  GstBus *bus;
   GstMessage *msg;
   GError *err = NULL;
 
   RDS_TEST_REQUIRE_GPU ();
+  bus = gst_bus_new ();
   h = make_harness (NV12_320, RGBA_160);
   gst_element_set_bus (h->element, bus);
   pool = make_pool (NV12_320, 2);
@@ -1104,13 +1105,14 @@ test_propose_allocation (void)
   GstHarness *h;
   GstBufferPool *pool, *proposed = NULL;
   GstBuffer *in = NULL, *out;
-  GstCaps *caps = gst_caps_from_string (NV12_320);
+  GstCaps *caps;
   GstQuery *query;
   GstStructure *config;
   guint min = 0, batch = 0, gpu = 99;
   RdsBufSurfaceMemType mt = RDS_BUF_MEM_SYSTEM;
 
   RDS_TEST_REQUIRE_GPU ();
+  caps = gst_caps_from_string (NV12_320);
   h = make_harness (NV12_320, RGBA_160);
   pool = make_pool (NV12_320, 1);
   g_assert_cmpint (gst_buffer_pool_acquire_buffer (pool, &in, NULL), ==, GST_FLOW_OK);
@@ -1143,7 +1145,7 @@ test_propose_allocation (void)
 static void
 test_decide_allocation (void)
 {
-  GstElement *e = gst_element_factory_make ("rdsvideoconvert", NULL);
+  GstElement *e;
   GstHarness *h;
   GstBufferPool *pool, *outpool;
   GstBuffer *in = NULL, *out;
@@ -1152,6 +1154,7 @@ test_decide_allocation (void)
   RdsBufSurfaceMemType mt = RDS_BUF_MEM_SYSTEM;
 
   RDS_TEST_REQUIRE_GPU ();
+  e = gst_element_factory_make ("rdsvideoconvert", NULL);
   g_object_set (e, "nvbuf-memory-type", 3, "output-buffers", 6, NULL);
   h = gst_harness_new_with_element (e, "sink", "src");
   gst_harness_set_src_caps_str (h, NV12_320);
@@ -1520,11 +1523,12 @@ test_sys_foreign_layout (void)
   GstVideoInfo info;
   gsize offset[GST_VIDEO_MAX_PLANES] = { 0 };
   gint stride[GST_VIDEO_MAX_PLANES] = { 0 };
-  GstCaps *caps = gst_caps_from_string (SYS_NV12_320);
+  GstCaps *caps;
   HostImage hin, hout;
   RefRect s = { 0, 0, 320, 240 }, d = { 0, 0, 160, 120 };
 
   RDS_TEST_REQUIRE_GPU ();
+  caps = gst_caps_from_string (SYS_NV12_320);
   g_assert_true (gst_video_info_from_caps (&info, caps));
   stride[0] = 384;
   stride[1] = 352;

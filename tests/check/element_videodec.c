@@ -303,14 +303,15 @@ test_pts_b_frames (void)
 {
   GstElement *pipe, *dec, *sink;
   GError *err = NULL;
-  GArray *in_pts = g_array_new (FALSE, FALSE, sizeof (GstClockTime));
-  GArray *out_pts = g_array_new (FALSE, FALSE, sizeof (GstClockTime));
+  GArray *in_pts, *out_pts;
   GstPad *pad;
   GstSample *s;
   gboolean reordered = FALSE;
 
   RDS_TEST_REQUIRE_GPU ();
   REQUIRE_VA_H264 ();
+  in_pts = g_array_new (FALSE, FALSE, sizeof (GstClockTime));
+  out_pts = g_array_new (FALSE, FALSE, sizeof (GstClockTime));
   pipe = gst_parse_launch ("videotestsrc pattern=ball num-buffers=30 "
       "! video/x-raw,format=NV12,width=320,height=240,framerate=30/1 ! vah264enc b-frames=2 ! h264parse "
       "! rdsvideodec name=dec ! appsink name=sink sync=false", &err);
@@ -403,9 +404,11 @@ test_size_change (gconstpointer data)
   GBytes *parts[2];
   GBytes *both;
   GPtrArray *ref, *ref_b, *rds, *sys;
-  gchar *enc = g_strdup_printf ("va%senc", sc->codec), *vadec = g_strdup_printf ("va%sdec", sc->codec);
+  gchar *enc, *vadec;
 
   RDS_TEST_REQUIRE_GPU ();
+  enc = g_strdup_printf ("va%senc", sc->codec);
+  vadec = g_strdup_printf ("va%sdec", sc->codec);
   if (!rds_test_have_element (enc) || !rds_test_have_element (vadec)) {
     g_test_skip_printf ("%s or %s not available", enc, vadec);
     g_free (vadec);
