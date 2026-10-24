@@ -274,6 +274,9 @@ assert_caps_str (GstCaps * caps, const gchar * expected)
   gst_caps_unref (exp);
 }
 
+#define NV12_320 "video/x-raw(memory:RDS),format=NV12,width=320,height=240,framerate=30/1"
+#define RGBA_160 "video/x-raw(memory:RDS),format=RGBA,width=160,height=120,framerate=30/1"
+
 #define SYS_IN "video/x-raw,format=NV12,width=320,height=240,framerate=30/1,pixel-aspect-ratio=1/1," \
   "colorimetry=bt601,chroma-site=jpeg,interlace-mode=progressive"
 #define RDS_IN "video/x-raw(memory:RDS),format=NV12,width=320,height=240,framerate=30/1," \
@@ -356,11 +359,83 @@ test_fixate (void)
   }
   gst_caps_unref (caps);
 
+  /* downstream adds a field the input lacks, as a list: still fixed (first value) */
+  caps = negotiate (e, "video/x-raw,format=NV12,width=320,height=240,framerate=30/1",
+      "video/x-raw,format=I420,colorimetry={bt601,bt709}");
+  assert_caps_str (caps, "video/x-raw,format=I420,width=320,height=240,framerate=30/1,colorimetry=bt601");
+  gst_caps_unref (caps);
+  caps = negotiate (e, SYS_IN, "video/x-raw,format=I420,colorimetry={bt709,bt2020}");
+  g_assert_cmpstr (gst_structure_get_string (gst_caps_get_structure (caps, 0), "colorimetry"), ==, "bt709");
+  gst_caps_unref (caps);
+
   /* no PAR on the input: none added */
   caps = negotiate (e, "video/x-raw,format=NV12,width=320,height=240,framerate=30/1", "video/x-raw,format=RGBA");
   assert_caps_str (caps, "video/x-raw,format=RGBA,width=320,height=240,framerate=30/1");
   gst_caps_unref (caps);
 
+  gst_object_unref (e);
+}
+
+/* gpu-id reaches the pool proposed upstream. Only allocation would fail on a missing GPU, so any id works here. */
+static void
+test_propose_allocation_gpu_id (void)
+{
+  GstElement *e = gst_element_factory_make ("rdsvideoconvert", NULL);
+  GstBaseTransformClass *klass = GST_BASE_TRANSFORM_GET_CLASS (e);
+  GstCaps *caps = gst_caps_from_string (NV12_320);
+  GstQuery *decide = gst_query_new_allocation (caps, TRUE), *query = gst_query_new_allocation (caps, TRUE);
+  GstBufferPool *proposed = NULL;
+  GstStructure *config;
+  guint batch = 0, gpu = 0;
+  RdsBufSurfaceMemType mt = RDS_BUF_MEM_SYSTEM;
+
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  g_object_set (e, "gpu-id", 3, NULL);
+  g_assert_true (klass->propose_allocation (GST_BASE_TRANSFORM (e), decide, query));
+  g_assert_cmpuint (gst_query_get_n_allocation_pools (query), ==, 1);
+  gst_query_parse_nth_allocation_pool (query, 0, &proposed, NULL, NULL, NULL);
+  g_assert_true (RDS_IS_BUFFER_POOL (proposed));
+  config = gst_buffer_pool_get_config (proposed);
+  g_assert_true (rds_buffer_pool_config_get_surface_params (config, &batch, &mt, &gpu));
+  g_assert_cmpuint (gpu, ==, 3);
+  g_assert_cmpuint (batch, ==, 1);
+  g_assert_cmpint (mt, ==, RDS_BUF_MEM_DEFAULT);
+  gst_structure_free (config);
+
+  gst_object_unref (proposed);
+  gst_query_unref (query);
+  gst_query_unref (decide);
+  gst_caps_unref (caps);
+  gst_element_set_state (e, GST_STATE_NULL);
+  gst_object_unref (e);
+}
+
+/* Pool settings are refused during READY -> PAUSED too (state READY, next PAUSED). */
+static void
+test_mutable_in_transition (void)
+{
+  GstElement *e = gst_element_factory_make ("rdsvideoconvert", NULL);
+  guint v = 0;
+
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  GST_OBJECT_LOCK (e);
+  GST_STATE_NEXT (e) = GST_STATE_PAUSED;
+  GST_STATE_PENDING (e) = GST_STATE_PAUSED;
+  GST_OBJECT_UNLOCK (e);
+  g_test_expect_message ("rdsvideo", G_LOG_LEVEL_WARNING, "*output-buffers*");
+  g_object_set (e, "output-buffers", 9, NULL);
+  g_test_assert_expected_messages ();
+  g_object_get (e, "output-buffers", &v, NULL);
+  g_assert_cmpuint (v, ==, 4);
+
+  GST_OBJECT_LOCK (e);
+  GST_STATE_NEXT (e) = GST_STATE_VOID_PENDING;
+  GST_STATE_PENDING (e) = GST_STATE_VOID_PENDING;
+  GST_OBJECT_UNLOCK (e);
+  g_object_set (e, "output-buffers", 9, NULL);
+  g_object_get (e, "output-buffers", &v, NULL);
+  g_assert_cmpuint (v, ==, 9);
+  gst_element_set_state (e, GST_STATE_NULL);
   gst_object_unref (e);
 }
 
@@ -414,8 +489,6 @@ make_harness (const gchar * in_caps, const gchar * out_caps)
   return h;
 }
 
-#define NV12_320 "video/x-raw(memory:RDS),format=NV12,width=320,height=240,framerate=30/1"
-#define RGBA_160 "video/x-raw(memory:RDS),format=RGBA,width=160,height=120,framerate=30/1"
 
 /* ---- gpu ---- */
 
@@ -759,6 +832,24 @@ test_passthrough_toggle (void)
   gst_object_unref (pool);
 }
 
+/* stop forgets the negotiated caps: a later passthrough toggle does not act on stale ones */
+static void
+test_passthrough_reset_on_stop (void)
+{
+  GstElement *conv;
+  GstCaps *caps;
+
+  RDS_TEST_REQUIRE_GPU ();
+  conv = run_pipeline ("videotestsrc num-buffers=1 ! video/x-raw,format=NV12,width=64,height=48 "
+      "! rdsvideoconvert name=conv ! fakesink", &caps);
+  gst_caps_unref (caps);
+  g_assert_true (GPOINTER_TO_INT (g_object_get_data (G_OBJECT (conv), "was-passthrough")));
+  g_object_set (conv, "disable-passthrough", TRUE, NULL);
+  g_object_set (conv, "disable-passthrough", FALSE, NULL);
+  g_assert_false (gst_base_transform_is_passthrough (GST_BASE_TRANSFORM (conv)));
+  gst_object_unref (conv);
+}
+
 static void
 test_crop_meta (void)
 {
@@ -933,6 +1024,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/videoconvert/wrap-surface", test_wrap_surface);
   g_test_add_func ("/cpu/videoconvert/transform-caps", test_transform_caps);
   g_test_add_func ("/cpu/videoconvert/fixate", test_fixate);
+  g_test_add_func ("/cpu/videoconvert/propose-allocation-gpu-id", test_propose_allocation_gpu_id);
+  g_test_add_func ("/cpu/videoconvert/mutable-in-transition", test_mutable_in_transition);
   g_test_add_func ("/gpu/videoconvert/convert-scale", test_convert_scale);
   g_test_add_func ("/gpu/videoconvert/session-per-call", test_session_per_call);
   g_test_add_func ("/gpu/videoconvert/passthrough", test_passthrough);
@@ -941,6 +1034,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/videoconvert/passthrough-full-caps", test_passthrough_full_caps);
   g_test_add_func ("/gpu/videoconvert/pipeline-passthrough", test_pipeline_passthrough);
   g_test_add_func ("/gpu/videoconvert/passthrough-toggle", test_passthrough_toggle);
+  g_test_add_func ("/gpu/videoconvert/passthrough-reset-on-stop", test_passthrough_reset_on_stop);
   g_test_add_func ("/gpu/videoconvert/crop-meta", test_crop_meta);
   g_test_add_func ("/gpu/videoconvert/caps-query", test_caps_query);
   g_test_add_func ("/gpu/videoconvert/propose-allocation", test_propose_allocation);

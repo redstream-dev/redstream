@@ -421,6 +421,9 @@ gst_rds_video_convert_stop (GstBaseTransform * trans)
       GST_WARNING_OBJECT (self, "hipStreamDestroy failed");
     self->stream = NULL;
   }
+  GST_OBJECT_LOCK (self);
+  self->caps_equal = FALSE;
+  GST_OBJECT_UNLOCK (self);
   return TRUE;
 }
 
@@ -509,11 +512,14 @@ map_failed:
 
 /* ---- properties ---- */
 
-/* Allocation settings are read when the pools are set up: refuse changes once streaming (object lock held). */
+/* Allocation settings are read when the pools are set up: refuse changes once streaming, including during the
+ * READY -> PAUSED transition (object lock held, which also guards the state fields). */
 static gboolean
 check_mutable (GstRdsVideoConvert * self, GParamSpec * pspec)
 {
-  if (GST_STATE (self) <= GST_STATE_READY)
+  GstState highest = MAX (GST_STATE (self), MAX (GST_STATE_NEXT (self), GST_STATE_PENDING (self)));
+
+  if (highest <= GST_STATE_READY)
     return TRUE;
   g_warning ("%s: property '%s' can only be changed in the NULL or READY state; keeping the current value",
       GST_OBJECT_NAME (self), pspec->name);
@@ -560,6 +566,9 @@ gst_rds_video_convert_set_property (GObject * object, guint prop_id, const GValu
   if (update_passthrough) {
     gboolean was = gst_base_transform_is_passthrough (trans);
 
+    /* Narrow race, accepted: set_caps on the streaming thread may compute passthrough from new caps between our
+     * unlock and set_passthrough below, and the last writer wins. It only matters if the caps change at that very
+     * moment; the next caps or property change corrects it. */
     /* Same caps make the base class skip set_caps on renegotiation, so switch here; reconfiguring the source pad
      * then sets up (or drops) the output pool before the next buffer. */
     gst_base_transform_set_passthrough (trans, passthrough);

@@ -9,6 +9,8 @@
 #include <rds/rds-buf-surface.h>
 #include <string.h>
 
+/* One generator per test executable, not thread-safe: fills run on the test thread only. Each fill reseeds it,
+ * so a pattern depends only on its seed. */
 static guint32 rng_state;
 
 static inline guint8
