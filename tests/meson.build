@@ -92,6 +92,13 @@ test('element_videodec_cpu', element_videodec_exe, args : ['-p', '/cpu/videodec'
 test('element_videodec', element_videodec_exe, args : ['-p', '/gpu/videodec'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
+element_streammux_exe = executable('element_streammux', 'check' / 'element_streammux.c',
+  dependencies : test_deps + [gst_base_dep, gst_app_dep, gst_video_dep, cc.find_library('m', required : false)])
+test('element_streammux_cpu', element_streammux_exe, args : ['-p', '/cpu/mux'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_streammux', element_streammux_exe, args : ['-p', '/gpu/mux'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180, depends : rds_plugins)
+
 # Decode + convert integration: autoplugging, end to end against vah264dec + the CPU reference, and the soak.
 # The soak (3000 1280x720 frames, leak check) is its own test entry, `meson test -C build pipeline_soak`; it takes
 # about 9 s (also under ASan), so it stays in the gpu suite.
