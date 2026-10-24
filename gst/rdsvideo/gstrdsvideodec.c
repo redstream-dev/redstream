@@ -124,6 +124,8 @@ struct _GstRdsVideoDec
   guint out_width, out_height;  /* display size: the decoder's output, already cropped */
   gboolean output_dirty;        /* the input caps changed (e.g. framerate): renew the output state */
   guint64 display_count;        /* pictures displayed since start or flush (drop-frame-interval) */
+  GstRdsSkipFrames last_skip_frames;    /* skip-frames as handle_frame last saw it */
+  gboolean wait_sync;           /* a delta frame was skipped: drop delta frames until the next key frame */
   /* results of the callbacks during one rocDecParseVideoData call */
   GstFlowReturn cb_flow;        /* non-OK: stop and return it (an error was already posted if needed) */
   gboolean cb_decode_error;     /* a picture failed to decode or to come out */
@@ -171,6 +173,8 @@ gst_rds_video_dec_set_property (GObject * object, guint prop_id, const GValue * 
       break;
     case PROP_SKIP_FRAMES:
       self->skip_frames = g_value_get_enum (value);
+      if (self->skip_frames == GST_RDS_SKIP_FRAMES_DECODE_NON_REF && GST_STATE (self) > GST_STATE_READY)
+        GST_WARNING_OBJECT (self, "skip-frames=decode_non_ref is Jetson-only on DeepStream; decoding every frame");
       break;
     case PROP_LOW_LATENCY_MODE:
       self->low_latency_mode = g_value_get_boolean (value);
@@ -498,9 +502,9 @@ on_decode (void *user_data, RocdecPicParams * pic)
 }
 
 /* Copies the decoded picture into the output buffer on the element's stream and waits for it (ready-on-push). Row
- * bytes: Y width; UV 2 * ceil(width / 2), over ceil(height / 2) rows. */
+ * bytes: Y width; UV 2 * ceil(width / 2), over ceil(height / 2) rows. On failure, *@detail says why (free it). */
 static gboolean
-copy_picture (GstRdsVideoDec * self, GstBuffer * outbuf, void *planes[3], const uint32_t pitch[3])
+copy_picture (GstRdsVideoDec * self, GstBuffer * outbuf, void *planes[3], const uint32_t pitch[3], gchar ** detail)
 {
   guint w = self->out_width, h = self->out_height;
   gsize row_bytes[2] = { w, 2 * ((w + 1) / 2) }, rows[2] = { h, (h + 1) / 2 };
@@ -517,13 +521,13 @@ copy_picture (GstRdsVideoDec * self, GstBuffer * outbuf, void *planes[3], const 
     RdsBufSurfaceParams *p;
 
     if (rds_buffer_get_surface (outbuf) == NULL || !gst_buffer_map (outbuf, &map, GST_MAP_WRITE)) {
-      GST_ERROR_OBJECT (self, "output buffer is not a mappable memory:RDS buffer");
+      *detail = g_strdup ("the output buffer is not a mappable memory:RDS buffer");
       return FALSE;
     }
     surf = (RdsBufSurface *) map.data;
     p = &surf->surfaceList[0];
     if (p->colorFormat != RDS_BUF_COLOR_FORMAT_NV12 || p->width != w || p->height != h) {
-      GST_ERROR_OBJECT (self, "output surface is %ux%u format %d, expected %ux%u NV12", p->width, p->height,
+      *detail = g_strdup_printf ("the output surface is %ux%u format %d, expected %ux%u NV12", p->width, p->height,
           p->colorFormat, w, h);
       gst_buffer_unmap (outbuf, &map);
       return FALSE;
@@ -538,7 +542,7 @@ copy_picture (GstRdsVideoDec * self, GstBuffer * outbuf, void *planes[3], const 
 
     gst_video_codec_state_unref (state);
     if (!ok) {
-      GST_ERROR_OBJECT (self, "cannot map the output frame");
+      *detail = g_strdup ("cannot map the output frame");
       return FALSE;
     }
     for (guint i = 0; i < 2; i++) {
@@ -563,7 +567,7 @@ copy_picture (GstRdsVideoDec * self, GstBuffer * outbuf, void *planes[3], const 
     gst_video_frame_unmap (&frame);
   }
   if (err != hipSuccess) {
-    GST_ERROR_OBJECT (self, "copying the decoded picture failed: %s", hipGetErrorString (err));
+    *detail = g_strdup_printf ("hipMemcpy2DAsync/hipStreamSynchronize: %s", hipGetErrorString (err));
     return FALSE;
   }
   return TRUE;
@@ -582,6 +586,7 @@ on_display (void *user_data, RocdecParserDispInfo * info)
   GstFlowReturn ret;
   guint64 index;
   guint interval;
+  gchar *detail = NULL;
 
   frame = gst_video_decoder_get_frame (dec, (int) info->pts);
   if (frame == NULL) {
@@ -600,7 +605,9 @@ on_display (void *user_data, RocdecParserDispInfo * info)
   GST_OBJECT_UNLOCK (self);
   index = self->display_count++;
   if (interval > 1 && index % interval != 0) {
-    /* drop-frame-interval: only every interval-th displayed picture goes out */
+    /* drop-frame-interval: only every interval-th displayed picture goes out. Configured drops use drop_frame (not
+     * release_frame) so the base class counts them as handled output (had_output_data: no "no valid frames" error at
+     * EOS when everything was dropped); the cost is a QoS message per dropped frame. */
     GST_LOG_OBJECT (self, "drop-frame-interval %u: dropping displayed picture %" G_GUINT64_FORMAT, interval, index);
     gst_video_decoder_drop_frame (dec, frame);
     return 1;
@@ -635,9 +642,14 @@ on_display (void *user_data, RocdecParserDispInfo * info)
     gst_video_decoder_release_frame (dec, frame);
     return 1;
   }
-  if (!copy_picture (self, frame->output_buffer, planes, pitch)) {
-    self->cb_decode_error = TRUE;
-    gst_video_decoder_drop_frame (dec, frame);
+  if (!copy_picture (self, frame->output_buffer, planes, pitch, &detail)) {
+    /* Not a bitstream problem (those stay tolerated, as GST_VIDEO_DECODER_ERROR): the GPU, the output pool or the
+     * negotiated memory is broken, and every later frame would fail the same way. Fatal. */
+    GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Cannot copy the decoded picture into the output buffer"),
+        ("%s", detail));
+    g_free (detail);
+    self->cb_flow = GST_FLOW_ERROR;
+    gst_video_decoder_release_frame (dec, frame);
     return 1;
   }
   ret = gst_video_decoder_finish_frame (dec, frame);
@@ -694,8 +706,9 @@ parse_packet (GstRdsVideoDec * self, RocdecSourceDataPacket * pkt)
   return ret;
 }
 
-/* Releases the frames still pending in the base class: once the parser is drained, it will never display them
- * (e.g. pictures before the first key frame, or ones it could not parse). */
+/* Releases the frames still pending in the base class: once the parser is drained, it will never display them.
+ * A backstop that no test reaches: frames whose decode fails are already dropped in handle_frame, and h264parse /
+ * h265parse drop slices that arrive before any parameter set. */
 static void
 release_pending_frames (GstRdsVideoDec * self)
 {
@@ -784,6 +797,8 @@ gst_rds_video_dec_start (GstVideoDecoder * dec)
   self->out_width = self->out_height = 0;
   self->output_dirty = FALSE;
   self->display_count = 0;
+  self->last_skip_frames = skip;
+  self->wait_sync = FALSE;
   return TRUE;
 }
 
@@ -851,9 +866,21 @@ gst_rds_video_dec_handle_frame (GstVideoDecoder * dec, GstVideoCodecFrame * fram
   GST_OBJECT_LOCK (self);
   skip = self->skip_frames;
   GST_OBJECT_UNLOCK (self);
-  if (skip == GST_RDS_SKIP_FRAMES_DECODE_KEY && !GST_VIDEO_CODEC_FRAME_IS_SYNC_POINT (frame)) {
-    /* decode_key: delta frames never reach the parser */
-    GST_LOG_OBJECT (self, "skip-frames=decode_key: dropping delta frame %u", frame->system_frame_number);
+  if (skip != self->last_skip_frames) {
+    /* leaving decode_key: the next delta frames may reference pictures that were skipped */
+    if (self->last_skip_frames == GST_RDS_SKIP_FRAMES_DECODE_KEY)
+      self->wait_sync = TRUE;
+    self->last_skip_frames = skip;
+  }
+  if (GST_VIDEO_CODEC_FRAME_IS_SYNC_POINT (frame)) {
+    self->wait_sync = FALSE;
+  } else if (skip == GST_RDS_SKIP_FRAMES_DECODE_KEY || self->wait_sync) {
+    /* decode_key: delta frames never reach the parser. After a skipped delta frame, later delta frames (even with
+     * decode_all again) would decode against missing references, which rocDecode does not report: wait for the next
+     * key frame. */
+    GST_LOG_OBJECT (self, "skip-frames: dropping delta frame %u%s", frame->system_frame_number,
+        skip == GST_RDS_SKIP_FRAMES_DECODE_KEY ? "" : " (waiting for a key frame)");
+    self->wait_sync = TRUE;
     return gst_video_decoder_drop_frame (dec, frame);
   }
 
@@ -869,16 +896,19 @@ gst_rds_video_dec_handle_frame (GstVideoDecoder * dec, GstVideoCodecFrame * fram
   memset (&pkt, 0, sizeof (pkt));
   pkt.payload = map.data;
   pkt.payload_size = (uint32_t) map.size;
-  pkt.flags = ROCDEC_PKT_TIMESTAMP;
+  /* one whole access unit per packet: END_OF_PICTURE lets the parser decode it within this call */
+  pkt.flags = ROCDEC_PKT_TIMESTAMP | ROCDEC_PKT_ENDOFPICTURE;
+  if (GST_BUFFER_FLAG_IS_SET (frame->input_buffer, GST_BUFFER_FLAG_DISCONT))
+    pkt.flags |= ROCDEC_PKT_DISCONTINUITY;
   /* on_display finds the frame again by this number (the parser hands it back in display order) */
   pkt.pts = frame->system_frame_number;
   GST_LOG_OBJECT (self, "parsing frame %u (%" G_GSIZE_FORMAT " bytes)", frame->system_frame_number, map.size);
   ret = parse_packet (self, &pkt);
   gst_buffer_unmap (frame->input_buffer, &map);
   if (self->cb_decode_failed) {
-    /* With whole access units, the parser decodes a packet's picture within the same call, so the picture that
-     * failed is this frame's (e.g. a P-frame whose references are missing at a mid-GOP start). The parser never
-     * displays it: drop it now rather than leaving it pending until the next drain. */
+    /* Packets carry ROCDEC_PKT_ENDOFPICTURE, so the parser decodes a packet's picture within the same call: the
+     * picture that failed is this frame's (e.g. a P-frame whose references are missing at a mid-GOP start). The
+     * parser never displays it: drop it now rather than leaving it pending until the next drain. */
     GstVideoCodecFrame *pending = gst_video_decoder_get_frame (dec, (int) frame->system_frame_number);
 
     if (pending != NULL) {

@@ -382,14 +382,16 @@ test_h265_parity (gconstpointer data)
 
 typedef struct
 {
+  const gchar *codec;
   Clip a, b;
 } SizeChange;
 
 static const SizeChange size_changes[] = {
   /* larger coded size: the decoder is recreated */
-  { { 320, 240, 15, 0, "ball" }, { 640, 480, 15, 2, "smpte" } },
+  { "h264", { 320, 240, 15, 0, "ball" }, { 640, 480, 15, 2, "smpte" } },
   /* smaller: reconfigured in place, onto surfaces of at most 1 MiB (the first-export workaround must run again) */
-  { { 1280, 720, 15, 2, "ball" }, { 640, 360, 15, 2, "ball" } },
+  { "h264", { 1280, 720, 15, 2, "ball" }, { 640, 360, 15, 2, "ball" } },
+  { "h265", { 1280, 720, 15, 2, "ball" }, { 640, 360, 15, 2, "ball" } },
 };
 
 /* Two streams back to back, each starting with its own SPS/PPS/IDR: every frame decodes as when each part is
@@ -401,19 +403,25 @@ test_size_change (gconstpointer data)
   GBytes *parts[2];
   GBytes *both;
   GPtrArray *ref, *ref_b, *rds, *sys;
+  gchar *enc = g_strdup_printf ("va%senc", sc->codec), *vadec = g_strdup_printf ("va%sdec", sc->codec);
 
   RDS_TEST_REQUIRE_GPU ();
-  REQUIRE_VA_H264 ();
-  parts[0] = rds_test_encode ("h264", sc->a.width, sc->a.height, sc->a.frames, sc->a.b_frames, sc->a.pattern);
-  parts[1] = rds_test_encode ("h264", sc->b.width, sc->b.height, sc->b.frames, sc->b.b_frames, sc->b.pattern);
+  if (!rds_test_have_element (enc) || !rds_test_have_element (vadec)) {
+    g_test_skip_printf ("%s or %s not available", enc, vadec);
+    g_free (vadec);
+    g_free (enc);
+    return;
+  }
+  parts[0] = rds_test_encode (sc->codec, sc->a.width, sc->a.height, sc->a.frames, sc->a.b_frames, sc->a.pattern);
+  parts[1] = rds_test_encode (sc->codec, sc->b.width, sc->b.height, sc->b.frames, sc->b.b_frames, sc->b.pattern);
   both = rds_test_concat (parts, 2);
-  ref = rds_test_decode_crc (parts[0], "h264", "vah264dec", FALSE);
-  ref_b = rds_test_decode_crc (parts[1], "h264", "vah264dec", FALSE);
+  ref = rds_test_decode_crc (parts[0], sc->codec, vadec, FALSE);
+  ref_b = rds_test_decode_crc (parts[1], sc->codec, vadec, FALSE);
   g_ptr_array_extend_and_steal (ref, ref_b);
   g_assert_cmpuint (ref->len, ==, sc->a.frames + sc->b.frames);
 
-  rds = rds_test_decode_crc (both, "h264", "rdsvideodec", TRUE);
-  sys = rds_test_decode_crc (both, "h264", "rdsvideodec", FALSE);
+  rds = rds_test_decode_crc (both, sc->codec, "rdsvideodec", TRUE);
+  sys = rds_test_decode_crc (both, sc->codec, "rdsvideodec", FALSE);
   assert_same_crcs (ref, rds, "memory:RDS path");
   assert_same_crcs (ref, sys, "system-memory fallback");
 
@@ -423,6 +431,8 @@ test_size_change (gconstpointer data)
   g_bytes_unref (both);
   g_bytes_unref (parts[1]);
   g_bytes_unref (parts[0]);
+  g_free (vadec);
+  g_free (enc);
 }
 
 /* A framerate change without a size change still reaches the output caps. */
@@ -646,6 +656,88 @@ test_undisplayed_frames (void)
   g_ptr_array_unref (aus);
 }
 
+/* drop-frame-interval counts displayed frames from the last flush: after a flush mid-phase, the output starts again
+ * at frame 0 of the new segment. */
+static void
+test_drop_frame_interval_flush (void)
+{
+  GPtrArray *aus, *ref, *got;
+  GBytes *stream;
+  GstHarness *h;
+  GstSegment seg;
+
+  RDS_TEST_REQUIRE_GPU ();
+  REQUIRE_VA_H264 ();
+  aus = rds_test_encode_aus ("h264", "video/x-raw,format=NV12,width=320,height=240,framerate=30/1", 30, 0,
+      "ball", NULL);
+  stream = rds_test_concat ((GBytes * const *) aus->pdata, aus->len);
+  ref = rds_test_decode_crc (stream, "h264", "vah264dec", FALSE);
+
+  h = new_dec_harness ("rdsvideodec drop-frame-interval=5");
+  harness_push_aus (h, aus, 0, 7);
+  harness_collect (h, NULL);
+  g_assert_true (gst_harness_push_event (h, gst_event_new_flush_start ()));
+  g_assert_true (gst_harness_push_event (h, gst_event_new_flush_stop (TRUE)));
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  g_assert_true (gst_harness_push_event (h, gst_event_new_segment (&seg)));
+  harness_collect (h, NULL);
+  harness_push_aus (h, aus, 0, aus->len);
+  g_assert_true (gst_harness_push_event (h, gst_event_new_eos ()));
+  got = g_ptr_array_new_with_free_func (g_free);
+  harness_collect (h, got);
+  g_assert_cmpuint (got->len, ==, 6);
+  for (guint i = 0; i < got->len; i++)
+    g_assert_cmpstr (got->pdata[i], ==, ref->pdata[5 * i]);
+
+  gst_harness_teardown (h);
+  g_ptr_array_unref (got);
+  g_ptr_array_unref (ref);
+  g_bytes_unref (stream);
+  g_ptr_array_unref (aus);
+}
+
+/* Switching skip-frames from decode_key back to decode_all while playing, before frame @data: the delta frames after
+ * the switch may reference skipped pictures, so output resumes at the next key frame, and every frame that comes
+ * out is correct. Switching right after a key frame (11) waits too: conservative, since only IDR-only streams could
+ * resume there. */
+static void
+test_skip_frames_switch (gconstpointer data)
+{
+  guint at = GPOINTER_TO_UINT (data);
+  GPtrArray *aus, *ref, *got;
+  GBytes *stream;
+  GstHarness *h;
+  GstElement *dec;
+  static const guint expected[] = { 0, 10, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29 };
+
+  RDS_TEST_REQUIRE_GPU ();
+  REQUIRE_VA_H264 ();
+  aus = rds_test_encode_aus ("h264", "video/x-raw,format=NV12,width=320,height=240,framerate=30/1", 30, 0,
+      "ball", "key-int-max=10");
+  stream = rds_test_concat ((GBytes * const *) aus->pdata, aus->len);
+  ref = rds_test_decode_crc (stream, "h264", "vah264dec", FALSE);
+  g_assert_cmpuint (ref->len, ==, 30);
+
+  h = new_dec_harness ("rdsvideodec skip-frames=decode_key");
+  dec = gst_harness_find_element (h, "rdsvideodec");
+  harness_push_aus (h, aus, 0, at);
+  g_object_set (dec, "skip-frames", 0, NULL);
+  harness_push_aus (h, aus, at, aus->len);
+  g_assert_true (gst_harness_push_event (h, gst_event_new_eos ()));
+  got = g_ptr_array_new_with_free_func (g_free);
+  harness_collect (h, got);
+  g_assert_cmpuint (got->len, ==, G_N_ELEMENTS (expected));
+  for (guint i = 0; i < got->len; i++)
+    g_assert_cmpstr (got->pdata[i], ==, ref->pdata[expected[i]]);
+
+  gst_object_unref (dec);
+  gst_harness_teardown (h);
+  g_ptr_array_unref (got);
+  g_ptr_array_unref (ref);
+  g_bytes_unref (stream);
+  g_ptr_array_unref (aus);
+}
+
 /* drop-frame-interval=5 keeps displayed frames 0, 5, 10, ... */
 static void
 test_drop_frame_interval (void)
@@ -845,8 +937,8 @@ main (int argc, char **argv)
     g_free (path);
   }
   for (guint i = 0; i < G_N_ELEMENTS (size_changes); i++) {
-    gchar *path = g_strdup_printf ("/gpu/videodec/size-change-%ux%u-to-%ux%u", size_changes[i].a.width,
-        size_changes[i].a.height, size_changes[i].b.width, size_changes[i].b.height);
+    gchar *path = g_strdup_printf ("/gpu/videodec/size-change-%s-%ux%u-to-%ux%u", size_changes[i].codec,
+        size_changes[i].a.width, size_changes[i].a.height, size_changes[i].b.width, size_changes[i].b.height);
     g_test_add_data_func (path, &size_changes[i], test_size_change);
     g_free (path);
   }
@@ -854,6 +946,9 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/videodec/flush", test_flush);
   g_test_add_func ("/gpu/videodec/undisplayed-frames", test_undisplayed_frames);
   g_test_add_func ("/gpu/videodec/drop-frame-interval", test_drop_frame_interval);
+  g_test_add_func ("/gpu/videodec/drop-frame-interval-flush", test_drop_frame_interval_flush);
+  g_test_add_data_func ("/gpu/videodec/skip-frames-switch-at-15", GUINT_TO_POINTER (15), test_skip_frames_switch);
+  g_test_add_data_func ("/gpu/videodec/skip-frames-switch-at-11", GUINT_TO_POINTER (11), test_skip_frames_switch);
   g_test_add_func ("/gpu/videodec/skip-frames-key", test_skip_frames_key);
   g_test_add_func ("/gpu/videodec/skip-frames-non-ref", test_skip_frames_non_ref);
   g_test_add_func ("/gpu/videodec/num-extra-surfaces", test_extra_surfaces);
