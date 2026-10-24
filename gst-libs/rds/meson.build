@@ -1,6 +1,6 @@
 rds_headers = files('rds-prelude.h', 'rds-compat-remap.h', 'rds_compat.h', 'rds-buf-surface.h',
   'rds-memory.h', 'rds-buffer-pool.h', 'rds-osd-types.h', 'rds-meta.h',
-  'rds-gst-meta.h', 'rds-event.h', 'rds.h', 'rds-compat-aliases.h')
+  'rds-gst-meta.h', 'rds-event.h', 'rds-transform.h', 'rds.h', 'rds-compat-aliases.h')
 install_headers(rds_headers, subdir : 'redstream-' + api_version / 'rds')
 
 hip_arch_args = []
@@ -29,7 +29,7 @@ rds_kernels = custom_target('rds-transform-kernels',
   command : [objcopy, '--wildcard', '--localize-symbol=__hip_cuid_*', '@INPUT@', '@OUTPUT@'])
 
 rds_sources = files('rds-compat-remap.c', 'rds-buf-surface.c', 'rds-memory.c',
-  'rds-buffer-pool.c', 'rds-meta.c', 'rds-meta-copy.c', 'rds-gst-meta.c', 'rds-event.c')
+  'rds-buffer-pool.c', 'rds-meta.c', 'rds-meta-copy.c', 'rds-gst-meta.c', 'rds-event.c', 'rds-transform.c')
 rds_c_args = ['-DG_LOG_DOMAIN="rds"', '-DBUILDING_RDS']
 rds_private_deps = [gst_dep, gst_video_dep, hip_dep]
 
