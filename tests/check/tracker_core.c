@@ -1122,7 +1122,8 @@ test_nvsort_ds80_predictions (void)
 }
 
 /* A box shrinking until its prediction collapses, with and without the aspect ratio, detected on every second frame
- * and then not at all: every reported box is finite with an area (size_similarity asserts it of the boxes it sees). */
+ * and then not at all: every reported box is finite and at least 1 px wide and high (size_similarity asserts an area
+ * of the boxes it sees). A prediction under 1 px falls back to the last matched box, never a sliver. */
 static void
 test_nvsort_shrinking (void)
 {
@@ -1150,8 +1151,8 @@ test_nvsort_shrinking (void)
         const RdsTrackerTarget *t = &fo->targets[i];
 
         g_assert_true (isfinite (t->x) && isfinite (t->y) && isfinite (t->w) && isfinite (t->h));
-        g_assert_cmpfloat (t->w, >, 0);
-        g_assert_cmpfloat (t->h, >, 0);
+        g_assert_cmpfloat (t->w, >=, 1);
+        g_assert_cmpfloat (t->h, >=, 1);
       }
     }
     rds_tracker_core_free (core);

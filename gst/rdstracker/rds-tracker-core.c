@@ -414,12 +414,14 @@ activate (RdsTrackerCore * core, Stream * st, Target * t)
   core->counter++;
 }
 
-/* The Kalman prediction of @t, or (ours) its last matched box when the prediction is not a finite box with an area. */
+/* The Kalman prediction of @t, or (ours) its last matched box when the prediction is not a finite box at least
+ * 1 px wide and high: the filter keeps a collapsed size at a tiny positive value, which would be reported as a
+ * sliver. */
 static void
 target_predicted_box (const Target * t, gfloat * x, gfloat * y, gfloat * w, gfloat * h)
 {
   rds_tracker_kf_get_box (&t->kf, x, y, w, h);
-  if (isfinite (*x) && isfinite (*y) && isfinite (*w) && isfinite (*h) && *w > 0 && *h > 0
+  if (isfinite (*x) && isfinite (*y) && isfinite (*w) && isfinite (*h) && *w >= 1 && *h >= 1
       && isfinite (*x + *w) && isfinite (*y + *h) && isfinite (*w * *h))
     return;
   *x = t->x;

@@ -251,8 +251,11 @@ if rds_tracker_enabled
   test('tracker_kf', executable('tracker_kf', 'check' / 'tracker_kf.c',
       dependencies : [rdstracker_core_dep, cc.find_library('m', required : false)]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
-  # The element: registration, properties and a system-memory batch passing through with its meta (cpu).
-  element_tracker_exe = executable('element_tracker', 'check' / 'element_tracker.c', dependencies : test_deps)
+  # The element: registration, properties, and tracking on scripted system-memory batches (write-back, created and
+  # removed objects, events, start errors, a seeded random run; cpu).
+  element_tracker_exe = executable('element_tracker', 'check' / 'element_tracker.c',
+    dependencies : test_deps,
+    c_args : ['-DRDS_TRACKER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'tracker-configs')])
   test('element_tracker_cpu', element_tracker_exe, args : ['-p', '/cpu/tracker'],
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 endif
