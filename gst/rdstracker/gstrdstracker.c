@@ -102,6 +102,9 @@ GST_ELEMENT_REGISTER_DEFINE (rdstracker, "rdstracker", GST_RANK_NONE, GST_TYPE_R
 
 /* ---- streaming ---- */
 
+/* Passthrough with transform_ip, as in rdsinfer: the buffer is never made writable. The RdsBatchMeta is shared by
+ * every holder of the batch on purpose (as DeepStream's batch meta is), so the tracking core writes it in place under
+ * rds_acquire_meta_lock, like rdsinfer adds its objects (see rdsinfer's header comment), and never touches pixels. */
 static GstFlowReturn
 gst_rds_tracker_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 {
@@ -112,6 +115,20 @@ gst_rds_tracker_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 }
 
 /* ---- properties ---- */
+
+/* The READY-only settings are read when streaming starts: refuse changes once streaming, including during the
+ * READY -> PAUSED transition (object lock held, which also guards the state fields). */
+static gboolean
+check_mutable (GstRdsTracker * self, GParamSpec * pspec)
+{
+  GstState highest = MAX (GST_STATE (self), MAX (GST_STATE_NEXT (self), GST_STATE_PENDING (self)));
+
+  if (highest <= GST_STATE_READY)
+    return TRUE;
+  g_warning ("%s: property '%s' can only be changed in the NULL or READY state; keeping the current value",
+      GST_OBJECT_NAME (self), pspec->name);
+  return FALSE;
+}
 
 static void
 gst_rds_tracker_set_property (GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec)
@@ -129,22 +146,27 @@ gst_rds_tracker_set_property (GObject * object, guint prop_id, const GValue * va
       self->ll_config_file = g_value_dup_string (value);
       break;
     case PROP_TRACKER_WIDTH:
-      self->tracker_width = g_value_get_uint (value);
+      if (check_mutable (self, pspec))
+        self->tracker_width = g_value_get_uint (value);
       break;
     case PROP_TRACKER_HEIGHT:
-      self->tracker_height = g_value_get_uint (value);
+      if (check_mutable (self, pspec))
+        self->tracker_height = g_value_get_uint (value);
       break;
     case PROP_GPU_ID:
-      self->gpu_id = g_value_get_uint (value);
+      if (check_mutable (self, pspec))
+        self->gpu_id = g_value_get_uint (value);
       break;
     case PROP_DISPLAY_TRACKING_ID:
       self->display_tracking_id = g_value_get_boolean (value);
       break;
     case PROP_TRACKING_ID_RESET_MODE:
-      self->tracking_id_reset_mode = g_value_get_uint (value);
+      if (check_mutable (self, pspec))
+        self->tracking_id_reset_mode = g_value_get_uint (value);
       break;
     case PROP_TRACKING_SURFACE_TYPE:
-      self->tracking_surface_type = g_value_get_uint (value);
+      if (check_mutable (self, pspec))
+        self->tracking_surface_type = g_value_get_uint (value);
       break;
     case PROP_COMPUTE_HW:
       self->compute_hw = g_value_get_enum (value);
@@ -153,7 +175,8 @@ gst_rds_tracker_set_property (GObject * object, guint prop_id, const GValue * va
       self->input_tensor_meta = g_value_get_boolean (value);
       break;
     case PROP_TENSOR_META_GIE_ID:
-      self->tensor_meta_gie_id = g_value_get_uint (value);
+      if (check_mutable (self, pspec))
+        self->tensor_meta_gie_id = g_value_get_uint (value);
       break;
     case PROP_SUB_BATCHES:
       g_free (self->sub_batches);
@@ -163,7 +186,8 @@ gst_rds_tracker_set_property (GObject * object, guint prop_id, const GValue * va
       self->sub_batch_err_recovery_trial_cnt = g_value_get_int (value);
       break;
     case PROP_USER_META_POOL_SIZE:
-      self->user_meta_pool_size = g_value_get_uint (value);
+      if (check_mutable (self, pspec))
+        self->user_meta_pool_size = g_value_get_uint (value);
       break;
     case PROP_OPERATE_ON_CLASS_IDS:
       g_free (self->operate_on_class_ids);
@@ -314,7 +338,8 @@ gst_rds_tracker_class_init (GstRdsTrackerClass * klass)
           "Size of the pool of tracker user meta", 1, G_MAXUINT, DEFAULT_USER_META_POOL_SIZE, PFLAGS_READY));
   g_object_class_install_property (gobject_class, PROP_OPERATE_ON_CLASS_IDS,
       g_param_spec_string ("operate-on-class-ids", "Operate on class IDs",
-          "Track only objects of these classes, separated by ';' (e.g. 0;2); empty: all classes", NULL, PFLAGS));
+          "Track only objects of these classes, separated by ';' (e.g. 0;2); unset or empty: all classes", NULL,
+          PFLAGS));
 
   gst_element_class_add_static_pad_template (element_class, &sink_template);
   gst_element_class_add_static_pad_template (element_class, &src_template);

@@ -1,5 +1,5 @@
-/* rdstracker: registration, pad templates, every property with its type, range, default and state flags, and a
- * system-memory batch passing through with its metadata untouched (cpu).
+/* rdstracker: registration, pad templates, every property with its type, range, default and state flags (enforced
+ * once streaming), and a system-memory batch passing through with its pixels and metadata untouched (cpu).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 
@@ -177,7 +177,36 @@ test_property_roundtrip (void)
   gst_object_unref (e);
 }
 
-/* A system-memory batch of @n frames with two objects each (untracked, as a detector leaves them). */
+/* The pixel value slot @slot of a test batch is filled with. */
+#define SLOT_VALUE(slot) ((guint8) (10 * ((slot) + 1)))
+
+/* Fills @om as object @k of frame @frame: detector fields as a detector leaves them (untracked), and sentinels in the
+ * tracker fields, so any write shows. */
+static void
+fill_object (RdsObjectMeta * om, guint frame, guint k)
+{
+  om->unique_component_id = 1;
+  om->class_id = (gint) (k + 2);
+  om->object_id = RDS_UNTRACKED_OBJECT_ID;
+  om->confidence = 0.5f + 0.1f * k;
+  om->tracker_confidence = -0.25f;
+  om->rect_params.left = 4.0f + frame;
+  om->rect_params.top = 6.0f + k;
+  om->rect_params.width = 10.0f + k;
+  om->rect_params.height = 12.0f + frame;
+  om->rect_params.border_width = 3;
+  om->rect_params.border_color.red = 0.75;
+  om->detector_bbox_info.org_bbox_coords.left = 5.0f + frame;
+  om->detector_bbox_info.org_bbox_coords.top = 7.0f + k;
+  om->detector_bbox_info.org_bbox_coords.width = 11.0f;
+  om->detector_bbox_info.org_bbox_coords.height = 13.0f;
+  om->tracker_bbox_info.org_bbox_coords.left = -1.0f;
+  om->tracker_bbox_info.org_bbox_coords.top = -2.0f;
+  om->tracker_bbox_info.org_bbox_coords.width = -3.0f;
+  om->tracker_bbox_info.org_bbox_coords.height = -4.0f;
+}
+
+/* A system-memory batch of @n frames (slot i filled with SLOT_VALUE (i)) with two objects each (fill_object). */
 static GstBuffer *
 make_batch (guint n)
 {
@@ -191,7 +220,7 @@ make_batch (guint n)
   for (guint i = 0; i < n; i++) {
     RdsFrameMeta *fm = rds_acquire_frame_meta_from_pool (bm);
 
-    g_assert_cmpint (rds_buf_surface_memset (s, i, -1, (guint8) (10 * (i + 1))), ==, 0);
+    g_assert_cmpint (rds_buf_surface_memset (s, i, -1, SLOT_VALUE (i)), ==, 0);
     fm->source_id = i;
     fm->pad_index = i;
     fm->batch_id = i;
@@ -201,18 +230,7 @@ make_batch (guint n)
     for (guint k = 0; k < 2; k++) {
       RdsObjectMeta *om = rds_acquire_obj_meta_from_pool (bm);
 
-      om->unique_component_id = 1;
-      om->class_id = (gint) k;
-      om->object_id = RDS_UNTRACKED_OBJECT_ID;
-      om->confidence = 0.5f + 0.1f * k;
-      om->rect_params.left = 4.0f + i;
-      om->rect_params.top = 6.0f + k;
-      om->rect_params.width = 10.0f;
-      om->rect_params.height = 12.0f;
-      om->detector_bbox_info.org_bbox_coords.left = om->rect_params.left;
-      om->detector_bbox_info.org_bbox_coords.top = om->rect_params.top;
-      om->detector_bbox_info.org_bbox_coords.width = om->rect_params.width;
-      om->detector_bbox_info.org_bbox_coords.height = om->rect_params.height;
+      fill_object (om, i, k);
       rds_add_obj_meta_to_frame (fm, om, NULL);
     }
   }
@@ -222,7 +240,26 @@ make_batch (guint n)
   return buf;
 }
 
-/* The same buffer comes out, with the same surface, the same batch meta and every object as it went in. */
+/* TRUE if every pixel byte of surface @idx of @s (system memory) equals @v. */
+static gboolean
+slot_is (const RdsBufSurface * s, guint idx, guint8 v)
+{
+  const RdsBufSurfaceParams *sp = &s->surfaceList[idx];
+  const RdsBufSurfacePlaneParams *pp = &sp->planeParams;
+
+  for (guint p = 0; p < pp->num_planes; p++) {
+    const guint8 *ptr = (const guint8 *) sp->dataPtr + pp->offset[p];
+
+    for (guint32 y = 0; y < pp->height[p]; y++)
+      for (guint32 x = 0; x < pp->width[p] * pp->bytesPerPix[p]; x++)
+        if (ptr[(gsize) y * pp->pitch[p] + x] != v)
+          return FALSE;
+  }
+  return TRUE;
+}
+
+/* The same buffer comes out, with the same surface and pixels, the same batch meta and every object field as it
+ * went in. */
 static void
 test_passthrough (void)
 {
@@ -242,6 +279,8 @@ test_passthrough (void)
   g_assert_true (out == in);
   g_assert_true (rds_buffer_get_surface (out) == s);
   g_assert_cmpuint (s->numFilled, ==, 2);
+  g_assert_true (slot_is (s, 0, SLOT_VALUE (0)));
+  g_assert_true (slot_is (s, 1, SLOT_VALUE (1)));
   g_assert_true (gst_buffer_get_rds_batch_meta (out) == bm);
   g_assert_cmpuint (GST_BUFFER_PTS (out), ==, 5 * GST_SECOND);
   g_assert_cmpuint (bm->num_frames_in_batch, ==, 2);
@@ -253,13 +292,20 @@ test_passthrough (void)
     g_assert_cmpuint (fm->num_obj_meta, ==, 2);
     for (RdsObjectMetaList * o = fm->obj_meta_list; o; o = o->next, k++) {
       RdsObjectMeta *om = o->data;
+      RdsObjectMeta want;
 
+      memset (&want, 0, sizeof (want));
+      fill_object (&want, n_frames, k);
+      g_assert_cmpint (om->unique_component_id, ==, want.unique_component_id);
+      g_assert_cmpint (om->class_id, ==, want.class_id);
       g_assert_true (om->object_id == RDS_UNTRACKED_OBJECT_ID);
-      g_assert_cmpfloat (om->rect_params.width, ==, 10.0f);
-      g_assert_cmpfloat (om->rect_params.height, ==, 12.0f);
-      g_assert_cmpfloat (om->rect_params.left, ==, 4.0f + n_frames);
-      g_assert_cmpfloat (om->tracker_bbox_info.org_bbox_coords.width, ==, 0.0f);
-      g_assert_cmpfloat (om->tracker_confidence, ==, 0.0f);
+      g_assert_cmpfloat (om->confidence, ==, want.confidence);
+      g_assert_cmpfloat (om->tracker_confidence, ==, want.tracker_confidence);
+      g_assert_cmpmem (&om->rect_params, sizeof (om->rect_params), &want.rect_params, sizeof (want.rect_params));
+      g_assert_cmpmem (&om->detector_bbox_info, sizeof (om->detector_bbox_info), &want.detector_bbox_info,
+          sizeof (want.detector_bbox_info));
+      g_assert_cmpmem (&om->tracker_bbox_info, sizeof (om->tracker_bbox_info), &want.tracker_bbox_info,
+          sizeof (want.tracker_bbox_info));
     }
     g_assert_cmpuint (k, ==, 2);
     n_frames++;
@@ -268,6 +314,49 @@ test_passthrough (void)
 
   gst_buffer_unref (out);
   gst_buffer_unref (in);
+  gst_harness_teardown (h);
+}
+
+/* Once streaming, the READY-only properties refuse changes with a warning and keep their value; the others still
+ * change. */
+static void
+test_ready_only (void)
+{
+  static const gchar *ready_only[] = { "tracker-width", "tracker-height", "gpu-id", "tracking-id-reset-mode",
+    "tracking-surface-type", "tensor-meta-gie-id", "user-meta-pool-size",
+  };
+  GstHarness *h = gst_harness_new ("rdstracker");
+  gboolean show = TRUE;
+
+  gst_harness_set_caps_str (h, IN_CAPS, IN_CAPS);
+  g_assert_cmpint (GST_STATE (h->element), ==, GST_STATE_PLAYING);
+  for (guint i = 0; i < G_N_ELEMENTS (ready_only); i++) {
+    GParamSpec *pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (h->element), ready_only[i]);
+    guint before, after;
+    gchar *pattern = g_strdup_printf ("*'%s'*NULL or READY*", ready_only[i]);
+
+    g_object_get (h->element, ready_only[i], &before, NULL);
+    g_test_expect_message ("rdstracker", G_LOG_LEVEL_WARNING, pattern);
+    g_object_set (h->element, ready_only[i], before == 0 ? 2u : before - 1, NULL);
+    g_test_assert_expected_messages ();
+    g_object_get (h->element, ready_only[i], &after, NULL);
+    g_assert_cmpuint (after, ==, before);
+    g_assert_true (pspec->flags & GST_PARAM_MUTABLE_READY);
+    g_free (pattern);
+  }
+  g_object_set (h->element, "display-tracking-id", FALSE, NULL);
+  g_object_get (h->element, "display-tracking-id", &show, NULL);
+  g_assert_false (show);
+
+  /* back in READY they change again */
+  gst_element_set_state (h->element, GST_STATE_READY);
+  g_object_set (h->element, "tracker-width", 320, NULL);
+  {
+    guint w;
+
+    g_object_get (h->element, "tracker-width", &w, NULL);
+    g_assert_cmpuint (w, ==, 320);
+  }
   gst_harness_teardown (h);
 }
 
@@ -283,6 +372,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/tracker/properties", test_properties);
   g_test_add_func ("/cpu/tracker/property-roundtrip", test_property_roundtrip);
   g_test_add_func ("/cpu/tracker/passthrough", test_passthrough);
+  g_test_add_func ("/cpu/tracker/ready-only", test_ready_only);
   {
     /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
      * process exit otherwise (seen under parallel ASan runs) */

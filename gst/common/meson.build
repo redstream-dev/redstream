@@ -1,6 +1,6 @@
 # Plugin-private code shared by several plugins (never installed): the YAML config reader, for rdsinfer and
-# rdstracker. Built only with libyaml; the plugins that need it are disabled without it.
-if yaml_dep.found()
+# rdstracker. Built only for those plugins (both need libyaml, so it is found here).
+if rds_infer_enabled or rds_tracker_enabled
   rds_plugin_common = static_library('rds-plugin-common',
     files('rds-keyfile-yaml.c'),
     dependencies : [dependency('glib-2.0'), yaml_dep],
