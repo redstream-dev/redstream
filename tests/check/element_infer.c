@@ -466,18 +466,19 @@ fmt_caps_name (RdsBufSurfaceColorFormat fmt)
   return fmt == RDS_BUF_COLOR_FORMAT_NV12 ? "NV12" : "RGBA";
 }
 
-/* A harness around @e (properties already set; the harness owns it afterwards), with a bus for its messages, negotiated for @fmt @w x @h. */
+/* A harness around @e (properties already set; the harness owns it afterwards), with @bus (or none) for its
+ * messages, negotiated for @fmt @width x @height. */
 static GstHarness *
 harness_for (GstElement * e, GstBus * bus, RdsBufSurfaceColorFormat fmt, guint width, guint height)
 {
+  gchar *caps = g_strdup_printf ("video/x-raw(memory:RDS), format=%s, width=%u, height=%u, framerate=30/1",
+      fmt_caps_name (fmt), width, height);
   GstHarness *h;
 
   /* the harness takes its own ref (transfer none): hand it ours */
   gst_object_ref_sink (e);
   h = gst_harness_new_with_element (e, "sink", "src");
   gst_object_unref (e);
-  gchar *caps = g_strdup_printf ("video/x-raw(memory:RDS), format=%s, width=%u, height=%u, framerate=30/1",
-      fmt_caps_name (fmt), width, height);
 
   if (bus)
     gst_element_set_bus (e, bus);
@@ -871,7 +872,6 @@ test_demux (void)
   mux_pipeline_push (&mp, 1);
   for (guint i = 0; i < 2; i++)
     gst_sample_unref (pull_sample (mp.sink[i]));
-  g_usleep (50000);
   /* batch 0's set (held by the copy only) and batch 1's (held by appsink) */
   g_assert_true (hook_get_output_sets (mp.infer, &n_sets, &n_free));
   g_assert_cmpuint (n_sets, ==, 2);
@@ -1124,6 +1124,8 @@ typedef struct
   GAsyncQueue *in_flight;       /* GstBuffer refs of batches pushed into rdsinfer; GINT_TO_POINTER (1) ends it */
   /* reader thread; partial: traversals that saw one frame of a batch done and not the other */
   guint traversals, seen_done, partial;
+  guint n_missed;               /* batches that passed the probe without the reader seeing them done */
+  gint missed_seq;              /* the last of them */
   gint probe_batches;           /* atomic */
   gboolean bad;
 } Readers;
@@ -1192,6 +1194,8 @@ reader_thread (gpointer data)
       if (done < 2 && g_atomic_int_get (&r->probe_batches) <= head_seq)
         break;
       r->seen_done += done == 2;
+      if (done < 2)
+        r->n_missed++, r->missed_seq = head_seq;
       gst_buffer_unref (g_queue_pop_head (&window));
       head_seq++;
     }
@@ -1272,7 +1276,10 @@ test_concurrency (void)
       "reader", r.probe_batches, r.traversals, r.partial, r.seen_done);
   g_assert_false (r.bad);
   g_assert_cmpint (r.probe_batches, ==, CONCURRENCY_BATCHES);
-  g_assert_cmpuint (r.seen_done, >=, CONCURRENCY_BATCHES - 1);
+  /* exactly the first batch, which rdsinfer got as a copy */
+  g_assert_cmpuint (r.n_missed, ==, 1);
+  g_assert_cmpint (r.missed_seq, ==, 0);
+  g_assert_cmpuint (r.seen_done, ==, CONCURRENCY_BATCHES - 1);
   /* a batch's results are added under one hold of the lock: never half of them */
   g_assert_cmpuint (r.partial, ==, 0);
 

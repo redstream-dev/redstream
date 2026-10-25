@@ -201,6 +201,7 @@ configure (GstRdsInfer * self, GArray * operate_on_class_ids, GError ** error)
   gboolean tensor_meta, raw_write, instance_mask, tensor_input, crop, clip;
   gpointer raw_cb;
   GArray *ids;
+  GError *err = NULL;
 
   GST_OBJECT_LOCK (self);
   path = g_strdup (self->config_file_path);
@@ -282,8 +283,18 @@ configure (GstRdsInfer * self, GArray * operate_on_class_ids, GError ** error)
   }
   overridden[n_over] = NULL;
   g_assert (n_over < G_N_ELEMENTS (overridden));
-  if (!rds_infer_config_validate (cfg, overridden, error))
+  if (!rds_infer_config_validate (cfg, overridden, &err)) {
+    /* errors about overridden keys name the config key: name the property instead where they differ */
+    if ((set & PROP_BIT (PROP_UNIQUE_ID)) && g_str_has_prefix (err->message, "element property gie-unique-id:")) {
+      gchar *msg = g_strconcat ("element property unique-id:",
+          err->message + strlen ("element property gie-unique-id:"), NULL);
+
+      g_free (err->message);
+      err->message = msg;
+    }
+    g_propagate_error (error, err);
     goto fail;
+  }
 
   if (set & PROP_BIT (PROP_INFER_ON_GIE_ID) || set & PROP_BIT (PROP_INFER_ON_CLASS_IDS))
     g_ptr_array_add (cfg->warnings, g_strdup ("element properties infer-on-gie-id and infer-on-class-ids: ignored: "
@@ -291,8 +302,8 @@ configure (GstRdsInfer * self, GArray * operate_on_class_ids, GError ** error)
   if (crop || clip)
     g_ptr_array_add (cfg->warnings, g_strdup ("element properties crop-objects-to-roi-boundary and "
             "clip-object-outside-roi: ignored: they apply to preprocessed-tensor ROIs, which are not supported yet"));
+  /* start marks it posted (not this function: the test hook calls it too) */
   if ((raw_write || raw_cb) && !(self->warned & WARN_RAW_OUTPUT)) {
-    self->warned |= WARN_RAW_OUTPUT;
     g_ptr_array_add (cfg->warnings, g_strdup ("element properties raw-output-file-write and "
             "raw-output-generated-callback: ignored: raw output dumps are not implemented"));
   }
@@ -537,6 +548,10 @@ gst_rds_infer_start (GstBaseTransform * trans)
   for (guint i = 0; i < self->cfg->warnings->len; i++)
     GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("%s", (const gchar *) g_ptr_array_index (self->cfg->warnings,
                 i)), (NULL));
+  GST_OBJECT_LOCK (self);
+  if (self->raw_output_file_write || self->raw_output_generated_callback)
+    self->warned |= WARN_RAW_OUTPUT;
+  GST_OBJECT_UNLOCK (self);
 
   self->gpu = self->cfg->gpu_id;
   if (hipGetDevice (&prev) != hipSuccess || hipSetDevice ((int) self->gpu) != hipSuccess) {
@@ -737,7 +752,9 @@ attach_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set)
   for (guint f = 0; f < self->jobs->len; f++) {
     FrameJob *job = &g_array_index (self->jobs, FrameJob, f);
 
-    /* a frame removed while the lock was released (by an application thread) gets nothing */
+    /* A frame removed while the lock was released (by an application thread) gets nothing. This assumes such a
+     * thread doesn't also add a new frame in between: one acquired from the pool could reuse the removed frame's
+     * memory and would then get its results. */
     if (!g_list_find (bm->frame_meta_list, job->frame))
       continue;
     if (cfg->network_type == 0)
@@ -785,10 +802,19 @@ gst_rds_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   }
   if (!snapshot_frames (self, bm, surf))
     return GST_FLOW_ERROR;
+  if (self->jobs->len == 0) {
+    GST_LOG_OBJECT (self, "batch without frames");
+    return GST_FLOW_OK;
+  }
   if (gst_debug_category_get_threshold (GST_CAT_DEFAULT) >= GST_LEVEL_DEBUG)
     t0 = g_get_monotonic_time ();
 
-  HIP_OR_FAIL (hipSetDevice ((int) self->gpu), "hipSetDevice");
+  /* Set on every batch and not restored: the streaming thread only runs our GPU work while it is in here, and
+   * whatever ran on it before may have left another device current. */
+  if (hipSetDevice ((int) self->gpu) != hipSuccess) {
+    GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("GPU %u is not available", self->gpu), (NULL));
+    return GST_FLOW_ERROR;
+  }
   /* 1. preprocessing: each frame into its slot's image, unfilled slots zeroed */
   for (guint f = 0; f < self->jobs->len; f++) {
     FrameJob *job = &g_array_index (self->jobs, FrameJob, f);
@@ -844,10 +870,10 @@ gst_rds_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   return GST_FLOW_OK;
 
 fail:
-  if (set) {
-    (void) hipStreamSynchronize (self->stream);
+  /* work already queued may still read the batch or write the set: wait for it before either goes */
+  (void) hipStreamSynchronize (self->stream);
+  if (set)
     rds_infer_output_set_unref (set);
-  }
   return GST_FLOW_ERROR;
 }
 

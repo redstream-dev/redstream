@@ -14,7 +14,8 @@ G_DECLARE_FINAL_TYPE (GstRdsInfer, gst_rds_infer, GST, RDS_INFER, GstBaseTransfo
 GST_ELEMENT_REGISTER_DECLARE (rdsinfer);
 
 /* Test hooks, exported from the plugin for tests/check/element_infer.c only (looked up with g_module_symbol; not
- * API, no header installs them). Call them while no buffer is being processed.
+ * API, no header installs them). Call them while the stream is idle (between buffers, e.g. after pulling one
+ * downstream); get_output_sets only reads counts, under the pool's lock.
  * - get_config: the configuration the element would start with (the config file plus the properties set), as a
  *   structure named "rdsinfer-config" whose fields are config key names; NULL with @error as start would fail.
  * - get_output_sets: the output sets allocated and the ones in the free list; FALSE when not started.
