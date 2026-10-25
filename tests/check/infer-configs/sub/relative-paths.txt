@@ -1,0 +1,8 @@
+# Relative paths resolve against this file's directory; absolute paths stay as they are.
+[property]
+onnx-file=models/model.onnx
+labelfile-path=../labels-3.txt
+model-engine-file=/opt/models/model_b1.mxr
+custom-lib-path=/usr/lib/libmyparser.so
+num-detected-classes=3
+parse-bbox-func-name=MyParser

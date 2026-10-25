@@ -1,0 +1,6 @@
+# Classifiers are not supported: an error.
+[property]
+onnx-file=model.onnx
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo
+network-type=1

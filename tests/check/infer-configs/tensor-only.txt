@@ -1,0 +1,5 @@
+# network-type=100 (no post-processing): no classes or parser needed.
+[property]
+onnx-file=model.onnx
+network-type=100
+output-tensor-meta=1

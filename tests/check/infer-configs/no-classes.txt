@@ -1,0 +1,4 @@
+# A detector needs num-detected-classes: an error.
+[property]
+onnx-file=model.onnx
+parse-bbox-func-name=RdsInferParseYolo

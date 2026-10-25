@@ -1,0 +1,6 @@
+# A TensorRT engine builder: an error.
+[property]
+onnx-file=model.onnx
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo
+engine-create-func-name=MyEngine

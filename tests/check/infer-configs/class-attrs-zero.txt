@@ -1,0 +1,8 @@
+# Class ids are written without leading zeros: [class-attrs-00] is an error.
+[property]
+onnx-file=model.onnx
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo
+
+[class-attrs-00]
+pre-cluster-threshold=0.5

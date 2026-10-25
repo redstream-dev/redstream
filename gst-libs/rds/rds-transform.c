@@ -402,7 +402,7 @@ rds_transform_force_kernel (gboolean force)
   g_atomic_int_set (&force_kernel, force ? 1 : 0);
 }
 
-/* The filter mapping: Bilinear and Algo1-3 run as bilinear, everything else (and no FILTER flag) as nearest. */
+/* The filter mapping (rds_transform_filter_is_bilinear); no FILTER flag runs as nearest. */
 static gboolean
 use_bilinear (const RdsBufSurfTransformParams * tp)
 {
@@ -410,33 +410,10 @@ use_bilinear (const RdsBufSurfTransformParams * tp)
 
   if (!(tp->transform_flag & RDS_BUFSURF_TRANSFORM_FILTER))
     return FALSE;
-  switch (tp->transform_filter) {
-    case RdsBufSurfTransformInter_Bilinear:
-      return TRUE;
-    case RdsBufSurfTransformInter_Algo1:
-    case RdsBufSurfTransformInter_Algo2:
-    case RdsBufSurfTransformInter_Algo3:
-      if (g_atomic_int_compare_and_exchange (&warned, 0, 1))
-        GST_WARNING ("filters Algo1-Algo3 run as bilinear on this implementation");
-      return TRUE;
-    default:
-      return FALSE;
-  }
-}
-
-static void
-kernel_surface (const RdsBufSurfaceParams * p, RdsKernelSurface * k)
-{
-  k->data = p->dataPtr;
-  k->width = p->width;
-  k->height = p->height;
-  k->format = p->colorFormat;
-  for (guint i = 0; i < 3; i++) {
-    gboolean has = i < p->planeParams.num_planes;
-
-    k->pitch[i] = has ? p->planeParams.pitch[i] : 0;
-    k->offset[i] = has ? p->planeParams.offset[i] : 0;
-  }
+  if (tp->transform_filter >= RdsBufSurfTransformInter_Algo1 && tp->transform_filter <= RdsBufSurfTransformInter_Algo3
+      && g_atomic_int_compare_and_exchange (&warned, 0, 1))
+    GST_WARNING ("filters Algo1-Algo3 run as bilinear on this implementation");
+  return rds_transform_filter_is_bilinear (tp->transform_filter);
 }
 
 /* Builds the job for surface @i: rects default to the whole surface; a 4:2:0 destination rect is aligned outward
@@ -448,8 +425,8 @@ build_job (const RdsBufSurface * src, const RdsBufSurface * dst, const RdsBufSur
   const RdsBufSurfaceParams *sp = &src->surfaceList[i], *dp = &dst->surfaceList[i];
 
   memset (job, 0, sizeof (*job));
-  kernel_surface (sp, &job->src);
-  kernel_surface (dp, &job->dst);
+  rds_kernel_surface_init (&job->src, sp);
+  rds_kernel_surface_init (&job->dst, dp);
   job->bilinear = bilinear;
 
   if (tp->transform_flag & RDS_BUFSURF_TRANSFORM_CROP_SRC) {

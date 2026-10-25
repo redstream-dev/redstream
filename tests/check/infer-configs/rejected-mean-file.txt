@@ -1,0 +1,6 @@
+# Mean files are not supported (use offsets): an error.
+[property]
+onnx-file=model.onnx
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo
+mean-file=mean.ppm

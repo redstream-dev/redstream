@@ -2,10 +2,14 @@ project('redstream', 'c',
   version : '0.0.1',
   license : 'LGPL-2.1-or-later',
   meson_version : '>= 1.4',
-  default_options : ['c_std=gnu11', 'warning_level=2', 'werror=true'])
+  default_options : ['c_std=gnu11', 'cpp_std=c++17', 'warning_level=2', 'werror=true'])
+
+# C++: the MIGraphX engine (C++ API) and the compat header's C++ checks.
+add_languages('cpp', native : false)
 
 api_version = '1.0'
 cc = meson.get_compiler('c')
+cxx = meson.get_compiler('cpp')
 gst_dep = dependency('gstreamer-1.0', version : '>= 1.28')
 gst_base_dep = dependency('gstreamer-base-1.0', version : '>= 1.28')
 gst_video_dep = dependency('gstreamer-video-1.0', version : '>= 1.28')
@@ -53,6 +57,50 @@ rocdecode_dep = declare_dependency(
 rocm_path_norm = rocm_path.endswith('/') and rocm_path != '/' ? rocm_path.substring(0, -1) : rocm_path
 rds_install_rpath = rocm_path_norm == '/opt/rocm' ? '' : rocm_path_norm / 'lib'
 
+# rdsinfer needs MIGraphX (C++ API over libmigraphx_c), libyaml (nvinfer-style YAML configs) and json-glib (compiled
+# program manifests). With -Dinfer=auto, a missing one disables rdsinfer, rds-compile and their tests.
+infer_opt = get_option('infer')
+rds_infer_enabled = false
+if not infer_opt.disabled()
+  infer_missing = []
+  migraphx_path = get_option('migraphx_path')
+  migraphx_dep = dependency('', required : false)
+  migraphx_libdir = ''
+  foreach dir : migraphx_path != '' ? [migraphx_path] : [rocm_path / 'extras-10', rocm_path]
+    if not migraphx_dep.found() and fs.exists(dir / 'include/migraphx/migraphx.hpp')
+      migraphx_lib = cxx.find_library('migraphx_c', dirs : [dir / 'lib'], required : false)
+      if migraphx_lib.found()
+        migraphx_dep = declare_dependency(
+          include_directories : include_directories(dir / 'include', is_system : true),
+          dependencies : migraphx_lib)
+        migraphx_libdir = dir / 'lib'
+      endif
+    endif
+  endforeach
+  if not migraphx_dep.found()
+    infer_missing += 'MIGraphX (include/migraphx/migraphx.hpp + libmigraphx_c; set -Dmigraphx_path)'
+  endif
+  yaml_dep = dependency('yaml-0.1', required : false)
+  if not yaml_dep.found()
+    infer_missing += 'libyaml (yaml-0.1)'
+  endif
+  json_glib_dep = dependency('json-glib-1.0', required : false)
+  if not json_glib_dep.found()
+    infer_missing += 'json-glib (json-glib-1.0)'
+  endif
+  if infer_missing.length() == 0
+    rds_infer_enabled = true
+    # MIGraphX may live outside the linker path (ROCm 10 puts it in <rocm>/extras-10/lib): rdsinfer and rds-compile
+    # get an install rpath to it, next to the ROCm one.
+    rds_infer_install_rpath = ':'.join([rds_install_rpath,
+      migraphx_libdir == rocm_path_norm / 'lib' ? '' : migraphx_libdir]).strip(':')
+  elif infer_opt.enabled()
+    error('rdsinfer: missing ' + ', '.join(infer_missing))
+  else
+    message('rdsinfer disabled: missing ' + ', '.join(infer_missing))
+  endif
+endif
+
 # Plugin metadata. RDS_ORIGIN is a placeholder until the public repository exists (TODO before release).
 rds_origin = 'https://example.invalid/redstream'
 rds_plugin_c_args = [
@@ -65,4 +113,5 @@ rds_plugin_c_args = [
 subdir('gst-libs/rds')
 subdir('gst')
 subdir('samples')
+subdir('tools')
 subdir('tests')

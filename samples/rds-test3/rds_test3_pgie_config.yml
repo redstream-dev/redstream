@@ -1,0 +1,34 @@
+# Primary detector for rds-test3: Ultralytics YOLO11n (80 COCO classes) with rdsinfer's built-in YOLO parser.
+#
+# The model is not in the repository (AGPL-3.0): tests/models/fetch-yolo11n.sh exports it into .cache/models.
+# Relative paths in this file are resolved against the directory of this file, so as written they point at
+# <source tree>/.cache/models wherever the sample runs from. From the build directory:
+#
+#   samples/rds-test3/rds-test3 --pgie-config ../samples/rds-test3/rds_test3_pgie_config.yml URI [URI...]
+#
+# To use a model elsewhere, set onnx-file and labelfile-path to absolute paths (or paths relative to this file).
+# The compiled MIGraphX program is cached next to the model (yolo11n_b<N>_3x640x640_<gfx>_fp32.mxr); the first run
+# compiles it, which takes a minute or more on a small GPU (tools/rds-compile can do it ahead of time).
+property:
+  onnx-file: ../../.cache/models/yolo11n.onnx
+  labelfile-path: ../../.cache/models/coco-labels.txt
+  # The export has a symbolic height and width: the network input size must be given.
+  infer-dims: [3, 640, 640]
+  # rds-test3 sets batch-size to the number of sources.
+  batch-size: 1
+  gie-unique-id: 1
+  network-type: 0
+  network-mode: 0
+  num-detected-classes: 80
+  # RGB scaled to [0, 1], letterboxed (centred), as Ultralytics preprocesses
+  model-color-format: 0
+  net-scale-factor: 0.00392156862745098
+  maintain-aspect-ratio: 1
+  symmetric-padding: 1
+  # NMS per class
+  cluster-mode: 2
+  parse-bbox-func-name: RdsInferParseYolo
+class-attrs-all:
+  pre-cluster-threshold: 0.25
+  nms-iou-threshold: 0.45
+  topk: 300

@@ -1,0 +1,4 @@
+# A list item containing ';' (line 4) would split into two items: an error.
+property:
+  onnx-file: model.onnx
+  output-blob-names: ["a;b", c]

@@ -1,0 +1,6 @@
+# A mapping nested inside a key (line 6): an error that names the line.
+property:
+  onnx-file: model.onnx
+  num-detected-classes: 2
+  offsets:
+    r: 1.0

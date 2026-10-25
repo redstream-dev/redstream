@@ -1,0 +1,4 @@
+# Neither onnx-file nor model-engine-file: an error.
+[property]
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo

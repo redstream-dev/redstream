@@ -39,6 +39,10 @@ RUN git clone --depth 1 --branch ${GST_VERSION} https://gitlab.freedesktop.org/g
  && ninja -C build && ninja -C build install && ldconfig \
  && rm -rf /opt/src/gstreamer/build
 
+# rdsinfer config files (nvinfer-style YAML). Kept after the GStreamer build so that layer stays cached.
+RUN apt-get update && apt-get install -y --no-install-recommends libyaml-dev \
+ && rm -rf /var/lib/apt/lists/*
+
 ENV HSA_OVERRIDE_GFX_VERSION=10.3.0 \
     LIBVA_DRIVER_NAME=radeonsi \
     PATH=/opt/rocm/bin:/opt/rocm/extras-10/bin:$PATH

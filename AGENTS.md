@@ -13,8 +13,9 @@ metadata-traversal code via a compatibility header.
 Status: **pre-alpha.** Phase 0 spikes and the walking skeleton are done; the libgstrds core is in place (surfaces,
 `memory:RDS`, pools, metadata, events, read-only surface views, the `rds_buf_surf_transform` GPU transform). The
 elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
-`rdsstreammux` (the default scaling mux: batches of fixed-size slots) and `rdsstreamdemux` (zero-copy per-source
-views of the batch). Nothing here is stable.
+`rdsstreammux` (the default scaling mux: batches of fixed-size slots), `rdsstreamdemux` (zero-copy per-source
+views of the batch) and `rdsinfer` (MIGraphX primary detector: nvinfer configs, custom bbox parsers, object and
+tensor meta). Nothing here is stable.
 
 ## Architecture principles
 
@@ -97,6 +98,20 @@ Known gotchas:
 - On machines with an NVIDIA GPU as well, VA-API may log `pci id for fd N: 10de:...`. This is harmless; the
   AMD render node is still picked.
 - MIGraphX compilation is slow on small GPUs (minutes; FP16 even slower). Always cache compiled programs (`.mxr`).
+  YOLO11n FP32 at batch 1 on the gfx1036 iGPU: the first compile on a cold user cache (comgr's kernel cache in
+  `$XDG_CACHE_HOME`, MIOpen's in `$HOME/.config/miopen`) takes ~70 s (~40 s with only comgr's cache cold), ~30 s
+  once both are warm; batch 2 and 4 take ~80-85 s. Loading a cached program takes ~350 ms. `rdsinfer` and
+  `rds-compile` cache programs as `<onnx stem>_b<N>_<C>x<H>x<W>_<gfx>_<fp32|fp16>.mxr` next to the ONNX file (else in
+  `$XDG_CACHE_HOME/redstream/`), with a `.mxr.json` manifest (model hash, MIGraphX and HIP versions, device,
+  shapes, options) that must match for the program to load. Tests reuse these caches: never delete them casually,
+  and never run two YOLO11n tests in parallel (`is_parallel : false`, generous `timeout`s).
+- MIGraphX gives every symbolic ONNX dimension a default (1) when it parses a model, silently. Whether a dimension is
+  fixed or symbolic comes from our own reader (`rds-infer-onnx`), which reads the file's declared input dims.
+- MIGraphX's C++ exceptions always say "Failed to call function"; the real reason is on stderr. Error messages name
+  the MIGraphX call instead (`RDS_MGX_CHECK` in `rds-infer-engine.cpp`).
+- MIGraphX `dlopen`s its GPU target (`libmigraphx_gpu.so`) through its own `$ORIGIN` RUNPATH, which ASan's `dlopen`
+  interceptor defeats: ASan test runs set `LD_LIBRARY_PATH` to MIGraphX's `migraphx/lib` (done in
+  `tests/meson.build`).
 - Build HIP code with the GPU attached, or pass `--offload-arch` explicitly. Otherwise hipcc targets the wrong arch
   and kernels fail with "device kernel image is invalid".
 - rocDecode must be fed whole NAL units or access units (`h264parse ! ...,alignment=au`). Split NAL units decode
@@ -110,6 +125,12 @@ Known gotchas:
 - Include GLib/GStreamer **before** HIP: HIP defines `__noinline__` as a macro, which breaks `gmacros.h`. Public
   headers never include HIP (device pointers are `gpointer`); only `rds-hip-private.h` does.
 - `hipHostMalloc` (pinned) memory shows up in the process's VmRSS, not in `hipMemGetInfo`.
+- With `HSA_OVERRIDE_GFX_VERSION` set, HIP's `gcnArchName` reports the overridden target (gfx1030 on a gfx1036).
+  The device's own architecture is the KFD topology's `gfx_target_version`; the engine's cache names use that one.
+- MIOpen (MIGraphX's convolutions) keeps its databases under `$HOME/.config/miopen`. GLib tests with
+  `G_TEST_OPTION_ISOLATE_DIRS` set `HOME=/dev/null`, so such tests point `MIOPEN_USER_DB_PATH` and
+  `MIOPEN_CUSTOM_CACHE_DIR` somewhere writable, and `AMD_COMGR_CACHE_DIR` too, since the isolated
+  `XDG_CACHE_HOME` is fresh for each test (`infer_engine` uses the build directory).
 
 Useful checks:
 
@@ -132,20 +153,42 @@ gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
   rds-meta*, rds-osd-types  batch/frame/object/user/display meta, pools, deep copy
   rds-gst-meta       RdsMeta GstMeta on buffers (gst_buffer_get_rds_batch_meta)
   rds-event          stream events (pad added/deleted, stream start/EOS/segment/reset)
-  rds_compat.h       DeepStream compat header (+ rds-compat-aliases.h, rds-compat-remap.c)
+  rds_compat.h       DeepStream compat header (+ rds-compat-aliases.h, rds-compat-remap.c); rds_compat_infer.h
+                     (C++) adds the custom parser ABI names, for parser libraries only
+  rds-infer*.h       rdsinfer types (C), its tensor output meta (rds-infer-meta.h) and the custom bbox parser ABI
+                     (rds-infer-custom-impl.h, C++); headers only
   rds-transform      rds_buf_surf_transform: batched crop/scale/colour conversion (NvBufSurfTransform-shaped)
-  rds-transform-kernels.hip  its HIP kernels (amdclang++, linked in as an object)
+  rds-transform-kernels.hip  its HIP kernels (amdclang++, linked in as an object); their device helpers
+                     (sampling, BT.601 colour) are in rds-kernel-common.h, shared with rdsinfer's kernel
   *-private.h        internal headers, not installed (rds-hip-private.h is the only HIP include)
 gst/rdsvideo/      libgstrdsvideo plugin: rdsvideodec (rocDecode, gstrdsvideodec.c), rdsvideoconvert
                    (gstrdsvideoconvert.c), shared helpers in rds-video-util
 gst/rdsmux/        libgstrdsmux plugin: rdsstreammux (GstAggregator, gstrdsstreammux.c) and rdsstreamdemux
                    (gstrdsstreamdemux.c)
-docs/              compat-matrix.md: what the compat header and the elements map, with status and sources
+gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; refcounted output sets and tensor meta in
+                   rds-infer-output; test hooks exported for element_infer). rds-infer-config parses
+                   nvinfer key-file/YAML configs from one key table; rds-infer-parse loads custom parser libraries
+                   (dlopen, ABI version check) and has the built-in YOLO parser; rds-infer-post does the detection
+                   post-processing (letterbox geometry, NMS, ROI/size filters); rds-infer-engine compiles ONNX with
+                   MIGraphX and caches the program (.mxr + .mxr.json manifest), reading the model's declared input
+                   dims with the small protobuf reader rds-infer-onnx. These are in the static rdsinfer-core library
+                   (C and C++: link it with link_language 'cpp'), shared with the tests; the letterbox +
+                   normalisation kernel (rds-infer-preprocess.hip) is the static rdsinfer-preprocess; config corpus
+                   in tests/check/infer-configs, test parser modules built from tests/check/infer-parser-*. Optional
+                   (-Dinfer, default auto): needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml
+                   and json-glib
+docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its rdsinfer
+                   config-key tables must match the key table: the infer_config test checks every row)
 samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
+tools/rds-compile/ rds-compile: pre-builds rdsinfer's program with its config parser and engine (exit 2: up to date)
 tests/check/       GLib unit, element and pipeline tests (suites cpu/gpu); test clips are encoded in-process
                    (rds-test-media.h, needs the VA encoder); soak memory probes in rds-test-soak.h
 tests/samples/     sample-level tests
+tests/tools/       tool tests (shell scripts)
 tests/media/       make-test-media.sh: generated H.264 clips (into git-ignored .cache/)
+tests/models/      committed tiny ONNX test models (make-test-models.py); fetch-yolo11n.sh exports YOLO11n and its
+                   test reference data (street photo, Ultralytics detections, parity tensors) into .cache/models
+                   (host, Docker; AGPL, never committed)
 spikes/            Phase 0 experiments (rocdec-hip, migraphx-devptr); reference code, not built by meson
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
 ```
@@ -163,6 +206,8 @@ meson test -C build --suite cpu  # GPU-free subset (gpu tests also skip themselv
                                  # building still needs the ROCm headers and libamdhip64
 tests/media/make-test-media.sh   # generates .cache/media/*.h264 for manual runs, benchmarks and spikes
                                  # (the tests encode their own clips)
+tests/models/fetch-yolo11n.sh    # ON THE HOST (Docker + network): exports YOLO11n and its reference data into
+                                 # .cache/models; without it the YOLO11n tests skip
 # run our elements from the build tree
 GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-720p.h264 ! h264parse \
   ! rdsvideodec ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA,width=640,height=640" ! fakesink sync=false
@@ -191,11 +236,13 @@ meson test -C build-rel --print-errorlogs
 - Element tests load plugins from `build/gst` (`GST_PLUGIN_PATH_1_0`) next to the system plugins, with a private
   registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
   `gst-plugin-scanner` can't load sanitized plugins. ASan runs with `use_sigaltstack=0` (Mesa's LLVM, loaded by the
-  VA driver, installs its own alternate signal stack). The soak tests (`pipeline_soak`, `pipeline_mux_soak`) check
-  host memory growth on VmRSS, or under ASan on ASan's live heap (`__sanitizer_get_current_allocated_bytes`, which
-  leaves out the quarantine, so ASan keeps its default options); the normal build's VmRSS check covers memory that
-  bypasses malloc (HIP pinned memory). Their memory probes live in `tests/check/rds-test-soak.h`: host memory, and
-  GPU memory from this process's DRM fdinfo (`drm-total-vram` +
+  VA driver, installs its own alternate signal stack). The soak tests (`pipeline_soak`, `pipeline_mux_soak`,
+  `pipeline_infer_soak`) check host memory growth on VmRSS, or under ASan on ASan's live heap
+  (`__sanitizer_get_current_allocated_bytes`, which leaves out the quarantine, so ASan keeps its default options);
+  the normal build's VmRSS check covers memory that bypasses malloc (HIP pinned memory). They are also in the `soak`
+  suite; `pipeline_infer_soak` takes about 4 min with YOLO11n (3000 batches of 4 at ~50 fps on a small iGPU, also
+  under ASan), so `meson test --no-suite soak` leaves the soaks out. Their memory probes live in
+  `tests/check/rds-test-soak.h`: host memory, and GPU memory from this process's DRM fdinfo (`drm-total-vram` +
   `drm-total-gtt` of its render-node fds, where HIP allocations are accounted), so other processes on the GPU don't
   skew it; `hipMemGetInfo` is device-wide.
 - Element and pipeline test `main()`s end with `gst_deinit ()` after `g_test_run ()`. Without it, a test process can
@@ -206,7 +253,18 @@ meson test -C build-rel --print-errorlogs
   library register the same GTypes twice. They run with `internal_test_env`: no plugin paths and their own
   registry, so even an in-process scan loads no plugin.
 - Library symbols are hidden by default. Mark public API with `RDS_API` (from `rds/rds-prelude.h`).
+- **C++** is used only where MIGraphX and the parser ABI need it (`rds-infer-engine.cpp`, `rds-infer-parse.cpp`), in
+  the same layout as the C code. No exception crosses into C: every C-callable function catches at its boundary and
+  turns the exception into a `GError` (or a failed parse), and calls into user parser libraries are wrapped in
+  try/catch. Executables that link `rdsinfer-core` need `link_language : 'cpp'`.
+- **Test models.** The committed `tests/models/scale2*.onnx` are our own tiny models (`make-test-models.py`), so the
+  element tests run offline and compile in seconds. YOLO11n is AGPL-3.0: `tests/models/fetch-yolo11n.sh` exports it
+  (pinned versions and hashes, `PYTHONHASHSEED=0` for a reproducible export) into the git-ignored `.cache/models`,
+  with its test reference data. Never commit it or anything derived from it; tests that need it `g_test_skip` with
+  a message naming the script.
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
+- The compat-matrix lint (`/cpu/infer-config/compat-matrix`) runs only in builds with rdsinfer: a build without
+  MIGraphX, such as a hosted CI runner, doesn't check `docs/compat-matrix.md` against the key table.
 - **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never
   waits on a stream. Library copies, memsets and staging syncs (`sync_for_cpu`/`sync_for_device`) are synchronous,
   on the calling thread's per-thread stream (`hipStreamPerThread`), so they don't wait for other streams' work. The

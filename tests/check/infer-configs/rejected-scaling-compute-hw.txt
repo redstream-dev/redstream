@@ -1,0 +1,6 @@
+# VIC (Jetson) scaling: an error.
+[property]
+onnx-file=model.onnx
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo
+scaling-compute-hw=2

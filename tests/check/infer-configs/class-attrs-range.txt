@@ -1,0 +1,8 @@
+# Class ids go from 0 to num-detected-classes - 1: [class-attrs-80] is an error with 80 classes.
+[property]
+onnx-file=model.onnx
+num-detected-classes=80
+parse-bbox-func-name=RdsInferParseYolo
+
+[class-attrs-80]
+pre-cluster-threshold=0.5
