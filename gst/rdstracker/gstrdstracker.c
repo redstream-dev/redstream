@@ -47,9 +47,7 @@ GST_DEBUG_CATEGORY (gst_rds_tracker_debug);
 /* ll-lib-file names that select the built-in tracker (as a basename or a path ending in one): DeepStream's own
  * library name, so configs and apps run unchanged, and ours. */
 #define BUILTIN_LIB "librdstracker-builtin.so"
-static const gchar *const builtin_libs[] = { "libnvds_nvmultiobjecttracker.so", BUILTIN_LIB,
-  "librdstracker-builtin"
-};
+static const gchar *const builtin_libs[] = { "libnvds_nvmultiobjecttracker.so", BUILTIN_LIB };
 
 /* DeepStream 8.0 behaviour: an object the tracker creates on a frame without inference has this confidence. */
 #define CREATED_CONFIDENCE (-0.1f)
@@ -304,7 +302,7 @@ gst_rds_tracker_start (GstBaseTransform * trans)
   if (!lib_is_builtin (lib)) {
     GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("element property ll-lib-file: %s: custom low-level tracker "
             "libraries are not supported yet; leave it unset, or set libnvds_nvmultiobjecttracker.so or "
-            BUILTIN_LIB " for the built-in tracker", lib), (NULL));
+            BUILTIN_LIB " (bare or as a path) for the built-in tracker", lib), (NULL));
     goto fail;
   }
   if (lib && *lib)
@@ -364,36 +362,46 @@ gst_rds_tracker_stop (GstBaseTransform * trans)
   return TRUE;
 }
 
+static void
+with_core (GstRdsTracker * self, void (*func) (RdsTrackerCore *, guint64), guint source_id)
+{
+  g_mutex_lock (&self->core_lock);
+  if (self->core)
+    func (self->core, source_id);
+  g_mutex_unlock (&self->core_lock);
+}
+
 /* Stream events change the core's per-stream state; PAD_ADDED needs nothing (streams are created on first sight).
- * Events are serialized with the buffers; core_lock keeps them off a batch in progress anyway. */
+ * Events are serialized with the buffers; core_lock keeps them off a batch in progress anyway. Only these four take
+ * it: FLUSH_START and the rest never wait for a batch. */
 static gboolean
 gst_rds_tracker_sink_event (GstBaseTransform * trans, GstEvent * event)
 {
   GstRdsTracker *self = GST_RDS_TRACKER (trans);
   guint source_id;
 
-  g_mutex_lock (&self->core_lock);
-  if (self->core) {
-    switch ((RdsEventType) GST_EVENT_TYPE (event)) {
-      case RDS_EVENT_PAD_DELETED:
-        if (rds_event_parse_pad_deleted (event, &source_id))
-          rds_tracker_core_remove_stream (self->core, source_id);
-        break;
-      case RDS_EVENT_STREAM_RESET:
-        if (rds_event_parse_stream_reset (event, &source_id))
-          rds_tracker_core_stream_reset (self->core, source_id);
-        break;
-      case RDS_EVENT_STREAM_EOS:
-        if (rds_event_parse_stream_eos (event, &source_id))
-          rds_tracker_core_stream_eos (self->core, source_id);
-        break;
-      default:
-        if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP)
+  switch ((RdsEventType) GST_EVENT_TYPE (event)) {
+    case RDS_EVENT_PAD_DELETED:
+      if (rds_event_parse_pad_deleted (event, &source_id))
+        with_core (self, rds_tracker_core_remove_stream, source_id);
+      break;
+    case RDS_EVENT_STREAM_RESET:
+      if (rds_event_parse_stream_reset (event, &source_id))
+        with_core (self, rds_tracker_core_stream_reset, source_id);
+      break;
+    case RDS_EVENT_STREAM_EOS:
+      if (rds_event_parse_stream_eos (event, &source_id))
+        with_core (self, rds_tracker_core_stream_eos, source_id);
+      break;
+    default:
+      if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP) {
+        g_mutex_lock (&self->core_lock);
+        if (self->core)
           rds_tracker_core_clear (self->core);
-        break;
-    }
+        g_mutex_unlock (&self->core_lock);
+      }
+      break;
   }
-  g_mutex_unlock (&self->core_lock);
   return GST_BASE_TRANSFORM_CLASS (gst_rds_tracker_parent_class)->sink_event (trans, event);
 }
 
@@ -472,6 +480,7 @@ create_object (RdsBatchMeta * bm, const RdsTrackerTarget * t, gfloat fw, gfloat 
   om->class_id = t->class_id;
   om->confidence = CREATED_CONFIDENCE;
   om->tracker_confidence = t->tracker_confidence;
+  /* the pool hands out zeroed metas today, but its API doesn't promise it */
   memset (&om->detector_bbox_info, 0, sizeof (om->detector_bbox_info));
   set_boxes (om, t, fw, fh);
   rds_object_meta_set_drawing_defaults (om);
@@ -657,12 +666,16 @@ gst_rds_tracker_set_property (GObject * object, guint prop_id, const GValue * va
   GST_OBJECT_LOCK (self);
   switch (prop_id) {
     case PROP_LL_LIB_FILE:
-      g_free (self->ll_lib_file);
-      self->ll_lib_file = g_value_dup_string (value);
+      if (check_mutable (self, pspec)) {
+        g_free (self->ll_lib_file);
+        self->ll_lib_file = g_value_dup_string (value);
+      }
       break;
     case PROP_LL_CONFIG_FILE:
-      g_free (self->ll_config_file);
-      self->ll_config_file = g_value_dup_string (value);
+      if (check_mutable (self, pspec)) {
+        g_free (self->ll_config_file);
+        self->ll_config_file = g_value_dup_string (value);
+      }
       break;
     case PROP_TRACKER_WIDTH:
       if (check_mutable (self, pspec))
@@ -709,8 +722,10 @@ gst_rds_tracker_set_property (GObject * object, guint prop_id, const GValue * va
         self->user_meta_pool_size = g_value_get_uint (value);
       break;
     case PROP_OPERATE_ON_CLASS_IDS:
-      g_free (self->operate_on_class_ids);
-      self->operate_on_class_ids = g_value_dup_string (value);
+      if (check_mutable (self, pspec)) {
+        g_free (self->operate_on_class_ids);
+        self->operate_on_class_ids = g_value_dup_string (value);
+      }
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -814,10 +829,10 @@ gst_rds_tracker_class_init (GstRdsTrackerClass * klass)
   g_object_class_install_property (gobject_class, PROP_LL_LIB_FILE,
       g_param_spec_string ("ll-lib-file", "Low-level library file",
           "Low-level tracker library: only the built-in tracker exists (unset, libnvds_nvmultiobjecttracker.so "
-          "or " BUILTIN_LIB ")", NULL, PFLAGS));
+          "or " BUILTIN_LIB ", bare or as a path)", NULL, PFLAGS_READY));
   g_object_class_install_property (gobject_class, PROP_LL_CONFIG_FILE,
       g_param_spec_string ("ll-config-file", "Low-level config file",
-          "Tracker configuration file (YAML)", NULL, PFLAGS));
+          "Tracker configuration file (YAML)", NULL, PFLAGS_READY));
   g_object_class_install_property (gobject_class, PROP_TRACKER_WIDTH,
       g_param_spec_uint ("tracker-width", "Tracker width",
           "Width of the frames the tracker works on", 0, G_MAXUINT, DEFAULT_TRACKER_WIDTH, PFLAGS_READY));
@@ -863,7 +878,7 @@ gst_rds_tracker_class_init (GstRdsTrackerClass * klass)
   g_object_class_install_property (gobject_class, PROP_OPERATE_ON_CLASS_IDS,
       g_param_spec_string ("operate-on-class-ids", "Operate on class IDs",
           "Track only objects of these classes, separated by ';' (e.g. 0;2); unset or empty: all classes", NULL,
-          PFLAGS));
+          PFLAGS_READY));
 
   gst_element_class_add_static_pad_template (element_class, &sink_template);
   gst_element_class_add_static_pad_template (element_class, &src_template);

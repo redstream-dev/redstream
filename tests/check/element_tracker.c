@@ -8,6 +8,7 @@
 
 #include <gst/check/gstharness.h>
 #include <glib/gstdio.h>
+#include <math.h>
 #include <rds/rds.h>
 #include <string.h>
 
@@ -80,8 +81,8 @@ test_properties (void)
     const gchar *def_str;               /* string properties */
     gboolean ready_only;
   } props[] = {
-    {"ll-lib-file", G_TYPE_STRING, 0, 0, 0, NULL, FALSE},
-    {"ll-config-file", G_TYPE_STRING, 0, 0, 0, NULL, FALSE},
+    {"ll-lib-file", G_TYPE_STRING, 0, 0, 0, NULL, TRUE},
+    {"ll-config-file", G_TYPE_STRING, 0, 0, 0, NULL, TRUE},
     {"tracker-width", G_TYPE_UINT, 0, G_MAXUINT, 960, NULL, TRUE},
     {"tracker-height", G_TYPE_UINT, 0, G_MAXUINT, 544, NULL, TRUE},
     {"gpu-id", G_TYPE_UINT, 0, G_MAXUINT, 0, NULL, TRUE},
@@ -94,7 +95,7 @@ test_properties (void)
     {"sub-batches", G_TYPE_STRING, 0, 0, 0, "", FALSE},
     {"sub-batch-err-recovery-trial-cnt", G_TYPE_INT, -1, G_MAXINT, 0, NULL, FALSE},
     {"user-meta-pool-size", G_TYPE_UINT, 1, G_MAXUINT, 32, NULL, TRUE},
-    {"operate-on-class-ids", G_TYPE_STRING, 0, 0, 0, NULL, FALSE},
+    {"operate-on-class-ids", G_TYPE_STRING, 0, 0, 0, NULL, TRUE},
   };
   GstElement *e = gst_element_factory_make ("rdstracker", NULL);
   GObjectClass *klass = G_OBJECT_GET_CLASS (e);
@@ -366,6 +367,7 @@ test_ready_only (void)
   static const gchar *ready_only[] = { "tracker-width", "tracker-height", "gpu-id", "tracking-id-reset-mode",
     "tracking-surface-type", "tensor-meta-gie-id", "user-meta-pool-size",
   };
+  static const gchar *ready_only_str[] = { "ll-lib-file", "ll-config-file", "operate-on-class-ids" };
   GstHarness *h = gst_harness_new ("rdstracker");
   gboolean show = TRUE;
 
@@ -385,6 +387,16 @@ test_ready_only (void)
     g_assert_true (pspec->flags & GST_PARAM_MUTABLE_READY);
     g_free (pattern);
   }
+  for (guint i = 0; i < G_N_ELEMENTS (ready_only_str); i++) {
+    gchar *pattern = g_strdup_printf ("*'%s'*NULL or READY*", ready_only_str[i]), *after = NULL;
+
+    g_test_expect_message ("rdstracker", G_LOG_LEVEL_WARNING, pattern);
+    g_object_set (h->element, ready_only_str[i], "0", NULL);
+    g_test_assert_expected_messages ();
+    g_object_get (h->element, ready_only_str[i], &after, NULL);
+    g_assert_null (after);
+    g_free (pattern);
+  }
   g_object_set (h->element, "display-tracking-id", FALSE, NULL);
   g_object_get (h->element, "display-tracking-id", &show, NULL);
   g_assert_false (show);
@@ -397,6 +409,14 @@ test_ready_only (void)
 
     g_object_get (h->element, "tracker-width", &w, NULL);
     g_assert_cmpuint (w, ==, 320);
+  }
+  g_object_set (h->element, "operate-on-class-ids", "1", NULL);
+  {
+    gchar *ids;
+
+    g_object_get (h->element, "operate-on-class-ids", &ids, NULL);
+    g_assert_cmpstr (ids, ==, "1");
+    g_free (ids);
   }
   gst_harness_teardown (h);
 }
@@ -1076,6 +1096,13 @@ test_start_errors (void)
   g_assert_nonnull (strstr (texts, "not supported"));
   g_free (texts);
 
+  /* only the names the error message lists */
+  e = gst_element_factory_make ("rdstracker", NULL);
+  g_object_set (e, "ll-lib-file", "librdstracker-builtin", NULL);
+  texts = start_error (e);
+  g_assert_nonnull (strstr (texts, "librdstracker-builtin.so (bare or as a path)"));
+  g_free (texts);
+
   e = gst_element_factory_make ("rdstracker", NULL);
   g_object_set (e, "ll-config-file", missing, NULL);
   texts = start_error (e);
@@ -1109,13 +1136,13 @@ test_start_errors (void)
   g_free (missing);
 }
 
-/* NVIDIA's library name (bare or as a path), ours, and an empty name all select the built-in tracker. */
+/* NVIDIA's library name and ours (each bare or as a path), and an empty name, select the built-in tracker. */
 static void
 test_builtin_lib (void)
 {
   static const gchar *names[] = { "libnvds_nvmultiobjecttracker.so",
     "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so", "librdstracker-builtin.so",
-    "librdstracker-builtin", "",
+    "/usr/lib/librdstracker-builtin.so", "",
   };
 
   for (guint i = 0; i < G_N_ELEMENTS (names); i++) {
@@ -1145,6 +1172,12 @@ test_noop_warnings (void)
 {
   static const gchar *props[] = { "compute-hw", "tracking-surface-type", "user-meta-pool-size",
     "input-tensor-meta", "tensor-meta-gie-id", "sub-batches", "sub-batch-err-recovery-trial-cnt",
+  };
+  static const gchar *noop_keys[] = { "BaseConfig.useBatchNumForFrameId: 1: ",
+    "TargetManagement.preserveStreamUpdateOrder: 1: ", "TargetManagement.enableBboxUnClipping: 1: ",
+    "TargetManagement.outputTerminatedTracks: 1: ", "TargetManagement.outputShadowTracks: 1: ",
+    "TargetManagement.outputVisibility: 1: ", "TargetManagement.terminatedTrackFilename: dump/track: ",
+    "TrajectoryManagement.enableReAssoc: 1: ",
   };
   GstElement *e = new_tracker (FAST_CONFIG);
   GstBus *bus = gst_bus_new ();
@@ -1179,7 +1212,15 @@ test_noop_warnings (void)
   g_object_set (e, "ll-config-file", path, NULL);
   bus = gst_bus_new ();
   h = harness_for (e, bus);
-  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, NULL), >, 0);
+  /* one warning per no-op key the file sets (see tracker_config), each posted once */
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, G_N_ELEMENTS (noop_keys));
+  for (guint i = 0; i < G_N_ELEMENTS (noop_keys); i++) {
+    const gchar *at = strstr (texts, noop_keys[i]);
+
+    g_assert_nonnull (at);
+    g_assert_null (strstr (at + 1, noop_keys[i]));
+  }
+  g_free (texts);
   g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
   harness_teardown_with_bus (h, bus);
   g_free (path);
@@ -1319,6 +1360,13 @@ test_random (void)
           g_assert_cmpfloat (om->rect_params.left, >=, 0);
           g_assert_cmpfloat (om->rect_params.left + om->rect_params.width, <=, FRAME_W);
           g_assert_cmpfloat (om->rect_params.width, >=, 0);
+          g_assert_cmpfloat (om->rect_params.top, >=, 0);
+          g_assert_cmpfloat (om->rect_params.top + om->rect_params.height, <=, FRAME_H);
+          g_assert_cmpfloat (om->rect_params.height, >=, 0);
+          g_assert_true (isfinite (om->tracker_bbox_info.org_bbox_coords.left));
+          g_assert_true (isfinite (om->tracker_bbox_info.org_bbox_coords.top));
+          g_assert_true (isfinite (om->tracker_bbox_info.org_bbox_coords.width));
+          g_assert_true (isfinite (om->tracker_bbox_info.org_bbox_coords.height));
           g_assert_nonnull (om->text_params.display_text);
           if (om->confidence == -0.1f)
             n_created++;
@@ -1414,6 +1462,130 @@ test_nvsort (void)
   g_free (path);
 }
 
+/* A good run, then a restart with a config that doesn't parse: the start fails with an error naming the file and
+ * the element stays usable; with the config fixed it tracks again. */
+static void
+test_restart_bad_config (void)
+{
+  gchar *bad = write_config ("bad-restart.yml", "TargetManagement:\n  probationAge: [0\n");
+  gchar *good = write_config ("good-restart.yml", FAST_CONFIG);
+  GstElement *e = gst_element_factory_make ("rdstracker", NULL);
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h;
+  GstBuffer *buf;
+  gchar *texts;
+
+  g_object_set (e, "ll-config-file", good, NULL);
+  h = harness_for (e, bus);
+  buf = new_batch (1, NULL, NULL);
+  add_det (buf, 0, 100, 100, 50, 50, 0, 0.9f, "a");
+  buf = run (h, buf);
+  assert_ids (nth_frame (buf, 0), "0");
+  gst_buffer_unref (buf);
+
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+  g_object_set (e, "ll-config-file", bad, NULL);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_PLAYING), ==, GST_STATE_CHANGE_FAILURE);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "bad-restart.yml"));
+  g_free (texts);
+
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+  g_object_set (e, "ll-config-file", good, NULL);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_PLAYING), ==, GST_STATE_CHANGE_SUCCESS);
+  g_assert_true (gst_harness_push_event (h, gst_event_new_stream_start ("restart")));
+  gst_harness_set_caps_str (h, IN_CAPS, IN_CAPS);
+  buf = new_batch (1, NULL, NULL);
+  add_det (buf, 0, 100, 100, 50, 50, 0, 0.9f, "a");
+  buf = run (h, buf);
+  assert_ids (nth_frame (buf, 0), "0");
+  gst_buffer_unref (buf);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
+  harness_teardown_with_bus (h, bus);
+  g_free (bad);
+  g_free (good);
+}
+
+/* A buffer without batch meta, and a batch with two frames of one source, are stream errors. */
+static void
+test_stream_errors (void)
+{
+  const guint sources[] = { 2, 2 };
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h = harness_for (new_tracker (FAST_CONFIG), bus);
+  GstBuffer *buf;
+  gchar *texts;
+
+  g_assert_cmpint (gst_harness_push (h, gst_buffer_new ()), ==, GST_FLOW_ERROR);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "rdstracker needs batches from rdsstreammux"));
+  g_free (texts);
+
+  buf = new_batch (2, sources, NULL);
+  add_det (buf, 0, 100, 100, 50, 50, 0, 0.9f, "a");
+  add_det (buf, 1, 100, 100, 50, 50, 0, 0.9f, "b");
+  g_assert_cmpint (gst_harness_push (h, buf), ==, GST_FLOW_ERROR);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "A batch has two frames of source 2"));
+  g_free (texts);
+  harness_teardown_with_bus (h, bus);
+}
+
+/* Clipping without pipeline_width/height: to the frame's surface slot (64x48) when the batch has one; not at all
+ * without a surface, where a box left of the frame keeps its negative left (its text offset is 0) and a NaN box
+ * added by an application is removed. */
+static void
+test_clip_size (void)
+{
+  GstHarness *h = harness_for (new_tracker (FAST_CONFIG), NULL);
+  RdsBatchMeta *bm;
+  RdsFrameMeta *fm;
+  RdsObjectMeta *om;
+  GstBuffer *buf;
+
+  buf = new_batch (1, NULL, NULL);
+  fm = nth_frame (buf, 0);
+  fm->pipeline_width = fm->pipeline_height = 0;
+  add_det (buf, 0, 50, 40, 30, 20, 0, 0.9f, "a");
+  buf = run (h, buf);
+  om = nth_obj (nth_frame (buf, 0), 0);
+  assert_coords (&om->tracker_bbox_info.org_bbox_coords, 50, 40, 30, 20);
+  assert_rect (&om->rect_params, 50, 40, 14, 8);
+  gst_buffer_unref (buf);
+  gst_harness_teardown (h);
+
+  h = harness_for (new_tracker (FAST_CONFIG), NULL);
+  for (guint b = 0; b < 2; b++) {
+    buf = gst_buffer_new ();
+    bm = rds_create_batch_meta (1);
+    fm = rds_acquire_frame_meta_from_pool (bm);
+    fm->bInferDone = b == 0;
+    rds_add_frame_meta_to_batch (bm, fm);
+    g_assert_nonnull (rds_buffer_add_batch_meta (buf, bm));
+    if (b == 0) {
+      om = add_det (buf, 0, -30, -10, 100, 50, 0, 0.9f, "left");
+      om = add_det (buf, 0, 200, 100, 50, 50, 0, 0.9f, "nan");
+      om->detector_bbox_info.org_bbox_coords = (RdsBbox_Coords) {
+      0, 0, 0, 0};
+      om->rect_params.left = NAN;
+    }
+    buf = run (h, buf);
+    fm = nth_frame (buf, 0);
+    g_assert_cmpuint (n_objs (fm), ==, 1);
+    om = nth_obj (fm, 0);
+    assert_ids (fm, "0");
+    assert_coords (&om->tracker_bbox_info.org_bbox_coords, -30, -10, 100, 50);
+    assert_rect (&om->rect_params, -30, -10, 100, 50);
+    if (b == 1) {
+      g_assert_cmpfloat (om->confidence, ==, -0.1f);
+      g_assert_cmpuint (om->text_params.x_offset, ==, 0);
+      g_assert_cmpuint (om->text_params.y_offset, ==, 0);
+    }
+    gst_buffer_unref (buf);
+  }
+  gst_harness_teardown (h);
+}
+
 static void
 remove_dir (const gchar * dir)
 {
@@ -1458,6 +1630,9 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/tracker/builtin-lib", test_builtin_lib);
   g_test_add_func ("/cpu/tracker/noop-warnings", test_noop_warnings);
   g_test_add_func ("/cpu/tracker/restart", test_restart);
+  g_test_add_func ("/cpu/tracker/restart-bad-config", test_restart_bad_config);
+  g_test_add_func ("/cpu/tracker/stream-errors", test_stream_errors);
+  g_test_add_func ("/cpu/tracker/clip-size", test_clip_size);
   g_test_add_func ("/cpu/tracker/meta-lock", test_meta_lock);
   g_test_add_func ("/cpu/tracker/random", test_random);
   g_test_add_func ("/cpu/tracker/nvsort", test_nvsort);
