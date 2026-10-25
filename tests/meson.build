@@ -111,6 +111,12 @@ if rds_infer_enabled
       link_language : 'cpp',
       c_args : ['-DRDS_INFER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'infer-configs')]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
+  # The built-in YOLO parser and the detection post-processing, against hand-computed cases and a naive reference
+  # (check/infer-post-ref.h). Prints the parser and post-processing times on a YOLO11n-sized output.
+  test('infer_post', executable('infer_post', 'check' / 'infer_post.c',
+      dependencies : [rdsinfer_core_dep],
+      link_language : 'cpp'),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
 
   # Test parser modules (never installed), loaded by path. The fixture is a DeepStream-style parser compiled against
   # the compat header, from two translation units that both include the parser header; the same sources are built
