@@ -108,8 +108,35 @@ if rds_infer_enabled
   # environment without plugin paths.
   test('infer_config', executable('infer_config', 'check' / 'infer_config.c',
       dependencies : [rdsinfer_core_dep],
+      link_language : 'cpp',
       c_args : ['-DRDS_INFER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'infer-configs')]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
+
+  # Test parser modules (never installed), loaded by path. The fixture is a DeepStream-style parser compiled against
+  # the compat header, from two translation units that both include the parser header; the same sources are built
+  # again with hidden visibility. The no-ABI module lacks the version symbol; the bad-ABI one has a wrong version.
+  fixture_parser_src = files('check' / 'infer-parser-fixture.cpp', 'check' / 'infer-parser-fixture-boxes.cpp')
+  fixture_parser_deps = [rds_dep.partial_dependency(compile_args : true, includes : true)]
+  infer_parser_fixture = shared_module('infer-parser-fixture', fixture_parser_src,
+    cpp_args : ['-DUSE_REDSTREAM'], dependencies : fixture_parser_deps)
+  infer_parser_hidden = shared_module('infer-parser-hidden', fixture_parser_src,
+    cpp_args : ['-DUSE_REDSTREAM'], dependencies : fixture_parser_deps, gnu_symbol_visibility : 'hidden')
+  infer_parser_noabi = shared_module('infer-parser-noabi', 'check' / 'infer-parser-noabi.c')
+  infer_parser_badabi = shared_module('infer-parser-badabi', 'check' / 'infer-parser-noabi.c',
+    c_args : ['-DRDS_TEST_ABI_VERSION=999'])
+  # export_dynamic: this executable's own copy of the version symbol is visible to dlsym, so the no-ABI test
+  # checks that the loader looks only in the module.
+  test('infer_abi', executable('infer_abi', 'check' / 'infer_abi.cpp', 'check' / 'infer_abi_noleak.cpp',
+      dependencies : [rds_dep, rdsinfer_core_dep],
+      export_dynamic : true,
+      cpp_args : [
+        '-DRDS_TEST_PARSER_FIXTURE="@0@"'.format(infer_parser_fixture.full_path()),
+        '-DRDS_TEST_PARSER_HIDDEN="@0@"'.format(infer_parser_hidden.full_path()),
+        '-DRDS_TEST_PARSER_NOABI="@0@"'.format(infer_parser_noabi.full_path()),
+        '-DRDS_TEST_PARSER_BADABI="@0@"'.format(infer_parser_badabi.full_path()),
+      ]),
+    suite : 'cpu', env : test_env, protocol : 'tap',
+    depends : [infer_parser_fixture, infer_parser_hidden, infer_parser_noabi, infer_parser_badabi])
 endif
 
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',

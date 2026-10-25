@@ -1,7 +1,9 @@
 /* Redstream source-compatibility header for applications written against DeepStream.
  * Provides element factory remapping, plus surface, transform, metadata and event aliases (NvBufSurface*,
- * NvBufSurfTransform*, NvDs*, NvOSD_*, gst_nvevent_*) over the Redstream API; see docs/compat-matrix.md for what
- * is covered.
+ * NvBufSurfTransform*, NvDs*, NvOSD_*, gst_nvevent_*, and the NvDsInfer* types) over the Redstream API; see
+ * docs/compat-matrix.md for what is covered. In C++ it also brings the custom bbox parser ABI
+ * (rds/rds-infer-custom-impl.h: NvDsInferParseCustomFunc, CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE, FLOAT, ...), so a
+ * DeepStream parser includes it in place of nvdsinfer_custom_impl.h.
  *
  *   #ifdef USE_REDSTREAM
  *   #include <rds/rds_compat.h>

@@ -2,6 +2,9 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <rds/rds_compat.h>
 
+/* The unprefixed nvinfer data-type names (FLOAT, HALF, ...) are C++ only: in C they stay free. */
+static const int FLOAT = 0, HALF = 1, INT8 = 2, INT32 = 3, INT64 = 4;
+
 /* Each DeepStream type name must be the Redstream type (pointer assignment fails on a mismatch under -Werror). */
 static void
 test_types (void)
@@ -55,6 +58,13 @@ test_types (void)
   { RdsBufSurfTransformRect *r = NULL; NvBufSurfTransformRect *n = r; g_assert_null (n); }
   { RdsBufSurfTransformParams *r = NULL; NvBufSurfTransformParams *n = r; g_assert_null (n); }
   { RdsBufSurfTransformConfigParams *r = NULL; NvBufSurfTransformConfigParams *n = r; g_assert_null (n); }
+  { RdsInferDims *r = NULL; NvDsInferDims *n = r; g_assert_null (n); }
+  { RdsInferDimsCHW *r = NULL; NvDsInferDimsCHW *n = r; g_assert_null (n); }
+  { RdsInferDataType *r = NULL; NvDsInferDataType *n = r; g_assert_null (n); }
+  { RdsInferLayerInfo *r = NULL; NvDsInferLayerInfo *n = r; g_assert_null (n); }
+  { RdsInferNetworkInfo *r = NULL; NvDsInferNetworkInfo *n = r; g_assert_null (n); }
+  { RdsInferObjectDetectionInfo *r = NULL; NvDsInferObjectDetectionInfo *n = r; g_assert_null (n); }
+  { RdsInferObjectDetectionInfo *r = NULL; NvDsInferParseObjectInfo *n = r; g_assert_null (n); }
 }
 
 /* The transform structs keep DeepStream's field names and the documented field types, so designated initializers
@@ -226,6 +236,8 @@ test_functions (void)
 static void
 test_constants (void)
 {
+  g_assert_cmpint (NVDSINFER_MAX_DIMS, ==, RDS_INFER_MAX_DIMS);
+  g_assert_cmpint (FLOAT + HALF + INT8 + INT32 + INT64, ==, 10);
   g_assert_true ((gint64) NVBUF_MEM_DEFAULT == (gint64) RDS_BUF_MEM_DEFAULT);
   g_assert_true ((gint64) NVBUF_MEM_CUDA_PINNED == (gint64) RDS_BUF_MEM_HIP_PINNED);
   g_assert_true ((gint64) NVBUF_MEM_CUDA_DEVICE == (gint64) RDS_BUF_MEM_HIP_DEVICE);

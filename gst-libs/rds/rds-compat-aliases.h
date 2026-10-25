@@ -6,6 +6,10 @@
 #define RDS_COMPAT_ALIASES_H
 
 #include <rds/rds.h>
+#include <rds/rds-infer.h>
+#ifdef __cplusplus
+#include <rds/rds-infer-custom-impl.h>
+#endif
 
 /* ---- NvBufSurface ---- */
 typedef RdsBufSurface NvBufSurface;
@@ -236,5 +240,29 @@ typedef RdsEventType GstNvEventType;
 #define gst_nvevent_parse_stream_segment rds_event_parse_stream_segment
 #define gst_nvevent_parse_stream_reset rds_event_parse_stream_reset
 #define gst_nvevent_parse_stream_start rds_event_parse_stream_start
+
+/* ---- nvinfer layer, network and object types (nvdsinfer.h) ---- */
+#define NVDSINFER_MAX_DIMS RDS_INFER_MAX_DIMS
+typedef RdsInferDims NvDsInferDims;
+typedef RdsInferDimsCHW NvDsInferDimsCHW;
+typedef RdsInferDataType NvDsInferDataType;
+typedef RdsInferLayerInfo NvDsInferLayerInfo;
+typedef RdsInferNetworkInfo NvDsInferNetworkInfo;
+typedef RdsInferObjectDetectionInfo NvDsInferObjectDetectionInfo;
+typedef RdsInferParseObjectInfo NvDsInferParseObjectInfo;
+
+#ifdef __cplusplus
+/* ---- Custom bbox parser ABI (nvdsinfer_custom_impl.h), C++ only ---- */
+/* Unscoped, unprefixed enumerators on DeepStream; constants of the Redstream enum here, so comparisons and switches
+ * on dataType compile warning-free. Only code that includes this header sees them. */
+constexpr RdsInferDataType FLOAT = RDS_INFER_DATA_FLOAT;
+constexpr RdsInferDataType HALF = RDS_INFER_DATA_HALF;
+constexpr RdsInferDataType INT8 = RDS_INFER_DATA_INT8;
+constexpr RdsInferDataType INT32 = RDS_INFER_DATA_INT32;
+constexpr RdsInferDataType INT64 = RDS_INFER_DATA_INT64;
+typedef RdsInferParseDetectionParams NvDsInferParseDetectionParams;
+typedef RdsInferParseCustomFunc NvDsInferParseCustomFunc;
+#define CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE RDS_CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE
+#endif
 
 #endif /* RDS_COMPAT_ALIASES_H */

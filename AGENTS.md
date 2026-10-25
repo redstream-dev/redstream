@@ -133,6 +133,7 @@ gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
   rds-gst-meta       RdsMeta GstMeta on buffers (gst_buffer_get_rds_batch_meta)
   rds-event          stream events (pad added/deleted, stream start/EOS/segment/reset)
   rds_compat.h       DeepStream compat header (+ rds-compat-aliases.h, rds-compat-remap.c)
+  rds-infer*.h       rdsinfer types (C) and the custom bbox parser ABI (rds-infer-custom-impl.h, C++); headers only
   rds-transform      rds_buf_surf_transform: batched crop/scale/colour conversion (NvBufSurfTransform-shaped)
   rds-transform-kernels.hip  its HIP kernels (amdclang++, linked in as an object)
   *-private.h        internal headers, not installed (rds-hip-private.h is the only HIP include)
@@ -141,8 +142,10 @@ gst/rdsvideo/      libgstrdsvideo plugin: rdsvideodec (rocDecode, gstrdsvideodec
 gst/rdsmux/        libgstrdsmux plugin: rdsstreammux (GstAggregator, gstrdsstreammux.c) and rdsstreamdemux
                    (gstrdsstreamdemux.c)
 gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (MIGraphX; element skeleton so far). rds-infer-config parses
-                   nvinfer key-file/YAML configs from one key table (static rdsinfer-core library, shared with
-                   the tests; corpus in tests/check/infer-configs). Optional (-Dinfer, default auto):
+                   nvinfer key-file/YAML configs from one key table; rds-infer-parse loads custom parser libraries
+                   (dlopen, ABI version check). Both are in the static rdsinfer-core library (C and C++: link it
+                   with link_language 'cpp'), shared with the tests; config corpus in tests/check/infer-configs,
+                   test parser modules built from tests/check/infer-parser-*. Optional (-Dinfer, default auto):
                    needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml and json-glib
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources
 samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
