@@ -634,8 +634,9 @@ gst_rds_tracker_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 
     frame_size (fm, surf, &fw, &fh);
     write_back (bm, fm, &out.frames[f], fw, fh, show_id);
-    GST_LOG_OBJECT (self, "source %u frame %d: %u reported, %u removed", fm->source_id, fm->frame_num,
-        out.frames[f].n_targets, out.frames[f].n_rejected);
+    GST_DEBUG_OBJECT (self, "source %u frame %d: %u tracks reported, %u objects removed, %u targets", fm->source_id,
+        fm->frame_num, out.frames[f].n_targets, out.frames[f].n_rejected,
+        rds_tracker_core_get_n_targets (self->core, fm->source_id));
   }
   rds_release_meta_lock (bm);
   g_mutex_unlock (&self->core_lock);

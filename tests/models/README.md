@@ -82,3 +82,38 @@ hashes in `DERIVED_SHA256` in `export-yolo11n.py` and here.
 
 The reference has 16 objects: 9 person, 3 car, and one each of truck, motorcycle, handbag and umbrella.
 `pipeline_infer` compares rdsinfer's detections with it per class, for the classes with at least 3 objects.
+
+## Fetched: the street clip for the tracker tests (`.cache/media/crosswalk-720p.h264`)
+
+**Video:** [Diagonal crosswalk at Yonge & Dundas in
+Toronto](https://commons.wikimedia.org/wiki/File:DiagonalCrosswalkYongeDundas.webm) by Raysonho @ Open Grid
+Scheduler / Grid Engine, Wikimedia Commons, released under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)
+(public domain dedication). A fixed camera on a busy intersection: dozens of pedestrians crossing in every
+direction, cars and a few cyclists; 56.6 s, 1356 frames at 23.976 fps.
+
+```bash
+tests/models/fetch-tracker-clip.sh    # on the host; needs Docker, network access and the GPU
+```
+
+- It downloads the original from `upload.wikimedia.org` (1920×1080 VP8 WebM, 72,708,305 bytes, sha256
+  `a497af7a6e905ae265fdc2dffd607eaa64a143ebd935137039a4e115bde0e01e`) into `.cache/tracker-clip/`, with timeouts,
+  and checks the sha256 before anything decodes it.
+- `rdsvideodec` decodes only H.264 and H.265, and the dev image has no VP8 decoder (no libvpx, and VA-API has no
+  VP8 on current AMD GPUs). So `decode-tracker-clip.py` decodes it in a throwaway `python:3.12-slim` container (the
+  same pinned image as the YOLO11n export) with PyAV, pinned with its hash in `tracker-clip-requirements.txt`, and
+  pipes raw I420 frames into `redstream:dev`, which scales them to 1280×720 (`videoscale`, bilinear) and encodes them
+  with `vah264enc` (constant QP: 22 for I, 24 for P; an IDR every 60 frames) into H.264 Annex-B, one access unit per
+  buffer.
+- An existing output is not redone. To redo it, delete it.
+
+**Reproducibility.** Only the source is pinned. The decode is bit-exact and the scaler is deterministic, but the
+hardware encoder's output depends on the GPU and its driver. On one machine re-runs give the same bytes; the script
+compares the result with the hash recorded on the machine the tests were tuned on (a gfx1036 iGPU, the Mesa in
+`redstream:dev`) and only warns on a mismatch:
+
+```
+ec96845ec40ad844f80c25909477e65025c7f596acb3a7969cefccde754cca9a  crosswalk-720p.h264
+```
+
+`pipeline_tracker` runs YOLO11n and `rdstracker` on it; its budgets come from a run on that encoding, so a different
+encoder can move the metrics a little.

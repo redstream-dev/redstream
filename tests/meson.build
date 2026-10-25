@@ -258,6 +258,39 @@ if rds_tracker_enabled
     c_args : ['-DRDS_TRACKER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'tracker-configs')])
   test('element_tracker_cpu', element_tracker_exe, args : ['-p', '/cpu/tracker'],
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+  # The tracking core replaying the street clip's detections that pipeline_tracker saves (skipped until it has run)
+  # against the element's IDs, and a scripted scene with known identities, both with the sample configs. With
+  # RDS_TRACKER_GRID=1 it also runs the parameter grid the sample configs were tuned with.
+  test('tracker_replay', executable('tracker_replay', 'check' / 'tracker_replay.c',
+      dependencies : [rdstracker_core_dep, cc.find_library('m', required : false)],
+      c_args : [
+        '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
+        '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+      ]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 300)
+endif
+
+if rds_tracker_enabled and rds_infer_enabled
+  # rdstracker end to end on a public street clip with YOLO11n (pipeline_tracker; skipped until
+  # tests/models/fetch-tracker-clip.sh and fetch-yolo11n.sh have run), and the four-source soak (its own entry,
+  # pipeline_tracker_soak, also in the soak suite; with scale2 and scripted objects without YOLO11n, and a generated
+  # clip without the street clip, so the leak check always runs). The YOLO11n programs are shared with infer_engine
+  # and pipeline_infer. Never in parallel: one compile or soak at a time.
+  pipeline_tracker_exe = executable('pipeline_tracker', 'check' / 'pipeline_tracker.c',
+    dependencies : pipeline_deps,
+    c_args : [
+      '-DRDS_TEST_MODELS="@0@"'.format(meson.current_source_dir() / 'models'),
+      '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
+      '-DRDS_TEST_CACHE_MEDIA="@0@"'.format(meson.project_source_root() / '.cache' / 'media'),
+      '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
+      '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+    ])
+  test('pipeline_tracker', pipeline_tracker_exe, args : ['-p', '/gpu/tracker-yolo'],
+    suite : ['gpu', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 900,
+    depends : rds_plugins)
+  test('pipeline_tracker_soak', pipeline_tracker_exe, args : ['-p', '/gpu/tracker-soak'],
+    suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,
+    depends : rds_plugins)
 endif
 
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',
@@ -308,12 +341,13 @@ test('rds_compile', find_program('tools/rds_compile.sh'), args : rds_compile_arg
   }),
   depends : rds_compile_depends)
 
-# The dry run checks the compat mapping; gst-inspect-1.0 (when found) checks that the mapped decoder and
-# converter (and rdsinfer, when built) resolve to real elements from the build tree. Not in ASan builds: the
-# uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process (plugin_load covers loading there).
+# The dry run checks the compat mapping, the default PGIE config and --tracker-config; gst-inspect-1.0 (when found)
+# checks that the mapped decoder and converter (and rdsinfer and rdstracker, when built) resolve to real elements from
+# the build tree. Not in ASan builds: the uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process
+# (plugin_load covers loading there).
 gst_inspect = find_program('gst-inspect-1.0', required : false)
 test('rds_test3_dry_run',
   find_program('samples/rds_test3_dry_run.sh'),
   args : [rds_test3_exe, gst_inspect.found() and not asan ? gst_inspect.full_path() : '',
-    rds_infer_enabled ? 'infer' : ''],
+    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : ''],
   suite : 'cpu', env : test_env, depends : rds_plugins)

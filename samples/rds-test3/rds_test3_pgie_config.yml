@@ -2,9 +2,10 @@
 #
 # The model is not in the repository (AGPL-3.0): tests/models/fetch-yolo11n.sh exports it into .cache/models.
 # Relative paths in this file are resolved against the directory of this file, so as written they point at
-# <source tree>/.cache/models wherever the sample runs from. From the build directory:
+# <source tree>/.cache/models wherever the sample runs from. rds-test3 uses this file unless --pgie-config is given;
+# from the build directory, with the sample tracker config:
 #
-#   samples/rds-test3/rds-test3 --pgie-config ../samples/rds-test3/rds_test3_pgie_config.yml URI [URI...]
+#   samples/rds-test3/rds-test3 --tracker-config ../samples/tracker/config_tracker_NvSORT.yml URI [URI...]
 #
 # To use a model elsewhere, set onnx-file and labelfile-path to absolute paths (or paths relative to this file).
 # The compiled MIGraphX program is cached next to the model (yolo11n_b<N>_3x640x640_<gfx>_fp32.mxr); the first run
