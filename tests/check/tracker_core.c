@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-tracker-core.h"
 
+#include <math.h>
 #include <string.h>
 
 #define TAG(n) GUINT_TO_POINTER (n)
@@ -282,6 +283,49 @@ test_active_termination (void)
   }
 }
 
+/* Age passing probationAge on a missed frame doesn't activate: activation needs a match. */
+static void
+test_activation_needs_match (void)
+{
+  RdsTrackerConfig *cfg = config_new ();
+  RdsTrackerCore *core;
+  const RdsTrackerFrameOut *fo;
+
+  cfg->probation_age = 2;
+  cfg->early_termination_age = 2;
+  core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+  STEP (core, 0, TRUE, sq (0, 1));
+  STEP (core, 0, TRUE, sq (0, 1));
+  fo = EMPTY (core, 0, TRUE);
+  g_assert_cmpuint (fo->n_targets, ==, 0);
+  g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, 1);
+  fo = STEP (core, 0, TRUE, sq (0, 2));
+  g_assert_cmpuint (id_of (fo, 2), ==, 0);
+  g_assert_cmpuint (fo->targets[0].age, ==, 4);
+  rds_tracker_core_free (core);
+}
+
+/* A match resets the shadow age: miss, match, miss survives maxShadowTrackingAge 1. */
+static void
+test_shadow_reset_on_match (void)
+{
+  RdsTrackerConfig *cfg = config_new ();
+  RdsTrackerCore *core;
+
+  cfg->probation_age = 0;
+  cfg->max_shadow_tracking_age = 1;
+  core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+  STEP (core, 0, TRUE, sq (0, 1));
+  EMPTY (core, 0, TRUE);
+  g_assert_cmpuint (id_of (STEP (core, 0, TRUE, sq (0, 2)), 2), ==, 0);
+  EMPTY (core, 0, TRUE);
+  g_assert_cmpuint (id_of (STEP (core, 0, TRUE, sq (0, 3)), 3), ==, 0);
+  EMPTY (core, 0, TRUE);
+  EMPTY (core, 0, TRUE);
+  g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, 0);
+  rds_tracker_core_free (core);
+}
+
 /* --- frames without inference --- */
 
 /* Inference every 2nd or 3rd frame; the object is missing on the second inference frame. Frames without inference
@@ -344,8 +388,10 @@ test_no_inference_report (void)
   }
   g_assert_true (fo->targets[0].last_user == TAG (4));
   g_assert_true (fo->targets[1].last_user == TAG (3));
-  /* detections on a frame without inference are not tracked */
-  assert_rejected (fo, 5, 0);
+  /* detections on a frame without inference are not tracked: passed through, not rejected */
+  assert_rejected (fo, 0);
+  g_assert_cmpuint (fo->n_untracked, ==, 1);
+  g_assert_true (fo->untracked[0] == TAG (5));
   g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, 2);
   rds_tracker_core_free (core);
 }
@@ -368,6 +414,8 @@ test_no_inference_probation (void)
   g_assert_cmpuint (fo->targets[0].age, ==, 4);
   rds_tracker_core_free (core);
 }
+
+static RdsTrackerCore *core_probation0 (void);
 
 static guint n_copies, n_frees;
 
@@ -428,6 +476,74 @@ test_last_user_copy (void)
   g_assert_cmpuint (n_frees, ==, 3);
 }
 
+/* Every target's copy is freed when a reset, an EOS, remove_stream or clear ends it. */
+static void
+test_last_user_free_events (void)
+{
+  RdsTrackerConfig *cfg = config_new ();
+  RdsTrackerCoreOptions opts = {.reset_mode = RDS_TRACKER_ID_RESET_BOTH,.user_copy = copy_label,
+    .user_copy_data = TAG (42),.user_free = free_label
+  };
+  RdsTrackerCore *core;
+  gchar label[] = "person";
+  RdsTrackerDet d = sq (0, 0);
+  RdsTrackerFrameIn in[4];
+
+  cfg->probation_age = 0;
+  core = rds_tracker_core_new (cfg, &opts);
+  rds_tracker_config_free (cfg);
+  n_copies = n_frees = 0;
+  d.user = label;
+  for (guint s = 0; s < 4; s++)
+    in[s] = (RdsTrackerFrameIn) {
+    .stream_id = s,.detection_done = TRUE,.dets = &d,.n_dets = 1};
+  rds_tracker_core_process (core, in, 4, &out);
+  g_assert_cmpuint (n_copies, ==, 4);
+  rds_tracker_core_stream_reset (core, 0);
+  g_assert_cmpuint (n_frees, ==, 1);
+  rds_tracker_core_stream_eos (core, 1);
+  g_assert_cmpuint (n_frees, ==, 2);
+  rds_tracker_core_remove_stream (core, 2);
+  g_assert_cmpuint (n_frees, ==, 3);
+  rds_tracker_core_clear (core);
+  g_assert_cmpuint (n_frees, ==, 4);
+  rds_tracker_core_free (core);
+  g_assert_cmpuint (n_copies, ==, 4);
+  g_assert_cmpuint (n_frees, ==, 4);
+}
+
+/* A copy function needs a free function. */
+static void
+test_user_copy_needs_free (void)
+{
+  RdsTrackerConfig *cfg = config_new ();
+  RdsTrackerCoreOptions opts = {.user_copy = copy_label };
+
+  g_test_expect_message ("rdstracker", G_LOG_LEVEL_CRITICAL, "*user_free*");
+  g_assert_null (rds_tracker_core_new (cfg, &opts));
+  g_test_assert_expected_messages ();
+  rds_tracker_config_free (cfg);
+}
+
+/* Two frames of one stream in one batch are a caller error: no output. */
+static void
+test_duplicate_stream_in_batch (void)
+{
+  RdsTrackerCore *core = core_probation0 ();
+  const RdsTrackerDet d = sq (0, 1);
+  RdsTrackerFrameIn in[] = {
+    {.stream_id = 5,.detection_done = TRUE,.dets = &d,.n_dets = 1},
+    {.stream_id = 5,.detection_done = TRUE,.dets = &d,.n_dets = 1},
+  };
+
+  g_test_expect_message ("rdstracker", G_LOG_LEVEL_CRITICAL, "*has_duplicate_streams*");
+  rds_tracker_core_process (core, in, 2, &out);
+  g_test_assert_expected_messages ();
+  g_assert_cmpuint (out.n_frames, ==, 0);
+  g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 5), ==, 0);
+  rds_tracker_core_free (core);
+}
+
 /* --- rejections --- */
 
 static void
@@ -476,6 +592,73 @@ test_duplicate_ignores_class (void)
   /* below the threshold it is a new target */
   fo = STEP (core, 0, TRUE, det (60, 100, 100, 100, 1, 0.9f, 5));
   g_assert_cmpuint (id_of (fo, 5), ==, 1);
+  rds_tracker_core_free (core);
+}
+
+/* minIouDiff4NewTarget 0: only overlapping detections are duplicates, lone ones still start targets. */
+static void
+test_min_iou_diff_zero (void)
+{
+  RdsTrackerConfig *cfg = config_new ();
+  RdsTrackerCore *core;
+  const RdsTrackerFrameOut *fo;
+
+  cfg->probation_age = 0;
+  cfg->min_iou_diff4new_target = 0;
+  core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+  fo = STEP (core, 0, TRUE, sq (0, 1), sq (300, 2));
+  g_assert_cmpuint (id_of (fo, 1), ==, 0);
+  g_assert_cmpuint (id_of (fo, 2), ==, 1);
+  /* class 1 can't match the class-0 target, and overlaps it */
+  fo = STEP (core, 0, TRUE, sq (0, 3), det (90, 100, 100, 100, 1, 0.9f, 4), sq (600, 5));
+  g_assert_cmpuint (id_of (fo, 3), ==, 0);
+  g_assert_cmpuint (id_of (fo, 5), ==, 2);
+  assert_rejected (fo, 4, 0);
+  rds_tracker_core_free (core);
+}
+
+/* The duplicate check sees a target created earlier on the same frame. */
+static void
+test_duplicate_same_frame (void)
+{
+  RdsTrackerCore *core;
+  RdsTrackerConfig *cfg = config_new ();
+  const RdsTrackerFrameOut *fo;
+
+  cfg->probation_age = 0;
+  core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+  fo = STEP (core, 0, TRUE, sq (0, 1), sq (5, 2));
+  g_assert_cmpuint (id_of (fo, 1), ==, 0);
+  assert_rejected (fo, 2, 0);
+  g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, 1);
+  rds_tracker_core_free (core);
+}
+
+/* Boxes that are not finite or have no area are rejected before association and never start a target. */
+static void
+test_invalid_boxes (void)
+{
+  RdsTrackerConfig *cfg = config_new ();
+  RdsTrackerCore *core;
+  const RdsTrackerFrameOut *fo;
+  const gfloat inf = INFINITY, nan = NAN;
+
+  cfg->probation_age = 0;
+  cfg->min_iou_diff4new_target = 1.0f;
+  core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+  fo = STEP (core, 0, TRUE, det (nan, 100, 100, 100, 0, 0.9f, 1), det (0, nan, 100, 100, 0, 0.9f, 2),
+      det (0, 100, inf, 100, 0, 0.9f, 3), det (0, 100, 100, nan, 0, 0.9f, 4), det (-inf, 100, 100, 100, 0, 0.9f, 5),
+      det (0, 100, 0, 100, 0, 0.9f, 6), det (0, 100, 100, -1, 0, 0.9f, 7),
+      det (G_MAXFLOAT, 100, G_MAXFLOAT, 100, 0, 0.9f, 8), det (0, 0, 1e30f, 1e30f, 0, 0.9f, 9));
+  assert_rejected (fo, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0);
+  g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, 0);
+  /* next to a target, invalid detections match nothing; a huge valid box gives finite scores */
+  STEP (core, 0, TRUE, sq (0, 10));
+  fo = STEP (core, 0, TRUE, det (nan, nan, nan, nan, 0, 0.9f, 11), det (0, 100, 0, 0, 0, 0.9f, 12),
+      det (-1e18f, -1e18f, 2e18f, 2e18f, 0, 0.9f, 13), sq (1, 14));
+  g_assert_cmpuint (id_of (fo, 14), ==, 0);
+  g_assert_cmpuint (fo->n_targets, ==, 2);
+  assert_rejected (fo, 11, 12, 0);
   rds_tracker_core_free (core);
 }
 
@@ -815,7 +998,10 @@ check_ids (const RdsTrackerFrameIn * in, guint n, const RdsTrackerBatchOut * bo,
     const RdsTrackerFrameOut *fo = &bo->frames[s];
     GHashTable *frame = g_hash_table_new (g_int64_hash, g_int64_equal);
 
-    g_assert_cmpuint (fo->n_targets + fo->n_rejected, >=, in[s].n_dets);
+    if (in[s].detection_done)
+      g_assert_cmpuint (fo->n_untracked, ==, 0);
+    else
+      g_assert_cmpuint (fo->n_rejected, ==, 0);
     for (guint i = 0; i < fo->n_targets; i++) {
       const guint64 *id = &fo->targets[i].id;
 
@@ -932,9 +1118,10 @@ test_clear (void)
   rds_tracker_core_clear (core);
   g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, 0);
   g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 1), ==, 0);
+  /* new targets; the counter continues, so no ID repeats across the flush */
   bo = BATCH2 (core, FALSE, b, a);
-  g_assert_cmpuint (id_of (&bo->frames[0], 2), ==, 0);
-  g_assert_cmpuint (id_of (&bo->frames[1], 1), ==, 1);
+  g_assert_cmpuint (id_of (&bo->frames[0], 2), ==, 2);
+  g_assert_cmpuint (id_of (&bo->frames[1], 1), ==, 3);
   g_assert_cmpuint (bo->frames[0].targets[0].age, ==, 1);
   rds_tracker_core_free (core);
 }
@@ -1012,6 +1199,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/tracker-core/activation", test_activation);
   g_test_add_func ("/cpu/tracker-core/ids-shared", test_ids_shared);
   g_test_add_func ("/cpu/tracker-core/dead-tentative-no-id", test_dead_tentative_no_id);
+  g_test_add_func ("/cpu/tracker-core/activation-needs-match", test_activation_needs_match);
+  g_test_add_func ("/cpu/tracker-core/shadow-reset-on-match", test_shadow_reset_on_match);
   g_test_add_func ("/cpu/tracker-core/tentative-early-termination", test_tentative_early_termination);
   g_test_add_func ("/cpu/tracker-core/tentative-shadow-termination", test_tentative_shadow_termination);
   g_test_add_func ("/cpu/tracker-core/active-termination", test_active_termination);
@@ -1019,8 +1208,14 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/tracker-core/no-inference-report", test_no_inference_report);
   g_test_add_func ("/cpu/tracker-core/no-inference-probation", test_no_inference_probation);
   g_test_add_func ("/cpu/tracker-core/last-user-copy", test_last_user_copy);
+  g_test_add_func ("/cpu/tracker-core/last-user-free-events", test_last_user_free_events);
+  g_test_add_func ("/cpu/tracker-core/user-copy-needs-free", test_user_copy_needs_free);
+  g_test_add_func ("/cpu/tracker-core/duplicate-stream-in-batch", test_duplicate_stream_in_batch);
   g_test_add_func ("/cpu/tracker-core/low-confidence", test_low_confidence);
   g_test_add_func ("/cpu/tracker-core/duplicate-ignores-class", test_duplicate_ignores_class);
+  g_test_add_func ("/cpu/tracker-core/min-iou-diff-zero", test_min_iou_diff_zero);
+  g_test_add_func ("/cpu/tracker-core/duplicate-same-frame", test_duplicate_same_frame);
+  g_test_add_func ("/cpu/tracker-core/invalid-boxes", test_invalid_boxes);
   g_test_add_func ("/cpu/tracker-core/cap", test_cap);
   g_test_add_func ("/cpu/tracker-core/rejected-exact", test_rejected_exact);
   g_test_add_func ("/cpu/tracker-core/crossing", test_crossing);

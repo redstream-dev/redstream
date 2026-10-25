@@ -32,8 +32,10 @@ typedef struct
    * detection's user pointer as it is, which is then only an opaque cookie: the caller's detection is gone by the
    * next batch. With @user_copy set, the core calls it on every matched detection's user pointer (with
    * @user_copy_data) and keeps the copy, freeing the previous one, and the copy of a terminated target, with
-   * @user_free. The element copies what it needs from the detection (label, display text, component ID) this way,
-   * so a target's copy lives exactly as long as the target, whatever its ID. */
+   * @user_free (required with @user_copy). The element copies what it needs from the detection (label, display
+   * text, component ID) this way, so a target's copy lives exactly as long as the target, whatever its ID. A
+   * reported last_user is valid only until the next call that can end a target: rds_tracker_core_process,
+   * _stream_reset, _stream_eos, _remove_stream, _clear or _free. */
   GCopyFunc user_copy;
   gpointer user_copy_data;
   GDestroyNotify user_free;
@@ -64,7 +66,8 @@ typedef struct
   gint class_id;
   gfloat tracker_confidence;
   gpointer associated_user;     /* this frame's matched detection's user pointer; NULL: not matched this frame */
-  gpointer last_user;           /* the last matched detection's user pointer, or its copy (RdsTrackerCoreOptions) */
+  gpointer last_user;           /* the last matched detection's user pointer, or its copy (RdsTrackerCoreOptions);
+                                 * valid until the next call that can end a target */
   guint age;
 } RdsTrackerTarget;
 
@@ -74,11 +77,14 @@ typedef struct
    * without inference, every Active target, newest ID first, with its last matched box and no associated_user. */
   const RdsTrackerTarget *targets;
   guint n_targets;
-  /* The user pointers of the frame's detections that have no reported target, in input order: below
-   * minDetectorConfidence, matched to or creating a Tentative target, duplicates, over maxTargetsPerStream, and
-   * every detection of a frame without inference. */
+  /* The user pointers of the frame's detections that have no reported target, in input order: an invalid box (not
+   * finite, or no area), below minDetectorConfidence, matched to or creating a Tentative target, duplicates, over
+   * maxTargetsPerStream. Frames with inference only. */
   gpointer const *rejected;
   guint n_rejected;
+  /* Every detection of a frame without inference, in input order: not tracked, to be left untouched (ours). */
+  gpointer const *untracked;
+  guint n_untracked;
 } RdsTrackerFrameOut;
 
 /* Owned by the core: valid until the next rds_tracker_core_process or rds_tracker_core_free. */
@@ -90,12 +96,14 @@ typedef struct
 
 typedef struct _RdsTrackerCore RdsTrackerCore;
 
-/* Copies what it needs from @cfg. @opts NULL: reset mode 1, no user copies. */
+/* Copies what it needs from @cfg. @opts NULL: reset mode 1, no user copies. The IOU tracker and NvSORT share this
+ * core; cfg->tracker_type is kept for the NvSORT path, which associates as the IOU tracker for now. */
 G_GNUC_INTERNAL RdsTrackerCore *rds_tracker_core_new (const RdsTrackerConfig * cfg,
     const RdsTrackerCoreOptions * opts);
 G_GNUC_INTERNAL void rds_tracker_core_free (RdsTrackerCore * core);
 
-/* Tracks one batch: @frames in batch order, at most one per stream. Streams are created on first sight. */
+/* Tracks one batch: @frames in batch order, at most one per stream (a critical and an empty @out otherwise).
+ * Streams are created on first sight. */
 G_GNUC_INTERNAL void rds_tracker_core_process (RdsTrackerCore * core, const RdsTrackerFrameIn * frames,
     guint n_frames, RdsTrackerBatchOut * out);
 
@@ -105,7 +113,7 @@ G_GNUC_INTERNAL void rds_tracker_core_remove_stream (RdsTrackerCore * core, guin
 G_GNUC_INTERNAL void rds_tracker_core_stream_reset (RdsTrackerCore * core, guint64 stream_id);
 /* A stream EOS: in reset modes 2 and 3, terminates the stream's targets and restarts its IDs at 0. */
 G_GNUC_INTERNAL void rds_tracker_core_stream_eos (RdsTrackerCore * core, guint64 stream_id);
-/* Drops every stream and restarts the ID counter (a flush). The useUniqueID upper half stays. */
+/* Drops every stream (a flush). The ID counter continues and the useUniqueID upper half stays. */
 G_GNUC_INTERNAL void rds_tracker_core_clear (RdsTrackerCore * core);
 
 /* The number of live targets of a stream, in every state (0 for an unknown stream). */
