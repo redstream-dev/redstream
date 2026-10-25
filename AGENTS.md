@@ -147,8 +147,9 @@ gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (MIGraphX; element skeleton s
                    (dlopen, ABI version check) and has the built-in YOLO parser; rds-infer-post does the detection
                    post-processing (letterbox geometry, NMS, ROI/size filters). All are in the static rdsinfer-core
                    library (C and C++: link it with link_language 'cpp'), shared with the tests; config corpus in
-                   tests/check/infer-configs, test parser modules built from tests/check/infer-parser-*. Optional (-Dinfer, default auto):
-                   needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml and json-glib
+                   tests/check/infer-configs, test parser modules built from tests/check/infer-parser-*. Optional
+                   (-Dinfer, default auto): needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml
+                   and json-glib
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources
 samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
 tests/check/       GLib unit, element and pipeline tests (suites cpu/gpu); test clips are encoded in-process

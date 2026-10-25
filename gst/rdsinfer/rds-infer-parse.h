@@ -27,7 +27,8 @@ typedef enum
  * number of anchors; the layout is the one whose dimension equals 4 + C ([4 + C, A] if both do). Rows 0-3 are the
  * box centre x, y, width and height in network-input pixels, rows 4.. the class scores (no objectness). Each anchor
  * gives at most one object: its best class (the lowest class id among equal scores), if that score is at least the
- * class's pre-cluster threshold. */
+ * class's pre-cluster threshold. Shapes are per image: a layer's inferDims have no batch dimension (the engine
+ * strips it), so the model output [1, 84, 8400] arrives as [84, 8400]. */
 #define RDS_INFER_PARSER_YOLO "RdsInferParseYolo"
 
 /* A parse function: of a loaded custom parser library, or built in. Not thread-safe: call it from one thread at a

@@ -57,7 +57,7 @@ post (const RdsInferConfig * cfg, const RdsInferLetterbox * lb, const RdsInferOb
     RdsInferPostFlags * flags)
 {
   GArray *out = detections_new ();
-  RdsInferPostFlags f = rds_infer_postprocess (cfg, lb, in, n, out);
+  RdsInferPostFlags f = rds_infer_postprocess (cfg, lb, in, n, NULL, out);
 
   if (flags)
     *flags = f;
@@ -240,17 +240,26 @@ yolo_parse_layout (gboolean transposed)
   /* At the threshold: kept. */
   yolo_set_box (&t, 300, 600, 620, 30, 40);
   yolo_set_score (&t, 300, 7, 0.6f);
+  /* A NaN score doesn't hide the other classes. */
+  yolo_set_box (&t, 400, 300, 300, 10, 10);
+  yolo_set_score (&t, 400, 0, NAN);
+  yolo_set_score (&t, 400, 4, 0.8f);
+  yolo_set_box (&t, 401, 300, 300, 10, 10);
+  yolo_set_score (&t, 401, 4, NAN);
+  yolo_set_score (&t, 401, 6, 0.7f);
   /* Equal scores: the lower class id. The last anchor. */
   yolo_set_box (&t, YOLO_ANCHORS - 1, 630, 630, 20, 20);
   yolo_set_score (&t, YOLO_ANCHORS - 1, 1, 0.6f);
   yolo_set_score (&t, YOLO_ANCHORS - 1, 0, 0.6f);
 
   yolo_parse_ok (parser, &t, objects);
-  g_assert_cmpuint (objects->len, ==, 4);
+  g_assert_cmpuint (objects->len, ==, 6);
   assert_object (&g_array_index (objects, RdsInferObjectDetectionInfo, 0), 3, 100, 200, 40, 60, 0.9f);
   assert_object (&g_array_index (objects, RdsInferObjectDetectionInfo, 1), 79, 320.5f, 10, 8, 12, 0.3f);
   assert_object (&g_array_index (objects, RdsInferObjectDetectionInfo, 2), 7, 600, 620, 30, 40, 0.6f);
-  assert_object (&g_array_index (objects, RdsInferObjectDetectionInfo, 3), 0, 630, 630, 20, 20, 0.6f);
+  assert_object (&g_array_index (objects, RdsInferObjectDetectionInfo, 3), 4, 300, 300, 10, 10, 0.8f);
+  assert_object (&g_array_index (objects, RdsInferObjectDetectionInfo, 4), 6, 300, 300, 10, 10, 0.7f);
+  assert_object (&g_array_index (objects, RdsInferObjectDetectionInfo, 5), 0, 630, 630, 20, 20, 0.6f);
 
   yolo_clear (&t);
   g_array_unref (objects);
@@ -371,6 +380,21 @@ test_yolo_bad_layers (void)
   assert_layers_fail (parser, &t.layer, 1, "input layer", NULL);
   t.layer.isInput = 0;
 
+  /* No classes: before rds_infer_parser_set_detection_params, or with num-detected-classes unset. */
+  {
+    GError *err = NULL;
+    RdsInferParser *fresh = rds_infer_parser_open_builtin (RDS_INFER_PARSER_YOLO, &err);
+    YoloTensor four;
+
+    g_assert_no_error (err);
+    yolo_init (&four, 64, 0, FALSE);
+    assert_layers_fail (fresh, &four.layer, 1, "num-detected-classes 0", "at least one class", NULL);
+    rds_infer_parser_set_detection_params (fresh, 0, NULL, NULL);
+    assert_layers_fail (fresh, &four.layer, 1, "num-detected-classes 0", NULL);
+    yolo_clear (&four);
+    rds_infer_parser_free (fresh);
+  }
+
   /* The per-call check also catches a missing buffer. */
   {
     GArray *objects = g_array_new (FALSE, FALSE, sizeof (RdsInferObjectDetectionInfo));
@@ -465,6 +489,23 @@ test_validate (void)
   out = post (cfg, &lb, in, G_N_ELEMENTS (in), &flags);
   g_assert_cmpint (flags, ==, RDS_INFER_POST_INVALID | RDS_INFER_POST_ROTATED);
   g_array_unref (out);
+
+  /* Finite in network pixels, not in frame pixels (x3 overflows float): invalid. */
+  {
+    RdsInferObjectDetectionInfo huge[] = {
+      obj (0, 2e38f, 10, 10, 10, 0.9f),
+      obj (0, 10, 150, 10, 2e38f, 0.9f),
+      obj (0, 10, 150, 10, 10, 0.9f),
+    };
+    RdsInferLetterbox big;
+
+    rds_infer_letterbox (640, 640, 1920, 1080, TRUE, TRUE, &big);
+    out = post (cfg, &big, huge, G_N_ELEMENTS (huge), &flags);
+    g_assert_cmpint (flags, ==, RDS_INFER_POST_INVALID);
+    g_assert_cmpuint (out->len, ==, 1);
+    assert_box (&det (out, 0)->box, 30, 30, 30, 30);
+    g_array_unref (out);
+  }
 
   /* Nothing in, nothing out. */
   out = post (cfg, &lb, NULL, 0, &flags);
@@ -690,6 +731,36 @@ test_letterbox (void)
     rds_infer_letterbox_map (&lb, lb.pad_left + lb.scaled_w / 2.0f, lb.pad_top + lb.scaled_h / 2.0f, 0, 0, m);
     g_assert_cmpfloat_with_epsilon (m[0], c->frame_w / 2.0, 1e-3);
     g_assert_cmpfloat_with_epsilon (m[1], c->frame_h / 2.0, 1e-3);
+  }
+}
+
+/* Bad sizes: a critical, and a zeroed result. */
+static void
+test_letterbox_invalid (void)
+{
+  static const guint bad[][4] = {
+    {0, 640, 640, 640}, {640, 0, 640, 640}, {640, 640, 0, 640}, {640, 640, 640, 0},
+    {(guint) G_MAXINT + 1, 640, 640, 640}, {640, 640, 640, G_MAXUINT},
+  };
+
+  for (guint i = 0; i < G_N_ELEMENTS (bad); i++) {
+    RdsInferLetterbox lb;
+
+    memset (&lb, 0xff, sizeof (lb));
+    g_test_expect_message ("rdsinfer", G_LOG_LEVEL_CRITICAL, "*assertion*failed*");
+    rds_infer_letterbox (bad[i][0], bad[i][1], bad[i][2], bad[i][3], TRUE, TRUE, &lb);
+    g_test_assert_expected_messages ();
+    g_assert_cmpuint (lb.scaled_w, ==, 0);
+    g_assert_cmpuint (lb.frame_h, ==, 0);
+    g_assert_cmpfloat (lb.scale_x, ==, 0);
+  }
+  /* The largest sizes are fine. */
+  {
+    RdsInferLetterbox lb;
+
+    rds_infer_letterbox (G_MAXINT, 640, 640, G_MAXINT, TRUE, TRUE, &lb);
+    g_assert_cmpuint (lb.scaled_h, ==, 640);
+    g_assert_cmpuint (lb.scaled_w, ==, 1);
   }
 }
 
@@ -1036,6 +1107,7 @@ test_random (void)
   static const guint frames[][2] = { {640, 640}, {1920, 1080}, {1080, 1920}, {1280, 721}, {320, 180} };
   const guint32 seed = 20261025;
   GRand *r = g_rand_new_with_seed (seed);
+  GByteArray *scratch = g_byte_array_new ();
   guint total = 0;
 
   g_test_message ("seed %u", seed);
@@ -1050,7 +1122,8 @@ test_random (void)
     random_config (r, cfg);
     random_objects (r, cfg->num_detected_classes, in, n);
     rds_infer_letterbox (640, 640, frames[f][0], frames[f][1], g_rand_boolean (r), g_rand_boolean (r), &lb);
-    rds_infer_postprocess (cfg, &lb, in, n, got);
+    /* Half of the sets reuse one scratch buffer. */
+    rds_infer_postprocess (cfg, &lb, in, n, set % 2 ? scratch : NULL, got);
     ref_postprocess (cfg, &lb, in, n, want);
     if (got->len != want->len)
       g_error ("set %u: %u detections, the reference has %u", set, got->len, want->len);
@@ -1058,6 +1131,9 @@ test_random (void)
       const RdsInferDetection *a = &g_array_index (got, RdsInferDetection, i);
       const RdsInferDetection *b = &g_array_index (want, RdsInferDetection, i);
 
+      /* Exact comparison: the implementation and the reference use the same formulas, and with inputs on a
+       * half-pixel grid and confidences in tenths every intermediate is exact or rounded the same way. If that
+       * changes (other inputs, FMA contraction), compare with a tolerance or build with -ffp-contract=off. */
       if (memcmp (a, b, sizeof (*a)) != 0)
         g_error ("set %u, detection %u: class %u conf %g (%g, %g) %gx%g, the reference has class %u conf %g "
             "(%g, %g) %gx%g", set, i, a->class_id, a->confidence, a->box.left, a->box.top, a->box.width,
@@ -1072,6 +1148,7 @@ test_random (void)
   g_test_message ("%u detections in 200 sets", total);
   /* The sets exercise something. */
   g_assert_cmpuint (total, >, 200);
+  g_byte_array_unref (scratch);
   g_rand_free (r);
 }
 
@@ -1092,6 +1169,7 @@ time_yolo (const gchar * what, RdsInferParser * parser, const RdsInferConfig * c
   gint64 *parse_us = g_new (gint64, runs), *post_us = g_new (gint64, runs);
   GArray *objects = g_array_new (FALSE, FALSE, sizeof (RdsInferObjectDetectionInfo));
   GArray *out = detections_new ();
+  GByteArray *scratch = g_byte_array_new ();
   RdsInferLetterbox lb;
   guint n_objects = 0, n_out = 0;
 
@@ -1106,7 +1184,7 @@ time_yolo (const gchar * what, RdsInferParser * parser, const RdsInferConfig * c
     g_assert_true (rds_infer_parser_parse (parser, &t->layer, 1, &yolo_net, objects, &err));
     t1 = g_get_monotonic_time ();
     rds_infer_postprocess (cfg, &lb, (const RdsInferObjectDetectionInfo *) (gpointer) objects->data,
-        objects->len, out);
+        objects->len, scratch, out);
     t2 = g_get_monotonic_time ();
     g_assert_no_error (err);
     parse_us[i] = t1 - t0;
@@ -1122,6 +1200,7 @@ time_yolo (const gchar * what, RdsInferParser * parser, const RdsInferConfig * c
   g_free (post_us);
   g_array_unref (objects);
   g_array_unref (out);
+  g_byte_array_unref (scratch);
 }
 
 static void
@@ -1179,6 +1258,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-post/topk", test_topk);
   g_test_add_func ("/cpu/infer-post/post-cluster-threshold", test_post_cluster_threshold);
   g_test_add_func ("/cpu/infer-post/letterbox", test_letterbox);
+  g_test_add_func ("/cpu/infer-post/letterbox-invalid", test_letterbox_invalid);
   g_test_add_func ("/cpu/infer-post/map", test_map);
   g_test_add_func ("/cpu/infer-post/filter-out", test_filter_out);
   g_test_add_func ("/cpu/infer-post/roi", test_roi);

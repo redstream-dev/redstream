@@ -7,6 +7,7 @@
 
 #include <dlfcn.h>
 #include <link.h>
+#include <math.h>
 #include <string.h>
 #include <exception>
 #include <type_traits>
@@ -191,6 +192,12 @@ yolo_layout (const RdsInferLayerInfo * layers, guint n_layers, unsigned int num_
   const char *name;
   gchar *what = NULL, *shape;
 
+  if (num_classes == 0) {
+    g_set_error (error, RDS_INFER_PARSER_ERROR, RDS_INFER_PARSER_ERROR_LAYERS,
+        BUILTIN_PATH ": " RDS_INFER_PARSER_YOLO " needs at least one class (num-detected-classes 0: the detection "
+        "params are not set)");
+    return FALSE;
+  }
   if (n_layers != 1) {
     what = g_strdup_printf ("the network has %u output layers", n_layers);
     goto fail;
@@ -260,11 +267,11 @@ parse_yolo (std::vector<RdsInferLayerInfo> const &outputLayersInfo, RdsInferNetw
     const float *p = data + (gsize) a * l.anchor_stride;
     const float *scores = p + (gsize) 4 * l.row_stride;
     unsigned int best_class = 0;
-    float best = scores[0];
+    float best = -INFINITY;
     float w, h;
 
-    /* Strictly greater: the lowest class id among equal scores. */
-    for (unsigned int c = 1; c < n_classes; c++) {
+    /* Strictly greater: the lowest class id among equal scores; NaN scores never win. */
+    for (unsigned int c = 0; c < n_classes; c++) {
       float s = scores[(gsize) c * l.row_stride];
 
       if (s > best) {

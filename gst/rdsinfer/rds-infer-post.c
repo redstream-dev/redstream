@@ -5,13 +5,17 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 void
 rds_infer_letterbox (guint net_w, guint net_h, guint frame_w, guint frame_h, gboolean keep_aspect,
     gboolean symmetric, RdsInferLetterbox * out)
 {
-  g_return_if_fail (net_w > 0 && net_h > 0 && frame_w > 0 && frame_h > 0);
   g_return_if_fail (out != NULL);
+  memset (out, 0, sizeof (*out));
+  /* Up to G_MAXINT: 2 * frame * net then fits in a guint64 (< 2^63). */
+  g_return_if_fail (net_w > 0 && net_h > 0 && frame_w > 0 && frame_h > 0);
+  g_return_if_fail (net_w <= G_MAXINT && net_h <= G_MAXINT && frame_w <= G_MAXINT && frame_h <= G_MAXINT);
 
   out->net_w = net_w;
   out->net_h = net_h;
@@ -129,20 +133,27 @@ nms_topk (const RdsInferConfig * cfg, Candidate * c, guint n)
 
 RdsInferPostFlags
 rds_infer_postprocess (const RdsInferConfig * cfg, const RdsInferLetterbox * lb,
-    const RdsInferObjectDetectionInfo * in, guint n_in, GArray * out)
+    const RdsInferObjectDetectionInfo * in, guint n_in, GByteArray * scratch, GArray * out)
 {
   RdsInferPostFlags flags = 0;
   Candidate *c;
   guint n = 0;
 
   g_return_val_if_fail (cfg != NULL && lb != NULL && out != NULL, 0);
+  g_return_val_if_fail (lb->scaled_w > 0 && lb->scaled_h > 0, 0);
   g_return_val_if_fail (n_in == 0 || in != NULL, 0);
+  g_return_val_if_fail (n_in <= G_MAXUINT / sizeof (Candidate), 0);
   g_return_val_if_fail (g_array_get_element_size (out) == sizeof (RdsInferDetection), 0);
   g_return_val_if_fail (cfg->cluster_mode == 2 || cfg->cluster_mode == 4, 0);
 
   if (n_in == 0)
     return 0;
-  c = g_new (Candidate, n_in);
+  if (scratch) {
+    g_byte_array_set_size (scratch, n_in * sizeof (Candidate));
+    c = (Candidate *) (gpointer) scratch->data;
+  } else {
+    c = g_new (Candidate, n_in);
+  }
 
   /* 1. Validation, then the pre-cluster threshold (as the parser contract asks parsers to; custom ones may not). */
   for (guint i = 0; i < n_in; i++) {
@@ -194,6 +205,11 @@ rds_infer_postprocess (const RdsInferConfig * cfg, const RdsInferLetterbox * lb,
     d.box.top = m[1];
     d.box.width = m[2];
     d.box.height = m[3];
+    /* Finite in network pixels, but too big for a float in frame pixels. */
+    if (!isfinite (m[0]) || !isfinite (m[1]) || !isfinite (m[2]) || !isfinite (m[3])) {
+      flags |= RDS_INFER_POST_INVALID;
+      continue;
+    }
 
     /* 6. filter-out-class-ids. */
     for (guint j = 0; j < cfg->filter_out_class_ids->len && !filtered; j++)
@@ -226,6 +242,7 @@ rds_infer_postprocess (const RdsInferConfig * cfg, const RdsInferLetterbox * lb,
       continue;
     g_array_append_val (out, d);
   }
-  g_free (c);
+  if (!scratch)
+    g_free (c);
   return flags;
 }

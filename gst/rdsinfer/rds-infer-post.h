@@ -20,7 +20,10 @@ G_BEGIN_DECLS
  *   (floor ((net_w - scaled_w) / 2), floor ((net_h - scaled_h) / 2)).
  * - Otherwise each axis is scaled on its own: scaled_w = net_w, scaled_h = net_h, no padding.
  * scale_x = scaled_w / frame_w and scale_y = scaled_h / frame_h are the effective per-axis scales of the rounded
- * sizes, so the scaled frame's edges map exactly onto the frame's. */
+ * sizes, so the scaled frame's edges map exactly onto the frame's. They are rounded floats, for information: the
+ * preprocessing derives its sampling step from the integers (frame_w / scaled_w, frame_h / scaled_h, offset by
+ * pad_left and pad_top), as rds_infer_letterbox_map does in reverse, so both agree exactly.
+ * All sizes are 1..G_MAXINT; a bad size is a critical and leaves @out zeroed. */
 typedef struct
 {
   guint net_w, net_h, frame_w, frame_h;
@@ -63,19 +66,24 @@ typedef enum
  * 2. cluster-mode=2: per-class greedy NMS with the class's nms-iou-threshold, highest confidence first, ties by
  *    lower input index. An object is suppressed by a kept one when their IoU is strictly greater than the
  *    threshold (IoU equal to the threshold is kept). IoU = intersection / union of the boxes (right = left + width,
- *    bottom = top + height, area = width * height, union = area1 + area2 - intersection), 0 for a zero union;
+ *    bottom = top + height, area = width * height, union = area1 + area2 - intersection), 0 for a zero union.
+ *    O(kept x candidates) per class: about 30 ms (release build) for 8400 boxes of one class that don't overlap,
+ *    which takes near-zero thresholds;
  * 3. cluster-mode=2: the class's topk best (in the same order) after NMS; -1 keeps all, 0 none;
  * 4. post-cluster-threshold (kept: confidence >= it);
- * 5. mapping to frame pixels (rds_infer_letterbox_map);
+ * 5. mapping to frame pixels (rds_infer_letterbox_map); a box that is no longer finite (float overflow) is
+ *    dropped as invalid;
  * 6. filter-out-class-ids;
  * 7. when roi-top-offset or roi-bottom-offset is set: the box's centre y must be in
  *    [roi-top-offset, frame_h - roi-bottom-offset) (frame pixels from the top and the bottom edge);
  * 8. detected-min-w/h and detected-max-w/h (0: no maximum) on the mapped, unclipped size;
  * 9. the box clipped to [0, frame_w] x [0, frame_h] gives rect; an empty rect drops the object.
  * cluster-mode=4 skips 2 and 3. Steps 1 and 3-8 use the class's attributes. The survivors are appended to @out
- * (a GArray of RdsInferDetection) in input order. */
+ * (a GArray of RdsInferDetection) in input order.
+ * @scratch, if not NULL, is working memory the caller keeps between calls (to avoid an allocation per frame); its
+ * contents are overwritten. */
 G_GNUC_INTERNAL RdsInferPostFlags rds_infer_postprocess (const RdsInferConfig * cfg, const RdsInferLetterbox * lb,
-    const RdsInferObjectDetectionInfo * in, guint n_in, GArray * out);
+    const RdsInferObjectDetectionInfo * in, guint n_in, GByteArray * scratch, GArray * out);
 
 G_END_DECLS
 
