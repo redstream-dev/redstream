@@ -13,6 +13,12 @@ common_test_env = {
 asan = '@0@'.format(get_option('b_sanitize')).contains('address')
 if asan
   common_test_env += {'GST_REGISTRY_FORK' : 'no'}
+  # MIGraphX dlopens its GPU target (<libdir>/migraphx/lib/libmigraphx_gpu.so) through its own RUNPATH
+  # ($ORIGIN/../lib/migraphx/lib). ASan's dlopen interceptor makes the runtime the caller, so that RUNPATH isn't
+  # searched: name the directory explicitly.
+  if rds_infer_enabled
+    common_test_env += {'LD_LIBRARY_PATH' : migraphx_libdir / 'migraphx' / 'lib'}
+  endif
 endif
 # Element tests load our plugins from the build tree (scanned recursively) next to the stock system plugins,
 # with a private registry so the user's cache is never touched.
@@ -124,6 +130,23 @@ if rds_infer_enabled
         cc.find_library('m', required : false)],
       link_language : 'cpp'),
     suite : 'gpu', env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 300)
+  # The MIGraphX engine and its program cache on the committed scale2 models (gpu), and its ONNX reader (cpu). The
+  # YOLO11n cases (their own entry) run only once tests/models/fetch-yolo11n.sh has fetched the model; they cache
+  # its programs in the build directory. A first YOLO11n compile takes about 30 s on a small GPU.
+  infer_engine_exe = executable('infer_engine', 'check' / 'infer_engine.c',
+    dependencies : [rdsinfer_core_dep, hip_dep, gst_dep, cc.find_library('m', required : false)],
+    link_language : 'cpp',
+    c_args : [
+      '-DRDS_TEST_MODELS="@0@"'.format(meson.current_source_dir() / 'models'),
+      '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
+      '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+    ])
+  test('infer_engine_cpu', infer_engine_exe, args : ['-p', '/cpu/infer-engine'],
+    suite : 'cpu', env : internal_test_env, protocol : 'tap')
+  test('infer_engine', infer_engine_exe, args : ['-p', '/gpu/infer-engine'],
+    suite : 'gpu', env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 600)
+  test('infer_engine_yolo', infer_engine_exe, args : ['-p', '/gpu/infer-yolo'],
+    suite : ['gpu', 'yolo'], env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 900)
 
   # Test parser modules (never installed), loaded by path. The fixture is a DeepStream-style parser compiled against
   # the compat header, from two translation units that both include the parser header; the same sources are built

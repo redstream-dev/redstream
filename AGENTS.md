@@ -110,6 +110,11 @@ Known gotchas:
 - Include GLib/GStreamer **before** HIP: HIP defines `__noinline__` as a macro, which breaks `gmacros.h`. Public
   headers never include HIP (device pointers are `gpointer`); only `rds-hip-private.h` does.
 - `hipHostMalloc` (pinned) memory shows up in the process's VmRSS, not in `hipMemGetInfo`.
+- With `HSA_OVERRIDE_GFX_VERSION` set, HIP's `gcnArchName` reports the overridden target (gfx1030 on a gfx1036).
+  The device's own architecture is the KFD topology's `gfx_target_version`; the engine's cache names use that one.
+- MIOpen (MIGraphX's convolutions) keeps its databases under `$HOME/.config/miopen`. GLib tests with
+  `G_TEST_OPTION_ISOLATE_DIRS` set `HOME=/dev/null`, so such tests point `MIOPEN_USER_DB_PATH` and
+  `MIOPEN_CUSTOM_CACHE_DIR` somewhere writable (`infer_engine` uses the build directory).
 
 Useful checks:
 
@@ -146,11 +151,12 @@ gst/rdsmux/        libgstrdsmux plugin: rdsstreammux (GstAggregator, gstrdsstrea
 gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (MIGraphX; element skeleton so far). rds-infer-config parses
                    nvinfer key-file/YAML configs from one key table; rds-infer-parse loads custom parser libraries
                    (dlopen, ABI version check) and has the built-in YOLO parser; rds-infer-post does the detection
-                   post-processing (letterbox geometry, NMS, ROI/size filters). These are in the static
-                   rdsinfer-core library (C and C++: link it with link_language 'cpp'), shared with the tests; the
-                   letterbox + normalisation kernel (rds-infer-preprocess.hip) is the static rdsinfer-preprocess;
-                   config corpus in tests/check/infer-configs, test parser modules built from
-                   tests/check/infer-parser-*. Optional
+                   post-processing (letterbox geometry, NMS, ROI/size filters); rds-infer-engine compiles ONNX with
+                   MIGraphX and caches the program (.mxr + .mxr.json manifest), reading the model's declared input
+                   dims with the small protobuf reader rds-infer-onnx. These are in the static rdsinfer-core library
+                   (C and C++: link it with link_language 'cpp'), shared with the tests; the letterbox +
+                   normalisation kernel (rds-infer-preprocess.hip) is the static rdsinfer-preprocess; config corpus
+                   in tests/check/infer-configs, test parser modules built from tests/check/infer-parser-*. Optional
                    (-Dinfer, default auto): needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml
                    and json-glib
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources
