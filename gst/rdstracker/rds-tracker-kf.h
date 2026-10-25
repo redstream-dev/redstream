@@ -38,9 +38,9 @@ G_GNUC_INTERNAL gboolean rds_tracker_kf_params_from_config (RdsTrackerKfParams *
 /* Starts a filter on a box with zero velocity. @params must outlive @kf. */
 G_GNUC_INTERNAL void rds_tracker_kf_init (RdsTrackerKf * kf, const RdsTrackerKfParams * params, gfloat x, gfloat y,
     gfloat w, gfloat h);
-/* One frame ahead. */
+/* One frame ahead. The height never goes below a small positive value. */
 G_GNUC_INTERNAL void rds_tracker_kf_predict (RdsTrackerKf * kf);
-/* Corrects the state with a measured box. */
+/* Corrects the state with a measured box; does nothing when the innovation covariance is (nearly) singular. */
 G_GNUC_INTERNAL void rds_tracker_kf_update (RdsTrackerKf * kf, gfloat x, gfloat y, gfloat w, gfloat h);
 /* The current state as a box (after rds_tracker_kf_predict, the prediction). */
 G_GNUC_INTERNAL void rds_tracker_kf_get_box (const RdsTrackerKf * kf, gfloat * x, gfloat * y, gfloat * w,

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-tracker-kf.h"
 
+#include <math.h>
 #include <string.h>
 
 #define N_MEAS 4
@@ -24,6 +25,14 @@
  * on the first frames and within 1.4 px after. */
 #define INIT_SCALE_LOC 10.0
 #define INIT_SCALE_VEL 13.0
+
+/* Ours: a floor on the measurement variances, so S = H P H^T + R stays invertible with measurementNoiseVar4Detector 0,
+ * and the smallest pivot the inversion accepts (below it the update is skipped and the prediction stands). */
+#define MIN_MEASUREMENT_VAR 1e-6
+#define MIN_PIVOT 1e-12
+
+/* Ours: the smallest height a prediction keeps; a shrinking box stops there, with its height velocity zeroed. */
+#define MIN_HEIGHT 1e-3
 
 /* Ours: the initial velocity variance in fixed-noise mode, as a multiple of processNoiseVar4Vel (the positions and
  * size start at the measurement noise). */
@@ -85,6 +94,7 @@ measurement_noise (const RdsTrackerKfParams * prm, gdouble h, gdouble * r)
       r[i] = sq (prm->weight_loc * h);
     else
       r[i] = prm->measurement;
+    r[i] = MAX (r[i], MIN_MEASUREMENT_VAR);
   }
 }
 
@@ -102,9 +112,9 @@ rds_tracker_kf_init (RdsTrackerKf * kf, const RdsTrackerKfParams * params, gfloa
 {
   gdouble r[N_MEAS];
 
-  g_return_if_fail (params->n_states == 6 || params->n_states == 8);
   memset (kf, 0, sizeof *kf);
   kf->params = params;
+  g_return_if_fail (params->n_states == 6 || params->n_states == 8);
   measure (params, x, y, w, h, kf->x);
   measurement_noise (params, h, r);
   for (guint i = 0; i < params->n_states; i++) {
@@ -134,6 +144,11 @@ rds_tracker_kf_predict (RdsTrackerKf * kf)
   /* F = I plus 1 at (i, i + 4) for every velocity: x' = F x, P' = F P F^T + Q */
   for (guint i = 0; i < n_vel; i++)
     kf->x[i] += kf->x[i + N_MEAS];
+  if (!(kf->x[IDX_H] > MIN_HEIGHT)) {
+    kf->x[IDX_H] = MIN_HEIGHT;
+    if (n == 8)
+      kf->x[N_MEAS + IDX_H] = 0;
+  }
   for (guint i = 0; i < n; i++)
     for (guint j = 0; j < n; j++)
       fp[i][j] = kf->p[i][j] + (i < n_vel ? kf->p[i + N_MEAS][j] : 0);
@@ -144,8 +159,9 @@ rds_tracker_kf_predict (RdsTrackerKf * kf)
     kf->p[i][i] += q[i];
 }
 
-/* Inverts the symmetric positive definite 4x4 @s in place by Gauss-Jordan elimination (no pivoting needed). */
-static void
+/* Inverts the symmetric positive definite 4x4 @s in place by Gauss-Jordan elimination (no pivoting needed); FALSE,
+ * leaving @s undefined, on a pivot below MIN_PIVOT. */
+static gboolean
 invert4 (gdouble s[N_MEAS][N_MEAS])
 {
   gdouble a[N_MEAS][2 * N_MEAS] = { {0} };
@@ -158,6 +174,8 @@ invert4 (gdouble s[N_MEAS][N_MEAS])
   for (guint c = 0; c < N_MEAS; c++) {
     gdouble piv = a[c][c];
 
+    if (!(fabs (piv) >= MIN_PIVOT))
+      return FALSE;
     for (guint j = 0; j < 2 * N_MEAS; j++)
       a[c][j] /= piv;
     for (guint i = 0; i < N_MEAS; i++) {
@@ -172,6 +190,7 @@ invert4 (gdouble s[N_MEAS][N_MEAS])
   for (guint i = 0; i < N_MEAS; i++)
     for (guint j = 0; j < N_MEAS; j++)
       s[i][j] = a[i][N_MEAS + j];
+  return TRUE;
 }
 
 void
@@ -188,7 +207,8 @@ rds_tracker_kf_update (RdsTrackerKf * kf, gfloat x, gfloat y, gfloat w, gfloat h
   for (guint i = 0; i < N_MEAS; i++)
     for (guint j = 0; j < N_MEAS; j++)
       s[i][j] = kf->p[i][j] + (i == j ? r[i] : 0);
-  invert4 (s);
+  if (!invert4 (s))
+    return;
   for (guint i = 0; i < n; i++)
     for (guint j = 0; j < N_MEAS; j++) {
       gdouble v = 0;

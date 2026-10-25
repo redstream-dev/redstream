@@ -246,12 +246,15 @@ box_iou (gfloat ax, gfloat ay, gfloat aw, gfloat ah, gfloat bx, gfloat by, gfloa
   return uni > 0 ? inter / uni : 0;
 }
 
-/* DeepStream 8.0 behaviour: the ratio of the smaller area to the larger, not a per-axis comparison. */
+/* DeepStream 8.0 behaviour: the ratio of the smaller area to the larger, not a per-axis comparison. Both boxes are
+ * valid: detections are checked (det_box_valid) and target boxes too (target_predicted_box). */
 static gfloat
 size_similarity (gfloat aw, gfloat ah, gfloat bw, gfloat bh)
 {
   gfloat a = aw * ah, b = bw * bh;
   gfloat hi = MAX (a, b);
+
+  g_assert (aw > 0 && ah > 0 && bw > 0 && bh > 0);
 
   return hi > 0 ? MIN (a, b) / hi : 0;
 }
@@ -411,6 +414,20 @@ activate (RdsTrackerCore * core, Stream * st, Target * t)
   core->counter++;
 }
 
+/* The Kalman prediction of @t, or (ours) its last matched box when the prediction is not a finite box with an area. */
+static void
+target_predicted_box (const Target * t, gfloat * x, gfloat * y, gfloat * w, gfloat * h)
+{
+  rds_tracker_kf_get_box (&t->kf, x, y, w, h);
+  if (isfinite (*x) && isfinite (*y) && isfinite (*w) && isfinite (*h) && *w > 0 && *h > 0
+      && isfinite (*x + *w) && isfinite (*y + *h) && isfinite (*w * *h))
+    return;
+  *x = t->x;
+  *y = t->y;
+  *w = t->w;
+  *h = t->h;
+}
+
 static void
 target_set_box (Target * t, const RdsTrackerDet * d)
 {
@@ -433,7 +450,7 @@ emit_target (RdsTrackerCore * core, const Target * t, gboolean matched, gpointer
   };
 
   if (!matched && core->has_kf)
-    rds_tracker_kf_get_box (&t->kf, &o.x, &o.y, &o.w, &o.h);
+    target_predicted_box (t, &o.x, &o.y, &o.w, &o.h);
   g_array_append_val (core->targets_out, o);
 }
 
@@ -594,7 +611,7 @@ rds_tracker_core_process (RdsTrackerCore * core, const RdsTrackerFrameIn * frame
       if (core->has_kf)
         rds_tracker_kf_predict (&t->kf);
       if (core->use_prediction) {
-        rds_tracker_kf_get_box (&t->kf, &t->bx, &t->by, &t->bw, &t->bh);
+        target_predicted_box (t, &t->bx, &t->by, &t->bw, &t->bh);
       } else {
         t->bx = t->x;
         t->by = t->y;

@@ -1063,7 +1063,9 @@ static const gfloat ds80_predicted_x[] = {
 
 /* A sanity check against DeepStream 8.0, not an exactness test: our predictions on the frames without inference
  * are within 1 px of the observed ones on the first three and within 1.5 px after (the Kalman filter's matrices are
- * not documented: ours follow DeepSORT). */
+ * not documented: ours follow DeepSORT). DeepStream's filter learns the velocity more slowly at first, then
+ * overshoots; no initial covariance of ours matches every frame within 1 px. The worst difference, 1.37 px at frame
+ * 9, then shrinks below 0.1 px by frame 29: 1.5 px leaves a small margin over it. */
 static void
 test_nvsort_ds80_predictions (void)
 {
@@ -1116,6 +1118,71 @@ test_nvsort_ds80_predictions (void)
     }
   }
   g_test_message ("largest difference: %.4f px", worst);
+  rds_tracker_core_free (core);
+}
+
+/* A box shrinking until its prediction collapses, with and without the aspect ratio, detected on every second frame
+ * and then not at all: every reported box is finite with an area (size_similarity asserts it of the boxes it sees). */
+static void
+test_nvsort_shrinking (void)
+{
+  for (guint aspect = 0; aspect <= 1; aspect++) {
+    RdsTrackerConfig *cfg = nvsort_config ();
+    RdsTrackerCore *core;
+
+    cfg->use_aspect_ratio = aspect;
+    cfg->max_shadow_tracking_age = 100;
+    core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+    for (guint f = 0; f < 50; f++) {
+      gboolean done = f % 2 == 0;
+      gfloat side = 100 - 12 * f;
+      const RdsTrackerFrameOut *fo;
+
+      if (done && side > 0) {
+        RdsTrackerDet d = det (100, 100, side, side, 0, 0.9f, 1);
+
+        fo = step (core, 0, TRUE, &d, 1);
+      } else {
+        /* a detection elsewhere still runs association against the collapsed target */
+        fo = done ? STEP (core, 0, TRUE, sq (90, 2)) : EMPTY (core, 0, FALSE);
+      }
+      for (guint i = 0; i < fo->n_targets; i++) {
+        const RdsTrackerTarget *t = &fo->targets[i];
+
+        g_assert_true (isfinite (t->x) && isfinite (t->y) && isfinite (t->w) && isfinite (t->h));
+        g_assert_cmpfloat (t->w, >, 0);
+        g_assert_cmpfloat (t->h, >, 0);
+      }
+    }
+    rds_tracker_core_free (core);
+  }
+}
+
+/* associationMatcherType 1 with stateEstimatorType 0: the cascade without a Kalman filter, on the last matched box.
+ * A tentative detection still never creates a target; frames without inference report the last matched box. */
+static void
+test_nvsort_no_kf (void)
+{
+  RdsTrackerConfig *cfg = nvsort_config ();
+  RdsTrackerCore *core;
+  const RdsTrackerFrameOut *fo;
+
+  cfg->state_estimator_type = 0;
+  cfg->min_matching_score4iou = 0.3f;
+  core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+  fo = STEP (core, 0, TRUE, det (300, 100, 100, 100, 0, 0.4f, 1));
+  g_assert_cmpuint (fo->n_targets, ==, 0);
+  assert_rejected (fo, 1, 0);
+  for (guint f = 0; f < 5; f++)
+    g_assert_cmpuint (id_of (STEP (core, 0, TRUE, sq (20 * f, 2)), 2), ==, 0);
+  fo = EMPTY (core, 0, FALSE);
+  assert_box (&fo->targets[0], 80, 100, 100, 100);
+  fo = EMPTY (core, 0, FALSE);
+  assert_box (&fo->targets[0], 80, 100, 100, 100);
+  /* stage 2 on the last box: a tentative detection keeps the Active target */
+  g_assert_cmpuint (id_of (STEP (core, 0, TRUE, det (90, 100, 100, 100, 0, 0.4f, 3)), 3), ==, 0);
+  /* 70 px from the last box (IOU 0.18, below 0.3): lost without a prediction, a new target */
+  g_assert_cmpuint (id_of (STEP (core, 0, TRUE, sq (160, 4)), 4), ==, 1);
   rds_tracker_core_free (core);
 }
 
@@ -1529,6 +1596,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/tracker-core/nvsort-reported-boxes", test_nvsort_reported_boxes);
   g_test_add_func ("/cpu/tracker-core/nvsort-use-prediction", test_nvsort_use_prediction);
   g_test_add_func ("/cpu/tracker-core/nvsort-ds80-predictions", test_nvsort_ds80_predictions);
+  g_test_add_func ("/cpu/tracker-core/nvsort-shrinking", test_nvsort_shrinking);
+  g_test_add_func ("/cpu/tracker-core/nvsort-no-kf", test_nvsort_no_kf);
   g_test_add_func ("/cpu/tracker-core/reset-mode0", test_reset_mode0);
   g_test_add_func ("/cpu/tracker-core/reset-mode1", test_reset_mode1);
   g_test_add_func ("/cpu/tracker-core/reset-mode2", test_reset_mode2);

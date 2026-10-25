@@ -1,5 +1,8 @@
 /* rdstracker Kalman filter: against a plain double-precision reference written here with full matrices, convergence on
- * a constant-velocity object, the aspect-ratio state, the two noise modes and covariance growth without updates.
+ * a constant-velocity object, the aspect-ratio state, the two noise modes, covariance growth without updates, and
+ * degenerate cases (a shrinking box, zero noise). The reference shares the implementation's noise constants and
+ * choices, so it checks the algebra; the noise model itself is covered by the convergence test here and by the
+ * DeepStream 8.0 comparison in tracker_core.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-tracker-kf.h"
 
@@ -239,7 +242,7 @@ ref_update (Ref * r, const gfloat * box)
 static void
 assert_close (gdouble a, gdouble b, gdouble rel)
 {
-  if (fabs (a - b) > rel * MAX (1.0, fabs (b)))
+  if (!(fabs (a - b) <= rel * fabs (b) + 1e-15))
     g_error ("%.12g differs from the reference %.12g", a, b);
 }
 
@@ -396,6 +399,55 @@ test_covariance_grows (void)
   }
 }
 
+/* A box shrinking fast, predicted 40 frames without updates: the height stops at a small positive value. */
+static void
+test_shrinking (void)
+{
+  for (guint v = 0; v < 2; v++) {
+    RdsTrackerKfParams prm = params_height (8, v);
+    RdsTrackerKf kf;
+    gfloat x, y, w, h;
+
+    rds_tracker_kf_init (&kf, &prm, 100, 100, 50, 100);
+    for (guint f = 1; f <= 5; f++) {
+      rds_tracker_kf_predict (&kf);
+      rds_tracker_kf_update (&kf, 100, 100, 50 - 8 * f, 100 - 15 * f);
+    }
+    for (guint f = 0; f < 40; f++) {
+      rds_tracker_kf_predict (&kf);
+      rds_tracker_kf_get_box (&kf, &x, &y, &w, &h);
+      g_assert_true (isfinite (x) && isfinite (y) && isfinite (w));
+      g_assert_true (isfinite (h) && h > 0);
+    }
+    /* and it recovers from a measurement */
+    rds_tracker_kf_update (&kf, 100, 100, 20, 20);
+    rds_tracker_kf_get_box (&kf, &x, &y, &w, &h);
+    g_assert_true (isfinite (x) && isfinite (w) && isfinite (h) && h > 0);
+  }
+}
+
+/* No measurement noise and no size process noise (SIMPLE, fixed noise): S stays invertible, the state finite. */
+static void
+test_zero_noise (void)
+{
+  RdsTrackerKfParams prm = params_fixed (6, FALSE);
+  RdsTrackerKf kf;
+
+  prm.measurement = 0;
+  prm.process_size = 0;
+  rds_tracker_kf_init (&kf, &prm, 0, 0, 50, 100);
+  for (guint f = 1; f <= 50; f++) {
+    rds_tracker_kf_predict (&kf);
+    rds_tracker_kf_update (&kf, 3 * f, 2 * f, 50 + (f % 3), 100 - (f % 5));
+    for (guint i = 0; i < prm.n_states; i++) {
+      g_assert_true (isfinite (kf.x[i]));
+      for (guint j = 0; j < prm.n_states; j++)
+        g_assert_true (isfinite (kf.p[i][j]));
+    }
+  }
+  g_assert_cmpfloat (fabs (kf.x[0] - 150), <, 1);
+}
+
 static void
 test_params_from_config (void)
 {
@@ -432,6 +484,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/tracker-kf/aspect-ratio", test_aspect_ratio);
   g_test_add_func ("/cpu/tracker-kf/noise-modes", test_noise_modes);
   g_test_add_func ("/cpu/tracker-kf/covariance-grows", test_covariance_grows);
+  g_test_add_func ("/cpu/tracker-kf/shrinking", test_shrinking);
+  g_test_add_func ("/cpu/tracker-kf/zero-noise", test_zero_noise);
   g_test_add_func ("/cpu/tracker-kf/params-from-config", test_params_from_config);
   return g_test_run ();
 }
