@@ -61,7 +61,7 @@ def fetch(url, path, expected):
     print("downloading", url, flush=True)
     # Wikimedia refuses requests without a descriptive User-Agent.
     req = urllib.request.Request(url, headers={"User-Agent": "redstream-test-fetch/1.0 (fetch-yolo11n.sh)"})
-    with urllib.request.urlopen(req) as r, open(path + ".part", "wb") as f:
+    with urllib.request.urlopen(req, timeout=60) as r, open(path + ".part", "wb") as f:
         shutil.copyfileobj(r, f)
     got = sha256(path + ".part")
     if got != expected:

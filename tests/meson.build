@@ -212,7 +212,8 @@ if rds_infer_enabled
 
   # rdsinfer end to end with YOLO11n: detections on a street photo against Ultralytics, batch 4 against batch 1
   # (pipeline_infer; skipped until tests/models/fetch-yolo11n.sh has run), and the four-source soak (its own entry,
-  # pipeline_infer_soak, about 4 min; with scale2 when YOLO11n isn't fetched, so the leak check always runs). The
+  # pipeline_infer_soak, about 4 min, also in the soak suite: `--no-suite soak` leaves it out; with scale2 when
+  # YOLO11n isn't fetched, so the leak check always runs). The
   # YOLO11n programs are cached in the build directory next to infer_engine's; a first compile takes about a minute at
   # batch 1 and more at batch 4, so the timeouts are generous. Never in parallel: one compile or soak at a time.
   pipeline_infer_exe = executable('pipeline_infer', 'check' / 'pipeline_infer.c',
@@ -226,7 +227,8 @@ if rds_infer_enabled
     suite : ['gpu', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 900,
     depends : rds_plugins)
   test('pipeline_infer_soak', pipeline_infer_exe, args : ['-p', '/gpu/infer-soak'],
-    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800, depends : rds_plugins)
+    suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,
+    depends : rds_plugins)
 endif
 
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',
@@ -244,7 +246,7 @@ pipeline_exe = executable('pipeline_decode_convert', 'check' / 'pipeline_decode_
 test('pipeline_decode_convert', pipeline_exe, args : ['-p', '/gpu/pipeline'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 test('pipeline_soak', pipeline_exe, args : ['-p', '/gpu/soak'],
-  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
+  suite : ['gpu', 'soak'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
 # Multi-source mux/demux integration: mixed sources against the CPU reference, a stalled source, dynamic sources,
 # and (its own entry, `pipeline_mux_soak`) four looped 720p sources with the leak check.
@@ -252,7 +254,7 @@ pipeline_mux_exe = executable('pipeline_mux', 'check' / 'pipeline_mux.c', depend
 test('pipeline_mux', pipeline_mux_exe, args : ['-p', '/gpu/mux-pipeline'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180, depends : rds_plugins)
 test('pipeline_mux_soak', pipeline_mux_exe, args : ['-p', '/gpu/mux-soak'],
-  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
+  suite : ['gpu', 'soak'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
 # rds-compile on the scale2 model (gpu; skips without a device, and without rdsinfer), then rdsinfer in
 # gst-launch-1.0 loading what it built (not in ASan builds: the uninstrumented gst-launch-1.0 can't load sanitized

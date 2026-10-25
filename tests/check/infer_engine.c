@@ -6,6 +6,8 @@
 #include "rds-test-util.h"
 #include "rds-infer-engine.h"
 #include "rds-infer-onnx.h"
+#include "rds-infer-parse.h"
+#include "rds-infer-post.h"
 
 #include <glib/gstdio.h>
 #include <math.h>
@@ -1160,6 +1162,92 @@ test_yolo_smoke (void)
   g_free (link);
 }
 
+/* ---- YOLO11n detections from a raw output, for the parity check ---- */
+
+#define YOLO_CLASSES 80
+#define YOLO_ANCHORS 8400
+
+static gint
+detection_by_confidence (gconstpointer a, gconstpointer b)
+{
+  gfloat ca = ((const RdsInferDetection *) a)->confidence, cb = ((const RdsInferDetection *) b)->confidence;
+
+  return ca < cb ? 1 : ca > cb ? -1 : 0;
+}
+
+/* @out (84 x 8400, one image) through the built-in YOLO parser and the post-processing at confidence >= @threshold
+ * with per-class NMS at IoU 0.45, in network pixels (640x640 frame, no letterbox). Returns RdsInferDetection sorted
+ * by confidence, highest first. */
+static GArray *
+yolo_detections (const gfloat * out, gfloat threshold)
+{
+  RdsInferConfig cfg = { 0 };
+  RdsInferClassAttrs attrs[YOLO_CLASSES];
+  gfloat pre[YOLO_CLASSES], post[YOLO_CLASSES] = { 0 };
+  RdsInferLayerInfo layer = { 0 };
+  RdsInferNetworkInfo net = { 640, 640, 3 };
+  RdsInferLetterbox lb;
+  RdsInferParser *parser;
+  GArray *objects = g_array_new (FALSE, FALSE, sizeof (RdsInferObjectDetectionInfo));
+  GArray *dets = g_array_new (FALSE, FALSE, sizeof (RdsInferDetection));
+  GError *err = NULL;
+
+  for (guint c = 0; c < YOLO_CLASSES; c++) {
+    attrs[c] = (RdsInferClassAttrs) {.pre_cluster_threshold = threshold,.nms_iou_threshold = 0.45f,.topk = -1 };
+    pre[c] = threshold;
+  }
+  cfg.num_detected_classes = YOLO_CLASSES;
+  cfg.cluster_mode = 2;
+  cfg.class_attrs = attrs;
+  cfg.filter_out_class_ids = g_array_new (FALSE, FALSE, sizeof (guint));
+  layer.dataType = RDS_INFER_DATA_FLOAT;
+  layer.inferDims.numDims = 2;
+  layer.inferDims.d[0] = 4 + YOLO_CLASSES;
+  layer.inferDims.d[1] = YOLO_ANCHORS;
+  layer.inferDims.numElements = (4 + YOLO_CLASSES) * YOLO_ANCHORS;
+  layer.layerName = "output0";
+  layer.buffer = (gpointer) out;
+
+  parser = rds_infer_parser_open_builtin (RDS_INFER_PARSER_YOLO, &err);
+  g_assert_no_error (err);
+  rds_infer_parser_set_detection_params (parser, YOLO_CLASSES, pre, post);
+  g_assert_true (rds_infer_parser_parse (parser, &layer, 1, &net, objects, &err));
+  g_assert_no_error (err);
+  rds_infer_letterbox (640, 640, 640, 640, TRUE, TRUE, &lb);
+  g_assert_cmpint (rds_infer_postprocess (&cfg, &lb, (const RdsInferObjectDetectionInfo *) objects->data,
+          objects->len, NULL, dets), ==, 0);
+  g_array_sort (dets, detection_by_confidence);
+  rds_infer_parser_free (parser);
+  g_array_unref (cfg.filter_out_class_ids);
+  g_array_unref (objects);
+  return dets;
+}
+
+/* Every one of the first @n of @top (or all, if fewer) has a detection in @pool with the same class, confidence
+ * within 0.02 and each box edge within 1 px; returns how many of them were checked. */
+static guint
+check_detections_in (GArray * top, GArray * pool, guint n, const gchar * what)
+{
+  n = MIN (n, top->len);
+  for (guint i = 0; i < n; i++) {
+    const RdsInferDetection *a = &g_array_index (top, RdsInferDetection, i);
+    gboolean found = FALSE;
+
+    for (guint j = 0; j < pool->len && !found; j++) {
+      const RdsInferDetection *b = &g_array_index (pool, RdsInferDetection, j);
+
+      found = a->class_id == b->class_id && fabsf (a->confidence - b->confidence) <= 0.02f
+          && fabsf (a->box.left - b->box.left) <= 1.0f && fabsf (a->box.top - b->box.top) <= 1.0f
+          && fabsf (a->box.left + a->box.width - b->box.left - b->box.width) <= 1.0f
+          && fabsf (a->box.top + a->box.height - b->box.top - b->box.height) <= 1.0f;
+    }
+    if (!found)
+      g_error ("%s detection %u (class %u, %.4f, box %.1f %.1f %.1f %.1f) has no match", what, i, a->class_id,
+          a->confidence, a->box.left, a->box.top, a->box.width, a->box.height);
+  }
+  return n;
+}
+
 /* Against ONNX Runtime's output on a stored input (raw little-endian float32, 1x3x640x640 in, 1x84x8400 out). */
 static void
 test_yolo_parity (void)
@@ -1191,6 +1279,29 @@ test_yolo_parity (void)
   }
   g_test_message ("max |diff| against ONNX Runtime: %g", max_diff);
   g_assert_cmpfloat (max_diff, <=, 0.02f);
+
+  /* Every top-100 detection matches, both ways. Both outputs are decoded the same way: the built-in parser at
+   * confidence >= 0 (every anchor's best class), then per-class greedy NMS at IoU 0.45. Greedy NMS keeps a box or not
+   * by the higher-confidence boxes only, so the top 100 here are the top 100 at any threshold; this image has only
+   * a few dozen above 0.05, so the top 100 reach far down. With every output value within 0.02 of the reference
+   * (checked above), a detection's confidence moves by at most 0.02 and its edges (centre +- size / 2) by at most
+   * 0.02 px: a match needs the same class, confidence within 0.02 and every edge within 1 px, far below the size of
+   * any box, so it can't pair two different objects. Each side's top 100 is looked up among all of the other side's
+   * detections, so a near-tie in the ranking can't fail the check. */
+  {
+    GArray *ours = yolo_detections (out, 0.0f), *theirs = yolo_detections ((const gfloat *) ref, 0.0f);
+    guint n;
+
+    g_assert_cmpuint (ours->len, >=, 100);
+    g_assert_cmpuint (theirs->len, >=, 100);
+    n = check_detections_in (ours, theirs, 100, "engine");
+    n += check_detections_in (theirs, ours, 100, "ONNX Runtime");
+    g_test_message ("top-100 detections (NMS 0.45): %u checked (100 each way, out of %u engine and %u ONNX Runtime "
+        "detections), all matched; the 100th has confidence %.4f", n, ours->len, theirs->len,
+        g_array_index (ours, RdsInferDetection, 99).confidence);
+    g_array_unref (ours);
+    g_array_unref (theirs);
+  }
   g_free (out);
   g_free (ref);
   g_free (in);

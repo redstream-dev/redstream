@@ -1,6 +1,7 @@
-/* rdsinfer end to end with YOLO11n (gpu): detections on a public street photo against Ultralytics' own prediction,
- * the same frame on four sources at batch 4 against batch 1, and a long four-source run through the decoder and the
- * mux (the soak, its own test entry) that neither leaks host nor GPU memory.
+/* rdsinfer end to end with YOLO11n (gpu): detections on a public street photo against Ultralytics' own prediction
+ * (through RGBA and through NV12 batches), the same frame on four sources at batch 4 against batch 1, and a long
+ * four-source run through the decoder and the mux (the soak, its own test entry) that neither leaks host nor GPU
+ * memory.
  * The YOLO11n model and the reference data come from tests/models/fetch-yolo11n.sh (.cache/models, never
  * committed); the tests that need them skip without them. Without them the soak runs the committed scale2 model, so
  * the leak check always runs.
@@ -179,10 +180,11 @@ collect_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user
   return GST_PAD_PROBE_OK;
 }
 
-/* The street image on @n_sources sources (one frame each) -> rdsstreammux (1280x720 RGBA, batch @n_sources) ->
- * rdsinfer (YOLO11n, batch @n_sources) -> fakesink. Returns the detections per source; each got exactly one frame. */
+/* The street image on @n_sources sources (one frame each) -> rdsstreammux (1280x720, batch @n_sources; RGBA
+ * batches when @rgba, else the mux's default NV12) -> rdsinfer (YOLO11n, batch @n_sources) -> fakesink. Returns the
+ * detections per source; each got exactly one frame. */
 static void
-run_street (guint n_sources, Collected * c)
+run_street (guint n_sources, gboolean rgba, Collected * c)
 {
   gchar *cfg = yolo_config (n_sources);
   GString *desc = g_string_new (NULL);
@@ -197,10 +199,10 @@ run_street (guint n_sources, Collected * c)
   for (guint i = 0; i < n_sources; i++)
     g_string_append_printf (desc, "filesrc location=" STREET " blocksize=%u ! rawvideoparse format=rgba width=%u "
         "height=%u framerate=30/1 ! m.sink_%u ", STREET_W * STREET_H * 4, STREET_W, STREET_H, i);
-  /* RGBA batches: the mux would otherwise convert to NV12 and halve the chroma resolution */
-  g_string_append_printf (desc, "rdsstreammux name=m width=%u height=%u batch-size=%u "
-      "! video/x-raw(memory:RDS),format=RGBA ! rdsinfer config-file-path=%s ! fakesink name=k sync=false",
-      STREET_W, STREET_H, n_sources, cfg);
+  /* RGBA batches keep the photo as it is; NV12 (the mux's default) halves the chroma resolution */
+  g_string_append_printf (desc, "rdsstreammux name=m width=%u height=%u batch-size=%u ! %s"
+      "rdsinfer config-file-path=%s ! fakesink name=k sync=false", STREET_W, STREET_H, n_sources,
+      rgba ? "video/x-raw(memory:RDS),format=RGBA ! " : "", cfg);
   pipe = gst_parse_launch (desc->str, &err);
   g_assert_no_error (err);
   g_string_free (desc, TRUE);
@@ -293,16 +295,17 @@ load_labels (void)
   return labels;
 }
 
+#define CLASS_PERSON 0
+
 /* The street photo at batch 1 against Ultralytics' prediction: per class, detections are matched greedily (highest
  * confidence first) to the unmatched reference object of that class with the highest IoU, if it is >= 0.5. Every
- * class with at least 3 reference objects needs precision and recall >= 0.9. Our letterbox pads with 0 where
- * Ultralytics pads with 114 (and fits the image into a 640x384 rectangle), and our resampling differs from
- * OpenCV's, so confidences near the threshold may differ. */
+ * class with at least 3 reference objects is checked: precision and recall >= @min_pr. At least one class must be
+ * checked, person among them. Prints the per-class table. */
 static void
-test_detect (void)
+check_street (gboolean rgba, gdouble min_pr)
 {
   const gchar *need[] = { STREET, STREET_REF, NULL };
-  guint n_ref[N_CLASSES] = { 0 }, n_ours[N_CLASSES] = { 0 }, n_match[N_CLASSES] = { 0 };
+  guint n_ref[N_CLASSES] = { 0 }, n_ours[N_CLASSES] = { 0 }, n_match[N_CLASSES] = { 0 }, n_checked = 0;
   gboolean *used;
   gchar **labels;
   Collected c;
@@ -314,10 +317,12 @@ test_detect (void)
   if (!have_yolo (need))
     return;
   ref = load_reference ();
+  g_assert_cmpuint (ref->len, >, 0);
   labels = load_labels ();
   t0 = g_get_monotonic_time ();
-  run_street (1, &c);
-  g_test_message ("pipeline run (with the program load or build): %.1f s", (g_get_monotonic_time () - t0) / 1e6);
+  run_street (1, rgba, &c);
+  g_test_message ("%s pipeline run (with the program load or build): %.1f s", rgba ? "RGBA" : "NV12",
+      (g_get_monotonic_time () - t0) / 1e6);
   ours = c.dets[0];
   g_array_sort (ours, by_confidence_desc);
 
@@ -369,9 +374,14 @@ test_detect (void)
     r = n_ref[k] ? (gdouble) n_match[k] / n_ref[k] : 1.0;
     g_test_message ("%-12s %4u %5u %8u %9.2f %6.2f%s", labels[k], n_ref[k], n_ours[k], n_match[k], p, r,
         n_ref[k] >= 3 ? "  (checked)" : "");
-    if (n_ref[k] >= 3 && (p < 0.9 || r < 0.9))
-      ok = FALSE;
+    if (n_ref[k] >= 3) {
+      n_checked++;
+      if (p < min_pr || r < min_pr)
+        ok = FALSE;
+    }
   }
+  g_assert_cmpuint (n_checked, >, 0);
+  g_assert_cmpuint (n_ref[CLASS_PERSON], >=, 3);
   g_assert_true (ok);
 
   g_free (used);
@@ -380,18 +390,25 @@ test_detect (void)
   collected_clear (&c);
 }
 
-static gint
-by_class_then_confidence (gconstpointer a, gconstpointer b)
+/* RGBA batches: P and R >= 0.9. Our letterbox pads with 0 where Ultralytics pads with 114 (and fits the image into
+ * a 640x384 rectangle), and our resampling differs from OpenCV's, so confidences near the threshold may differ. */
+static void
+test_detect (void)
 {
-  const Det *x = a, *y = b;
-
-  if (x->class_id != y->class_id)
-    return x->class_id < y->class_id ? -1 : 1;
-  return by_confidence_desc (a, b);
+  check_street (TRUE, 0.9);
 }
 
-/* The street image on four sources at batch 4: every slot gets the batch-1 detections (same classes, confidence
- * within 1e-3, boxes within 0.5 px). */
+/* The mux's default NV12 batches (as after a decoder): the RGBA photo loses half its chroma resolution and goes
+ * through BT.601 and back, so P and R >= 0.8. */
+static void
+test_detect_nv12 (void)
+{
+  check_street (FALSE, 0.8);
+}
+
+/* The street image on four sources at batch 4: every slot gets the batch-1 detections. Each batch-4 detection is
+ * paired with the unpaired batch-1 detection of its class with the highest IoU; the counts must be equal and each
+ * pair within 1e-3 confidence and 0.5 px per box value. */
 static void
 test_batch4 (void)
 {
@@ -399,24 +416,43 @@ test_batch4 (void)
   Collected one, four;
   GArray *want;
   gfloat max_conf = 0.0f, max_px = 0.0f;
+  gboolean *used;
 
   RDS_TEST_REQUIRE_GPU ();
   if (!have_yolo (need))
     return;
-  run_street (1, &one);
-  run_street (4, &four);
+  run_street (1, TRUE, &one);
+  run_street (4, TRUE, &four);
   want = one.dets[0];
-  g_array_sort (want, by_class_then_confidence);
   g_assert_cmpuint (want->len, >, 0);
+  used = g_new (gboolean, want->len);
   for (guint s = 0; s < 4; s++) {
     GArray *got = four.dets[s];
 
-    g_array_sort (got, by_class_then_confidence);
     g_assert_cmpuint (got->len, ==, want->len);
-    for (guint i = 0; i < want->len; i++) {
-      const Det *a = &g_array_index (want, Det, i), *b = &g_array_index (got, Det, i);
+    memset (used, 0, want->len * sizeof (gboolean));
+    for (guint i = 0; i < got->len; i++) {
+      const Det *b = &g_array_index (got, Det, i), *a;
+      gint best = -1;
+      gfloat best_iou = 0.0f;
 
-      g_assert_cmpint (a->class_id, ==, b->class_id);
+      for (guint j = 0; j < want->len; j++) {
+        const Det *w = &g_array_index (want, Det, j);
+        gfloat v;
+
+        if (used[j] || w->class_id != b->class_id)
+          continue;
+        v = iou (w, b);
+        if (best < 0 || v > best_iou) {
+          best_iou = v;
+          best = (gint) j;
+        }
+      }
+      if (best < 0)
+        g_error ("slot %u: no batch-1 detection of class %d left for (%.1f, %.1f, %.1f, %.1f)", s, b->class_id,
+            b->left, b->top, b->width, b->height);
+      used[best] = TRUE;
+      a = &g_array_index (want, Det, best);
       max_conf = MAX (max_conf, fabsf (a->confidence - b->confidence));
       max_px = MAX (max_px, fabsf (a->left - b->left));
       max_px = MAX (max_px, fabsf (a->top - b->top));
@@ -428,6 +464,7 @@ test_batch4 (void)
       want->len, max_conf, max_px);
   g_assert_cmpfloat (max_conf, <=, 1e-3f);
   g_assert_cmpfloat (max_px, <=, 0.5f);
+  g_free (used);
   collected_clear (&one);
   collected_clear (&four);
 }
@@ -454,6 +491,7 @@ infer_soak_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer u
   InferSoakStats *st = user_data;
   RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (GST_PAD_PROBE_INFO_BUFFER (info));
 
+  g_assert_nonnull (bm);
   st->batches++;
   st->frames += bm->num_frames_in_batch;
   for (GList * l = bm->frame_meta_list; l; l = l->next)
@@ -569,6 +607,7 @@ main (int argc, char **argv)
   gst_init (&argc, &argv);
   g_test_init (&argc, &argv, NULL);
   g_test_add_func ("/gpu/infer-yolo/detect", test_detect);
+  g_test_add_func ("/gpu/infer-yolo/detect-nv12", test_detect_nv12);
   g_test_add_func ("/gpu/infer-yolo/batch4", test_batch4);
   g_test_add_func ("/gpu/infer-soak/yolo", test_infer_soak);
   ret = g_test_run ();

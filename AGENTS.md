@@ -225,9 +225,10 @@ meson test -C build-rel --print-errorlogs
   VA driver, installs its own alternate signal stack). The soak tests (`pipeline_soak`, `pipeline_mux_soak`,
   `pipeline_infer_soak`) check host memory growth on VmRSS, or under ASan on ASan's live heap
   (`__sanitizer_get_current_allocated_bytes`, which leaves out the quarantine, so ASan keeps its default options);
-  the normal build's VmRSS check covers memory that
-  bypasses malloc (HIP pinned memory). Their memory probes live in `tests/check/rds-test-soak.h`: host memory, and
-  GPU memory from this process's DRM fdinfo (`drm-total-vram` +
+  the normal build's VmRSS check covers memory that bypasses malloc (HIP pinned memory). They are also in the `soak`
+  suite; `pipeline_infer_soak` takes about 4 min with YOLO11n (3000 batches of 4 at ~50 fps on a small iGPU, also
+  under ASan), so `meson test --no-suite soak` leaves the soaks out. Their memory probes live in
+  `tests/check/rds-test-soak.h`: host memory, and GPU memory from this process's DRM fdinfo (`drm-total-vram` +
   `drm-total-gtt` of its render-node fds, where HIP allocations are accounted), so other processes on the GPU don't
   skew it; `hipMemGetInfo` is device-wide.
 - Element and pipeline test `main()`s end with `gst_deinit ()` after `g_test_run ()`. Without it, a test process can

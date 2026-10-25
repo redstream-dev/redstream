@@ -76,5 +76,9 @@ fdf61dc33ff54c832120746e91a44367881cae29581fa023b246720668790f5a  street-ref.jso
 bac1b23e05f85f6c8665cdfb05258f8a140922c04e177168d5933687d78f3fb9  yolo-parity-out.f32
 ```
 
+The script's up-to-date check only looks for the files: it doesn't re-verify the reference hashes, so after changing
+the pins (or the photo), delete the four files (or all of `.cache/models/`) to regenerate them, and record the new
+hashes in `DERIVED_SHA256` in `export-yolo11n.py` and here.
+
 The reference has 16 objects: 9 person, 3 car, and one each of truck, motorcycle, handbag and umbrella.
 `pipeline_infer` compares rdsinfer's detections with it per class, for the classes with at least 3 objects.
