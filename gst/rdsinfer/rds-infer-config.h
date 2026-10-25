@@ -6,6 +6,8 @@
 #ifndef RDS_INFER_CONFIG_H
 #define RDS_INFER_CONFIG_H
 
+#include "rds-infer-engine.h"
+
 #include <glib.h>
 
 G_BEGIN_DECLS
@@ -75,6 +77,12 @@ G_GNUC_INTERNAL RdsInferConfig *rds_infer_config_load (const gchar * path, GErro
 G_GNUC_INTERNAL gboolean rds_infer_config_validate (const RdsInferConfig * cfg, const gchar * const *overridden,
     GError ** error);
 G_GNUC_INTERNAL void rds_infer_config_free (RdsInferConfig * cfg);
+
+/* The engine options rdsinfer (and rds-compile) open the engine with: onnx-file, model-engine-file, batch-size,
+ * gpu-id, network-mode, and infer-dims in the model's input order (stored in @dims, which opts->infer_dims then
+ * points to). The strings are @cfg's. FALSE when onnx-file is unset: a cached program is checked against it. */
+G_GNUC_INTERNAL gboolean rds_infer_config_get_engine_options (const RdsInferConfig * cfg,
+    RdsInferEngineOptions * opts, guint dims[3], GError ** error);
 
 typedef enum
 {

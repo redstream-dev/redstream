@@ -113,4 +113,5 @@ rds_plugin_c_args = [
 subdir('gst-libs/rds')
 subdir('gst')
 subdir('samples')
+subdir('tools')
 subdir('tests')

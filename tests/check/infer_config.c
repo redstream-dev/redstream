@@ -645,6 +645,63 @@ test_validate (void)
   rds_infer_config_free (cfg);
 }
 
+/* The engine options rdsinfer and rds-compile open the engine with. */
+static void
+test_engine_options (void)
+{
+  gchar *path = tmp_config ("pgie.txt", "[property]\nonnx-file=m.onnx\nmodel-engine-file=m.mxr\nnetwork-type=100\n"
+      "batch-size=3\nnetwork-mode=2\ninfer-dims=3;48;64\nnetwork-input-order=1\n", NULL);
+  gchar *dir = g_path_get_dirname (path), *onnx = g_build_filename (dir, "m.onnx", NULL);
+  gchar *engine = g_build_filename (dir, "m.mxr", NULL);
+  RdsInferConfig *cfg = rds_infer_config_load (path, NULL);
+  RdsInferEngineOptions opts;
+  guint dims[3];
+  GError *err = NULL;
+
+  g_assert_nonnull (cfg);
+  cfg->gpu_id = 1;              /* from the element property (the config key is a no-op) */
+  g_assert_true (rds_infer_config_get_engine_options (cfg, &opts, dims, &err));
+  g_assert_no_error (err);
+  g_assert_cmpstr (opts.onnx_file, ==, onnx);
+  g_assert_cmpstr (opts.engine_file, ==, engine);
+  g_assert_cmpuint (opts.batch_size, ==, 3);
+  g_assert_cmpuint (opts.gpu_id, ==, 1);
+  g_assert_true (opts.fp16);
+  g_assert_false (opts.force_rebuild);
+  g_assert_false (opts.no_build);
+  g_assert_null (opts.output_file);
+  /* infer-dims is C;H;W, an NHWC model's input is H, W, C */
+  g_assert_true (opts.infer_dims == dims);
+  g_assert_cmpuint (dims[0], ==, 48);
+  g_assert_cmpuint (dims[1], ==, 64);
+  g_assert_cmpuint (dims[2], ==, 3);
+
+  cfg->network_input_order = 0;
+  cfg->network_mode = 0;
+  g_assert_true (rds_infer_config_get_engine_options (cfg, &opts, dims, &err));
+  g_assert_false (opts.fp16);
+  g_assert_cmpuint (dims[0], ==, 3);
+  g_assert_cmpuint (dims[1], ==, 48);
+  g_assert_cmpuint (dims[2], ==, 64);
+  cfg->has_infer_dims = FALSE;
+  g_assert_true (rds_infer_config_get_engine_options (cfg, &opts, dims, &err));
+  g_assert_null (opts.infer_dims);
+
+  /* a program needs the model it is checked against */
+  g_clear_pointer (&cfg->onnx_file, g_free);
+  g_assert_false (rds_infer_config_get_engine_options (cfg, &opts, dims, &err));
+  g_assert_error (err, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_UNSUPPORTED);
+  g_assert_true (g_str_has_prefix (err->message, cfg->config_path));
+  g_assert_nonnull (strstr (err->message, ":onnx-file: (unset): "));
+  g_clear_error (&err);
+
+  rds_infer_config_free (cfg);
+  g_free (engine);
+  g_free (onnx);
+  g_free (dir);
+  tmp_cleanup (path);
+}
+
 static void
 collect_key (const RdsInferKeyDesc * key, gpointer user_data)
 {
@@ -718,6 +775,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-config/numbers", test_numbers);
   g_test_add_func ("/cpu/infer-config/keyfile-values", test_keyfile_values);
   g_test_add_func ("/cpu/infer-config/labels", test_labels);
+  g_test_add_func ("/cpu/infer-config/engine-options", test_engine_options);
   g_test_add_func ("/cpu/infer-config/validate", test_validate);
   g_test_add_func ("/cpu/infer-config/key-table", test_key_table);
   return g_test_run ();

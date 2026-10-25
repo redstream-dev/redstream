@@ -112,7 +112,7 @@ static RdsInferEngine *
 open_engine (const gchar * onnx, const gchar * engine_file, guint batch, gboolean fp16, const guint * dims,
     gboolean force)
 {
-  RdsInferEngineOptions opts = { onnx, engine_file, batch, 0, fp16, dims, force };
+  RdsInferEngineOptions opts = { onnx, engine_file, batch, 0, fp16, dims, force, FALSE, NULL };
   GError *err = NULL;
   RdsInferEngine *e = rds_infer_engine_open (&opts, &err);
 
@@ -305,7 +305,7 @@ test_onnx_reader_truncated (void)
 static void
 test_invalid_options (void)
 {
-  RdsInferEngineOptions opts = { SCALE2, NULL, 0, 0, FALSE, dims_64x48, FALSE };
+  RdsInferEngineOptions opts = { SCALE2, NULL, 0, 0, FALSE, dims_64x48, FALSE, FALSE, NULL };
   static const guint zero_dims[3] = { 3, 0, 48 };
   GError *err = NULL;
 
@@ -319,6 +319,13 @@ test_invalid_options (void)
   g_clear_error (&err);
   opts.onnx_file = SCALE2;
   opts.infer_dims = zero_dims;
+  g_assert_null (rds_infer_engine_open (&opts, &err));
+  g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_INVALID);
+  g_clear_error (&err);
+  /* only loading, and never loading */
+  opts.infer_dims = dims_64x48;
+  opts.force_rebuild = TRUE;
+  opts.no_build = TRUE;
   g_assert_null (rds_infer_engine_open (&opts, &err));
   g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_INVALID);
   g_clear_error (&err);
@@ -532,6 +539,165 @@ test_engine_file (void)
   g_free (cache);
   g_free (custom_json);
   g_free (custom);
+  remove_dir (dir);
+  g_free (dir);
+  g_free (onnx);
+}
+
+/* Opens @onnx with no_build (and @output_file, or NULL): the engine, or NULL with the NOT_CACHED error in *err. */
+static RdsInferEngine *
+open_no_build (const gchar * onnx, const gchar * engine_file, const gchar * output_file, guint batch, GError ** err)
+{
+  RdsInferEngineOptions opts = { onnx, engine_file, batch, 0, FALSE, dims_64x48, FALSE, TRUE, output_file };
+
+  return rds_infer_engine_open (&opts, err);
+}
+
+/* no_build finds what an ordinary open would load, and fails (saying why) where that would build. */
+static void
+test_no_build (void)
+{
+  gchar *onnx, *dir, *stale, *cache;
+  RdsInferEngine *e;
+  GError *err = NULL;
+
+  RDS_TEST_REQUIRE_GPU ();
+  dir = make_model_dir (SCALE2, &onnx);
+  g_assert_null (open_no_build (onnx, NULL, NULL, 2, &err));
+  g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_NOT_CACHED);
+  g_test_message ("%s", err->message);
+  g_assert_nonnull (strstr (err->message, "doesn't exist"));
+  g_clear_error (&err);
+  g_assert_false (dir_has_tmp (dir));
+
+  e = open_engine (onnx, NULL, 2, FALSE, dims_64x48, FALSE);
+  cache = g_strdup (rds_infer_engine_get_program_path (e));
+  rds_infer_engine_free (e);
+  e = open_no_build (onnx, NULL, NULL, 2, &err);
+  g_assert_no_error (err);
+  g_assert_false (rds_infer_engine_was_built (e));
+  g_assert_cmpstr (rds_infer_engine_get_program_path (e), ==, cache);
+  check_scale2 (e, 2, 0.0f);
+  rds_infer_engine_free (e);
+
+  /* a stale model-engine-file with a matching cache entry: loaded, with the element's warning */
+  stale = g_build_filename (dir, "stale.mxr", NULL);
+  write_file (stale, "not a program", -1);
+  e = open_no_build (onnx, stale, NULL, 2, &err);
+  g_assert_no_error (err);
+  g_assert_cmpstr (rds_infer_engine_get_program_path (e), ==, cache);
+  g_assert_true (has_warning (e, stale));
+  rds_infer_engine_free (e);
+
+  /* the manifest edited: not up to date any more, and the reason says why */
+  {
+    gchar *json = g_strconcat (cache, ".json", NULL), *m = read_file (json), *p = strstr (m, "\"batch_size\"");
+
+    g_assert_nonnull (p);
+    p = strchr (p, ':');
+    g_assert_nonnull (p);
+    p[1] = '9';
+    write_file (json, m, -1);
+    g_free (m);
+    g_free (json);
+  }
+  g_assert_null (open_no_build (onnx, NULL, NULL, 2, &err));
+  g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_NOT_CACHED);
+  g_test_message ("%s", err->message);
+  g_assert_nonnull (strstr (err->message, "batch_size"));
+  g_clear_error (&err);
+
+  g_free (stale);
+  g_free (cache);
+  remove_dir (dir);
+  g_free (dir);
+  g_free (onnx);
+}
+
+/* output_file: built and saved only there (+ .json), looked up only there. */
+static void
+test_output_file (void)
+{
+  gchar *onnx, *dir, *out, *out_json, *other, *nodir;
+  RdsInferEngineOptions opts = { NULL, NULL, 2, 0, FALSE, dims_64x48, FALSE, FALSE, NULL };
+  RdsInferEngine *e;
+  GError *err = NULL;
+  GDir *d;
+  const gchar *name;
+  guint n_mxr = 0;
+
+  RDS_TEST_REQUIRE_GPU ();
+  dir = make_model_dir (SCALE2, &onnx);
+  out = g_build_filename (dir, "out.mxr", NULL);
+  out_json = g_strconcat (out, ".json", NULL);
+  opts.onnx_file = onnx;
+  opts.output_file = out;
+  e = rds_infer_engine_open (&opts, &err);
+  g_assert_no_error (err);
+  g_assert_true (rds_infer_engine_was_built (e));
+  g_assert_cmpstr (rds_infer_engine_get_program_path (e), ==, out);
+  g_assert_cmpstr (rds_infer_engine_get_manifest_path (e), ==, out_json);
+  g_assert_true (g_file_test (out_json, G_FILE_TEST_IS_REGULAR));
+  rds_infer_engine_free (e);
+  /* nothing under the cache name */
+  d = g_dir_open (dir, 0, NULL);
+  while ((name = g_dir_read_name (d)))
+    if (g_str_has_suffix (name, ".mxr"))
+      n_mxr++;
+  g_dir_close (d);
+  g_assert_cmpuint (n_mxr, ==, 1);
+  g_assert_false (dir_has_tmp (dir));
+
+  /* found there, also with a model-engine-file (ignored) */
+  e = open_no_build (onnx, "ignored.mxr", out, 2, &err);
+  g_assert_no_error (err);
+  g_assert_cmpstr (rds_infer_engine_get_program_path (e), ==, out);
+  check_scale2 (e, 2, 0.0f);
+  rds_infer_engine_free (e);
+
+  /* the cache name holds a match, another output file doesn't exist: not found */
+  e = open_engine (onnx, NULL, 2, FALSE, dims_64x48, FALSE);
+  rds_infer_engine_free (e);
+  other = g_build_filename (dir, "other.mxr", NULL);
+  g_assert_null (open_no_build (onnx, NULL, other, 2, &err));
+  g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_NOT_CACHED);
+  g_assert_nonnull (strstr (err->message, other));
+  g_clear_error (&err);
+
+  /* its directory is made if needed */
+  nodir = g_build_filename (dir, "sub", "x.mxr", NULL);
+  opts.output_file = nodir;
+  e = rds_infer_engine_open (&opts, &err);
+  g_assert_no_error (err);
+  g_assert_cmpstr (rds_infer_engine_get_program_path (e), ==, nodir);
+  rds_infer_engine_free (e);
+  g_free (nodir);
+
+  /* an output file that can't be written: built, not saved, a warning names it */
+  nodir = g_build_filename (dir, "ro", "x.mxr", NULL);
+  {
+    gchar *ro = g_path_get_dirname (nodir);
+
+    g_assert_cmpint (g_mkdir (ro, 0555), ==, 0);
+    if (access (ro, W_OK) == 0) {
+      g_test_message ("running as root: a 0555 directory is still writable, unwritable case skipped");
+    } else {
+      opts.output_file = nodir;
+      e = rds_infer_engine_open (&opts, &err);
+      g_assert_no_error (err);
+      g_assert_null (rds_infer_engine_get_program_path (e));
+      g_assert_null (rds_infer_engine_get_manifest_path (e));
+      g_assert_true (has_warning (e, nodir));
+      rds_infer_engine_free (e);
+    }
+    g_chmod (ro, 0755);
+    g_free (ro);
+  }
+
+  g_free (nodir);
+  g_free (other);
+  g_free (out_json);
+  g_free (out);
   remove_dir (dir);
   g_free (dir);
   g_free (onnx);
@@ -785,7 +951,7 @@ test_external_data (void)
 {
   GByteArray *model = external_data_model ();
   gchar *dir, *onnx;
-  RdsInferEngineOptions opts = { NULL, NULL, 1, 0, FALSE, NULL, FALSE };
+  RdsInferEngineOptions opts = { NULL, NULL, 1, 0, FALSE, NULL, FALSE, FALSE, NULL };
   GError *err = NULL;
 
   RDS_TEST_REQUIRE_GPU ();
@@ -831,7 +997,7 @@ static void
 test_fixed_batch (void)
 {
   gchar *onnx, *dir;
-  RdsInferEngineOptions opts = { NULL, NULL, 2, 0, FALSE, dims_64x48, FALSE };
+  RdsInferEngineOptions opts = { NULL, NULL, 2, 0, FALSE, dims_64x48, FALSE, FALSE, NULL };
   GError *err = NULL;
   RdsInferEngine *e;
 
@@ -855,7 +1021,9 @@ test_fixed_batch (void)
 static void
 test_errors (void)
 {
-  RdsInferEngineOptions opts = { RDS_TEST_MODELS "/missing.onnx", NULL, 1, 0, FALSE, dims_64x48, FALSE };
+  RdsInferEngineOptions opts = { RDS_TEST_MODELS "/missing.onnx", NULL, 1, 0, FALSE, dims_64x48, FALSE, FALSE,
+    NULL
+  };
   static const guint wrong_c[3] = { 4, 64, 48 };
   GError *err = NULL;
   gchar *onnx, *dir;
@@ -1042,6 +1210,8 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-engine/build-and-cache", test_build_and_cache);
   g_test_add_func ("/gpu/infer-engine/invalidation", test_invalidation);
   g_test_add_func ("/gpu/infer-engine/engine-file", test_engine_file);
+  g_test_add_func ("/gpu/infer-engine/no-build", test_no_build);
+  g_test_add_func ("/gpu/infer-engine/output-file", test_output_file);
   g_test_add_func ("/gpu/infer-engine/readonly-dir", test_readonly_dir);
   g_test_add_func ("/gpu/infer-engine/atomic-write", test_atomic_write);
   g_test_add_func ("/gpu/infer-engine/dims-keyed", test_dims_keyed);

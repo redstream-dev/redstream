@@ -229,6 +229,29 @@ test('pipeline_mux', pipeline_mux_exe, args : ['-p', '/gpu/mux-pipeline'],
 test('pipeline_mux_soak', pipeline_mux_exe, args : ['-p', '/gpu/mux-soak'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
+# rds-compile on the scale2 model (gpu; skips without a device, and without rdsinfer), then rdsinfer in
+# gst-launch-1.0 loading what it built (not in ASan builds: the uninstrumented gst-launch-1.0 can't load sanitized
+# plugins). The kernel caches live in the build directory, as for infer_engine.
+gst_launch = find_program('gst-launch-1.0', required : false)
+rds_compile_path = ''
+rds_compile_depends = rds_plugins
+if rds_infer_enabled
+  rds_compile_path = rds_compile_exe.full_path()
+  rds_compile_depends += rds_compile_exe
+endif
+rds_compile_args = [rds_compile_path, gst_launch.found() and not asan ? gst_launch.full_path() : '',
+  meson.current_source_dir() / 'models' / 'scale2.onnx', meson.current_build_dir()]
+test('rds_compile', find_program('tools/rds_compile.sh'), args : rds_compile_args,
+  suite : 'gpu', is_parallel : false, timeout : 300,
+  env : environment(common_test_env + {
+    'GST_PLUGIN_PATH_1_0' : meson.project_build_root() / 'gst',
+    'GST_REGISTRY_1_0' : meson.current_build_dir() / 'registry.bin',
+    'MIOPEN_USER_DB_PATH' : meson.current_build_dir() / 'miopen',
+    'MIOPEN_CUSTOM_CACHE_DIR' : meson.current_build_dir() / 'miopen',
+    'AMD_COMGR_CACHE_DIR' : meson.current_build_dir() / 'comgr',
+  }),
+  depends : rds_compile_depends)
+
 # The dry run checks the compat mapping; gst-inspect-1.0 (when found) checks that the mapped decoder and
 # converter (and rdsinfer, when built) resolve to real elements from the build tree. Not in ASan builds: the
 # uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process (plugin_load covers loading there).

@@ -168,9 +168,11 @@ gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; refcounted ou
                    and json-glib
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources
 samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
+tools/rds-compile/ rds-compile: pre-builds rdsinfer's program with its config parser and engine (exit 2: up to date)
 tests/check/       GLib unit, element and pipeline tests (suites cpu/gpu); test clips are encoded in-process
                    (rds-test-media.h, needs the VA encoder); soak memory probes in rds-test-soak.h
 tests/samples/     sample-level tests
+tests/tools/       tool tests (shell scripts)
 tests/media/       make-test-media.sh: generated H.264 clips (into git-ignored .cache/)
 tests/models/      committed tiny ONNX test models (make-test-models.py); fetch-yolo11n.sh exports YOLO11n into
                    .cache/models (host, Docker; AGPL, never committed)

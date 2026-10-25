@@ -309,6 +309,23 @@ element's own non-blocking stream, one synchronization per batch, parsing on the
 partial batch) are zeroed, not inferred on stale pixels. The batch's metadata lock is held only to read the frame
 list and to add the results, never during GPU work.
 
+#### Pre-building programs: `rds-compile` (`trtexec`)
+
+The element compiles the model on its first start, which takes minutes on a small GPU. `rds-compile` does it ahead
+of time with the element's own config parser and engine, so the program lands where the element looks for it:
+
+```bash
+rds-compile -c CONFIG [-b BATCH] [--fp16|--fp32] [-g GPU] [-o OUT.mxr] [--force]
+```
+
+- `-b`, `--fp16`/`--fp32` and `-g` override `batch-size`, `network-mode` and `gpu-id`; `--fp16` with `--fp32` is an
+  error. Without `-o` the program is looked up and written like the element does (`model-engine-file`, then the
+  cache name next to the ONNX file, then `$XDG_CACHE_HOME/redstream/`). `-o` looks up and writes only that file,
+  with its manifest next to it as `OUT.mxr.json`; point `model-engine-file` at it.
+- Prints the program's path on stdout; the build reason, warnings and errors (with the element's messages) on
+  stderr.
+- Exit status: 0 built, 1 error, 2 already up to date (the element would load it; `--force` rebuilds).
+
 ## NvBufSurface
 
 Types are `typedef`s, functions and enumerators are object-like macros (taking a function's address works).

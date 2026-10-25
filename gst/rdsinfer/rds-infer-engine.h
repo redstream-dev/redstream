@@ -31,6 +31,7 @@ typedef enum
   RDS_INFER_ENGINE_ERROR_MODEL,         /* the model can't be used as asked (encoding, input dims, batch, types) */
   RDS_INFER_ENGINE_ERROR_DEVICE,        /* no such GPU, or a HIP call failed */
   RDS_INFER_ENGINE_ERROR_MIGRAPHX,      /* a MIGraphX call failed; MIGraphX prints its own reason to stderr */
+  RDS_INFER_ENGINE_ERROR_NOT_CACHED,    /* no_build and no matching program; the message says why (the build reason) */
 } RdsInferEngineError;
 
 typedef struct
@@ -41,13 +42,18 @@ typedef struct
   gboolean fp16;
   const guint *infer_dims;              /* C, H, W, or NULL to take them from the model */
   gboolean force_rebuild;               /* never load a cached program */
+  gboolean no_build;                    /* only load: fail with NOT_CACHED where a program would be built */
+  /* Look up and save the program only here (+ ".json"), instead of engine_file and the cache names; NULL: unset.
+   * When it can't be written, the program isn't cached (a warning says why). */
+  const gchar *output_file;
 } RdsInferEngineOptions;
 
 typedef struct _RdsInferEngine RdsInferEngine;
 
 /* Loads a matching cached program (engine_file first, then the cache name in the model's directory, then in
- * $XDG_CACHE_HOME/redstream/) or builds one and saves it under the cache name. The model's input must be a float
- * NCHW tensor whose batch dimension is symbolic (or fixed at batch_size). Ends with one warm-up run. */
+ * $XDG_CACHE_HOME/redstream/) or builds one and saves it under the cache name. With no_build, the same lookup
+ * decides whether the program is up to date (rds-compile). The model's input must be a float NCHW tensor whose batch
+ * dimension is symbolic (or fixed at batch_size). Ends with one warm-up run. */
 G_GNUC_INTERNAL RdsInferEngine *rds_infer_engine_open (const RdsInferEngineOptions * opts, GError ** error);
 
 /* The .mxr loaded or written; NULL when a built program couldn't be saved (a warning says why). */

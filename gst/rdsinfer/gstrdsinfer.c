@@ -413,29 +413,12 @@ open_engine (GstRdsInfer * self, GError ** error)
   RdsInferConfig *cfg = self->cfg;
   gboolean nhwc = cfg->network_input_order == 1;
   guint dims[3], d0, d1, d2, c, h, w;
-  RdsInferEngineOptions opts = {
-    .onnx_file = cfg->onnx_file,
-    .engine_file = cfg->model_engine_file,
-    .batch_size = cfg->batch_size,
-    .gpu_id = self->gpu,
-    .fp16 = cfg->network_mode == 2,
-  };
+  RdsInferEngineOptions opts;
   GError *err = NULL;
   GPtrArray *warnings;
 
-  if (!cfg->onnx_file) {
-    g_set_error (error, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_UNSUPPORTED,
-        "%s:onnx-file: (unset): rdsinfer needs the ONNX model (a cached program is checked against it)",
-        cfg->config_path);
+  if (!rds_infer_config_get_engine_options (cfg, &opts, dims, error))
     return FALSE;
-  }
-  if (cfg->has_infer_dims) {
-    /* infer-dims is channels;height;width; an NHWC model's dims are in H, W, C order */
-    dims[0] = nhwc ? cfg->infer_dims[1] : cfg->infer_dims[0];
-    dims[1] = nhwc ? cfg->infer_dims[2] : cfg->infer_dims[1];
-    dims[2] = nhwc ? cfg->infer_dims[0] : cfg->infer_dims[2];
-    opts.infer_dims = dims;
-  }
   if (!(self->engine = rds_infer_engine_open (&opts, &err))) {
     g_set_error (error, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_INVALID, "%s:onnx-file: %s",
         cfg->config_path, err->message);

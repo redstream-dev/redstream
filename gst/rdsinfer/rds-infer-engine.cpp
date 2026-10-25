@@ -716,6 +716,8 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
   std::vector<size_t> input_lens;
   std::vector<std::string> names;
   std::string reason;
+  /* With output_file, only that file is looked up and written. */
+  const gchar *engine_file = opts && !opts->output_file ? opts->engine_file : NULL;
   gboolean need_build = TRUE, is_trt;
   int n_devices = 0;
   GError *err = NULL;
@@ -725,6 +727,11 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
     g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_INVALID,
         "invalid engine options: %s", !opts || !opts->onnx_file ? "no ONNX file" : opts->batch_size == 0 ?
         "batch size 0" : "an infer-dims value is 0");
+    return NULL;
+  }
+  if (opts->force_rebuild && opts->no_build) {
+    g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_INVALID,
+        "invalid engine options: force_rebuild and no_build together");
     return NULL;
   }
   if (!HIP_CHECK (hipGetDeviceCount (&n_devices), error))
@@ -791,31 +798,35 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
   st.candidates[0] = g_build_filename (st.dir, st.name, NULL);
   st.candidates[1] = g_build_filename (st.xdg_dir, st.name, NULL);
 
-  is_trt = opts->engine_file && g_str_has_suffix (opts->engine_file, ".engine");
+  is_trt = engine_file && g_str_has_suffix (engine_file, ".engine");
   if (is_trt)
     g_ptr_array_add (e->warnings, g_strdup_printf ("model-engine-file %s is a TensorRT engine; ignored, the "
-            "compiled program comes from the ONNX model", opts->engine_file));
+            "compiled program comes from the ONNX model", engine_file));
   if (opts->force_rebuild) {
     reason = "rebuild forced";
   } else {
     std::vector<const gchar *> paths;
     std::string engine_file_reason;
 
-    if (opts->engine_file && !is_trt)
-      paths.push_back (opts->engine_file);
-    paths.push_back (st.candidates[0]);
-    paths.push_back (st.candidates[1]);
+    if (opts->output_file) {
+      paths.push_back (opts->output_file);
+    } else {
+      if (engine_file && !is_trt)
+        paths.push_back (engine_file);
+      paths.push_back (st.candidates[0]);
+      paths.push_back (st.candidates[1]);
+    }
     for (size_t i = 0; i < paths.size () && need_build; i++) {
       gchar *why = NULL;
 
       /* engine_file may name a cache file itself. */
-      if (i > 0 && opts->engine_file && strcmp (paths[i], opts->engine_file) == 0)
+      if (i > 0 && engine_file && strcmp (paths[i], engine_file) == 0)
         continue;
       if (try_load (e.get (), paths[i], st.key, input_lens, names, &why)) {
         need_build = FALSE;
         e->program_path = g_strdup (paths[i]);
       } else {
-        if (i == 0 && paths[0] == opts->engine_file)
+        if (i == 0 && paths[0] == engine_file)
           engine_file_reason = why;
         /* The first candidate, and any other that exists, explain why nothing was loaded. */
         if (i == 0 || g_file_test (paths[i], G_FILE_TEST_EXISTS)) {
@@ -828,33 +839,47 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
     }
     if (!need_build && !engine_file_reason.empty ())
       g_ptr_array_add (e->warnings, g_strdup_printf ("model-engine-file %s doesn't match (%s); using %s",
-              opts->engine_file, engine_file_reason.c_str (), e->program_path));
+              engine_file, engine_file_reason.c_str (), e->program_path));
   }
 
+  if (need_build && opts->no_build) {
+    g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_NOT_CACHED, "no matching compiled program: %s",
+        reason.c_str ());
+    return NULL;
+  }
   if (need_build) {
+    const gchar *targets[2] = { st.candidates[0], st.candidates[1] };
+    guint n_targets = 2;
     gboolean saved = FALSE;
 
+    if (opts->output_file) {
+      targets[0] = opts->output_file;
+      n_targets = 1;
+    }
     e->built = TRUE;
     e->build_reason = g_strdup (reason.c_str ());
     if (!build_program (e.get (), st.onnx, st.onnx_len, st.dir, input_lens, opts->fp16, error)
         || !read_parameters (e.get (), input_lens, names, error))
       return NULL;
     json_object_set_member (st.key, "outputs", outputs_node (e.get ()));
-    for (guint i = 0; i < 2 && !saved; i++) {
-      gchar *d = g_path_get_dirname (st.candidates[i]);
+    for (guint i = 0; i < n_targets && !saved; i++) {
+      gchar *d = g_path_get_dirname (targets[i]);
 
       if (dir_writable (d)) {
-        if (save_program (e->program, st.key, st.candidates[i], &err)) {
+        if (save_program (e->program, st.key, targets[i], &err)) {
           saved = TRUE;
-          e->program_path = g_strdup (st.candidates[i]);
+          e->program_path = g_strdup (targets[i]);
         } else {
           g_ptr_array_add (e->warnings, g_strdup_printf ("can't save the compiled program: %s", err->message));
           g_clear_error (&err);
         }
+      } else if (opts->output_file) {
+        g_ptr_array_add (e->warnings, g_strdup_printf ("can't save the compiled program to %s: %s is not "
+                "writable", opts->output_file, d));
       }
       g_free (d);
     }
-    if (!saved)
+    if (!saved && !opts->output_file)
       g_ptr_array_add (e->warnings, g_strdup_printf ("the compiled program is not cached: neither %s nor %s is "
               "writable", st.dir, st.xdg_dir));
   }

@@ -135,6 +135,7 @@ Build and run the tests (inside the container):
 ```bash
 meson setup build && meson test -C build --print-errorlogs
 build/samples/rds-test3/rds-test3 --dry-run file:///a.mp4   # shows the DeepStream → Redstream element mapping
+build/tools/rds-compile -c config.txt   # pre-builds rdsinfer's MIGraphX program, like trtexec (docs/compat-matrix.md)
 ```
 
 The image targets RDNA2 APUs by default (`HSA_OVERRIDE_GFX_VERSION=10.3.0`, `--build-arg GFX=gfx1030`).

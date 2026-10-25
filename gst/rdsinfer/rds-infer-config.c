@@ -696,6 +696,37 @@ rds_infer_config_validate (const RdsInferConfig * cfg, const gchar * const *over
   return TRUE;
 }
 
+gboolean
+rds_infer_config_get_engine_options (const RdsInferConfig * cfg, RdsInferEngineOptions * opts, guint dims[3],
+    GError ** error)
+{
+  gboolean nhwc;
+
+  g_return_val_if_fail (cfg != NULL && opts != NULL && dims != NULL, FALSE);
+
+  nhwc = cfg->network_input_order == 1;
+  if (!cfg->onnx_file) {
+    g_set_error (error, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_UNSUPPORTED,
+        "%s:onnx-file: (unset): rdsinfer needs the ONNX model (a cached program is checked against it)",
+        cfg->config_path);
+    return FALSE;
+  }
+  memset (opts, 0, sizeof (*opts));
+  opts->onnx_file = cfg->onnx_file;
+  opts->engine_file = cfg->model_engine_file;
+  opts->batch_size = cfg->batch_size;
+  opts->gpu_id = cfg->gpu_id;
+  opts->fp16 = cfg->network_mode == 2;
+  if (cfg->has_infer_dims) {
+    /* infer-dims is channels;height;width; an NHWC model's dims are in H, W, C order */
+    dims[0] = nhwc ? cfg->infer_dims[1] : cfg->infer_dims[0];
+    dims[1] = nhwc ? cfg->infer_dims[2] : cfg->infer_dims[1];
+    dims[2] = nhwc ? cfg->infer_dims[0] : cfg->infer_dims[2];
+    opts->infer_dims = dims;
+  }
+  return TRUE;
+}
+
 /* Label file: one label per line, or all of them on one ';'-separated line. Whitespace around labels, a CR before
  * the newline and trailing blank lines are ignored. */
 static gboolean
