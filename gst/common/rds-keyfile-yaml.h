@@ -12,7 +12,8 @@ G_BEGIN_DECLS
  * null group is an empty one; sequences are joined with ';' (the key-file list separator), so an item containing
  * ';' is an error. Anything nested deeper, and group or key names with control characters, are errors. Errors are
  * G_FILE_ERROR (can't read @path) or G_KEY_FILE_ERROR_PARSE, with "PATH:LINE: " in front of the message, like
- * g_key_file_load_from_file. Only the first document is read. */
+ * g_key_file_load_from_file. Only the first document is read. An OpenCV-style "%YAML:1.0" first line (tracker
+ * configs) is skipped like a comment. */
 G_GNUC_INTERNAL GKeyFile *rds_keyfile_from_yaml (const gchar * path, GError ** error);
 
 G_END_DECLS

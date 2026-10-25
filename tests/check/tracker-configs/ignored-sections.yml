@@ -1,0 +1,29 @@
+%YAML:1.0
+# A config with a visual tracker and Re-ID, which rdstracker doesn't have: it runs as NvSORT.
+BaseConfig:
+  minDetectorConfidence: 0.1
+
+TargetManagement:
+  searchRegionPaddingScale: 2
+
+DataAssociator:
+  associationMatcherType: 1
+  minMatchingScore4VisualSimilarity: 0.3
+  matchingScoreWeight4VisualSimilarity: 0.4
+  thresholdMahalanobis: 20.0
+
+StateEstimator:
+  stateEstimatorType: 1
+
+VisualTracker:
+  visualTrackerType: 1
+  useColorNames: 1
+  useHog: 1
+  featureImgSizeLevel: 3
+
+ReID:
+  reidType: 2
+  batchSize: 50
+  inferDims: [128, 64, 3]
+  offsets: [10.5, 20.5, 30.5]
+  onnxFile: reid.onnx

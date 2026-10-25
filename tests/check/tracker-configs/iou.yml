@@ -1,0 +1,25 @@
+%YAML:1.0
+# An IOU tracker: no state estimator, greedy matching. The first line is the OpenCV-style header that tracker
+# configs usually start with.
+BaseConfig:
+  minDetectorConfidence: 0.2
+
+TargetManagement:
+  maxTargetsPerStream: 64
+  minIouDiff4NewTarget: 0.4
+  probationAge: 3
+  maxShadowTrackingAge: 10
+  earlyTerminationAge: 1
+
+TrajectoryManagement:
+  useUniqueID: 0
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 0
+  checkClassMatch: 0
+  minMatchingScore4Overall: 0.1
+  minMatchingScore4SizeSimilarity: 0.2
+  minMatchingScore4Iou: 0.3
+  matchingScoreWeight4SizeSimilarity: 0.25
+  matchingScoreWeight4Iou: 0.75

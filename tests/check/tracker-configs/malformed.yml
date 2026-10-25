@@ -1,0 +1,3 @@
+BaseConfig:
+  minDetectorConfidence: 0.3
+  probationAge: [1, 2

@@ -1,3 +1,14 @@
+# Plugin-private code shared by the plugin and the tests: the config parser (YAML read through rds-plugin-common).
+rdstracker_core = static_library('rdstracker-core',
+  files('rds-tracker-config.c'),
+  c_args : ['-DG_LOG_DOMAIN="rdstracker"'],
+  dependencies : [dependency('glib-2.0'), rds_plugin_common_dep],
+  gnu_symbol_visibility : 'hidden',
+  pic : true)
+rdstracker_core_dep = declare_dependency(link_with : rdstracker_core,
+  include_directories : include_directories('.'),
+  dependencies : [dependency('glib-2.0'), rds_plugin_common_dep])
+
 gstrdstracker = library('gstrdstracker',
   files('plugin.c', 'gstrdstracker.c'),
   c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdstracker"'],

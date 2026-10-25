@@ -206,6 +206,41 @@ fill_object (RdsObjectMeta * om, guint frame, guint k)
   om->tracker_bbox_info.org_bbox_coords.height = -4.0f;
 }
 
+static void
+assert_color_equal (const RdsOSD_ColorParams * a, const RdsOSD_ColorParams * b)
+{
+  g_assert_cmpfloat (a->red, ==, b->red);
+  g_assert_cmpfloat (a->green, ==, b->green);
+  g_assert_cmpfloat (a->blue, ==, b->blue);
+  g_assert_cmpfloat (a->alpha, ==, b->alpha);
+}
+
+/* Field by field: the structs have padding, which the pool doesn't have to zero. */
+static void
+assert_rect_equal (const RdsOSD_RectParams * a, const RdsOSD_RectParams * b)
+{
+  g_assert_cmpfloat (a->left, ==, b->left);
+  g_assert_cmpfloat (a->top, ==, b->top);
+  g_assert_cmpfloat (a->width, ==, b->width);
+  g_assert_cmpfloat (a->height, ==, b->height);
+  g_assert_cmpuint (a->border_width, ==, b->border_width);
+  assert_color_equal (&a->border_color, &b->border_color);
+  g_assert_cmpuint (a->has_bg_color, ==, b->has_bg_color);
+  g_assert_cmpuint (a->reserved, ==, b->reserved);
+  assert_color_equal (&a->bg_color, &b->bg_color);
+  g_assert_cmpint (a->has_color_info, ==, b->has_color_info);
+  g_assert_cmpint (a->color_id, ==, b->color_id);
+}
+
+static void
+assert_bbox_equal (const RdsComp_BboxInfo * a, const RdsComp_BboxInfo * b)
+{
+  g_assert_cmpfloat (a->org_bbox_coords.left, ==, b->org_bbox_coords.left);
+  g_assert_cmpfloat (a->org_bbox_coords.top, ==, b->org_bbox_coords.top);
+  g_assert_cmpfloat (a->org_bbox_coords.width, ==, b->org_bbox_coords.width);
+  g_assert_cmpfloat (a->org_bbox_coords.height, ==, b->org_bbox_coords.height);
+}
+
 /* A system-memory batch of @n frames (slot i filled with SLOT_VALUE (i)) with two objects each (fill_object). */
 static GstBuffer *
 make_batch (guint n)
@@ -301,11 +336,9 @@ test_passthrough (void)
       g_assert_true (om->object_id == RDS_UNTRACKED_OBJECT_ID);
       g_assert_cmpfloat (om->confidence, ==, want.confidence);
       g_assert_cmpfloat (om->tracker_confidence, ==, want.tracker_confidence);
-      g_assert_cmpmem (&om->rect_params, sizeof (om->rect_params), &want.rect_params, sizeof (want.rect_params));
-      g_assert_cmpmem (&om->detector_bbox_info, sizeof (om->detector_bbox_info), &want.detector_bbox_info,
-          sizeof (want.detector_bbox_info));
-      g_assert_cmpmem (&om->tracker_bbox_info, sizeof (om->tracker_bbox_info), &want.tracker_bbox_info,
-          sizeof (want.tracker_bbox_info));
+      assert_rect_equal (&om->rect_params, &want.rect_params);
+      assert_bbox_equal (&om->detector_bbox_info, &want.detector_bbox_info);
+      assert_bbox_equal (&om->tracker_bbox_info, &want.tracker_bbox_info);
     }
     g_assert_cmpuint (k, ==, 2);
     n_frames++;

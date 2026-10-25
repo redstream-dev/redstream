@@ -102,6 +102,10 @@ rds_keyfile_from_yaml (const gchar * path, GError ** error)
 
   if (!g_file_get_contents (path, &text, &len, error))
     return NULL;
+  /* OpenCV's FileStorage starts files with "%YAML:1.0", which is not a valid YAML directive, and often has no "---"
+   * after it: read that line as a comment (line numbers stay the same). */
+  if (g_str_has_prefix (text, "%YAML:"))
+    text[0] = '#';
   yaml_parser_initialize (&parser);
   yaml_parser_set_input_string (&parser, (const guchar *) text, len);
   if (!yaml_parser_load (&parser, &doc)) {
