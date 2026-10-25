@@ -9,8 +9,9 @@
  *   and rounding to 0..255, through the helpers in rds-kernel-common.h): the RGBA value for RGB and BGR, the GRAY8
  *   value for GRAY (the luma for YUV and GRAY8 sources, the BT.601 intensity of RGB for RGB-family sources);
  * - outside it (the letterbox padding): 0;
- * then y = scale * (x - offsets[c]). RGB writes R, G, B as channels 0, 1, 2 and BGR writes B, G, R; GRAY has one
- * channel (offsets[0]). NCHW puts channel c of pixel (x, y) at c * out_h * out_w + y * out_w + x, NHWC at
+ * then y = scale * (x - offsets[c]), so padding pixels are scale * (0 - offsets[c]) in the tensor, not 0. The
+ * caller guarantees finite scale and offsets (the config parser rejects non-finite ones); the kernel doesn't check.
+ * RGB writes R, G, B as channels 0, 1, 2 and BGR writes B, G, R; GRAY has one channel (offsets[0]). NCHW puts channel c of pixel (x, y) at c * out_h * out_w + y * out_w + x, NHWC at
  * (y * out_w + x) * channels + c.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_INFER_PREPROCESS_H
@@ -41,7 +42,8 @@ typedef struct
 
 /* Writes image @index of the float tensor at @dst (out_w * out_h * channels floats per image) and nothing else,
  * asynchronously on @stream (a hipStream_t, NULL for the null stream) on the current device. Returns 0, or -1 if
- * the job is invalid (no source or destination, an empty or out-of-range rect, channels not matching color) or the
+ * the job is invalid (no source or destination, an unknown source format, a source plane the format reads with a
+ * pitch shorter than its row (0 included), an empty or out-of-range rect, channels not matching color) or the
  * launch failed. */
 __attribute__ ((visibility ("hidden"))) int rds_infer_preprocess_launch (const RdsPreprocessJob * job, float *dst,
     unsigned index, void *stream);

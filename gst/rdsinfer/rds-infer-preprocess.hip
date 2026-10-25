@@ -81,6 +81,28 @@ rds_infer_preprocess_kernel (RdsPreprocessJob job, float *dst)
   }
 }
 
+/* The planes the source format reads have a pitch that holds a row: one luma plane, or for 4:2:0 also the chroma
+ * plane(s) of (width + 1) / 2 samples. */
+static int
+source_planes_ok (const RdsKernelSurface * s)
+{
+  unsigned long long w = s->width, cw = (w + 1) / 2;
+
+  switch (s->format) {
+    case RDS_KFMT_NV12:
+      return s->pitch[0] >= w && s->pitch[1] >= 2 * cw;
+    case RDS_KFMT_YUV420:
+      return s->pitch[0] >= w && s->pitch[1] >= cw && s->pitch[2] >= cw;
+    case RDS_KFMT_GRAY8:
+      return s->pitch[0] >= w;
+    case RDS_KFMT_RGB:
+    case RDS_KFMT_BGR:
+      return s->pitch[0] >= 3 * w;
+    default:                   /* RGBA, BGRA, RGBx, BGRx */
+      return s->pitch[0] >= 4 * w;
+  }
+}
+
 extern "C" int
 rds_infer_preprocess_launch (const RdsPreprocessJob * job, float *dst, unsigned index, void *stream)
 {
@@ -89,7 +111,8 @@ rds_infer_preprocess_launch (const RdsPreprocessJob * job, float *dst, unsigned 
   if (job == NULL || dst == NULL)
     return -1;
   s = &job->src;
-  if (s->data == NULL || s->width == 0 || s->height == 0 || s->format < RDS_KFMT_GRAY8 || s->format > RDS_KFMT_BGR)
+  if (s->data == NULL || s->width == 0 || s->height == 0 || s->format < RDS_KFMT_GRAY8 || s->format > RDS_KFMT_BGR
+      || !source_planes_ok (s))
     return -1;
   if (job->color < RDS_PREPROCESS_RGB || job->color > RDS_PREPROCESS_GRAY
       || job->channels != (job->color == RDS_PREPROCESS_GRAY ? 1u : 3u))

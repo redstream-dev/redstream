@@ -13,12 +13,14 @@ endforeach
 if hip_arch_args.length() == 0
   error('offload_arch is empty; pass e.g. -Doffload_arch=gfx1030')
 endif
+# Headers every HIP kernel includes (also rdsinfer's, gst/rdsinfer/meson.build).
+rds_kernel_headers = files('rds-transform-private.h', 'rds-kernel-common.h')
 # Not built with b_sanitize: a custom_target doesn't inherit it.
 rds_kernels_raw = custom_target('rds-transform-kernels-raw',
   input : 'rds-transform-kernels.hip',
   output : 'rds-transform-kernels-raw.o',
   depfile : 'rds-transform-kernels-raw.d',
-  depend_files : files('rds-transform-private.h', 'rds-kernel-common.h'),
+  depend_files : rds_kernel_headers,
   command : [amdclang, '-x', 'hip', hip_arch_args, '-fPIC', '-O2', '-std=c++17', '-fvisibility=hidden',
     '-D__HIP_PLATFORM_AMD__', '-I' + meson.current_source_dir(), '-MD', '-MF', '@DEPFILE@',
     '-c', '@INPUT@', '-o', '@OUTPUT@'])

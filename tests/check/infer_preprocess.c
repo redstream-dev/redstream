@@ -9,11 +9,21 @@
 
 #include <string.h>
 
-/* The kernel rounds sampled values to bytes like the converter, in float: a value this close to a rounding
- * boundary may round either way (bilinear positions and weights carry float error, up to ~3e-4 of a step between
- * neighbours up to 255 apart). Nearest positions are exact; only the YUV conversion is in float there. */
+/* The kernel rounds sampled values to bytes like the converter, but in float, and the reference in double: a value
+ * within delta of a rounding boundary may legitimately land on the neighbouring byte. Exactness (same bytes as
+ * rds_buf_surf_transform) is checked separately by /gpu/preprocess/matches-transform; here the window only has to
+ * cover float error.
+ * - Nearest: positions are integers (exact). Only the BT.601 conversion is in float: a few operations at magnitude
+ *   <= 255 with float-rounded coefficients, ~1e-4; DELTA_NEAREST has a 20x margin.
+ * - Bilinear: the position p = (k + 0.5) * (len / dlen) - 0.5 (chroma: half of it) costs one division, one
+ *   multiplication and one subtraction in float, so |error of p| <= ~3 * len * 2^-24 (len: the source side, as
+ *   the position reaches it): 2.3e-4 at len = 1280, 6e-5 at len = 333, and 0 when len / dlen and the products are
+ *   exact (the power-of-two ratios most of the matrix has). The weight carries the same error and multiplies a
+ *   neighbour contrast of up to 255, on each of the two axes. A YUV source into RGB adds the conversion gain: an
+ *   error in Y and in U reaches B as 1.164 + 2.017. So delta = 2 * 255 * 3 * len * 2^-24 * gain + DELTA_NEAREST,
+ *   with gain 3.181 for YUV into RGB/BGR and 1 otherwise (RGB sources, GRAY: the gray weights sum to 1): 0.37 at
+ *   worst (NV12 1280x720 into RGB), 0.03 for RGB 333x187. bilinear_delta () computes it per job. */
 #define DELTA_NEAREST 0.002
-#define DELTA_BILINEAR 0.08
 #define TOL 1e-4
 
 static const RdsBufSurfaceColorFormat formats[] = {
@@ -177,11 +187,21 @@ typedef struct
   guint64 values, alt;
 } Stats;
 
+static double
+bilinear_delta (const RdsPreprocessJob * job)
+{
+  gboolean yuv = job->src.format == RDS_KFMT_NV12 || job->src.format == RDS_KFMT_YUV420;
+  double gain = yuv && job->color != RDS_PREPROCESS_GRAY ? 1.164 + 2.017 : 1.0;
+  double len = MAX (job->src.width, job->src.height);
+
+  return 2.0 * 255.0 * 3.0 * len * ldexp (1.0, -24) * gain + DELTA_NEAREST;
+}
+
 /* Checks image @out (one image of the tensor) against the reference samples. */
 static void
 check_image (const RdsPreprocessJob * job, const float *out, const RefSamples * rs, Stats * st)
 {
-  double delta = job->bilinear ? DELTA_BILINEAR : DELTA_NEAREST;
+  double delta = job->bilinear ? bilinear_delta (job) : DELTA_NEAREST;
 
   for (guint y = 0; y < job->out_h; y++) {
     for (guint x = 0; x < job->out_w; x++) {
@@ -326,18 +346,29 @@ test_matrix_sizes (void)
 static void
 test_matches_transform (void)
 {
-  static const RdsBufSurfaceColorFormat srcs[] = { RDS_BUF_COLOR_FORMAT_NV12, RDS_BUF_COLOR_FORMAT_BGRx };
+  static const struct
+  {
+    RdsBufSurfaceColorFormat fmt;
+    guint sw, sh, net_w, net_h;
+    Aspect aspect;
+  } cases[] = {
+    {RDS_BUF_COLOR_FORMAT_NV12, 333, 187, 320, 192, ASPECT_SYMMETRIC},
+    {RDS_BUF_COLOR_FORMAT_BGRx, 333, 187, 320, 192, ASPECT_SYMMETRIC},
+    {RDS_BUF_COLOR_FORMAT_RGBA, 333, 187, 320, 192, ASPECT_SYMMETRIC},
+    {RDS_BUF_COLOR_FORMAT_NV12, 1280, 720, 640, 640, ASPECT_TOP_LEFT},
+    {RDS_BUF_COLOR_FORMAT_RGBA, 1280, 720, 640, 640, ASPECT_OFF},
+  };
   hipStream_t stream;
   double max_d = 0.0;
 
   RDS_TEST_REQUIRE_GPU ();
   stream = new_stream ();
-  for (guint f = 0; f < G_N_ELEMENTS (srcs); f++) {
+  for (guint f = 0; f < G_N_ELEMENTS (cases); f++) {
     for (int bl = 0; bl <= 1; bl++) {
-      for (guint ci = 0; ci < 12; ci += 2) {
-        const Combo *cb = &combos[ci];  /* every colour and order, normalised */
-        RdsBufSurface *src = create_surf (srcs[f], 333, 187, 1), *conv;
-        RdsPreprocessJob job = make_job (src, 0, 320, 192, ASPECT_SYMMETRIC, bl, cb);
+      for (guint ci = 0; ci < 12; ci++) {
+        const Combo *cb = &combos[ci];  /* every colour, order and normalisation */
+        RdsBufSurface *src = create_surf (cases[f].fmt, cases[f].sw, cases[f].sh, 1), *conv;
+        RdsPreprocessJob job = make_job (src, 0, cases[f].net_w, cases[f].net_h, cases[f].aspect, bl, cb);
         gboolean gray = cb->color == RDS_PREPROCESS_GRAY;
         RdsBufSurfTransformParams tp = {
           .transform_flag = RDS_BUFSURF_TRANSFORM_FILTER,
@@ -452,6 +483,33 @@ test_invalid (void)
   g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
   job = good, job.src.width = 0;
   g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
+  job = good, job.src.format = 0;
+  g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
+  job = good, job.src.pitch[0] = 4 * job.src.width - 1;       /* RGBA row doesn't fit */
+  g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
+  job = good, job.src.pitch[0] = 0;
+  g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
+  /* 4:2:0 sources need their chroma planes */
+  {
+    RdsBufSurface *nv12 = create_surf (RDS_BUF_COLOR_FORMAT_NV12, 63, 47, 1);
+    RdsBufSurface *i420 = create_surf (RDS_BUF_COLOR_FORMAT_YUV420, 63, 47, 1);
+    RdsPreprocessJob j;
+
+    j = make_job (nv12, 0, 32, 32, ASPECT_SYMMETRIC, TRUE, &combos[0]);
+    g_assert_cmpint (rds_infer_preprocess_launch (&j, dev, 0, NULL), ==, 0);
+    j.src.pitch[1] = 0;
+    g_assert_cmpint (rds_infer_preprocess_launch (&j, dev, 0, NULL), ==, -1);
+    j = make_job (nv12, 0, 32, 32, ASPECT_SYMMETRIC, TRUE, &combos[0]);
+    j.src.pitch[1] = 2 * 32 - 1;        /* 32 interleaved UV pairs per row */
+    g_assert_cmpint (rds_infer_preprocess_launch (&j, dev, 0, NULL), ==, -1);
+    j = make_job (i420, 0, 32, 32, ASPECT_SYMMETRIC, TRUE, &combos[0]);
+    g_assert_cmpint (rds_infer_preprocess_launch (&j, dev, 0, NULL), ==, 0);
+    j.src.pitch[2] = 0;
+    g_assert_cmpint (rds_infer_preprocess_launch (&j, dev, 0, NULL), ==, -1);
+    g_assert_cmpint (hipDeviceSynchronize (), ==, hipSuccess);
+    g_assert_cmpint (rds_buf_surface_destroy (nv12), ==, 0);
+    g_assert_cmpint (rds_buf_surface_destroy (i420), ==, 0);
+  }
   g_assert_cmpint (hipDeviceSynchronize (), ==, hipSuccess);
 
   /* a letterbox computed for another frame size is refused */
