@@ -916,7 +916,9 @@ is_type_max (const KeyInfo * k)
 {
   if (k->type == TYPE_FLOAT || k->type == TYPE_OFFSETS)
     return k->max == G_MAXFLOAT;
-  return k->max == G_MAXINT || k->max == G_MAXUINT;
+  if (k->type == TYPE_UINT || k->type == TYPE_UINT_LIST || k->type == TYPE_DIMS)
+    return k->max == G_MAXUINT;
+  return k->max == G_MAXINT;
 }
 
 void

@@ -662,6 +662,13 @@ collect_key (const RdsInferKeyDesc * key, gpointer user_data)
   } else if (!strcmp (key->name, "cluster-mode")) {
     g_assert_cmpstr (key->range, ==, "0..4");
     g_assert_cmpstr (key->accepted, ==, "2, 4");
+  } else if (!strcmp (key->name, "roi-top-offset")) {
+    /* unsigned, capped below G_MAXUINT: the real bound */
+    g_assert_cmpstr (key->range, ==, "0..2147483647");
+  } else if (!strcmp (key->name, "gpu-id")) {
+    g_assert_cmpstr (key->range, ==, ">= 0");
+  } else if (!strcmp (key->name, "topk")) {
+    g_assert_cmpstr (key->range, ==, ">= -1");
   } else if (!strcmp (key->name, "onnx-file")) {
     g_assert_cmpstr (key->type, ==, "path");
     g_assert_null (key->default_value);
