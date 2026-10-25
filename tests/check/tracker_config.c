@@ -449,6 +449,107 @@ test_errors (void)
   text_fails ("BaseConfig: 3\n", RDS_TRACKER_CONFIG_ERROR_PARSE, "1: ", NULL);
 }
 
+/* Numbers: overflow, underflow, inf and nan, trailing text. */
+static void
+test_numbers (void)
+{
+  text_fails ("TargetManagement:\n  probationAge: 99999999999999999999\n", RDS_TRACKER_CONFIG_ERROR_INVALID,
+      "TargetManagement.probationAge: 99999999999999999999: ", "out of range", NULL);
+  text_fails ("TargetManagement:\n  probationAge: 3x\n", RDS_TRACKER_CONFIG_ERROR_INVALID,
+      "TargetManagement.probationAge: 3x: ", "not an integer", NULL);
+  text_fails ("BaseConfig:\n  minDetectorConfidence: 1e39\n", RDS_TRACKER_CONFIG_ERROR_INVALID,
+      "BaseConfig.minDetectorConfidence: 1e39: ", "out of range for a 32-bit float", NULL);
+  text_fails ("BaseConfig:\n  minDetectorConfidence: 1e400\n", RDS_TRACKER_CONFIG_ERROR_INVALID,
+      "BaseConfig.minDetectorConfidence: 1e400: ", "out of range for a 32-bit float", NULL);
+  text_fails ("BaseConfig:\n  minDetectorConfidence: 1e-50\n", RDS_TRACKER_CONFIG_ERROR_INVALID,
+      "BaseConfig.minDetectorConfidence: 1e-50: ", "out of range for a 32-bit float", NULL);
+  text_fails ("BaseConfig:\n  minDetectorConfidence: inf\n", RDS_TRACKER_CONFIG_ERROR_INVALID,
+      "BaseConfig.minDetectorConfidence: inf: ", "not a finite number", NULL);
+  text_fails ("BaseConfig:\n  minDetectorConfidence: -inf\n", RDS_TRACKER_CONFIG_ERROR_INVALID,
+      "BaseConfig.minDetectorConfidence: -inf: ", "not a finite number", NULL);
+  text_fails ("BaseConfig:\n  minDetectorConfidence: 0.5x\n", RDS_TRACKER_CONFIG_ERROR_INVALID,
+      "BaseConfig.minDetectorConfidence: 0.5x: ", "not a number", NULL);
+}
+
+/* Map-form cameraModelFilepath and other nesting in the ignored sections: skipped with a warning each, and the
+ * config runs. The plain reader, and any other section, still refuse nesting. */
+static void
+test_nested_ignored (void)
+{
+  gchar *path = corpus ("sv3dt.yml");
+  const gchar *lenient[] = { "ObjectModelProjection", NULL };
+  GPtrArray *warnings = g_ptr_array_new_with_free_func (g_free);
+  GError *err = NULL;
+  GKeyFile *kf;
+  RdsTrackerConfig *cfg = load_ok ("sv3dt.yml");
+
+  g_assert_cmpuint (cfg->warnings->len, ==, 3);
+  g_assert_cmpuint (count_warnings (cfg, "ObjectModelProjection.cameraModelFilepath: a nested value (line 14)"), ==,
+      1);
+  g_assert_cmpuint (count_warnings (cfg, "PoseEstimator.extraModels: a nested value"), ==, 1);
+  g_assert_cmpuint (count_warnings (cfg, "ObjectModelProjection, PoseEstimator: "), ==, 1);
+  g_assert_cmpint (cfg->tracker_type, ==, RDS_TRACKER_TYPE_NVSORT);
+  g_assert_cmpfloat (cfg->min_detector_confidence, ==, 0.1f);
+  rds_tracker_config_free (cfg);
+
+  g_assert_null (rds_keyfile_from_yaml (path, &err));
+  g_assert_error (err, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_PARSE);
+  g_clear_error (&err);
+  /* only the listed groups are lenient: PoseEstimator still fails */
+  g_assert_null (rds_keyfile_from_yaml_full (path, lenient, warnings, &err));
+  g_assert_error (err, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_PARSE);
+  g_clear_error (&err);
+  g_ptr_array_set_size (warnings, 0);
+  kf = rds_keyfile_from_yaml_full (path, (const gchar *[]) { "ObjectModelProjection", "PoseEstimator", NULL },
+      warnings, &err);
+  g_assert_no_error (err);
+  g_assert_cmpuint (warnings->len, ==, 2);
+  g_assert_false (g_key_file_has_key (kf, "ObjectModelProjection", "cameraModelFilepath", NULL));
+  g_assert_true (g_key_file_has_key (kf, "ObjectModelProjection", "maxConvexHullSize", NULL));
+  g_key_file_unref (kf);
+  g_ptr_array_unref (warnings);
+  g_free (path);
+
+  text_fails ("BaseConfig:\n  minDetectorConfidence:\n    a: 1\n", RDS_TRACKER_CONFIG_ERROR_PARSE, "3: ", NULL);
+}
+
+/* The undocumented NvDCF re-association keys and both spellings of the Re-ID weight load without warnings. */
+static void
+test_quiet_keys (void)
+{
+  RdsTrackerConfig *cfg = load_ok ("nvdcf-undocumented.yml");
+
+  g_assert_cmpuint (cfg->warnings->len, ==, 0);
+  rds_tracker_config_free (cfg);
+  cfg = load_ok ("reid-spellings.yml");
+  g_assert_cmpuint (cfg->warnings->len, ==, 0);
+  rds_tracker_config_free (cfg);
+  text_fails ("DataAssociator:\n  matchingScoreWeight4ReIDSimilarity: 2\n", RDS_TRACKER_CONFIG_ERROR_INVALID,
+      "DataAssociator.matchingScoreWeight4ReIDSimilarity: 2: ", NULL);
+}
+
+/* A UTF-8 byte order mark before the "%YAML:1.0" line. */
+static void
+test_bom (void)
+{
+  gchar *path = corpus ("bom.yml");
+  GError *err = NULL;
+  GKeyFile *kf = rds_keyfile_from_yaml (path, &err);
+  gchar *v;
+  RdsTrackerConfig *cfg;
+
+  g_assert_no_error (err);
+  v = g_key_file_get_string (kf, "BaseConfig", "minDetectorConfidence", NULL);
+  g_assert_cmpstr (v, ==, "0.35");
+  g_free (v);
+  g_key_file_unref (kf);
+  g_free (path);
+  cfg = load_ok ("bom.yml");
+  g_assert_cmpfloat (cfg->min_detector_confidence, ==, 0.35f);
+  g_assert_cmpuint (cfg->warnings->len, ==, 0);
+  rds_tracker_config_free (cfg);
+}
+
 /* Every key in the table: its default parses back, a non-number is rejected for numbers and bools, and values just
  * outside its range are rejected with "FILE:SECTION.KEY: VALUE: ". */
 typedef struct
@@ -517,7 +618,7 @@ walk_key (const RdsTrackerKeyDesc * key, gpointer user_data)
   }
 }
 
-/* Every key the public tracker documentation lists, by section. */
+/* Every key the public tracker documentation lists (in its tables or sample configs), by section. */
 static const gchar *const documented[] = {
   "BaseConfig.minDetectorConfidence", "BaseConfig.checkClassMatch", "BaseConfig.useBatchNumForFrameId",
   "TargetManagement.preserveStreamUpdateOrder", "TargetManagement.maxTargetsPerStream",
@@ -538,6 +639,13 @@ static const gchar *const documented[] = {
   "TrajectoryManagement.trajectoryProjectionMeasurementNoiseScale",
   "TrajectoryManagement.trackletSpacialSearchRegionScale", "TrajectoryManagement.reidExtractionInterval",
   "TrajectoryManagement.checkClassMatchForReAssoc",
+  /* undocumented, from a published NvDCF sample */
+  "TrajectoryManagement.enableVanishingTrackletReconstruction",
+  "TrajectoryManagement.minInclusionRatio4DuplicateTrackletRemoval",
+  "TrajectoryManagement.minIou4DuplicateTrackletRemoval",
+  "TrajectoryManagement.minMatchRatio4ValidTrackletDetermination",
+  "TrajectoryManagement.minVisibility4VanishingTrackletReconstruction",
+  "TrajectoryManagement.visibilityThreshold4VanishingTrackletDetection",
   "DataAssociator.dataAssociatorType", "DataAssociator.associationMatcherType", "DataAssociator.checkClassMatch",
   "DataAssociator.minMatchingScore4Overall", "DataAssociator.minMatchingScore4SizeSimilarity",
   "DataAssociator.minMatchingScore4Iou", "DataAssociator.matchingScoreWeight4SizeSimilarity",
@@ -601,6 +709,10 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/tracker-config/check-class-match", test_check_class_match);
   g_test_add_func ("/cpu/tracker-config/noop", test_noop);
   g_test_add_func ("/cpu/tracker-config/errors", test_errors);
+  g_test_add_func ("/cpu/tracker-config/numbers", test_numbers);
+  g_test_add_func ("/cpu/tracker-config/nested-ignored", test_nested_ignored);
+  g_test_add_func ("/cpu/tracker-config/quiet-keys", test_quiet_keys);
+  g_test_add_func ("/cpu/tracker-config/bom", test_bom);
   g_test_add_func ("/cpu/tracker-config/key-table", test_key_table);
   return g_test_run ();
 }

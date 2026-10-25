@@ -3,10 +3,9 @@
  * it). YAML files are read into a GKeyFile first, so both formats go through the same typed parser.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-infer-config.h"
+#include "rds-config-parse.h"
 #include "rds-keyfile-yaml.h"
 
-#include <errno.h>
-#include <math.h>
 #include <stdarg.h>
 #include <string.h>
 
@@ -300,13 +299,6 @@ warn_once (LoadCtx * ctx, const gchar * group, const gchar * key, const gchar * 
   g_free (qkey);
 }
 
-/* Locale-independent %g. */
-static const gchar *
-fmt_num (gchar * buf, gdouble v)
-{
-  return g_ascii_formatd (buf, G_ASCII_DTOSTR_BUF_SIZE, "%.10g", v);
-}
-
 static gboolean
 is_number_type (KeyType type)
 {
@@ -325,48 +317,7 @@ is_integer_type (KeyType type)
 static gboolean
 parse_number (const KeyInfo * k, const gchar * s, gdouble * out, gchar ** reason)
 {
-  gchar *end = NULL, buf[G_ASCII_DTOSTR_BUF_SIZE];
-  gdouble v;
-
-  errno = 0;
-  if (is_integer_type (k->type)) {
-    gint64 i = g_ascii_strtoll (s, &end, 10);
-
-    if (!*s || *end) {
-      *reason = g_strdup ("not an integer");
-      return FALSE;
-    }
-    if (errno == ERANGE) {
-      *reason = g_strdup ("out of range");
-      return FALSE;
-    }
-    v = (gdouble) i;
-  } else {
-    v = g_ascii_strtod (s, &end);
-    if (!*s || *end) {
-      *reason = g_strdup ("not a number");
-      return FALSE;
-    }
-    if (!isfinite (v)) {
-      *reason = g_strdup ("not a finite number");
-      return FALSE;
-    }
-    /* floats are stored as gfloat: values it can't hold (including ones that would become 0) are out of range */
-    if (errno == ERANGE || fabs (v) > G_MAXFLOAT || (v != 0 && fabs (v) < G_MINFLOAT)) {
-      *reason = g_strdup ("out of range for a 32-bit float");
-      return FALSE;
-    }
-  }
-  if (k->min_exclusive ? v <= k->min : v < k->min) {
-    *reason = g_strdup_printf ("must be %s %s", k->min_exclusive ? "greater than" : "at least", fmt_num (buf, k->min));
-    return FALSE;
-  }
-  if (v > k->max) {
-    *reason = g_strdup_printf ("must be at most %s", fmt_num (buf, k->max));
-    return FALSE;
-  }
-  *out = v;
-  return TRUE;
+  return rds_config_parse_number (s, is_integer_type (k->type), k->min, k->min_exclusive, k->max, out, reason);
 }
 
 /* Splits a ';' list into trimmed elements. A trailing ';' is allowed; an empty element elsewhere is not. */
@@ -392,18 +343,6 @@ split_list (const gchar * s, gchar ** reason)
   return items;
 }
 
-static gboolean
-parse_bool (const gchar * s, gboolean * out)
-{
-  if (!strcmp (s, "1") || !g_ascii_strcasecmp (s, "true"))
-    *out = TRUE;
-  else if (!strcmp (s, "0") || !g_ascii_strcasecmp (s, "false"))
-    *out = FALSE;
-  else
-    return FALSE;
-  return TRUE;
-}
-
 /* Parses @raw as @k's type. With @base, stores it into k's field (paths resolved against
  * @config_dir); without, only checks it. @num receives the value of a scalar bool or number (for the accepted-value
  * checks). On failure @reason says why. */
@@ -420,7 +359,7 @@ parse_value (const KeyInfo * k, const gchar * raw, gpointer base, const gchar * 
     case TYPE_BOOL:{
       gboolean b = FALSE;
 
-      if (!(ok = parse_bool (s, &b)))
+      if (!(ok = rds_config_parse_bool (s, &b)))
         *reason = g_strdup ("not a boolean (use 0/1 or true/false)");
       else if (base)
         FIELD (gboolean, base, k) = b;
@@ -979,8 +918,8 @@ rds_infer_config_foreach_key (RdsInferConfigKeyFunc func, gpointer user_data)
     };
 
     if (is_number_type (k->type)) {
-      fmt_num (min, k->min);
-      fmt_num (max, k->max);
+      rds_config_format_number (min, k->min);
+      rds_config_format_number (max, k->max);
       if (k->min_exclusive)
         range = g_strdup_printf ("> %s", min);
       else if (is_type_max (k))

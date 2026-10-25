@@ -1,0 +1,3 @@
+DataAssociator:
+  matchingScoreWeight4ReidSimilarity: 0.2
+  matchingScoreWeight4ReIDSimilarity: 0.3

@@ -1,0 +1,26 @@
+%YAML:1.0
+# A tracker with the 3D projection and pose add-ons, the camera models given per sensor name (a mapping): those
+# sections are ignored, and so is the mapping.
+BaseConfig:
+  minDetectorConfidence: 0.1
+
+DataAssociator:
+  associationMatcherType: 1
+
+StateEstimator:
+  stateEstimatorType: 2
+
+ObjectModelProjection:
+  cameraModelFilepath:
+    cam-north: cameras/north.yml
+    cam-south: cameras/south.yml
+  outputFootLocation: 1
+  maxConvexHullSize: 12
+
+PoseEstimator:
+  poseEstimatorType: 1
+  inferDims: [256, 192, 3]
+  operateOnClassIds: [0]
+  extraModels:
+    - name: a
+    - name: b

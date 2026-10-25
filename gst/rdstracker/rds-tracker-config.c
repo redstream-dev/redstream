@@ -3,10 +3,9 @@
  * compat matrix. The YAML file is read into a GKeyFile first (sections become groups).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-tracker-config.h"
+#include "rds-config-parse.h"
 #include "rds-keyfile-yaml.h"
 
-#include <errno.h>
-#include <math.h>
 #include <stdarg.h>
 #include <string.h>
 
@@ -179,6 +178,20 @@ static const KeyInfo keys[] = {
       NONNEG_F,.def = "0.0",.trackers = T_NVDCF,.note = NOTE_REASSOC},
   {.name = "reidExtractionInterval",.section = SEC_TRAJECTORY,.type = TYPE_INT,.status = IGN,.min = -1,
       .max = G_MAXINT,.def = "0",.trackers = T_NVDCF,.note = NOTE_REASSOC},
+  /* undocumented: in a published NvDCF sample config only; permissive types and no range, so such configs load
+   * quietly */
+  {.name = "enableVanishingTrackletReconstruction",.section = SEC_TRAJECTORY,.type = TYPE_INT,.status = IGN,
+      .min = G_MININT,.max = G_MAXINT,.trackers = T_NVDCF,.note = "undocumented; " NOTE_REASSOC},
+  {.name = "minInclusionRatio4DuplicateTrackletRemoval",.section = SEC_TRAJECTORY,.type = TYPE_FLOAT,
+      .status = IGN, ANY,.trackers = T_NVDCF,.note = "undocumented; " NOTE_REASSOC},
+  {.name = "minIou4DuplicateTrackletRemoval",.section = SEC_TRAJECTORY,.type = TYPE_FLOAT,.status = IGN, ANY,
+      .trackers = T_NVDCF,.note = "undocumented; " NOTE_REASSOC},
+  {.name = "minMatchRatio4ValidTrackletDetermination",.section = SEC_TRAJECTORY,.type = TYPE_FLOAT,.status = IGN,
+      ANY,.trackers = T_NVDCF,.note = "undocumented; " NOTE_REASSOC},
+  {.name = "minVisibility4VanishingTrackletReconstruction",.section = SEC_TRAJECTORY,.type = TYPE_FLOAT,
+      .status = IGN, ANY,.trackers = T_NVDCF,.note = "undocumented; " NOTE_REASSOC},
+  {.name = "visibilityThreshold4VanishingTrackletDetection",.section = SEC_TRAJECTORY,.type = TYPE_FLOAT,
+      .status = IGN, ANY,.trackers = T_NVDCF,.note = "undocumented; " NOTE_REASSOC},
   {.name = "checkClassMatchForReAssoc",.section = SEC_TRAJECTORY,.type = TYPE_BOOL,.status = DEPR,
       .trackers = T_NVDCF,.note = "deprecated: use checkClassMatch"},
 
@@ -386,13 +399,6 @@ warn_once (LoadCtx * ctx, const gchar * what, const gchar * fmt, ...)
   g_free (msg);
 }
 
-/* Locale-independent %g. */
-static const gchar *
-fmt_num (gchar * buf, gdouble v)
-{
-  return g_ascii_formatd (buf, G_ASCII_DTOSTR_BUF_SIZE, "%.10g", v);
-}
-
 static gboolean
 is_number_type (KeyType type)
 {
@@ -416,60 +422,7 @@ is_list_type (KeyType type)
 static gboolean
 parse_number (const KeyInfo * k, const gchar * s, gdouble * out, gchar ** reason)
 {
-  gchar *end = NULL, buf[G_ASCII_DTOSTR_BUF_SIZE];
-  gdouble v;
-
-  errno = 0;
-  if (is_integer_type (k->type)) {
-    gint64 i = g_ascii_strtoll (s, &end, 10);
-
-    if (!*s || *end) {
-      *reason = g_strdup ("not an integer");
-      return FALSE;
-    }
-    if (errno == ERANGE) {
-      *reason = g_strdup ("out of range");
-      return FALSE;
-    }
-    v = (gdouble) i;
-  } else {
-    v = g_ascii_strtod (s, &end);
-    if (!*s || *end) {
-      *reason = g_strdup ("not a number");
-      return FALSE;
-    }
-    if (!isfinite (v)) {
-      *reason = g_strdup ("not a finite number");
-      return FALSE;
-    }
-    /* floats are stored as gfloat: values it can't hold (including ones that would become 0) are out of range */
-    if (errno == ERANGE || fabs (v) > G_MAXFLOAT || (v != 0 && fabs (v) < G_MINFLOAT)) {
-      *reason = g_strdup ("out of range for a 32-bit float");
-      return FALSE;
-    }
-  }
-  if (v < k->min) {
-    *reason = g_strdup_printf ("must be at least %s", fmt_num (buf, k->min));
-    return FALSE;
-  }
-  if (v > k->max) {
-    *reason = g_strdup_printf ("must be at most %s", fmt_num (buf, k->max));
-    return FALSE;
-  }
-  *out = v;
-  return TRUE;
-}
-
-static gboolean
-parse_bool (const gchar * s, gboolean * out)
-{
-  if (!strcmp (s, "1") || !g_ascii_strcasecmp (s, "true"))
-    *out = TRUE;
-  else if (!strcmp (s, "0") || !g_ascii_strcasecmp (s, "false"))
-    *out = FALSE;
-  else
-    return FALSE;
-  return TRUE;
+  return rds_config_parse_number (s, is_integer_type (k->type), k->min, FALSE, k->max, out, reason);
 }
 
 /* Parses @raw (as the YAML reader gives it: lists ';'-joined) as @k's type; with @base, stores a scalar into k's
@@ -485,7 +438,7 @@ parse_value (const KeyInfo * k, const gchar * raw, gpointer base, gdouble * num,
     case TYPE_BOOL:{
       gboolean b = FALSE;
 
-      if (!(ok = parse_bool (s, &b)))
+      if (!(ok = rds_config_parse_bool (s, &b)))
         *reason = g_strdup ("not a boolean (use 0/1 or true/false)");
       else if (base)
         FIELD (gboolean, base, k) = b;
@@ -665,8 +618,8 @@ parse_file (LoadCtx * ctx, GKeyFile * kf, GError ** error)
   if (ok && ctx->check_class_match[0] && ctx->check_class_match[1]) {
     gboolean base = FALSE, assoc = FALSE;
 
-    parse_bool (ctx->check_class_match[0], &base);
-    parse_bool (ctx->check_class_match[1], &assoc);
+    rds_config_parse_bool (ctx->check_class_match[0], &base);
+    rds_config_parse_bool (ctx->check_class_match[1], &assoc);
     if (base != assoc)
       ok = key_error (error, ctx->path, section_names[SEC_ASSOC], "checkClassMatch", ctx->check_class_match[1],
           "differs from BaseConfig.checkClassMatch (%s); set it in one section", ctx->check_class_match[0]);
@@ -703,8 +656,15 @@ rds_tracker_config_load (const gchar * path, GError ** error)
   LoadCtx ctx = { 0 };
   GError *err = NULL;
   gboolean ok = TRUE;
+  GPtrArray *warnings = g_ptr_array_new_with_free_func (g_free);
+  const gchar *lenient[G_N_ELEMENTS (ignored_sections) + 1] = { NULL };
 
-  if (path && !(kf = rds_keyfile_from_yaml (path, &err))) {
+  /* the sections rdstracker ignores may nest deeper than the reader takes (cameraModelFilepath keyed by sensor
+   * name): those values are skipped with a warning */
+  for (guint i = 0; i < G_N_ELEMENTS (ignored_sections); i++)
+    lenient[i] = section_names[ignored_sections[i]];
+  if (path && !(kf = rds_keyfile_from_yaml_full (path, lenient, warnings, &err))) {
+    g_ptr_array_unref (warnings);
     if (err->domain == G_FILE_ERROR)
       g_set_error (error, RDS_TRACKER_CONFIG_ERROR, RDS_TRACKER_CONFIG_ERROR_FILE, "%s: can't read the config: %s",
           path, err->message);
@@ -716,7 +676,7 @@ rds_tracker_config_load (const gchar * path, GError ** error)
 
   cfg = g_new0 (RdsTrackerConfig, 1);
   cfg->config_path = g_strdup (path);
-  cfg->warnings = g_ptr_array_new_with_free_func (g_free);
+  cfg->warnings = warnings;
   apply_defaults (cfg);
   cfg->tracker_type = RDS_TRACKER_TYPE_IOU;
   ctx.path = path;
@@ -794,9 +754,9 @@ rds_tracker_config_foreach_key (RdsTrackerConfigKeyFunc func, gpointer user_data
     };
 
     if (is_number_type (k->type)) {
-      fmt_num (min, k->min);
-      fmt_num (max, k->max);
-      if (k->min == -G_MAXFLOAT && is_type_max (k))
+      rds_config_format_number (min, k->min);
+      rds_config_format_number (max, k->max);
+      if ((k->min == -G_MAXFLOAT || k->min == G_MININT) && is_type_max (k))
         range = g_strdup ("any");
       else if (is_type_max (k))
         range = g_strdup_printf (">= %s", min);
