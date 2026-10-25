@@ -9,6 +9,7 @@ add_languages('cpp', native : false)
 
 api_version = '1.0'
 cc = meson.get_compiler('c')
+cxx = meson.get_compiler('cpp')
 gst_dep = dependency('gstreamer-1.0', version : '>= 1.28')
 gst_base_dep = dependency('gstreamer-base-1.0', version : '>= 1.28')
 gst_video_dep = dependency('gstreamer-video-1.0', version : '>= 1.28')
@@ -61,7 +62,6 @@ rds_install_rpath = rocm_path_norm == '/opt/rocm' ? '' : rocm_path_norm / 'lib'
 infer_opt = get_option('infer')
 rds_infer_enabled = false
 if not infer_opt.disabled()
-  cxx = meson.get_compiler('cpp')
   infer_missing = []
   migraphx_path = get_option('migraphx_path')
   migraphx_dep = dependency('', required : false)
@@ -90,6 +90,10 @@ if not infer_opt.disabled()
   endif
   if infer_missing.length() == 0
     rds_infer_enabled = true
+    # MIGraphX may live outside the linker path (ROCm 10 puts it in <rocm>/extras-10/lib): rdsinfer and rds-compile
+    # get an install rpath to it, next to the ROCm one.
+    rds_infer_install_rpath = ':'.join([rds_install_rpath,
+      migraphx_libdir == rocm_path_norm / 'lib' ? '' : migraphx_libdir]).strip(':')
   elif infer_opt.enabled()
     error('rdsinfer: missing ' + ', '.join(infer_missing))
   else

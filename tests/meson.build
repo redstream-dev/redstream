@@ -42,7 +42,7 @@ foreach t : cpu_tests
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 endforeach
 
-# plugin_load also checks that rdsinfer is there exactly when the build has it.
+# plugin_load also checks that rdsinfer loads when the build has it.
 test('plugin_load', executable('plugin_load', 'check' / 'plugin_load.c', dependencies : test_deps,
     c_args : ['-DRDS_HAVE_INFER=@0@'.format(rds_infer_enabled ? 1 : 0)]),
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)

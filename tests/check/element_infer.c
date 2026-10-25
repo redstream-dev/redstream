@@ -64,7 +64,7 @@ test_config_file_path (void)
 
   g_assert_nonnull (pspec);
   g_assert_true (G_PARAM_SPEC_VALUE_TYPE (pspec) == G_TYPE_STRING);
-  g_assert_true (pspec->flags & G_PARAM_READWRITE);
+  g_assert_true ((pspec->flags & G_PARAM_READWRITE) == G_PARAM_READWRITE);
   g_object_get (e, "config-file-path", &path, NULL);
   g_assert_null (path);
   g_object_set (e, "config-file-path", "/tmp/pgie.yml", NULL);
