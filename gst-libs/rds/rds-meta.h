@@ -53,7 +53,8 @@ typedef enum
   RDS_CLASSIFIER_META,
   RDS_LABEL_INFO_META,
   RDS_USER_META,
-  /* 8 .. 4095: reserved for Redstream components (inference tensors in Phase 5, analytics in M2). */
+  /* 8 .. 4095: reserved for Redstream components. The ones DeepStream defines keep their documented values. */
+  RDS_INFER_TENSOR_OUTPUT_META = 12,                /* RdsInferTensorMeta (rds-infer-meta.h) in a user meta */
   RDS_RESERVED_META = 4095,
   RDS_GST_CUSTOM_META = 4096,
   RDS_BATCH_GST_META,                               /* RdsMeta wrapping an RdsBatchMeta (rds-gst-meta.h) */

@@ -7,6 +7,7 @@
 
 #include <rds/rds.h>
 #include <rds/rds-infer.h>
+#include <rds/rds-infer-meta.h>
 
 /* ---- NvBufSurface ---- */
 typedef RdsBufSurface NvBufSurface;
@@ -155,6 +156,7 @@ typedef RdsMeta NvDsMeta;
 #define NVDS_CLASSIFIER_META RDS_CLASSIFIER_META
 #define NVDS_LABEL_INFO_META RDS_LABEL_INFO_META
 #define NVDS_USER_META RDS_USER_META
+#define NVDSINFER_TENSOR_OUTPUT_META RDS_INFER_TENSOR_OUTPUT_META
 #define NVDS_RESERVED_META RDS_RESERVED_META
 #define NVDS_GST_CUSTOM_META RDS_GST_CUSTOM_META
 #define NVDS_BATCH_GST_META RDS_BATCH_GST_META
@@ -247,6 +249,9 @@ typedef RdsInferLayerInfo NvDsInferLayerInfo;
 typedef RdsInferNetworkInfo NvDsInferNetworkInfo;
 typedef RdsInferObjectDetectionInfo NvDsInferObjectDetectionInfo;
 typedef RdsInferParseObjectInfo NvDsInferParseObjectInfo;
+
+/* ---- nvinfer tensor output meta (gstnvdsinfer.h) ---- */
+typedef RdsInferTensorMeta NvDsInferTensorMeta;
 
 /* The custom bbox parser ABI aliases (nvdsinfer_custom_impl.h) are C++ and live in rds/rds_compat_infer.h. */
 

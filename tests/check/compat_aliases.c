@@ -65,6 +65,7 @@ test_types (void)
   { RdsInferNetworkInfo *r = NULL; NvDsInferNetworkInfo *n = r; g_assert_null (n); }
   { RdsInferObjectDetectionInfo *r = NULL; NvDsInferObjectDetectionInfo *n = r; g_assert_null (n); }
   { RdsInferObjectDetectionInfo *r = NULL; NvDsInferParseObjectInfo *n = r; g_assert_null (n); }
+  { RdsInferTensorMeta *r = NULL; NvDsInferTensorMeta *n = r; g_assert_null (n); }
 }
 
 /* The transform structs keep DeepStream's field names and the documented field types, so designated initializers
@@ -272,6 +273,9 @@ test_constants (void)
   g_assert_true ((gint64) NVDS_CLASSIFIER_META == (gint64) RDS_CLASSIFIER_META);
   g_assert_true ((gint64) NVDS_LABEL_INFO_META == (gint64) RDS_LABEL_INFO_META);
   g_assert_true ((gint64) NVDS_USER_META == (gint64) RDS_USER_META);
+  g_assert_true ((gint64) NVDSINFER_TENSOR_OUTPUT_META == (gint64) RDS_INFER_TENSOR_OUTPUT_META);
+  /* the documented position in NvDsMetaType */
+  g_assert_cmpint (RDS_INFER_TENSOR_OUTPUT_META, ==, 12);
   g_assert_true ((gint64) NVDS_RESERVED_META == (gint64) RDS_RESERVED_META);
   g_assert_true ((gint64) NVDS_GST_CUSTOM_META == (gint64) RDS_GST_CUSTOM_META);
   g_assert_true ((gint64) NVDS_BATCH_GST_META == (gint64) RDS_BATCH_GST_META);

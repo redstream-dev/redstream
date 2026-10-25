@@ -43,6 +43,33 @@ static_assert (offsetof (RdsInferObjectDetectionInfo, rotation_angle) == 24, "")
 static_assert (sizeof (RdsInferObjectDetectionInfo) == 7 * 4, "");
 static_assert (RDS_INFER_DATA_FLOAT == 0 && RDS_INFER_DATA_HALF == 1 && RDS_INFER_DATA_INT8 == 2
     && RDS_INFER_DATA_INT32 == 3 && RDS_INFER_DATA_INT64 == 4, "");
+/* The tensor meta: the documented fields in order, with the documented types. */
+#define TM_ORDER(a, b) static_assert (offsetof (RdsInferTensorMeta, a) < offsetof (RdsInferTensorMeta, b), "")
+TM_ORDER (unique_id, num_output_layers);
+TM_ORDER (num_output_layers, output_layers_info);
+TM_ORDER (output_layers_info, out_buf_ptrs_host);
+TM_ORDER (out_buf_ptrs_host, out_buf_ptrs_dev);
+TM_ORDER (out_buf_ptrs_dev, gpu_id);
+TM_ORDER (gpu_id, priv_data);
+TM_ORDER (priv_data, network_info);
+TM_ORDER (network_info, maintain_aspect_ratio);
+TM_ORDER (maintain_aspect_ratio, symmetric_padding);
+#undef TM_ORDER
+static_assert (offsetof (RdsInferTensorMeta, unique_id) == 0, "");
+/* symmetric_padding is the last field (only tail padding after it) */
+static_assert (sizeof (RdsInferTensorMeta) - offsetof (RdsInferTensorMeta, symmetric_padding) - sizeof (gboolean)
+    < alignof (RdsInferTensorMeta), "");
+static_assert (std::is_same<decltype (RdsInferTensorMeta::unique_id), guint>::value, "");
+static_assert (std::is_same<decltype (RdsInferTensorMeta::num_output_layers), guint>::value, "");
+static_assert (std::is_same<decltype (RdsInferTensorMeta::output_layers_info), RdsInferLayerInfo *>::value, "");
+static_assert (std::is_same<decltype (RdsInferTensorMeta::out_buf_ptrs_host), void **>::value, "");
+static_assert (std::is_same<decltype (RdsInferTensorMeta::out_buf_ptrs_dev), void **>::value, "");
+static_assert (std::is_same<decltype (RdsInferTensorMeta::gpu_id), gint>::value, "");
+static_assert (std::is_same<decltype (RdsInferTensorMeta::priv_data), void *>::value, "");
+static_assert (std::is_same<decltype (RdsInferTensorMeta::network_info), RdsInferNetworkInfo>::value, "");
+static_assert (std::is_same<decltype (RdsInferTensorMeta::maintain_aspect_ratio), gboolean>::value, "");
+static_assert (std::is_same<decltype (RdsInferTensorMeta::symmetric_padding), gboolean>::value, "");
+static_assert (RDS_INFER_TENSOR_OUTPUT_META == 12, "");
 
 /* ---- The DeepStream names are the same types ---- */
 
@@ -57,6 +84,8 @@ static_assert (std::is_same<NvDsInferObjectDetectionInfo, RdsInferObjectDetectio
 static_assert (std::is_same<NvDsInferParseObjectInfo, RdsInferObjectDetectionInfo>::value, "");
 static_assert (std::is_same<RdsInferParseObjectInfo, RdsInferObjectDetectionInfo>::value, "");
 static_assert (std::is_same<NvDsInferParseCustomFunc, RdsInferParseCustomFunc>::value, "");
+static_assert (std::is_same<NvDsInferTensorMeta, RdsInferTensorMeta>::value, "");
+static_assert (NVDSINFER_TENSOR_OUTPUT_META == RDS_INFER_TENSOR_OUTPUT_META, "");
 static_assert (std::is_same<decltype (FLOAT), const RdsInferDataType>::value, "");
 static_assert (FLOAT == RDS_INFER_DATA_FLOAT && HALF == RDS_INFER_DATA_HALF && INT8 == RDS_INFER_DATA_INT8
     && INT32 == RDS_INFER_DATA_INT32 && INT64 == RDS_INFER_DATA_INT64, "");
