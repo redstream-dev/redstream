@@ -1,0 +1,5 @@
+# Key files treat a backslash as an escape: "\m" is invalid, and the error shows the value as written.
+[property]
+onnx-file=C:\models\yolo.onnx
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo

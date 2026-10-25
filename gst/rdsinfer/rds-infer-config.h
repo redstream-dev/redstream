@@ -34,7 +34,9 @@ typedef struct
 typedef struct
 {
   gchar *config_path;                           /* the file as given to rds_infer_config_load */
-  gchar *config_dir;                            /* absolute; relative paths in the file are resolved against it */
+  /* Absolute, but symlinks are not resolved: for a symlinked config file it is the link's directory. Relative paths
+   * in the file are resolved against it and normalised (g_canonicalize_filename). */
+  gchar *config_dir;
   gchar *onnx_file, *model_engine_file, *labelfile_path, *custom_lib_path, *parse_bbox_func_name;
   guint batch_size, interval, gie_unique_id, num_detected_classes, gpu_id;
   gint network_mode, network_type, process_mode, cluster_mode, model_color_format, network_input_order,
@@ -55,9 +57,19 @@ typedef struct
 
 /* Loads @path (YAML if it ends in .yml or .yaml, a key file otherwise), validates it and loads the labels. */
 G_GNUC_INTERNAL RdsInferConfig *rds_infer_config_load (const gchar * path, GError ** error);
-/* The cross-key and supported-value checks of rds_infer_config_load, for re-running after element properties
- * override fields. */
-G_GNUC_INTERNAL gboolean rds_infer_config_validate (const RdsInferConfig * cfg, GError ** error);
+
+/* The supported-value and cross-key checks of rds_infer_config_load, for re-running after element properties
+ * override fields. Overrides follow these rules:
+ * - strings: g_free the old value, store a g_strdup'ed new one (NULL for unset). Paths from properties are used as
+ *   given, not resolved against config_dir.
+ * - filter_out_class_ids: replace its contents; it stays non-NULL.
+ * - num_detected_classes, class_attrs and labels must not change (they were sized and loaded together).
+ * - Ranges are checked only while parsing the file, not here: the element's GParamSpecs must carry the same bounds
+ *   (batch-size 1..1024, interval 0..32, ...).
+ * @overridden lists the config key names (not property names) whose values came from element properties, NULL
+ * for none. Errors about those keys read "element property KEY: VALUE: reason" instead of "FILE:KEY: ...". */
+G_GNUC_INTERNAL gboolean rds_infer_config_validate (const RdsInferConfig * cfg, const gchar * const *overridden,
+    GError ** error);
 G_GNUC_INTERNAL void rds_infer_config_free (RdsInferConfig * cfg);
 
 typedef enum
@@ -67,12 +79,26 @@ typedef enum
   RDS_INFER_KEY_REJECTED,               /* an error whenever it is set */
 } RdsInferKeyStatus;
 
-/* @group is "property" or "class-attrs" (both [class-attrs-all] and [class-attrs-<id>]). @note says why a key is
- * a no-op or rejected, or which values of a supported key are rejected; NULL when there is nothing to add. */
-typedef void (*RdsInferConfigKeyFunc) (const gchar * group, const gchar * name, RdsInferKeyStatus status,
-    const gchar * note, gpointer user_data);
+/* One key of the table, as text (for the compat matrix). */
+typedef struct
+{
+  const gchar *group;           /* "property" or "class-attrs" (both [class-attrs-all] and [class-attrs-<id>]) */
+  const gchar *name;
+  const gchar *type;            /* "bool", "int", "uint", "float", "string", "path", "float list", "dims",
+                                 * "uint list", "int list", "string list" */
+  RdsInferKeyStatus status;
+  const gchar *default_value;   /* as it would be written in the file; NULL: none (unset or zero) */
+  const gchar *range;           /* "MIN..MAX", ">= MIN" or "> MIN" (of each element for lists); NULL: not a number */
+  const gchar *accepted;        /* the supported values, e.g. "2, 4", when not every value in range is; else NULL */
+  const gchar *note;            /* why a key is a no-op or rejected, or why other values are rejected; NULL: none */
+} RdsInferKeyDesc;
+
+/* @key and its strings are valid during the call only. */
+typedef void (*RdsInferConfigKeyFunc) (const RdsInferKeyDesc * key, gpointer user_data);
 /* Calls @func for every key in the table, in table order. */
 G_GNUC_INTERNAL void rds_infer_config_foreach_key (RdsInferConfigKeyFunc func, gpointer user_data);
+/* Checks the key table itself (fields, ranges, accepted values, defaults, notes); FALSE with the first mistake. */
+G_GNUC_INTERNAL gboolean rds_infer_config_check_table (GError ** error);
 
 G_END_DECLS
 

@@ -12,7 +12,7 @@ valid_name (const gchar * s, gboolean is_group)
   if (!*s || !g_utf8_validate (s, -1, NULL))
     return FALSE;
   for (const gchar * p = s; *p; p++)
-    if (*p == '[' || *p == ']' || *p == '\n' || *p == '\r' || (!is_group && *p == '='))
+    if (*p == '[' || *p == ']' || g_ascii_iscntrl (*p) || (!is_group && *p == '='))
       return FALSE;
   return is_group || (!g_ascii_isspace (s[0]) && !g_ascii_isspace (s[strlen (s) - 1]));
 }
@@ -25,18 +25,31 @@ fail (GError ** error, const gchar * path, const yaml_node_t * node, const gchar
   return FALSE;
 }
 
+/* A plain (unquoted) empty, ~ or null scalar: YAML's null. */
+static gboolean
+is_null (const yaml_node_t * node)
+{
+  const gchar *v;
+
+  if (node->type != YAML_SCALAR_NODE || node->data.scalar.style != YAML_PLAIN_SCALAR_STYLE)
+    return FALSE;
+  v = (const gchar *) node->data.scalar.value;
+  return !*v || !strcmp (v, "~") || !strcmp (v, "null") || !strcmp (v, "Null") || !strcmp (v, "NULL");
+}
+
+/* A scalar's text; null is "" (unset). */
 static const gchar *
 scalar (const yaml_node_t * node)
 {
-  return (const gchar *) node->data.scalar.value;
+  return is_null (node) ? "" : (const gchar *) node->data.scalar.value;
 }
 
 static gboolean
 add_group (GKeyFile * kf, yaml_document_t * doc, const gchar * path, const gchar * group, yaml_node_t * map,
     GError ** error)
 {
-  if (map->type == YAML_SCALAR_NODE && map->data.scalar.length == 0)
-    return TRUE;                /* "group:" with nothing under it */
+  if (is_null (map))
+    return TRUE;                /* "group:" or "group: ~", with nothing under it */
   if (map->type != YAML_MAPPING_NODE)
     return fail (error, path, map, "a group must be a mapping of keys to values");
 
@@ -44,7 +57,7 @@ add_group (GKeyFile * kf, yaml_document_t * doc, const gchar * path, const gchar
     yaml_node_t *k = yaml_document_get_node (doc, pair->key), *v = yaml_document_get_node (doc, pair->value);
 
     if (k->type != YAML_SCALAR_NODE || !valid_name (scalar (k), FALSE))
-      return fail (error, path, k, "a key must be a plain name");
+      return fail (error, path, k, "a key must be a plain name (no '=', '[', ']' or control characters)");
     if (v->type == YAML_SCALAR_NODE) {
       if (!g_utf8_validate (scalar (v), -1, NULL))
         return fail (error, path, v, "a value must be valid UTF-8");
@@ -58,6 +71,10 @@ add_group (GKeyFile * kf, yaml_document_t * doc, const gchar * path, const gchar
         if (item->type != YAML_SCALAR_NODE || !g_utf8_validate (scalar (item), -1, NULL)) {
           g_string_free (joined, TRUE);
           return fail (error, path, item, "a list must hold plain values");
+        }
+        if (strchr (scalar (item), ';')) {
+          g_string_free (joined, TRUE);
+          return fail (error, path, item, "a list item can't contain ';' (it separates the items)");
         }
         if (joined->len)
           g_string_append_c (joined, ';');
@@ -110,7 +127,7 @@ rds_keyfile_from_yaml (const gchar * path, GError ** error)
       yaml_node_t *k = yaml_document_get_node (&doc, pair->key);
 
       if (k->type != YAML_SCALAR_NODE || !valid_name (scalar (k), TRUE))
-        ok = fail (error, path, k, "a group name must be a plain name");
+        ok = fail (error, path, k, "a group name must be a plain name (no '[', ']' or control characters)");
       else
         ok = add_group (kf, &doc, path, scalar (k), yaml_document_get_node (&doc, pair->value), error);
     }

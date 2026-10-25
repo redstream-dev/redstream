@@ -1,4 +1,4 @@
-# A mapping nested inside a key (line 5): an error that names the line.
+# A mapping nested inside a key (line 6): an error that names the line.
 property:
   onnx-file: model.onnx
   num-detected-classes: 2

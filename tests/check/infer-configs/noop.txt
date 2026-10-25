@@ -1,5 +1,5 @@
-# Keys accepted as no-ops: one warning each. Two of them appear twice (eps also in a class group) and still warn
-# once. "no-such-key" and the [extra] group are unknown: warnings too.
+# Keys accepted as no-ops: one warning each. eps appears twice (also in [class-attrs-1]) and still warns once.
+# "no-such-key" and the [extra] group are unknown: warnings too.
 [property]
 onnx-file=model.onnx
 num-detected-classes=2

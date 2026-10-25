@@ -8,8 +8,9 @@
 G_BEGIN_DECLS
 
 /* The top-level mapping's keys become groups; each group is a mapping of key to a scalar or a sequence of scalars.
- * Scalars become strings as written; sequences are joined with ';' (the key-file list separator). Anything nested
- * deeper is an error. Errors are G_FILE_ERROR (can't read @path) or G_KEY_FILE_ERROR_PARSE, with "PATH:LINE: "
+ * Scalars become strings as written, except that a plain null (empty, ~, null, Null, NULL) becomes "" (unset) and a
+ * null group is an empty one; sequences are joined with ';' (the key-file list separator), so an item containing
+ * ';' is an error. Anything nested deeper, and group or key names with control characters, are errors. Errors are G_FILE_ERROR (can't read @path) or G_KEY_FILE_ERROR_PARSE, with "PATH:LINE: "
  * in front of the message, like g_key_file_load_from_file. Only the first document is read. */
 G_GNUC_INTERNAL GKeyFile *rds_keyfile_from_yaml (const gchar * path, GError ** error);
 

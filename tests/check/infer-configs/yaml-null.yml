@@ -1,0 +1,12 @@
+# Plain null values (empty, ~, null, Null, NULL) leave a key unset, and a null group is an empty group. A quoted
+# "~" is a string (a relative path here).
+property:
+  onnx-file: "~"
+  model-engine-file: ~
+  labelfile-path: null
+  custom-lib-path: Null
+  output-blob-names: NULL
+  num-detected-classes: 1
+  parse-bbox-func-name: RdsInferParseYolo
+  mean-file:
+class-attrs-all: ~

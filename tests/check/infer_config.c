@@ -25,17 +25,15 @@ load_ok (const gchar * name)
   return cfg;
 }
 
-/* Loads a corpus file that must fail with @code; the message must contain "<path>:" followed by each of the
- * NULL-terminated substrings in order. */
+/* Loads @path, which must fail with @code; the message must contain "<path>:" followed by each of the
+ * NULL-terminated substrings in @ap, in order. */
 static void
-load_fails (const gchar * name, gint code, ...)
+assert_load_fails (const gchar * path, gint code, va_list ap)
 {
-  gchar *path = corpus (name);
   gchar *prefix = g_strconcat (path, ":", NULL);
   GError *err = NULL;
   RdsInferConfig *cfg = rds_infer_config_load (path, &err);
   const gchar *pos, *want;
-  va_list ap;
 
   g_assert_null (cfg);
   g_assert_error (err, RDS_INFER_CONFIG_ERROR, code);
@@ -43,7 +41,6 @@ load_fails (const gchar * name, gint code, ...)
   pos = strstr (err->message, prefix);
   g_assert_nonnull (pos);
   pos += strlen (prefix);
-  va_start (ap, code);
   while ((want = va_arg (ap, const gchar *))) {
     const gchar *found = strstr (pos, want);
 
@@ -51,11 +48,73 @@ load_fails (const gchar * name, gint code, ...)
       g_error ("\"%s\" not found after the file name in \"%s\"", want, err->message);
     pos = found + strlen (want);
   }
-  va_end (ap);
   g_error_free (err);
   g_free (prefix);
+}
+
+/* A corpus file that must fail: see assert_load_fails. */
+static void
+load_fails (const gchar * name, gint code, ...)
+{
+  gchar *path = corpus (name);
+  va_list ap;
+
+  va_start (ap, code);
+  assert_load_fails (path, code, ap);
+  va_end (ap);
   g_free (path);
 }
+
+/* A one-off config: @text written to a fresh temp dir as @name (with @labels as labels.txt unless NULL). Returns
+ * the config path; tmp_cleanup removes both files and the dir. */
+static gchar *
+tmp_config (const gchar * name, const gchar * text, const gchar * labels)
+{
+  GError *err = NULL;
+  gchar *dir = g_dir_make_tmp ("rds-infer-config-XXXXXX", &err);
+  gchar *path = g_build_filename (dir, name, NULL);
+
+  g_assert_no_error (err);
+  g_assert_true (g_file_set_contents (path, text, -1, NULL));
+  if (labels) {
+    gchar *lbl = g_build_filename (dir, "labels.txt", NULL);
+
+    g_assert_true (g_file_set_contents (lbl, labels, -1, NULL));
+    g_free (lbl);
+  }
+  g_free (dir);
+  return path;
+}
+
+static void
+tmp_cleanup (gchar * path)
+{
+  gchar *dir = g_path_get_dirname (path), *lbl = g_build_filename (dir, "labels.txt", NULL);
+
+  g_unlink (lbl);
+  g_unlink (path);
+  g_rmdir (dir);
+  g_free (lbl);
+  g_free (dir);
+  g_free (path);
+}
+
+/* A one-off config that must fail: see assert_load_fails. */
+static void
+text_fails (const gchar * name, const gchar * text, gint code, ...)
+{
+  gchar *path = tmp_config (name, text, NULL);
+  va_list ap;
+
+  va_start (ap, code);
+  assert_load_fails (path, code, ap);
+  va_end (ap);
+  tmp_cleanup (path);
+}
+
+#define DETECTOR_TXT "[property]\nonnx-file=m.onnx\nnum-detected-classes=2\nparse-bbox-func-name=RdsInferParseYolo\n"
+#define DETECTOR_YML "property:\n  onnx-file: m.onnx\n  num-detected-classes: 2\n" \
+  "  parse-bbox-func-name: RdsInferParseYolo\n"
 
 static guint
 count_warnings (RdsInferConfig * cfg, const gchar * needle)
@@ -275,7 +334,7 @@ test_relative_paths (void)
   gchar *dir = g_build_filename (RDS_INFER_CONFIGS, "sub", NULL);
   gchar *abs_dir = g_canonicalize_filename (dir, NULL);
   gchar *onnx = g_build_filename (abs_dir, "models", "model.onnx", NULL);
-  gchar *labels = g_build_filename (abs_dir, "..", "labels-3.txt", NULL);
+  gchar *labels = g_canonicalize_filename ("../labels-3.txt", abs_dir);
 
   for (guint f = 0; f < G_N_ELEMENTS (files); f++) {
     RdsInferConfig *cfg = load_ok (files[f]);
@@ -385,7 +444,7 @@ test_missing (void)
   g_clear_error (&err);
   g_free (path);
 
-  load_fails ("missing-property.txt", RDS_INFER_CONFIG_ERROR_INVALID, "property", NULL);
+  load_fails ("missing-property.txt", RDS_INFER_CONFIG_ERROR_INVALID, " no [property] group", NULL);
   load_fails ("missing-labels.txt", RDS_INFER_CONFIG_ERROR_FILE, "labelfile-path: ", "no-such-labels.txt", NULL);
 }
 
@@ -394,6 +453,62 @@ test_malformed_yaml (void)
 {
   load_fails ("malformed.yml", RDS_INFER_CONFIG_ERROR_PARSE, "6: ", "line 5", NULL);
   load_fails ("nested.yml", RDS_INFER_CONFIG_ERROR_PARSE, "6: ", NULL);
+  load_fails ("ctrl-group.yml", RDS_INFER_CONFIG_ERROR_PARSE, "2: ", NULL);
+  text_fails ("pgie.yml", DETECTOR_YML "  \"x\\x01y\": 1\n", RDS_INFER_CONFIG_ERROR_PARSE, "5: ", NULL);
+  load_fails ("semicolon-item.yml", RDS_INFER_CONFIG_ERROR_PARSE, "4: ", "';'", NULL);
+}
+
+/* Plain ~, null, Null, NULL and empty values are unset, for keys and for groups; quoted ones are strings. */
+static void
+test_yaml_null (void)
+{
+  RdsInferConfig *cfg = load_ok ("yaml-null.yml");
+  gchar *tilde = g_build_filename (cfg->config_dir, "~", NULL);
+
+  g_assert_null (cfg->model_engine_file);
+  g_assert_null (cfg->labelfile_path);
+  g_assert_null (cfg->custom_lib_path);
+  g_assert_null (cfg->output_blob_names);
+  g_assert_cmpstr (cfg->onnx_file, ==, tilde);  /* quoted "~" */
+  g_assert_cmpstr (cfg->labels[0], ==, "");
+  g_assert_cmpfloat (cfg->class_attrs[0].pre_cluster_threshold, ==, 0.25f);
+  g_assert_cmpuint (cfg->warnings->len, ==, 0);
+  g_free (tilde);
+  rds_infer_config_free (cfg);
+}
+
+/* Numbers: trailing text, inf and nan, out-of-range integers and floats. */
+static void
+test_numbers (void)
+{
+  text_fails ("pgie.txt", DETECTOR_TXT "batch-size=12abc\n", RDS_INFER_CONFIG_ERROR_INVALID, "batch-size: 12abc: ",
+      "not an integer", NULL);
+  text_fails ("pgie.txt", DETECTOR_TXT "batch-size=99999999999999999999\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "batch-size: 99999999999999999999: ", "out of range", NULL);
+  text_fails ("pgie.txt", DETECTOR_TXT "net-scale-factor=inf\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "net-scale-factor: inf: ", "not a finite number", NULL);
+  text_fails ("pgie.txt", DETECTOR_TXT "net-scale-factor=nan\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "net-scale-factor: nan: ", "not a finite number", NULL);
+  text_fails ("pgie.txt", DETECTOR_TXT "net-scale-factor=1e-310\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "net-scale-factor: 1e-310: ", "out of range", NULL);
+  text_fails ("pgie.txt", DETECTOR_TXT "net-scale-factor=1e39\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "net-scale-factor: 1e39: ", "out of range", NULL);
+  text_fails ("pgie.txt", DETECTOR_TXT "offsets=1;1e-50;2\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "offsets: 1;1e-50;2: ", "out of range", NULL);
+}
+
+/* Odd key-file values: a backslash (invalid key-file escape) shows the raw text; an empty rejected key is unset;
+ * class ids are written without leading zeros. */
+static void
+test_keyfile_values (void)
+{
+  RdsInferConfig *cfg;
+
+  load_fails ("backslash.txt", RDS_INFER_CONFIG_ERROR_INVALID, "onnx-file: C:\\models\\yolo.onnx: ", NULL);
+  cfg = load_ok ("empty-rejected.txt");
+  g_assert_cmpuint (cfg->warnings->len, ==, 0);
+  rds_infer_config_free (cfg);
+  load_fails ("class-attrs-zero.txt", RDS_INFER_CONFIG_ERROR_INVALID, "class-attrs-00: ", NULL);
 }
 
 /* The YAML reader on its own: groups, scalars, sequences. */
@@ -427,33 +542,39 @@ test_yaml_keyfile (void)
   g_free (path);
 }
 
+static gchar *
+labels_config_text (guint num_classes)
+{
+  return g_strdup_printf ("[property]\nonnx-file=m.onnx\nnum-detected-classes=%u\n"
+      "parse-bbox-func-name=RdsInferParseYolo\nlabelfile-path=labels.txt\n", num_classes);
+}
+
 /* Writes @labels (raw bytes) and a config using it into a fresh temp dir, then loads it. */
 static RdsInferConfig *
 load_with_labels (const gchar * labels, guint num_classes)
 {
+  gchar *text = labels_config_text (num_classes), *path = tmp_config ("pgie.txt", text, labels);
   GError *err = NULL;
-  gchar *dir = g_dir_make_tmp ("rds-infer-config-XXXXXX", &err);
-  gchar *cfg_path, *lbl_path, *text;
-  RdsInferConfig *cfg;
+  RdsInferConfig *cfg = rds_infer_config_load (path, &err);
 
   g_assert_no_error (err);
-  lbl_path = g_build_filename (dir, "labels.txt", NULL);
-  cfg_path = g_build_filename (dir, "pgie.txt", NULL);
-  text = g_strdup_printf ("[property]\nonnx-file=m.onnx\nnum-detected-classes=%u\n"
-      "parse-bbox-func-name=RdsInferParseYolo\nlabelfile-path=labels.txt\n", num_classes);
-  g_assert_true (g_file_set_contents (lbl_path, labels, -1, NULL));
-  g_assert_true (g_file_set_contents (cfg_path, text, -1, NULL));
-  cfg = rds_infer_config_load (cfg_path, &err);
-  g_assert_no_error (err);
   g_assert_nonnull (cfg);
-  g_unlink (lbl_path);
-  g_unlink (cfg_path);
-  g_rmdir (dir);
+  tmp_cleanup (path);
   g_free (text);
-  g_free (cfg_path);
-  g_free (lbl_path);
-  g_free (dir);
   return cfg;
+}
+
+static void
+labels_fail (const gchar * labels, guint num_classes, ...)
+{
+  gchar *text = labels_config_text (num_classes), *path = tmp_config ("pgie.txt", text, labels);
+  va_list ap;
+
+  va_start (ap, num_classes);
+  assert_load_fails (path, RDS_INFER_CONFIG_ERROR_INVALID, ap);
+  va_end (ap);
+  tmp_cleanup (path);
+  g_free (text);
 }
 
 static void
@@ -487,6 +608,8 @@ test_labels (void)
   assert_labels ("person\ncar\n", 4, short_labels, 1);       /* fewer: warning, empty labels */
   assert_labels (long_file, 3, with_long, 0);                 /* kept whole */
   assert_labels ("person\ncar\ntraffic light\nextra\n", 3, abc, 1);  /* more: warning, extra ignored */
+  /* labels go into metadata and messages: invalid UTF-8 is an error naming the file and line */
+  labels_fail ("person\ncar\nbad \xff label\n", 3, "labelfile-path: ", "labels.txt:3: ", "UTF-8", NULL);
   g_free (long_file);
   g_free (long_label);
 }
@@ -498,32 +621,63 @@ test_validate (void)
   RdsInferConfig *cfg = load_ok ("defaults.txt");
   GError *err = NULL;
 
-  g_assert_true (rds_infer_config_validate (cfg, &err));
+  const gchar *overridden[] = { "process-mode", NULL };
+  gchar *prefix = g_strconcat (cfg->config_path, ":process-mode: 2: ", NULL);
+
+  g_assert_true (rds_infer_config_validate (cfg, NULL, &err));
   g_assert_no_error (err);
   cfg->process_mode = 2;
-  g_assert_false (rds_infer_config_validate (cfg, &err));
+  /* from the file: FILE:KEY */
+  g_assert_false (rds_infer_config_validate (cfg, NULL, &err));
   g_assert_error (err, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_UNSUPPORTED);
-  g_assert_nonnull (strstr (err->message, "process-mode: 2: "));
+  g_assert_true (g_str_has_prefix (err->message, prefix));
+  g_clear_error (&err);
+  /* from an element property: named as such */
+  g_assert_false (rds_infer_config_validate (cfg, overridden, &err));
+  g_assert_error (err, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_UNSUPPORTED);
+  g_assert_true (g_str_has_prefix (err->message, "element property process-mode: 2: "));
   g_clear_error (&err);
   cfg->process_mode = 1;
   cfg->batch_size = 4;
   cfg->interval = 3;
-  g_assert_true (rds_infer_config_validate (cfg, &err));
+  g_assert_true (rds_infer_config_validate (cfg, overridden, &err));
+  g_free (prefix);
   rds_infer_config_free (cfg);
 }
 
 static void
-collect_key (const gchar * group, const gchar * name, RdsInferKeyStatus status, const gchar * note G_GNUC_UNUSED,
-    gpointer user_data)
+collect_key (const RdsInferKeyDesc * key, gpointer user_data)
 {
-  g_hash_table_insert (user_data, g_strconcat (group, "/", name, NULL), GINT_TO_POINTER (status + 1));
+  g_assert_nonnull (key->type);
+  g_assert_true (key->status == RDS_INFER_KEY_SUPPORTED || key->note);
+  g_hash_table_insert (user_data, g_strconcat (key->group, "/", key->name, NULL), GINT_TO_POINTER (key->status + 1));
+  if (!strcmp (key->name, "batch-size")) {
+    g_assert_cmpstr (key->type, ==, "uint");
+    g_assert_cmpstr (key->default_value, ==, "1");
+    g_assert_cmpstr (key->range, ==, "1..1024");
+    g_assert_null (key->accepted);
+  } else if (!strcmp (key->name, "net-scale-factor")) {
+    g_assert_cmpstr (key->type, ==, "float");
+    g_assert_cmpstr (key->range, ==, "> 0");
+  } else if (!strcmp (key->name, "cluster-mode")) {
+    g_assert_cmpstr (key->range, ==, "0..4");
+    g_assert_cmpstr (key->accepted, ==, "2, 4");
+  } else if (!strcmp (key->name, "onnx-file")) {
+    g_assert_cmpstr (key->type, ==, "path");
+    g_assert_null (key->default_value);
+    g_assert_null (key->range);
+  }
 }
 
 static void
 test_key_table (void)
 {
   GHashTable *keys = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  GError *err = NULL;
 
+  /* the table is consistent: fields, ranges, accepted values, defaults */
+  g_assert_true (rds_infer_config_check_table (&err));
+  g_assert_no_error (err);
   rds_infer_config_foreach_key (collect_key, keys);
 #define STATUS(k) (GPOINTER_TO_INT (g_hash_table_lookup (keys, k)) - 1)
   g_assert_cmpint (STATUS ("property/onnx-file"), ==, RDS_INFER_KEY_SUPPORTED);
@@ -553,6 +707,9 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-config/missing", test_missing);
   g_test_add_func ("/cpu/infer-config/malformed-yaml", test_malformed_yaml);
   g_test_add_func ("/cpu/infer-config/yaml-keyfile", test_yaml_keyfile);
+  g_test_add_func ("/cpu/infer-config/yaml-null", test_yaml_null);
+  g_test_add_func ("/cpu/infer-config/numbers", test_numbers);
+  g_test_add_func ("/cpu/infer-config/keyfile-values", test_keyfile_values);
   g_test_add_func ("/cpu/infer-config/labels", test_labels);
   g_test_add_func ("/cpu/infer-config/validate", test_validate);
   g_test_add_func ("/cpu/infer-config/key-table", test_key_table);
