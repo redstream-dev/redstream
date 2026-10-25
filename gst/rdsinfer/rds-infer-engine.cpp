@@ -601,12 +601,16 @@ out:
 }
 
 static gboolean
-build_program (RdsInferEngine * e, const gchar * onnx, gsize onnx_len, const std::vector<size_t> &input_lens,
-    gboolean fp16, GError ** error)
+build_program (RdsInferEngine * e, const gchar * onnx, gsize onnx_len, const gchar * model_dir,
+    const std::vector<size_t> &input_lens, gboolean fp16, GError ** error)
 {
+  /* Models whose initializers use external data are refused before this, but the reader scans initializers only:
+   * external tensors elsewhere (Constant node attributes, sparse initializers, subgraphs) are resolved against the
+   * model's directory, as they would be for a file path. */
   return RDS_MGX_CHECK ("migraphx::parse_onnx_buffer", error,
       migraphx::onnx_options o;
       o.set_input_parameter_shape (e->input_name, input_lens);
+      o.set_external_data_path (model_dir);
       e->program = migraphx::parse_onnx_buffer (onnx, onnx_len, o))
       && (!fp16 || RDS_MGX_CHECK ("migraphx::quantize_fp16", error, migraphx::quantize_fp16 (e->program)))
       && RDS_MGX_CHECK ("migraphx::program::compile", error,
@@ -832,7 +836,7 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
 
     e->built = TRUE;
     e->build_reason = g_strdup (reason.c_str ());
-    if (!build_program (e.get (), st.onnx, st.onnx_len, input_lens, opts->fp16, error)
+    if (!build_program (e.get (), st.onnx, st.onnx_len, st.dir, input_lens, opts->fp16, error)
         || !read_parameters (e.get (), input_lens, names, error))
       return NULL;
     json_object_set_member (st.key, "outputs", outputs_node (e.get ()));
