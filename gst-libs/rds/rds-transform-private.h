@@ -1,6 +1,7 @@
 /* Private declarations shared by the C side of libgstrds and its HIP kernel file (rds-transform-kernels.hip).
  * The shared part is plain C, no GLib and no HIP types (streams are void *), so both compilers can include it;
- * the C-only part at the end is hidden from the HIP compiler. Not installed, not exported.
+ * the C-only part at the end is hidden from the HIP compiler. The device helpers the kernels share are in
+ * rds-kernel-common.h. Not installed, not exported.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_TRANSFORM_PRIVATE_H
 #define RDS_TRANSFORM_PRIVATE_H
@@ -72,6 +73,38 @@ RDS_TRANSFORM_INTERNAL RdsBufSurfTransform_Error rds_transform_validate (const R
 /* Test hook: TRUE makes same-format copies go through the kernel instead of hipMemcpy2DAsync, so tests can check
  * that both give the same bytes. Process-wide; FALSE restores the default. */
 RDS_TRANSFORM_INTERNAL void rds_transform_force_kernel (gboolean force);
+
+/* The filter mapping of rds_buf_surf_transform (with the FILTER flag set): Bilinear and Algo1-3 run as bilinear,
+ * everything else as nearest. Inline, so code outside libgstrds (rdsinfer's preprocessing) maps the same way. */
+static inline gboolean
+rds_transform_filter_is_bilinear (RdsBufSurfTransform_Inter filter)
+{
+  switch (filter) {
+    case RdsBufSurfTransformInter_Bilinear:
+    case RdsBufSurfTransformInter_Algo1:
+    case RdsBufSurfTransformInter_Algo2:
+    case RdsBufSurfTransformInter_Algo3:
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+
+/* The kernel view of one surface of a batch: its dataPtr, size, format and up to three planes (unused ones 0). */
+static inline void
+rds_kernel_surface_init (RdsKernelSurface * k, const RdsBufSurfaceParams * p)
+{
+  k->data = (unsigned char *) p->dataPtr;
+  k->width = p->width;
+  k->height = p->height;
+  k->format = p->colorFormat;
+  for (guint i = 0; i < 3; i++) {
+    gboolean has = i < p->planeParams.num_planes;
+
+    k->pitch[i] = has ? p->planeParams.pitch[i] : 0;
+    k->offset[i] = has ? p->planeParams.offset[i] : 0;
+  }
+}
 #endif
 
 #endif /* RDS_TRANSFORM_PRIVATE_H */

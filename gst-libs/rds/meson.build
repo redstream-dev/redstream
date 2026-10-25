@@ -18,7 +18,7 @@ rds_kernels_raw = custom_target('rds-transform-kernels-raw',
   input : 'rds-transform-kernels.hip',
   output : 'rds-transform-kernels-raw.o',
   depfile : 'rds-transform-kernels-raw.d',
-  depend_files : files('rds-transform-private.h'),
+  depend_files : files('rds-transform-private.h', 'rds-kernel-common.h'),
   command : [amdclang, '-x', 'hip', hip_arch_args, '-fPIC', '-O2', '-std=c++17', '-fvisibility=hidden',
     '-D__HIP_PLATFORM_AMD__', '-I' + meson.current_source_dir(), '-MD', '-MF', '@DEPFILE@',
     '-c', '@INPUT@', '-o', '@OUTPUT@'])
