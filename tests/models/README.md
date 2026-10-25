@@ -104,7 +104,10 @@ tests/models/fetch-tracker-clip.sh    # on the host; needs Docker, network acces
   pipes raw I420 frames into `redstream:dev`, which scales them to 1280×720 (`videoscale`, bilinear) and encodes them
   with `vah264enc` (constant QP: 22 for I, 24 for P; an IDR every 60 frames) into H.264 Annex-B, one access unit per
   buffer.
-- An existing output is not redone. To redo it, delete it.
+- The decode and encode containers run without network access; only the pip install step has it. The download is
+  https-only, redirects included.
+- The output is redone whenever its recipe changes: `crosswalk-720p.h264.recipe` next to it records the source
+  hash, the decoder script's and requirements' hashes, both image IDs and the encode pipeline.
 
 **Reproducibility.** Only the source is pinned. The decode is bit-exact and the scaler is deterministic, but the
 hardware encoder's output depends on the GPU and its driver. On one machine re-runs give the same bytes; the script

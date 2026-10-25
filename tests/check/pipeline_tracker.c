@@ -11,6 +11,7 @@
 #include "rds-test-media.h"
 #include "rds-test-soak.h"
 #include "rds-test-tracks.h"
+#include "rds-tracker-config.h"
 
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
@@ -120,18 +121,17 @@ scale2_config (void)
   return path;
 }
 
-/* probationAge of a tracker config (the metrics need it); 5 (the default) when the file doesn't set it. */
+/* probationAge of a tracker config as rdstracker reads it (the metrics need it). */
 static guint
 config_probation (const gchar * path)
 {
-  gchar *text = NULL, *p;
-  guint v = 5;
+  GError *err = NULL;
+  RdsTrackerConfig *cfg = rds_tracker_config_load (path, &err);
+  guint v;
 
-  g_assert_true (g_file_get_contents (path, &text, NULL, NULL));
-  p = strstr (text, "probationAge:");
-  if (p)
-    v = (guint) g_ascii_strtoull (p + strlen ("probationAge:"), NULL, 10);
-  g_free (text);
+  g_assert_no_error (err);
+  v = cfg->probation_age;
+  rds_tracker_config_free (cfg);
   return v;
 }
 
@@ -288,8 +288,8 @@ run_clip (const gchar * tracker_config)
 
   t0 = g_get_monotonic_time ();
   g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
-  /* a first YOLO11n compile takes about a minute on a small GPU */
-  wait_eos (pipe, 900 * GST_SECOND);
+  /* a first YOLO11n compile takes about a minute on a small GPU; a run about 30 s */
+  wait_eos (pipe, 600 * GST_SECOND);
   gst_element_set_state (pipe, GST_STATE_NULL);
   gst_object_unref (pipe);
 
@@ -303,24 +303,28 @@ run_clip (const gchar * tracker_config)
   return r.dets;
 }
 
-/* Saves @dets (with their IDs) into WORK_DIR, for tracker_replay. */
+/* Saves @dets (with their IDs, the config and the core library) into WORK_DIR, for tracker_replay. */
 static void
 save_dets (const GArray * dets, const gchar * config, const gchar * name)
 {
   gchar *path = g_build_filename (WORK_DIR, name, NULL);
   GError *err = NULL;
 
-  g_assert_true (track_dets_save (dets, config, path, &err));
+  g_assert_true (track_dets_save (dets, config, RDS_TEST_TRACKER_CORE, path, &err));
   g_assert_no_error (err);
   g_test_message ("detections and IDs saved to %s", path);
   g_free (path);
 }
 
 /* Budgets for every class together, from a measured run (YOLO11n, the NvSORT sample config, this clip: coverage
- * 0.987, 10 switches, 315 tracks of 67.5 frames on average): coverage at most 0.05 below the measured, switches at
- * most 20 % (and at least 2) above. */
-#define NVSORT_COVERAGE_MIN (0.987 - 0.05)
-#define NVSORT_SWITCHES_MAX 12
+ * 0.988, 4 switches, 283 tracks of 75.6 frames on average, 16835 detections with conf >= 0.5): coverage at most 0.05
+ * below the measured, switches at most 20 % (and at least 2) above. */
+#define NVSORT_COVERAGE_MIN (0.988 - 0.05)
+#define NVSORT_SWITCHES_MAX 6
+/* and enough data that the budgets mean something: at least 80 % of the measured detections, and tracks at least
+ * 0.7 times as long on average */
+#define NVSORT_ELIGIBLE_MIN (16835 * 8 / 10)
+#define NVSORT_MEAN_LENGTH_MIN (0.7 * 75.6)
 
 /* The clip with the NvSORT sample config (checked against the budgets), then with the IOU one (printed only). */
 static void
@@ -337,7 +341,11 @@ test_clip (void)
   save_dets (dets, NVSORT_CONFIG, "crosswalk-nvsort.txt");
   track_print_table ("NvSORT (samples/tracker/config_tracker_NvSORT.yml):", dets, config_probation (NVSORT_CONFIG),
       &all);
-  g_test_message ("budget: coverage >= %.3f, switches <= %u", NVSORT_COVERAGE_MIN, NVSORT_SWITCHES_MAX);
+  g_test_message ("budget: coverage >= %.3f, switches <= %u; at least %u detections, mean length >= %.1f",
+      NVSORT_COVERAGE_MIN, NVSORT_SWITCHES_MAX, NVSORT_ELIGIBLE_MIN, NVSORT_MEAN_LENGTH_MIN);
+  g_assert_cmpuint (all.tracks, >, 0);
+  g_assert_cmpuint (all.eligible, >=, NVSORT_ELIGIBLE_MIN);
+  g_assert_cmpfloat (all.mean_length, >=, NVSORT_MEAN_LENGTH_MIN);
   g_assert_cmpfloat (track_coverage (&all), >=, NVSORT_COVERAGE_MIN);
   g_assert_cmpuint (all.switches, <=, NVSORT_SWITCHES_MAX);
   g_array_unref (dets);

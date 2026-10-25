@@ -266,6 +266,7 @@ if rds_tracker_enabled
       c_args : [
         '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
         '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+        '-DRDS_TEST_TRACKER_CORE="@0@"'.format(rdstracker_core.full_path()),
       ]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 300)
 endif
@@ -276,17 +277,21 @@ if rds_tracker_enabled and rds_infer_enabled
   # pipeline_tracker_soak, also in the soak suite; with scale2 and scripted objects without YOLO11n, and a generated
   # clip without the street clip, so the leak check always runs). The YOLO11n programs are shared with infer_engine
   # and pipeline_infer. Never in parallel: one compile or soak at a time.
+  # It links rdstracker-core for the config parser only (no GTypes in it), and records the core library's hash with the
+  # detections it saves, for tracker_replay.
   pipeline_tracker_exe = executable('pipeline_tracker', 'check' / 'pipeline_tracker.c',
-    dependencies : pipeline_deps,
+    dependencies : pipeline_deps + [rdstracker_core_dep],
     c_args : [
       '-DRDS_TEST_MODELS="@0@"'.format(meson.current_source_dir() / 'models'),
       '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
       '-DRDS_TEST_CACHE_MEDIA="@0@"'.format(meson.project_source_root() / '.cache' / 'media'),
       '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
       '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+      '-DRDS_TEST_TRACKER_CORE="@0@"'.format(rdstracker_core.full_path()),
     ])
+  # two runs of up to 600 s each (a first YOLO11n compile in the first)
   test('pipeline_tracker', pipeline_tracker_exe, args : ['-p', '/gpu/tracker-yolo'],
-    suite : ['gpu', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 900,
+    suite : ['gpu', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1500,
     depends : rds_plugins)
   test('pipeline_tracker_soak', pipeline_tracker_exe, args : ['-p', '/gpu/tracker-soak'],
     suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,

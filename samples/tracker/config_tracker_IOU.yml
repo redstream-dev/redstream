@@ -19,7 +19,7 @@ DataAssociator:
   associationMatcherType: 0
   checkClassMatch: 1
   minMatchingScore4Overall: 0.2
-  minMatchingScore4SizeSimilarity: 0.5
+  minMatchingScore4SizeSimilarity: 0.3
   minMatchingScore4Iou: 0.1
   matchingScoreWeight4SizeSimilarity: 0.4
   matchingScoreWeight4Iou: 0.6

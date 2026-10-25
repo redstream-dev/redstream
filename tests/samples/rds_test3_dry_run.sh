@@ -23,6 +23,10 @@ fi
 out=$("$1" --dry-run --tracker-config tracker.yml file:///dev/null)
 echo "$out"
 echo "$out" | grep -A1 -x 'nvinfer -> rdsinfer' | grep -qx 'nvtracker -> rdstracker'
+# an empty file name is refused
+if "$1" --dry-run --tracker-config '' file:///dev/null >/dev/null 2>&1; then
+  exit 1
+fi
 
 # nvv4l2decoder, nvvideoconvert and (when built) nvinfer and nvtracker now map to real elements of the build tree
 # (GST_PLUGIN_PATH_1_0 comes from the test environment).

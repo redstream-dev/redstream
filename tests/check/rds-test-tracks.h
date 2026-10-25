@@ -194,10 +194,11 @@ track_metrics (const GArray * dets, gint class_id, guint probation, TrackStats *
   g_hash_table_unref (by_id);
 }
 
+/* NaN without eligible detections: any comparison with a budget then fails */
 static gdouble
 track_coverage (const TrackStats * st)
 {
-  return st->eligible ? (gdouble) st->covered / st->eligible : 1.0;
+  return st->eligible ? (gdouble) st->covered / st->eligible : NAN;
 }
 
 #define TRACK_CLASS_PERSON 0
@@ -226,8 +227,7 @@ track_print_table (const gchar * title, const GArray * dets, guint probation, Tr
   }
 }
 
-/* The sha256 of a file's contents, as hex (NULL if it can't be read): tells which tracker config a dump was made
- * with. */
+/* The sha256 of a file's contents, as hex (NULL if it can't be read). */
 static gchar *
 track_file_sha256 (const gchar * path)
 {
@@ -241,18 +241,32 @@ track_file_sha256 (const gchar * path)
   return sum;
 }
 
-/* The detections as text: a first line "# config SHA256" (@config's checksum), then one detection per line:
+/* A dump's first line: which tracker config (@config's sha256) and which tracking core (the sha256 of @core, the
+ * built core library the element links) made its IDs. */
+static gchar *
+track_dump_header (const gchar * config, const gchar * core)
+{
+  gchar *config_sum = track_file_sha256 (config), *core_sum = track_file_sha256 (core);
+  gchar *head;
+
+  g_assert_nonnull (config_sum);
+  g_assert_nonnull (core_sum);
+  head = g_strdup_printf ("# config %s core %s\n", config_sum, core_sum);
+  g_free (config_sum);
+  g_free (core_sum);
+  return head;
+}
+
+/* The detections as text: a first line from track_dump_header, then one detection per line:
  * "frame class conf x y w h id" (id -1: none). */
 static G_GNUC_UNUSED gboolean
-track_dets_save (const GArray * dets, const gchar * config, const gchar * path, GError ** error)
+track_dets_save (const GArray * dets, const gchar * config, const gchar * core, const gchar * path, GError ** error)
 {
-  GString *s = g_string_new (NULL);
-  gchar *sum = track_file_sha256 (config);
+  gchar *head = track_dump_header (config, core);
+  GString *s = g_string_new (head);
   gboolean ok;
 
-  g_string_append_printf (s, "# config %s\n", sum);
-  g_free (sum);
-
+  g_free (head);
   for (guint i = 0; i < dets->len; i++) {
     const TrackDet *d = &g_array_index (dets, TrackDet, i);
 
@@ -264,18 +278,15 @@ track_dets_save (const GArray * dets, const gchar * config, const gchar * path, 
   return ok;
 }
 
-/* NULL if @path can't be read, a line doesn't parse or the dump wasn't made with @config as it is now (NULL: any
- * config). The IDs are the ones saved. */
+/* NULL if @path can't be read, a line doesn't parse, or the dump wasn't made with @config and @core as they are now
+ * (both NULL: by any). The IDs are the ones saved. */
 static G_GNUC_UNUSED GArray *
-track_dets_load (const gchar * path, const gchar * config)
+track_dets_load (const gchar * path, const gchar * config, const gchar * core)
 {
-  gchar *sum = config ? track_file_sha256 (config) : NULL, *head;
-
+  gchar *head = config ? track_dump_header (config, core) : g_strdup ("");
   gchar *text = NULL, **lines;
   GArray *dets;
 
-  head = config ? g_strdup_printf ("# config %s\n", sum) : g_strdup ("");
-  g_free (sum);
   if (!g_file_get_contents (path, &text, NULL, NULL) || !g_str_has_prefix (text, head)) {
     g_free (head);
     g_free (text);

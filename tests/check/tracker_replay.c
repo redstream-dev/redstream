@@ -1,7 +1,8 @@
 /* The tracking core on recorded and scripted detections, with the sample tracker configs (samples/tracker):
- * - the street clip's YOLO11n detections that pipeline_tracker saves, replayed through the core: the IDs must be the
- *   element's, and the metrics table is printed (skipped until pipeline_tracker has run in this build directory with
- *   the configs as they are);
+ * - the street clip's YOLO11n detections that pipeline_tracker saves, replayed through the core: a consistency check,
+ *   not a quality one. The core must give exactly the IDs the element gave (the element adds nothing to the core's
+ *   decisions), and the metrics table is printed. Skipped unless pipeline_tracker has run in this build directory
+ *   with the configs and the core library as they are now (the dump's header records both);
  * - a scripted scene with known identities (noisy boxes, misses, occlusions, crossings): ID switches and coverage
  *   against the truth.
  * With RDS_TRACKER_GRID=1, also the parameter grid the sample configs were chosen from, on both.
@@ -77,13 +78,13 @@ static void
 check_clip (const gchar * dump_name, const gchar * config)
 {
   gchar *path = g_build_filename (DUMP_DIR, dump_name, NULL);
-  GArray *dets = track_dets_load (path, config), *ours;
+  GArray *dets = track_dets_load (path, config, RDS_TEST_TRACKER_CORE), *ours;
   RdsTrackerConfig *cfg;
   guint n_tracked = 0;
 
   if (!dets) {
-    gchar *msg = g_strdup_printf ("no %s made with %s as it is (run pipeline_tracker in this build first)", path,
-        config);
+    gchar *msg = g_strdup_printf ("no %s made with %s and the core as they are (run pipeline_tracker in this "
+        "build first)", path, config);
 
     g_test_skip (msg);
     g_free (msg);
@@ -289,9 +290,16 @@ test_scene_iou (void)
 
 /* ---- the grid ---- */
 
-/* One run of the grid: @base with the grid's keys replaced, on the clip's detections (if saved) and the scene. */
+typedef struct
+{
+  guint probation, shadow;
+  gdouble iou_diff, min_iou, min_overall, min_size;
+} GridPoint;
+
+/* One run of the grid: @base_path with the grid's keys replaced by @g, on the clip's detections (if saved) and the
+ * scene. */
 static void
-grid_run (const gchar * base_path, GArray * clip, guint probation, guint shadow, gdouble iou_diff, gdouble min_iou)
+grid_run (const gchar * base_path, GArray * clip, const GridPoint * g)
 {
   gchar *text = NULL, *tmp = NULL, **lines;
   GString *s = g_string_new (NULL);
@@ -308,26 +316,33 @@ grid_run (const gchar * base_path, GArray * clip, guint probation, guint shadow,
     const gchar *l = lines[i];
 
     if (g_str_has_prefix (l, "  probationAge:"))
-      g_string_append_printf (s, "  probationAge: %u\n", probation);
+      g_string_append_printf (s, "  probationAge: %u\n", g->probation);
     else if (g_str_has_prefix (l, "  maxShadowTrackingAge:"))
-      g_string_append_printf (s, "  maxShadowTrackingAge: %u\n", shadow);
+      g_string_append_printf (s, "  maxShadowTrackingAge: %u\n", g->shadow);
     else if (g_str_has_prefix (l, "  minIouDiff4NewTarget:"))
-      g_string_append_printf (s, "  minIouDiff4NewTarget: %g\n", iou_diff);
+      g_string_append_printf (s, "  minIouDiff4NewTarget: %g\n", g->iou_diff);
     else if (g_str_has_prefix (l, "  minMatchingScore4Iou:"))
-      g_string_append_printf (s, "  minMatchingScore4Iou: %g\n", min_iou);
+      g_string_append_printf (s, "  minMatchingScore4Iou: %g\n", g->min_iou);
+    else if (g_str_has_prefix (l, "  minMatchingScore4Overall:"))
+      g_string_append_printf (s, "  minMatchingScore4Overall: %g\n", g->min_overall);
+    else if (g_str_has_prefix (l, "  minMatchingScore4SizeSimilarity:"))
+      g_string_append_printf (s, "  minMatchingScore4SizeSimilarity: %g\n", g->min_size);
     else
       g_string_append_printf (s, "%s\n", l);
   }
   g_assert_true (g_file_set_contents (tmp, s->str, -1, NULL));
   cfg = load_config (tmp);
-  g_assert_cmpuint (cfg->probation_age, ==, probation);
+  g_assert_cmpuint (cfg->probation_age, ==, g->probation);
+  g_assert_cmpfloat (cfg->min_matching_score4overall, ==, (gfloat) g->min_overall);
+  g_assert_cmpfloat (cfg->min_matching_score4size_similarity, ==, (gfloat) g->min_size);
   run_scene (cfg, &sc);
   if (clip) {
     replay (cfg, clip);
-    track_metrics (clip, -1, probation, &cs);
+    track_metrics (clip, -1, g->probation, &cs);
   }
-  g_test_message ("  %5u %6u %8.2f %6.2f | %7u %8.3f %8.1f | %7u %6u %8.3f", probation, shadow, iou_diff, min_iou,
-      cs.switches, track_coverage (&cs), cs.mean_length, sc.switches, sc.merges, (gdouble) sc.covered / sc.eligible);
+  g_test_message ("  %5u %6u %7.2f %6.2f %7.2f %6.2f | %6u %7.3f %7.1f | %7u %6u %8.3f", g->probation, g->shadow,
+      g->iou_diff, g->min_iou, g->min_overall, g->min_size, cs.switches, clip ? track_coverage (&cs) : 0.0,
+      cs.mean_length, sc.switches, sc.merges, (gdouble) sc.covered / sc.eligible);
   rds_tracker_config_free (cfg);
   g_unlink (tmp);
   g_free (tmp);
@@ -337,34 +352,56 @@ grid_run (const gchar * base_path, GArray * clip, guint probation, guint shadow,
 }
 
 static void
+grid_header (const gchar * title)
+{
+  g_test_message ("%s", title);
+  g_test_message ("  %5s %6s %7s %6s %7s %6s | %6s %7s %7s | %7s %6s %8s", "prob", "shadow", "iouDiff", "minIou",
+      "overall", "size", "clipSw", "clipCov", "clipLen", "sceneSw", "merges", "sceneCov");
+}
+
+/* Two stages per tracker (each run takes milliseconds): the life-cycle keys and the IOU minimum with the other match
+ * minimums at the sample configs' values, then the match minimums (overall score, size similarity, IOU) around the
+ * life-cycle values chosen in the first stage. */
+static void
 test_grid (void)
 {
   static const guint probations[] = { 2, 3, 5 };
   static const guint shadows_nvsort[] = { 15, 30, 60 }, shadows_iou[] = { 5, 15, 30 };
   static const gdouble iou_diffs[] = { 0.3, 0.5 }, min_ious[] = { 0.1, 0.3 };
+  static const gdouble min_overalls[] = { 0.1, 0.2, 0.3 }, min_sizes[] = { 0.3, 0.5 };
   const gchar *configs[] = { NVSORT_CONFIG, IOU_CONFIG };
-  gchar *path = g_build_filename (DUMP_DIR, "crosswalk-nvsort.txt", NULL);
-  /* the detections, whatever config tracked them */
-  GArray *clip = track_dets_load (path, NULL);
+  gchar *path;
+  GArray *clip;
 
   if (!g_getenv ("RDS_TRACKER_GRID")) {
     g_test_skip ("set RDS_TRACKER_GRID=1 to run the grid");
-    g_free (path);
     return;
   }
+  path = g_build_filename (DUMP_DIR, "crosswalk-nvsort.txt", NULL);
+  /* the detections, whatever config and core tracked them */
+  clip = track_dets_load (path, NULL, NULL);
   if (!clip)
     g_test_message ("no %s: the scripted scene only", path);
   for (guint c = 0; c < G_N_ELEMENTS (configs); c++) {
     const guint *shadows = c == 0 ? shadows_nvsort : shadows_iou;
 
-    g_test_message ("%s, varying:", configs[c]);
-    g_test_message ("  %5s %6s %8s %6s | %7s %8s %8s | %7s %6s %8s", "prob", "shadow", "iouDiff", "minIou",
-        "clipSw", "clipCov", "clipLen", "sceneSw", "merges", "sceneCov");
+    grid_header (configs[c]);
     for (guint p = 0; p < G_N_ELEMENTS (probations); p++)
       for (guint s = 0; s < 3; s++)
         for (guint d = 0; d < G_N_ELEMENTS (iou_diffs); d++)
-          for (guint m = 0; m < G_N_ELEMENTS (min_ious); m++)
-            grid_run (configs[c], clip, probations[p], shadows[s], iou_diffs[d], min_ious[m]);
+          for (guint m = 0; m < G_N_ELEMENTS (min_ious); m++) {
+            GridPoint g = { probations[p], shadows[s], iou_diffs[d], min_ious[m], 0.2, 0.5 };
+
+            grid_run (configs[c], clip, &g);
+          }
+    grid_header ("  match minimums:");
+    for (guint o = 0; o < G_N_ELEMENTS (min_overalls); o++)
+      for (guint z = 0; z < G_N_ELEMENTS (min_sizes); z++)
+        for (guint m = 0; m < G_N_ELEMENTS (min_ious); m++) {
+          GridPoint g = { 3, 30, 0.5, min_ious[m], min_overalls[o], min_sizes[z] };
+
+          grid_run (configs[c], clip, &g);
+        }
   }
   if (clip)
     g_array_unref (clip);

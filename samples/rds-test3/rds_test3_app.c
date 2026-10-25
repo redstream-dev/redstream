@@ -94,6 +94,16 @@ on_bus_message (GstBus * bus G_GNUC_UNUSED, GstMessage * msg, gpointer user_data
   return TRUE;
 }
 
+/* The element made from DeepStream factory @name, or NULL if this run has none. */
+static GstElement *
+element_for (const gchar ** factories, GstElement ** elements, guint n, const gchar * name)
+{
+  for (guint i = 0; i < n; i++)
+    if (strcmp (factories[i], name) == 0)
+      return elements[i];
+  return NULL;
+}
+
 static int
 run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const gchar * tracker_config)
 {
@@ -111,15 +121,18 @@ run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const
     }
     gst_bin_add (GST_BIN (pipeline), elements[i]);
   }
-  GstElement *mux = elements[0], *pgie = elements[1], *tiler = elements[tracker_config ? 3 : 2];
+  GstElement *mux = element_for (factories, elements, n_factories, "nvstreammux");
+  GstElement *pgie = element_for (factories, elements, n_factories, "nvinfer");
+  GstElement *tracker = element_for (factories, elements, n_factories, "nvtracker");
+  GstElement *tiler = element_for (factories, elements, n_factories, "nvmultistreamtiler");
   guint rows = (guint) sqrt (num_sources);
   guint cols = (guint) ceil (1.0 * num_sources / rows);
 
   g_object_set (mux, "batch-size", num_sources, "width", MUXER_WIDTH, "height", MUXER_HEIGHT,
       "batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC, NULL);
   g_object_set (pgie, "config-file-path", pgie_config, "batch-size", num_sources, NULL);
-  if (tracker_config)
-    g_object_set (elements[2], "ll-config-file", tracker_config, NULL);
+  if (tracker)
+    g_object_set (tracker, "ll-config-file", tracker_config, NULL);
   g_object_set (tiler, "rows", rows, "columns", cols, "width", TILED_WIDTH, "height", TILED_HEIGHT, NULL);
 
   for (guint i = 0; i < num_sources; i++) {
@@ -192,6 +205,13 @@ main (int argc, char **argv)
   guint num_sources = uris ? g_strv_length (uris) : 0;
   if (num_sources == 0) {
     g_printerr ("Usage: %s [--dry-run] [--pgie-config FILE] [--tracker-config FILE] URI [URI...]\n", argv[0]);
+    return 1;
+  }
+  if (tracker_config && !*tracker_config) {
+    g_printerr ("--tracker-config needs a file\n");
+    g_strfreev (uris);
+    g_free (pgie_config);
+    g_free (tracker_config);
     return 1;
   }
 
