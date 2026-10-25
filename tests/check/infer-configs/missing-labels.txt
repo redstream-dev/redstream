@@ -1,0 +1,6 @@
+# labelfile-path names a file that doesn't exist: an error naming it.
+[property]
+onnx-file=model.onnx
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo
+labelfile-path=no-such-labels.txt

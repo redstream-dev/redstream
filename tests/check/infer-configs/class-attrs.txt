@@ -1,0 +1,19 @@
+# [class-attrs-2] overrides one key; class 2 inherits the rest from [class-attrs-all]. Legacy "threshold" is
+# pre-cluster-threshold.
+[property]
+onnx-file=model.onnx
+num-detected-classes=4
+parse-bbox-func-name=RdsInferParseYolo
+
+[class-attrs-all]
+pre-cluster-threshold=0.4
+nms-iou-threshold=0.6
+topk=20
+roi-top-offset=10
+detected-max-w=500
+
+[class-attrs-2]
+nms-iou-threshold=0.3
+
+[class-attrs-3]
+threshold=0.9

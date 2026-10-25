@@ -1,0 +1,6 @@
+# Unbalanced brackets on line 5: an error that names the line.
+property:
+  onnx-file: model.onnx
+  num-detected-classes: 2
+  offsets: [1.0, 2.0
+  parse-bbox-func-name: RdsInferParseYolo

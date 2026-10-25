@@ -1,0 +1,7 @@
+# One offset for a GRAY model (one channel).
+[property]
+onnx-file=model.onnx
+num-detected-classes=1
+parse-bbox-func-name=RdsInferParseYolo
+model-color-format=2
+offsets=128

@@ -1,0 +1,28 @@
+# Keys accepted as no-ops: one warning each. Two of them appear twice (eps also in a class group) and still warn
+# once. "no-such-key" and the [extra] group are unknown: warnings too.
+[property]
+onnx-file=model.onnx
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo
+gpu-id=1
+workspace-size=1024
+force-implicit-batch-dim=1
+enable-dla=0
+use-dla-core=0
+tensor-meta-pool-size=8
+scaling-compute-hw=1
+is-classifier=0
+crop-objects-to-roi-boundary=1
+no-such-key=1
+
+[class-attrs-all]
+eps=0.2
+group-threshold=1
+minBoxes=3
+dbscan-min-score=0.5
+
+[class-attrs-1]
+eps=0.3
+
+[extra]
+foo=bar

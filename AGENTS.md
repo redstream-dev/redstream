@@ -140,7 +140,9 @@ gst/rdsvideo/      libgstrdsvideo plugin: rdsvideodec (rocDecode, gstrdsvideodec
                    (gstrdsvideoconvert.c), shared helpers in rds-video-util
 gst/rdsmux/        libgstrdsmux plugin: rdsstreammux (GstAggregator, gstrdsstreammux.c) and rdsstreamdemux
                    (gstrdsstreamdemux.c)
-gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (MIGraphX; skeleton so far). Optional (-Dinfer, default auto):
+gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (MIGraphX; element skeleton so far). rds-infer-config parses
+                   nvinfer key-file/YAML configs from one key table (static rdsinfer-core library, shared with
+                   the tests; corpus in tests/check/infer-configs). Optional (-Dinfer, default auto):
                    needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml and json-glib
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources
 samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)

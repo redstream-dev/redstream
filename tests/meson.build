@@ -104,6 +104,12 @@ test('element_streammux', element_streammux_exe, args : ['-p', '/gpu/mux'],
 if rds_infer_enabled
   test('element_infer_cpu', executable('element_infer', 'check' / 'element_infer.c', dependencies : test_deps),
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+  # The config parser on its own, against the corpus in check/infer-configs. It uses no GStreamer, so it gets the
+  # environment without plugin paths.
+  test('infer_config', executable('infer_config', 'check' / 'infer_config.c',
+      dependencies : [rdsinfer_core_dep],
+      c_args : ['-DRDS_INFER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'infer-configs')]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap')
 endif
 
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',

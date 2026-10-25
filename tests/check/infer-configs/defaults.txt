@@ -1,0 +1,5 @@
+# Only the keys a detector must have: everything else takes its default.
+[property]
+onnx-file=model.onnx
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo

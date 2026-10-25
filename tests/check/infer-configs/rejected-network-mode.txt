@@ -1,0 +1,6 @@
+# INT8 is not supported: an error.
+[property]
+onnx-file=model.onnx
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo
+network-mode=1

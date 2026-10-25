@@ -1,0 +1,6 @@
+# The deprecated DBSCAN switch: an error.
+[property]
+onnx-file=model.onnx
+num-detected-classes=2
+parse-bbox-func-name=RdsInferParseYolo
+enable-dbscan=1

@@ -1,0 +1,4 @@
+# A detector without parse-bbox-func-name would use nvinfer's internal resnet parser, which rdsinfer lacks: an error.
+[property]
+onnx-file=model.onnx
+num-detected-classes=2

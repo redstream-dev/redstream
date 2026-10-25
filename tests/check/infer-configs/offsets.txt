@@ -1,0 +1,6 @@
+# offsets as a ';' list (as in nvinfer's documentation).
+[property]
+onnx-file=model.onnx
+num-detected-classes=1
+parse-bbox-func-name=RdsInferParseYolo
+offsets=77.5;21.2;11.8
