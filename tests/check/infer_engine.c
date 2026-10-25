@@ -673,7 +673,7 @@ test_output_file (void)
   rds_infer_engine_free (e);
   g_free (nodir);
 
-  /* an output file that can't be written: built, not saved, a warning names it */
+  /* an output file that can't be written: an error before building (OUTPUT is set ahead of build_program) */
   nodir = g_build_filename (dir, "ro", "x.mxr", NULL);
   {
     gchar *ro = g_path_get_dirname (nodir);
@@ -683,12 +683,17 @@ test_output_file (void)
       g_test_message ("running as root: a 0555 directory is still writable, unwritable case skipped");
     } else {
       opts.output_file = nodir;
-      e = rds_infer_engine_open (&opts, &err);
-      g_assert_no_error (err);
-      g_assert_null (rds_infer_engine_get_program_path (e));
-      g_assert_null (rds_infer_engine_get_manifest_path (e));
-      g_assert_true (has_warning (e, nodir));
-      rds_infer_engine_free (e);
+      g_assert_null (rds_infer_engine_open (&opts, &err));
+      g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_OUTPUT);
+      g_test_message ("%s", err->message);
+      g_assert_nonnull (strstr (err->message, nodir));
+      g_clear_error (&err);
+      /* also when forced */
+      opts.force_rebuild = TRUE;
+      g_assert_null (rds_infer_engine_open (&opts, &err));
+      g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_OUTPUT);
+      g_clear_error (&err);
+      opts.force_rebuild = FALSE;
     }
     g_chmod (ro, 0755);
     g_free (ro);
@@ -1057,6 +1062,7 @@ test_errors (void)
   g_assert_null (rds_infer_engine_open (&opts, &err));
   g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_DEVICE);
   g_test_message ("%s", err->message);
+  g_assert_true (g_str_has_prefix (err->message, "gpu-id 99: no such GPU"));
   g_clear_error (&err);
 
   /* Not a model. */

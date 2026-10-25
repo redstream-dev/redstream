@@ -4,6 +4,7 @@
 # and config errors, then rdsinfer in gst-launch-1.0 loading the program instead of building it. An empty
 # <rds-compile> (built without rdsinfer) or no ROCm device skips; an empty <gst-launch-1.0> (not found, or a sanitized
 # build, whose plugins it can't load) skips the element checks.
+# <work dir>/rds-compile is removed on exit.
 set -eu
 compile=$1 launch=$2 model=$3 work=$4
 
@@ -17,7 +18,12 @@ if [ ! -e /dev/kfd ]; then
 fi
 
 dir=$work/rds-compile
-rm -rf "$dir"
+cleanup() {
+  [ ! -d "$dir/ro" ] || chmod u+w "$dir/ro"
+  rm -rf "$dir"
+}
+trap cleanup EXIT
+cleanup
 mkdir -p "$dir"
 cp "$model" "$dir/scale2.onnx"
 cfg=$dir/cfg.txt
@@ -81,29 +87,49 @@ run 0 -c "$cfg" -o "$dir/custom.mxr"
 run 2 -c "$cfg" -o "$dir/custom.mxr"
 run 0 -c "$cfg" -o "$dir/sub/x.mxr"
 [ -f "$dir/sub/x.mxr.json" ] || fail '-o: the directory was not made'
-# a directory that can't be written: built but not saved, an error
+# a name that isn't .mxr: a warning, written anyway
+run 0 -c "$cfg" -o "$dir/prog.bin"
+[ "$out" = "$dir/prog.bin" ] && [ -f "$dir/prog.bin.json" ] || fail '-o prog.bin: program or manifest missing'
+echo "$err" | grep -q '^rds-compile: warning: -o .*not a \.mxr name' || fail '-o prog.bin: no warning'
+# a directory that can't be written: an error before building
 mkdir -m 0555 "$dir/ro"
 if [ -w "$dir/ro" ]; then
   echo 'running as root: a 0555 directory is still writable, unwritable case skipped'
 else
   run 1 -c "$cfg" -o "$dir/ro/x.mxr"
   [ -z "$out" ] || fail "unwritable -o: printed $out"
+  echo "$err" | grep -qF "rds-compile: can't write $dir/ro/x.mxr: " || fail 'unwritable -o: unexpected message'
+  if echo "$err" | grep -q '^rds-compile: built '; then
+    fail 'unwritable -o: built anyway'
+  fi
 fi
-chmod 0755 "$dir/ro"
+chmod u+w "$dir/ro"
 
 # bad options: exit 1, an error prefixed with the program name, nothing on stdout
-for args in "-c $cfg --fp16 --fp32" "-c $cfg -b 0" "-c $cfg -b 1025" "-c $cfg -g -1" "-c $cfg extra" \
-    "-c $cfg --no-such-option" "-b 2" "-c $cfg -g 99"; do
-  # shellcheck disable=SC2086
-  run 1 $args
-  [ -z "$out" ] || fail "$args: printed $out"
-  echo "$err" | grep -q '^rds-compile: ' || fail "$args: no prefixed error"
-done
-run 1 -c "$dir/missing.txt"
+bad_option() {
+  run 1 "$@"
+  [ -z "$out" ] || fail "$*: printed $out"
+  echo "$err" | grep -q '^rds-compile: ' || fail "$*: no prefixed error"
+}
+bad_option -c "$cfg" --fp16 --fp32
+bad_option -c "$cfg" -b 0
+bad_option -c "$cfg" -b 1025
+bad_option -c "$cfg" -b -2147483648
+echo "$err" | grep -q 'the batch size must be' || fail '-b -2147483648: no range error'
+bad_option -c "$cfg" -b two
+bad_option -c "$cfg" -g -1
+bad_option -c "$cfg" -g -2147483648
+echo "$err" | grep -q 'the GPU id must be' || fail '-g -2147483648: no range error'
+bad_option -c "$cfg" extra
+bad_option -c "$cfg" --no-such-option
+bad_option -b 2
+bad_option -c "$cfg" -g 99
+echo "$err" | grep -q '^rds-compile: gpu-id 99: no such GPU' || fail '-g 99: unexpected message'
+bad_option -c "$dir/missing.txt"
 
 # a bad config: the element's own message
 run 1 -c "$bad"
-echo "$err" | grep -q "^rds-compile: $bad:onnx-file: " || fail 'bad config: unexpected message'
+echo "$err" | grep -qF "rds-compile: $bad:onnx-file: " || fail 'bad config: unexpected message'
 compile_msg=$(echo "$err" | sed -n 's/^rds-compile: //p' | head -n 1)
 
 if [ -z "$launch" ]; then
@@ -126,7 +152,7 @@ echo "element: $element_msg"
 
 pipeline "$cfg" || { cat "$dir/launch.log"; fail 'the pipeline failed'; }
 grep "rdsinfer" "$dir/launch.log" | grep -E 'loaded|built' || true
-grep -q "loaded $prog\$" "$dir/launch.log" || fail "the element did not load $prog"
+grep -qF "loaded $prog" "$dir/launch.log" || fail "the element did not load $prog"
 if grep -q "built .* because" "$dir/launch.log"; then
   fail 'the element built a program'
 fi

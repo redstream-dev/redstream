@@ -738,7 +738,7 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
     return NULL;
   if (opts->gpu_id >= (guint) n_devices) {
     g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_DEVICE,
-        "gpu-id %u: %d ROCm device%s visible", opts->gpu_id, n_devices, n_devices == 1 ? "" : "s");
+        "gpu-id %u: no such GPU (%d ROCm device%s visible)", opts->gpu_id, n_devices, n_devices == 1 ? "" : "s");
     return NULL;
   }
   DeviceScope scope (opts->gpu_id);
@@ -853,6 +853,16 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
     gboolean saved = FALSE;
 
     if (opts->output_file) {
+      gchar *d = g_path_get_dirname (opts->output_file);
+      gboolean ok = dir_writable (d);
+
+      /* Fail before the (slow) build, not after it. */
+      if (!ok)
+        g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_OUTPUT, "can't write %s: %s is not "
+            "writable", opts->output_file, d);
+      g_free (d);
+      if (!ok)
+        return NULL;
       targets[0] = opts->output_file;
       n_targets = 1;
     }
@@ -873,9 +883,6 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
           g_ptr_array_add (e->warnings, g_strdup_printf ("can't save the compiled program: %s", err->message));
           g_clear_error (&err);
         }
-      } else if (opts->output_file) {
-        g_ptr_array_add (e->warnings, g_strdup_printf ("can't save the compiled program to %s: %s is not "
-                "writable", opts->output_file, d));
       }
       g_free (d);
     }

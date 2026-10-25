@@ -425,6 +425,7 @@ open_engine (GstRdsInfer * self, GError ** error)
     g_error_free (err);
     return FALSE;
   }
+  /* tests/tools/rds_compile.sh matches these two messages. */
   if (rds_infer_engine_was_built (self->engine))
     GST_INFO_OBJECT (self, "built %s because %s", GST_STR_NULL (rds_infer_engine_get_program_path (self->engine)),
         rds_infer_engine_get_build_reason (self->engine));

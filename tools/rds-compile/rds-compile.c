@@ -18,8 +18,31 @@ enum
   EXIT_UP_TO_DATE = 2,
 };
 
-/* -b and -g unset */
-#define UNSET G_MININT
+/* An integer option and whether it was given (any value can be typed, so none can mean "unset") */
+typedef struct
+{
+  gint value;
+  gboolean set;
+} IntOption;
+
+static IntOption batch_opt, gpu_opt;
+
+static gboolean
+parse_int_option (const gchar * name, const gchar * value, gpointer data, GError ** error)
+{
+  IntOption *o = g_str_equal (name, "-b") || g_str_equal (name, "--batch-size") ? &batch_opt : &gpu_opt;
+  gint64 v;
+
+  (void) data;
+  if (!g_ascii_string_to_signed (value, 10, G_MININT, G_MAXINT, &v, NULL)) {
+    g_set_error (error, G_OPTION_ERROR, G_OPTION_ERROR_BAD_VALUE, "Cannot parse integer value \"%s\" for %s", value,
+        name);
+    return FALSE;
+  }
+  o->value = (gint) v;
+  o->set = TRUE;
+  return TRUE;
+}
 
 static void
 print_warnings (GPtrArray * warnings)
@@ -28,11 +51,13 @@ print_warnings (GPtrArray * warnings)
     g_printerr (PROG ": warning: %s\n", (const gchar *) g_ptr_array_index (warnings, i));
 }
 
-/* An engine error as the element reports it: the config file and key first. A missing GPU is about gpu-id. */
+/* An engine error as the element reports it: the config file and key first. A missing GPU is about gpu-id, an
+ * unwritable output about -o. */
 static void
 print_engine_error (const RdsInferConfig * cfg, GError * err)
 {
-  if (g_error_matches (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_DEVICE))
+  if (g_error_matches (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_DEVICE)
+      || g_error_matches (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_OUTPUT))
     g_printerr (PROG ": %s\n", err->message);
   else
     g_printerr (PROG ": %s:onnx-file: %s\n", cfg->config_path, err->message);
@@ -42,14 +67,13 @@ int
 main (int argc, char **argv)
 {
   gchar *config = NULL, *output = NULL;
-  gint batch = UNSET, gpu = UNSET;
   gboolean fp16 = FALSE, fp32 = FALSE, force = FALSE;
   const GOptionEntry entries[] = {
     {"config", 'c', 0, G_OPTION_ARG_FILENAME, &config, "The rdsinfer (nvinfer) config file", "CONFIG"},
-    {"batch-size", 'b', 0, G_OPTION_ARG_INT, &batch, "Override batch-size", "BATCH"},
+    {"batch-size", 'b', 0, G_OPTION_ARG_CALLBACK, (gpointer) parse_int_option, "Override batch-size", "BATCH"},
     {"fp16", 0, 0, G_OPTION_ARG_NONE, &fp16, "Build for FP16 (network-mode=2)", NULL},
     {"fp32", 0, 0, G_OPTION_ARG_NONE, &fp32, "Build for FP32 (network-mode=0)", NULL},
-    {"gpu-id", 'g', 0, G_OPTION_ARG_INT, &gpu, "Override gpu-id", "GPU"},
+    {"gpu-id", 'g', 0, G_OPTION_ARG_CALLBACK, (gpointer) parse_int_option, "Override gpu-id", "GPU"},
     {"output", 'o', 0, G_OPTION_ARG_FILENAME, &output,
         "Write the program here (and its manifest to OUT.mxr.json) instead of the cache name", "OUT.mxr"},
     {"force", 0, 0, G_OPTION_ARG_NONE, &force, "Rebuild even when the program is up to date", NULL},
@@ -84,30 +108,32 @@ main (int argc, char **argv)
     g_printerr (PROG ": --fp16 and --fp32 exclude each other\n");
     goto out;
   }
-  if (batch != UNSET && (batch < 1 || batch > RDS_INFER_MAX_BATCH_SIZE)) {
-    g_printerr (PROG ": -b %d: the batch size must be 1..%d\n", batch, RDS_INFER_MAX_BATCH_SIZE);
+  if (batch_opt.set && (batch_opt.value < 1 || batch_opt.value > RDS_INFER_MAX_BATCH_SIZE)) {
+    g_printerr (PROG ": -b %d: the batch size must be 1..%d\n", batch_opt.value, RDS_INFER_MAX_BATCH_SIZE);
     goto out;
   }
-  if (gpu != UNSET && gpu < 0) {
-    g_printerr (PROG ": -g %d: the GPU id must be >= 0\n", gpu);
+  if (gpu_opt.set && gpu_opt.value < 0) {
+    g_printerr (PROG ": -g %d: the GPU id must be >= 0\n", gpu_opt.value);
     goto out;
   }
+  if (output && !g_str_has_suffix (output, ".mxr"))
+    g_printerr (PROG ": warning: -o %s: not a .mxr name; the program is written there anyway\n", output);
 
   /* The element's steps: load, apply the overrides, validate. */
   if (!(cfg = rds_infer_config_load (config, &err))) {
     g_printerr (PROG ": %s\n", err->message);
     goto out;
   }
-  if (batch != UNSET) {
-    cfg->batch_size = (guint) batch;
+  if (batch_opt.set) {
+    cfg->batch_size = (guint) batch_opt.value;
     overridden[n_over++] = "batch-size";
   }
   if (fp16 || fp32) {
     cfg->network_mode = fp16 ? 2 : 0;
     overridden[n_over++] = "network-mode";
   }
-  if (gpu != UNSET) {
-    cfg->gpu_id = (guint) gpu;
+  if (gpu_opt.set) {
+    cfg->gpu_id = (guint) gpu_opt.value;
     overridden[n_over++] = "gpu-id";
   }
   overridden[n_over] = NULL;
@@ -122,7 +148,8 @@ main (int argc, char **argv)
   }
   opts.output_file = output;
 
-  /* Up to date: the lookup the element runs finds a program it would load. */
+  /* Up to date: the lookup the element runs finds a program it would load. This really opens the engine (loads the
+   * program and does the warm-up run), on purpose: the check is the element's own lookup, not a copy of it. */
   if (!force) {
     opts.no_build = TRUE;
     if ((e = rds_infer_engine_open (&opts, &err))) {

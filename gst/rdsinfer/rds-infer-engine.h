@@ -32,6 +32,7 @@ typedef enum
   RDS_INFER_ENGINE_ERROR_DEVICE,        /* no such GPU, or a HIP call failed */
   RDS_INFER_ENGINE_ERROR_MIGRAPHX,      /* a MIGraphX call failed; MIGraphX prints its own reason to stderr */
   RDS_INFER_ENGINE_ERROR_NOT_CACHED,    /* no_build and no matching program; the message says why (the build reason) */
+  RDS_INFER_ENGINE_ERROR_OUTPUT,        /* output_file's directory can't be written (checked before building) */
 } RdsInferEngineError;
 
 typedef struct
@@ -44,7 +45,7 @@ typedef struct
   gboolean force_rebuild;               /* never load a cached program */
   gboolean no_build;                    /* only load: fail with NOT_CACHED where a program would be built */
   /* Look up and save the program only here (+ ".json"), instead of engine_file and the cache names; NULL: unset.
-   * When it can't be written, the program isn't cached (a warning says why). */
+   * When a build is needed and its directory can't be written, fails with OUTPUT before building. */
   const gchar *output_file;
 } RdsInferEngineOptions;
 

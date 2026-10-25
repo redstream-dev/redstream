@@ -321,7 +321,8 @@ rds-compile -c CONFIG [-b BATCH] [--fp16|--fp32] [-g GPU] [-o OUT.mxr] [--force]
 - `-b`, `--fp16`/`--fp32` and `-g` override `batch-size`, `network-mode` and `gpu-id`; `--fp16` with `--fp32` is an
   error. Without `-o` the program is looked up and written like the element does (`model-engine-file`, then the
   cache name next to the ONNX file, then `$XDG_CACHE_HOME/redstream/`). `-o` looks up and writes only that file,
-  with its manifest next to it as `OUT.mxr.json`; point `model-engine-file` at it.
+  with its manifest next to it as `OUT.mxr.json` (an unwritable directory is an error before building); point
+  `model-engine-file` at it.
 - Prints the program's path on stdout; the build reason, warnings and errors (with the element's messages) on
   stderr.
 - Exit status: 0 built, 1 error, 2 already up to date (the element would load it; `--force` rebuilds).
