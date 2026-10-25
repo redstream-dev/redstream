@@ -1,6 +1,7 @@
-# Plugin-private code shared by the plugin and the tests: the config parser (YAML read through rds-plugin-common).
+# Plugin-private code shared by the plugin and the tests: the config parser (YAML read through rds-plugin-common) and
+# the tracking core (GLib only).
 rdstracker_core = static_library('rdstracker-core',
-  files('rds-tracker-config.c'),
+  files('rds-tracker-config.c', 'rds-tracker-core.c'),
   c_args : ['-DG_LOG_DOMAIN="rdstracker"'],
   dependencies : [dependency('glib-2.0'), rds_plugin_common_dep],
   gnu_symbol_visibility : 'hidden',

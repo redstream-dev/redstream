@@ -242,6 +242,9 @@ if rds_tracker_enabled
       dependencies : [rdstracker_core_dep],
       c_args : ['-DRDS_TRACKER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'tracker-configs')]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
+  # The tracking core on scripted sequences (life cycle, IDs, association, reset modes); prints a 4 x 50 x 1000 timing.
+  test('tracker_core', executable('tracker_core', 'check' / 'tracker_core.c', dependencies : [rdstracker_core_dep]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap')
   # The element: registration, properties and a system-memory batch passing through with its meta (cpu).
   element_tracker_exe = executable('element_tracker', 'check' / 'element_tracker.c', dependencies : test_deps)
   test('element_tracker_cpu', element_tracker_exe, args : ['-p', '/cpu/tracker'],
