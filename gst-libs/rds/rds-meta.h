@@ -55,12 +55,33 @@ typedef enum
   RDS_USER_META,
   /* 8 .. 4095: reserved for Redstream components. The ones DeepStream defines keep their documented values. */
   RDS_INFER_TENSOR_OUTPUT_META = 12,                /* RdsInferTensorMeta (rds-infer-meta.h) in a user meta */
+  /* the tracker's misc meta types (not emitted by rdstracker yet) */
+  RDS_TRACKER_PAST_FRAME_META = 15,
+  RDS_TRACKER_BATCH_REID_META,
+  RDS_TRACKER_OBJ_REID_META,
+  RDS_TRACKER_TERMINATED_LIST_META,
+  RDS_TRACKER_SHADOW_LIST_META,
+  RDS_OBJ_VISIBILITY,
+  RDS_OBJ_IMAGE_FOOT_LOCATION,
+  RDS_OBJ_WORLD_FOOT_LOCATION,
+  RDS_OBJ_IMAGE_CONVEX_HULL,
   RDS_RESERVED_META = 4095,
   RDS_GST_CUSTOM_META = 4096,
   RDS_BATCH_GST_META,                               /* RdsMeta wrapping an RdsBatchMeta (rds-gst-meta.h) */
   RDS_START_USER_META = RDS_GST_CUSTOM_META + 4096 + 1,
   RDS_FORCE32_META = 0x7FFFFFFF,
 } RdsMetaType;
+
+/* The state of a tracked target, as tracker meta reports it. */
+typedef enum
+{
+  RDS_TRACKER_STATE_EMPTY = 0,
+  RDS_TRACKER_STATE_ACTIVE = 1,
+  RDS_TRACKER_STATE_INACTIVE = 2,
+  RDS_TRACKER_STATE_TENTATIVE = 3,
+  RDS_TRACKER_STATE_PROJECTED = 4,
+  RDS_TRACKER_STATE_QUASIACTIVE = 5,
+} RdsTrackerState;
 
 typedef struct _RdsBatchMeta RdsBatchMeta;
 typedef struct _RdsMetaPool RdsMetaPool;            /* opaque */

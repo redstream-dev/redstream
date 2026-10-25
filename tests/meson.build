@@ -48,9 +48,10 @@ foreach t : cpu_tests
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 endforeach
 
-# plugin_load also checks that rdsinfer loads when the build has it.
+# plugin_load also checks that rdsinfer and rdstracker load when the build has them.
 test('plugin_load', executable('plugin_load', 'check' / 'plugin_load.c', dependencies : test_deps,
-    c_args : ['-DRDS_HAVE_INFER=@0@'.format(rds_infer_enabled ? 1 : 0)]),
+    c_args : ['-DRDS_HAVE_INFER=@0@'.format(rds_infer_enabled ? 1 : 0),
+      '-DRDS_HAVE_TRACKER=@0@'.format(rds_tracker_enabled ? 1 : 0)]),
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
 # GPU-free tests that call private library symbols: they link only the static internal copy of libgstrds
@@ -231,6 +232,13 @@ if rds_infer_enabled
   test('pipeline_infer_soak', pipeline_infer_exe, args : ['-p', '/gpu/infer-soak'],
     suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,
     depends : rds_plugins)
+endif
+
+if rds_tracker_enabled
+  # The element: registration, properties and a system-memory batch passing through with its meta (cpu).
+  element_tracker_exe = executable('element_tracker', 'check' / 'element_tracker.c', dependencies : test_deps)
+  test('element_tracker_cpu', element_tracker_exe, args : ['-p', '/cpu/tracker'],
+    suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 endif
 
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',
