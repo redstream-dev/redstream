@@ -117,6 +117,13 @@ if rds_infer_enabled
       dependencies : [rdsinfer_core_dep],
       link_language : 'cpp'),
     suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
+  # The preprocessing kernel against its CPU reference (check/infer-preprocess-ref.h) and against
+  # rds_buf_surf_transform; prints the max differences and the batch timing. Internal: the static libgstrds only.
+  test('infer_preprocess', executable('infer_preprocess', 'check' / 'infer_preprocess.c',
+      dependencies : [rds_internal_dep, rdsinfer_core_dep, rdsinfer_preprocess_dep, hip_dep,
+        cc.find_library('m', required : false)],
+      link_language : 'cpp'),
+    suite : 'gpu', env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 300)
 
   # Test parser modules (never installed), loaded by path. The fixture is a DeepStream-style parser compiled against
   # the compat header, from two translation units that both include the parser header; the same sources are built

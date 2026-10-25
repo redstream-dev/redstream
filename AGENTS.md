@@ -136,7 +136,8 @@ gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
                      (C++) adds the custom parser ABI names, for parser libraries only
   rds-infer*.h       rdsinfer types (C) and the custom bbox parser ABI (rds-infer-custom-impl.h, C++); headers only
   rds-transform      rds_buf_surf_transform: batched crop/scale/colour conversion (NvBufSurfTransform-shaped)
-  rds-transform-kernels.hip  its HIP kernels (amdclang++, linked in as an object)
+  rds-transform-kernels.hip  its HIP kernels (amdclang++, linked in as an object); their device helpers
+                     (sampling, BT.601 colour) are in rds-kernel-common.h, shared with rdsinfer's kernel
   *-private.h        internal headers, not installed (rds-hip-private.h is the only HIP include)
 gst/rdsvideo/      libgstrdsvideo plugin: rdsvideodec (rocDecode, gstrdsvideodec.c), rdsvideoconvert
                    (gstrdsvideoconvert.c), shared helpers in rds-video-util
@@ -145,9 +146,11 @@ gst/rdsmux/        libgstrdsmux plugin: rdsstreammux (GstAggregator, gstrdsstrea
 gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (MIGraphX; element skeleton so far). rds-infer-config parses
                    nvinfer key-file/YAML configs from one key table; rds-infer-parse loads custom parser libraries
                    (dlopen, ABI version check) and has the built-in YOLO parser; rds-infer-post does the detection
-                   post-processing (letterbox geometry, NMS, ROI/size filters). All are in the static rdsinfer-core
-                   library (C and C++: link it with link_language 'cpp'), shared with the tests; config corpus in
-                   tests/check/infer-configs, test parser modules built from tests/check/infer-parser-*. Optional
+                   post-processing (letterbox geometry, NMS, ROI/size filters). These are in the static
+                   rdsinfer-core library (C and C++: link it with link_language 'cpp'), shared with the tests; the
+                   letterbox + normalisation kernel (rds-infer-preprocess.hip) is the static rdsinfer-preprocess;
+                   config corpus in tests/check/infer-configs, test parser modules built from
+                   tests/check/infer-parser-*. Optional
                    (-Dinfer, default auto): needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml
                    and json-glib
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources
