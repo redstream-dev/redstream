@@ -1012,14 +1012,13 @@ rds_infer_engine_free (RdsInferEngine * e)
   if (!e)
     return;
   {
-    /* The program's GPU resources are released on its device. */
+    /* The program's GPU resources are released on its device. A failure here is dropped: the engine never logs,
+     * and teardown has no caller to hand an error to. */
     DeviceScope scope (e->gpu_id);
     GError *err = NULL;
 
-    if (!RDS_MGX_CHECK ("migraphx::program::~program", &err, e->program = migraphx::program ())) {
-      g_warning ("%s", err->message);
+    if (!RDS_MGX_CHECK ("migraphx::program::~program", &err, e->program = migraphx::program ()))
       g_error_free (err);
-    }
   }
   g_free (e->program_path);
   g_free (e->manifest_path);

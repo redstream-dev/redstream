@@ -1,7 +1,7 @@
 /* rdsinfer: registration, pad templates, properties and how they override the config file (cpu); start errors,
- * the tensor path on the scale2 test model (output = 2 x input) against the CPU preprocessing reference, partial
- * batches, tensor meta through rdsstreamdemux, interval, the detector path with the fixture parser, and concurrent
- * metadata readers (gpu, skipped without a ROCm device).
+ * the tensor path on the scale2 test model (output = 2 x input) against the CPU preprocessing reference, a restart,
+ * partial batches, tensor meta through rdsstreamdemux, interval, the detector path with the fixture parser, and
+ * concurrent metadata readers (gpu, skipped without a ROCm device).
  * The element's test hooks (gstrdsinfer.h) are looked up in the loaded plugin.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
@@ -722,6 +722,80 @@ test_tensor_meta (void)
   g_free (cfg);
 }
 
+/* Pushes one 2-slot 96x64 NV12 batch (pattern @seed) through @h and checks both frames' tensor meta (TENSOR_CONFIG,
+ * as test_tensor_meta) and its unique_id. */
+static void
+push_check_tensor (GstHarness * h, guint32 seed, guint unique_id)
+{
+  static const gfloat offsets[3] = { 10, 20, 30 };
+  GstBuffer *in = make_batch (RDS_BUF_COLOR_FORMAT_NV12, 96, 64, 2, 2, seed), *out;
+  RdsBufSurface *s = rds_buffer_get_surface (in);
+
+  g_assert_cmpint (gst_harness_push (h, gst_buffer_ref (in)), ==, GST_FLOW_OK);
+  out = gst_harness_pull (h);
+  for (guint i = 0; i < 2; i++) {
+    RdsInferTensorMeta *tm = frame_tensor_meta (nth_frame (out, i));
+    HostImage src;
+
+    g_assert_nonnull (tm);
+    g_assert_cmpuint (tm->unique_id, ==, unique_id);
+    snapshot (s, i, &src);
+    check_tensor_image (&src, tm->out_buf_ptrs_host[0], 64, 48, 0, 2, 64, 43, TRUE, 0.5f, offsets);
+    host_image_clear (&src);
+  }
+  gst_buffer_unref (out);
+  gst_buffer_unref (in);
+}
+
+/* The same element PLAYING -> NULL -> PLAYING: NULL releases the config, engine, parser and output sets, the
+ * restart builds them again (a property set in between applies) and the results are right. One-time warnings are
+ * once per element, not per start: the raw-output one is not posted again. */
+static void
+test_restart (void)
+{
+  gchar *cfg = write_file ("restart.txt", TENSOR_CONFIG "batch-size=2\n"), *texts;
+  const gchar *caps = "video/x-raw(memory:RDS), format=NV12, width=96, height=64, framerate=30/1";
+  GstBus *bus = gst_bus_new ();
+  GstElement *e;
+  GstHarness *h;
+  guint n_sets, n_free;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  load_hooks ();
+  e = new_infer (cfg);
+  g_object_set (e, "unique-id", 7, "raw-output-file-write", TRUE, NULL);
+  /* before the harness starts it, so start's warnings reach the bus */
+  gst_element_set_bus (e, bus);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 96, 64);
+  pop_messages (bus, GST_MESSAGE_WARNING, &texts);
+  g_assert_nonnull (strstr (texts, "raw-output-file-write"));
+  g_free (texts);
+  for (guint b = 0; b < 2; b++)
+    push_check_tensor (h, 11 + b, 7);
+
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+  g_assert_false (hook_get_output_sets (e, &n_sets, &n_free));
+  g_object_set (e, "unique-id", 8, NULL);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_PLAYING), ==, GST_STATE_CHANGE_SUCCESS);
+  /* the element's pads lost their sticky events */
+  g_assert_true (gst_harness_push_event (h, gst_event_new_stream_start ("restart")));
+  gst_harness_set_caps_str (h, caps, caps);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 0);
+  g_free (texts);
+  g_assert_true (hook_get_output_sets (e, &n_sets, &n_free));
+  g_assert_cmpuint (n_sets, ==, 0);
+  for (guint b = 0; b < 3; b++)
+    push_check_tensor (h, 21 + b, 8);
+  /* a new pool: one set, reused for each batch */
+  g_assert_true (hook_get_output_sets (e, &n_sets, &n_free));
+  g_assert_cmpuint (n_sets, ==, 1);
+  g_assert_cmpuint (n_free, ==, 1);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
+  harness_teardown_with_bus (h, bus);
+  g_free (cfg);
+}
+
 /* ---- gpu: through rdsstreammux and rdsstreamdemux ---- */
 
 typedef struct
@@ -1310,6 +1384,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer/start-errors", test_start_errors);
   g_test_add_func ("/gpu/infer/no-batch-meta", test_no_batch_meta);
   g_test_add_func ("/gpu/infer/tensor-meta", test_tensor_meta);
+  g_test_add_func ("/gpu/infer/restart", test_restart);
   g_test_add_func ("/gpu/infer/demux", test_demux);
   g_test_add_func ("/gpu/infer/interval", test_interval);
   g_test_add_func ("/gpu/infer/detector", test_detector);

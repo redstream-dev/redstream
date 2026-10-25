@@ -338,7 +338,7 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `model-engine-file` | path | none |  | supported | a compiled MIGraphX program (`.mxr`), see "Models and compiled programs" |
 | `labelfile-path` | path | none |  | supported | see "Config files" |
 | `infer-dims` | dims | none | 1..2147483647 | supported | `C;H;W` of one input image (also for `network-input-order=1`); required when the model's height or width is symbolic |
-| `output-blob-names` | string list | none |  | supported | read and checked, but every output of the model goes to the parser and the tensor meta |
+| `output-blob-names` | string list | none |  | accepted no-op | all outputs are passed to the parser and to the tensor meta |
 | `batch-size` | uint | `1` (ours) | 1..1024 | supported | the program is compiled for this batch size; the model's batch dimension must be symbolic or equal to it |
 | `network-mode` | int | `0` (ours) | 0..3 | supported | accepted values: 0, 2 (FP32, FP16; inputs and outputs stay FP32). INT8 (1) and BEST (3) fail at start |
 | `network-type` | int | `0` (ours) | 0..100 | supported | accepted values: 0, 100 (detector; no post-processing, tensor meta only). Classifiers (1) and segmentation (2, 3) fail at start |

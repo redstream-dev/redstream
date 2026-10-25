@@ -4,7 +4,7 @@
 
 #include <gst/gst.h>
 /* after GLib/GStreamer: HIP defines __noinline__ */
-#include <hip/hip_runtime_api.h>
+#include "rds-infer-device.h"
 
 GST_DEBUG_CATEGORY_EXTERN (gst_rds_infer_debug);
 #define GST_CAT_DEFAULT gst_rds_infer_debug
@@ -31,7 +31,7 @@ static void
 set_free (RdsInferOutputPool * pool, RdsInferOutputSet * set)
 {
   int prev = 0;
-  gboolean switched = hipGetDevice (&prev) == hipSuccess && hipSetDevice ((int) pool->gpu_id) == hipSuccess;
+  gboolean switched = rds_infer_device_enter (pool->gpu_id, &prev);
 
   for (guint i = 0; i < pool->n_outputs; i++) {
     if (set->dev[i])
@@ -40,7 +40,7 @@ set_free (RdsInferOutputPool * pool, RdsInferOutputSet * set)
       (void) hipHostFree (set->host[i]);
   }
   if (switched)
-    (void) hipSetDevice (prev);
+    rds_infer_device_restore (prev);
   g_free (set->dev);
   g_free (set->host);
   g_free (set);

@@ -51,16 +51,14 @@ print_warnings (GPtrArray * warnings)
     g_printerr (PROG ": warning: %s\n", (const gchar *) g_ptr_array_index (warnings, i));
 }
 
-/* An engine error as the element reports it: the config file and key first. A missing GPU is about gpu-id, an
- * unwritable output about -o. */
+/* An engine error as the element reports it */
 static void
 print_engine_error (const RdsInferConfig * cfg, GError * err)
 {
-  if (g_error_matches (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_DEVICE)
-      || g_error_matches (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_OUTPUT))
-    g_printerr (PROG ": %s\n", err->message);
-  else
-    g_printerr (PROG ": %s:onnx-file: %s\n", cfg->config_path, err->message);
+  gchar *msg = rds_infer_config_format_engine_error (cfg, err);
+
+  g_printerr (PROG ": %s\n", msg);
+  g_free (msg);
 }
 
 int

@@ -88,6 +88,9 @@ GST_PLUGIN_PATH_1_0=build/gst GST_DEBUG=rdsinfer:5 gst-launch-1.0 rdsstreammux n
   filesrc location=.cache/media/smpte-1366x768.h264 ! h264parse ! rdsvideodec ! m.sink_1
 ```
 
+The generated test clips (a bouncing ball, SMPTE bars) contain nothing YOLO11n detects, so expect 0 objects per
+frame: this checks that the pipeline runs, not what it finds.
+
 ## How it maps to DeepStream
 
 | DeepStream | Redstream |

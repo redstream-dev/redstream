@@ -263,6 +263,8 @@ meson test -C build-rel --print-errorlogs
   with its test reference data. Never commit it or anything derived from it; tests that need it `g_test_skip` with
   a message naming the script.
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
+- The compat-matrix lint (`/cpu/infer-config/compat-matrix`) runs only in builds with rdsinfer: a build without
+  MIGraphX, such as a hosted CI runner, doesn't check `docs/compat-matrix.md` against the key table.
 - **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never
   waits on a stream. Library copies, memsets and staging syncs (`sync_for_cpu`/`sync_for_device`) are synchronous,
   on the calling thread's per-thread stream (`hipStreamPerThread`), so they don't wait for other streams' work. The

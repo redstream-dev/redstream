@@ -30,6 +30,7 @@
 #include <string.h>
 /* after GLib/GStreamer: HIP defines __noinline__ */
 #include <hip/hip_runtime_api.h>
+#include "rds-infer-device.h"
 
 GST_DEBUG_CATEGORY (gst_rds_infer_debug);
 #define GST_CAT_DEFAULT gst_rds_infer_debug
@@ -201,7 +202,6 @@ configure (GstRdsInfer * self, GArray * operate_on_class_ids, GError ** error)
   gboolean tensor_meta, raw_write, instance_mask, tensor_input, crop, clip;
   gpointer raw_cb;
   GArray *ids;
-  GError *err = NULL;
 
   GST_OBJECT_LOCK (self);
   path = g_strdup (self->config_file_path);
@@ -281,20 +281,10 @@ configure (GstRdsInfer * self, GArray * operate_on_class_ids, GError ** error)
         "preprocessed tensor input is not supported yet");
     goto fail;
   }
-  overridden[n_over] = NULL;
   g_assert (n_over < G_N_ELEMENTS (overridden));
-  if (!rds_infer_config_validate (cfg, overridden, &err)) {
-    /* errors about overridden keys name the config key: name the property instead where they differ */
-    if ((set & PROP_BIT (PROP_UNIQUE_ID)) && g_str_has_prefix (err->message, "element property gie-unique-id:")) {
-      gchar *msg = g_strconcat ("element property unique-id:",
-          err->message + strlen ("element property gie-unique-id:"), NULL);
-
-      g_free (err->message);
-      err->message = msg;
-    }
-    g_propagate_error (error, err);
+  overridden[n_over] = NULL;
+  if (!rds_infer_config_validate (cfg, overridden, error))
     goto fail;
-  }
 
   if (set & PROP_BIT (PROP_INFER_ON_GIE_ID) || set & PROP_BIT (PROP_INFER_ON_CLASS_IDS))
     g_ptr_array_add (cfg->warnings, g_strdup ("element properties infer-on-gie-id and infer-on-class-ids: ignored: "
@@ -371,7 +361,7 @@ release_resources (GstRdsInfer * self)
   gboolean switched = FALSE;
 
   if (self->stream || self->input || self->engine) {
-    switched = hipGetDevice (&prev) == hipSuccess && hipSetDevice ((int) self->gpu) == hipSuccess;
+    switched = rds_infer_device_enter (self->gpu, &prev);
     if (self->stream)
       (void) hipStreamSynchronize (self->stream);
   }
@@ -388,7 +378,7 @@ release_resources (GstRdsInfer * self)
     (void) hipStreamDestroy (self->stream);
   self->stream = NULL;
   if (switched)
-    (void) hipSetDevice (prev);
+    rds_infer_device_restore (prev);
   g_clear_pointer (&self->cfg, rds_infer_config_free);
   g_clear_pointer (&self->out_dims, g_free);
   g_clear_pointer (&self->out_names, g_free);
@@ -420,8 +410,10 @@ open_engine (GstRdsInfer * self, GError ** error)
   if (!rds_infer_config_get_engine_options (cfg, &opts, dims, error))
     return FALSE;
   if (!(self->engine = rds_infer_engine_open (&opts, &err))) {
-    g_set_error (error, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_INVALID, "%s:onnx-file: %s",
-        cfg->config_path, err->message);
+    gchar *msg = rds_infer_config_format_engine_error (cfg, err);
+
+    g_set_error_literal (error, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_INVALID, msg);
+    g_free (msg);
     g_error_free (err);
     return FALSE;
   }
@@ -538,7 +530,7 @@ gst_rds_infer_start (GstBaseTransform * trans)
   GST_OBJECT_UNLOCK (self);
 
   self->gpu = self->cfg->gpu_id;
-  if (hipGetDevice (&prev) != hipSuccess || hipSetDevice ((int) self->gpu) != hipSuccess) {
+  if (!rds_infer_device_enter (self->gpu, &prev)) {
     GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND, ("element property gpu-id: %u: no such GPU", self->gpu), (NULL));
     release_resources (self);
     return FALSE;
@@ -546,7 +538,7 @@ gst_rds_infer_start (GstBaseTransform * trans)
   herr = hipStreamCreateWithFlags (&self->stream, hipStreamNonBlocking);
   if (herr != hipSuccess) {
     self->stream = NULL;
-    (void) hipSetDevice (prev);
+    rds_infer_device_restore (prev);
     GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Cannot create a HIP stream on GPU %u", self->gpu),
         ("hipStreamCreateWithFlags: %s", hipGetErrorString (herr)));
     release_resources (self);
@@ -563,7 +555,7 @@ gst_rds_infer_start (GstBaseTransform * trans)
       ok = FALSE;
     }
   }
-  (void) hipSetDevice (prev);
+  rds_infer_device_restore (prev);
   if (!ok) {
     post_config_error (self, err);
     g_error_free (err);
@@ -886,10 +878,10 @@ rds_infer_test_read_input (GstElement * element, gfloat * dst, gsize n_floats)
 
   if (!self->input || n_floats > self->cfg->batch_size * self->image_floats)
     return FALSE;
-  if (hipGetDevice (&prev) != hipSuccess || hipSetDevice ((int) self->gpu) != hipSuccess)
+  if (!rds_infer_device_enter (self->gpu, &prev))
     return FALSE;
   ok = hipMemcpy (dst, self->input, n_floats * sizeof (gfloat), hipMemcpyDeviceToHost) == hipSuccess;
-  (void) hipSetDevice (prev);
+  rds_infer_device_restore (prev);
   return ok;
 }
 

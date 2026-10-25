@@ -399,7 +399,8 @@ test_detect (void)
 }
 
 /* The mux's default NV12 batches (as after a decoder): the RGBA photo loses half its chroma resolution and goes
- * through BT.601 and back, so P and R >= 0.8. */
+ * through BT.601 and back, so P and R >= 0.8. That allows one missed person; car, with 3 reference objects, must
+ * still be 3/3. */
 static void
 test_detect_nv12 (void)
 {

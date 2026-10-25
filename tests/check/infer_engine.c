@@ -1287,7 +1287,9 @@ test_yolo_parity (void)
    * (checked above), a detection's confidence moves by at most 0.02 and its edges (centre +- size / 2) by at most
    * 0.02 px: a match needs the same class, confidence within 0.02 and every edge within 1 px, far below the size of
    * any box, so it can't pair two different objects. Each side's top 100 is looked up among all of the other side's
-   * detections, so a near-tie in the ranking can't fail the check. */
+   * detections, so a near-tie in the ranking alone doesn't fail the check. It is not guaranteed, though: the 100th
+   * detection is at confidence ~0.01, where a 0.02 output change could flip an anchor's best class or which box
+   * survives NMS, so another GPU could fail it. Here it holds with a wide margin. */
   {
     GArray *ours = yolo_detections (out, 0.0f), *theirs = yolo_detections ((const gfloat *) ref, 0.0f);
     guint n;

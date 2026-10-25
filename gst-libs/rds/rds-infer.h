@@ -1,4 +1,5 @@
-/* Redstream: rdsinfer's layer, network and object types (counterpart of DeepStream's nvdsinfer.h). C and C++.
+/* Redstream: rdsinfer's layer, network and object types (counterpart of DeepStream's nvdsinfer.h). C11 and C++
+ * (C11: RdsInferLayerInfo has an anonymous union).
  * Names and field order follow NVIDIA's public API reference; Redstream-only additions are marked "ours". The
  * custom bbox parser ABI built on them (C++) is rds/rds-infer-custom-impl.h.
  * SPDX-License-Identifier: LGPL-2.1-or-later */

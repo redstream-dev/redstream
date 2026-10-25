@@ -52,7 +52,6 @@ typedef struct
   guint infer_dims[3];                          /* C, H, W */
   gboolean has_infer_dims;
   gboolean maintain_aspect_ratio, symmetric_padding, output_tensor_meta;
-  gchar **output_blob_names;                    /* NULL-terminated, NULL when unset */
   GArray *filter_out_class_ids;                 /* guint, never NULL */
   RdsInferClassAttrs *class_attrs;              /* num_detected_classes entries, after inheritance */
   gchar **labels;                               /* NULL-terminated, num_detected_classes entries ("" if none) */
@@ -83,6 +82,11 @@ G_GNUC_INTERNAL void rds_infer_config_free (RdsInferConfig * cfg);
  * points to). The strings are @cfg's. FALSE when onnx-file is unset: a cached program is checked against it. */
 G_GNUC_INTERNAL gboolean rds_infer_config_get_engine_options (const RdsInferConfig * cfg,
     RdsInferEngineOptions * opts, guint dims[3], GError ** error);
+/* An engine error from opening @cfg's engine, as rdsinfer and rds-compile report it: "FILE:onnx-file: ..." for the
+ * model and its program. A missing GPU or failed HIP call (RDS_INFER_ENGINE_ERROR_DEVICE) and an unwritable output
+ * (RDS_INFER_ENGINE_ERROR_OUTPUT) keep their own message: it names gpu-id or the output path, which may come from an
+ * element property or the command line rather than the file. Free with g_free (). */
+G_GNUC_INTERNAL gchar *rds_infer_config_format_engine_error (const RdsInferConfig * cfg, const GError * err);
 
 typedef enum
 {

@@ -87,8 +87,8 @@ static const KeyInfo keys[] = {
   {.name = "labelfile-path",.group = PROP,.type = TYPE_PATH,.status = SUP,.field = P (labelfile_path)},
   {.name = "infer-dims",.group = PROP,.type = TYPE_DIMS,.status = SUP,.min = 1,.max = G_MAXINT,
       .field = P (infer_dims)},
-  {.name = "output-blob-names",.group = PROP,.type = TYPE_STRING_LIST,.status = SUP,
-      .field = P (output_blob_names)},
+  {.name = "output-blob-names",.group = PROP,.type = TYPE_STRING_LIST,.status = NOOP,
+      .note = "all outputs are passed to the parser and to the tensor meta"},
   {.name = "batch-size",.group = PROP,.type = TYPE_UINT,.status = SUP,.min = 1,.max = RDS_INFER_MAX_BATCH_SIZE,
       .def = "1",.field = P (batch_size)},
   {.name = "network-mode",.group = PROP,.type = TYPE_INT,.status = SUP,.min = 0,.max = 3,.def = "0",
@@ -727,6 +727,17 @@ rds_infer_config_get_engine_options (const RdsInferConfig * cfg, RdsInferEngineO
   return TRUE;
 }
 
+gchar *
+rds_infer_config_format_engine_error (const RdsInferConfig * cfg, const GError * err)
+{
+  g_return_val_if_fail (cfg != NULL && err != NULL, NULL);
+
+  if (g_error_matches (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_DEVICE)
+      || g_error_matches (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_OUTPUT))
+    return g_strdup (err->message);
+  return g_strdup_printf ("%s:onnx-file: %s", cfg->config_path, err->message);
+}
+
 /* Label file: one label per line, or all of them on one ';'-separated line. Whitespace around labels, a CR before
  * the newline and trailing blank lines are ignored. */
 static gboolean
@@ -931,7 +942,6 @@ rds_infer_config_free (RdsInferConfig * cfg)
   g_free (cfg->labelfile_path);
   g_free (cfg->custom_lib_path);
   g_free (cfg->parse_bbox_func_name);
-  g_strfreev (cfg->output_blob_names);
   if (cfg->filter_out_class_ids)
     g_array_unref (cfg->filter_out_class_ids);
   g_free (cfg->class_attrs);

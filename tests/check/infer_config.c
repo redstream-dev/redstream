@@ -183,7 +183,6 @@ test_txt_yaml_equal (void)
   g_assert_cmpint (t->maintain_aspect_ratio, ==, y->maintain_aspect_ratio);
   g_assert_cmpint (t->symmetric_padding, ==, y->symmetric_padding);
   g_assert_cmpint (t->output_tensor_meta, ==, y->output_tensor_meta);
-  assert_strv_equal (t->output_blob_names, y->output_blob_names);
   g_assert_cmpuint (t->filter_out_class_ids->len, ==, y->filter_out_class_ids->len);
   for (guint i = 0; i < t->filter_out_class_ids->len; i++)
     g_assert_cmpuint (g_array_index (t->filter_out_class_ids, guint, i), ==,
@@ -191,8 +190,11 @@ test_txt_yaml_equal (void)
   for (guint i = 0; i < t->num_detected_classes; i++)
     assert_attrs_equal (&t->class_attrs[i], &y->class_attrs[i]);
   assert_strv_equal (t->labels, y->labels);
-  g_assert_cmpuint (t->warnings->len, ==, 0);
-  g_assert_cmpuint (y->warnings->len, ==, 0);
+  /* output-blob-names is an accepted no-op: one warning each */
+  g_assert_cmpuint (t->warnings->len, ==, 1);
+  g_assert_cmpuint (y->warnings->len, ==, 1);
+  g_assert_cmpuint (count_warnings (t, "output-blob-names: output0: ignored: "), ==, 1);
+  g_assert_cmpuint (count_warnings (y, "output-blob-names: "), ==, 1);
 
   /* and the values are the ones written */
   g_assert_cmpuint (t->batch_size, ==, 2);
@@ -215,8 +217,6 @@ test_txt_yaml_equal (void)
   g_assert_cmpstr (t->parse_bbox_func_name, ==, "RdsInferParseYolo");
   g_assert_cmpuint (t->filter_out_class_ids->len, ==, 2);
   g_assert_cmpuint (g_array_index (t->filter_out_class_ids, guint, 1), ==, 2);
-  g_assert_cmpuint (g_strv_length (t->output_blob_names), ==, 1);
-  g_assert_cmpstr (t->output_blob_names[0], ==, "output0");
   g_assert_cmpfloat (t->class_attrs[0].pre_cluster_threshold, ==, 0.3f);
   g_assert_cmpfloat (t->class_attrs[0].post_cluster_threshold, ==, 0.0f);
   g_assert_cmpfloat (t->class_attrs[1].post_cluster_threshold, ==, 0.6f);
@@ -257,7 +257,6 @@ test_defaults (void)
   g_assert_null (cfg->model_engine_file);
   g_assert_null (cfg->labelfile_path);
   g_assert_null (cfg->custom_lib_path);
-  g_assert_null (cfg->output_blob_names);
   g_assert_nonnull (cfg->filter_out_class_ids);
   g_assert_cmpuint (cfg->filter_out_class_ids->len, ==, 0);
   g_assert_cmpuint (cfg->num_detected_classes, ==, 2);
@@ -468,7 +467,7 @@ test_yaml_null (void)
   g_assert_null (cfg->model_engine_file);
   g_assert_null (cfg->labelfile_path);
   g_assert_null (cfg->custom_lib_path);
-  g_assert_null (cfg->output_blob_names);
+  g_assert_cmpuint (cfg->filter_out_class_ids->len, ==, 0);
   g_assert_cmpstr (cfg->onnx_file, ==, tilde);  /* quoted "~" */
   g_assert_cmpstr (cfg->labels[0], ==, "");
   g_assert_cmpfloat (cfg->class_attrs[0].pre_cluster_threshold, ==, 0.25f);
@@ -702,6 +701,35 @@ test_engine_options (void)
   tmp_cleanup (path);
 }
 
+/* Engine errors as rdsinfer and rds-compile report them: under the config's onnx-file, except a GPU or an output
+ * path problem, whose message already names gpu-id or the path. */
+static void
+test_engine_error (void)
+{
+  RdsInferConfig *cfg = load_ok ("minimal.txt");
+  GError *err = g_error_new_literal (RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL, "m.onnx: bad");
+  gchar *msg = rds_infer_config_format_engine_error (cfg, err), *want;
+
+  want = g_strconcat (cfg->config_path, ":onnx-file: m.onnx: bad", NULL);
+  g_assert_cmpstr (msg, ==, want);
+  g_free (want);
+  g_free (msg);
+  g_error_free (err);
+
+  err = g_error_new_literal (RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_DEVICE, "gpu-id 9: no such GPU");
+  msg = rds_infer_config_format_engine_error (cfg, err);
+  g_assert_cmpstr (msg, ==, "gpu-id 9: no such GPU");
+  g_free (msg);
+  g_error_free (err);
+
+  err = g_error_new_literal (RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_OUTPUT, "can't write x.mxr");
+  msg = rds_infer_config_format_engine_error (cfg, err);
+  g_assert_cmpstr (msg, ==, "can't write x.mxr");
+  g_free (msg);
+  g_error_free (err);
+  rds_infer_config_free (cfg);
+}
+
 static void
 collect_key (const RdsInferKeyDesc * key, gpointer user_data)
 {
@@ -803,11 +831,12 @@ test_compat_matrix (void)
   gpointer id;
   GError *err = NULL;
 
-  g_assert_true (g_file_get_contents (RDS_COMPAT_MATRIX, &text, NULL, &err));
+  g_file_get_contents (RDS_COMPAT_MATRIX, &text, NULL, &err);
   g_assert_no_error (err);
+  g_assert_nonnull (text);
   lines = g_strsplit (text, "\n", -1);
   for (guint i = 0; lines[i]; i++) {
-    gchar **cells;
+    gchar **cells, *id;
 
     if (lines[i][0] == '#') {
       group = strstr (lines[i], "Config keys: `[property]`") ? "property"
@@ -818,12 +847,24 @@ test_compat_matrix (void)
       continue;
     /* "| a | b |" splits into "", " a ", " b ", "" */
     cells = g_strsplit (lines[i] + 1, "|", -1);
-    g_assert_cmpuint (g_strv_length (cells), ==, 7);
     for (guint c = 0; cells[c]; c++)
       g_strstrip (cells[c]);
-    g_assert_true (g_str_has_prefix (cells[0], "`") && g_str_has_suffix (cells[0], "`"));
+    if (g_strv_length (cells) != 7 || !g_str_has_prefix (cells[0], "`") || !g_str_has_suffix (cells[0], "`")) {
+      g_test_message ("compat-matrix.md:%u: %s: expected 6 cells, the first a `key`", i + 1, lines[i]);
+      mc.n_bad++;
+      g_strfreev (cells);
+      continue;
+    }
     cells[0][strlen (cells[0]) - 1] = '\0';
-    g_assert_true (g_hash_table_insert (mc.rows, g_strconcat (group, "/", cells[0] + 1, NULL), cells));
+    id = g_strconcat (group, "/", cells[0] + 1, NULL);
+    if (g_hash_table_contains (mc.rows, id)) {
+      g_test_message ("compat-matrix.md:%u: %s: duplicate row", i + 1, lines[i]);
+      mc.n_bad++;
+      g_free (id);
+      g_strfreev (cells);
+      continue;
+    }
+    g_hash_table_insert (mc.rows, id, cells);
   }
   rds_infer_config_foreach_key (check_matrix_key, &mc);
   g_hash_table_iter_init (&it, mc.rows);
@@ -899,6 +940,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-config/keyfile-values", test_keyfile_values);
   g_test_add_func ("/cpu/infer-config/labels", test_labels);
   g_test_add_func ("/cpu/infer-config/engine-options", test_engine_options);
+  g_test_add_func ("/cpu/infer-config/engine-error", test_engine_error);
   g_test_add_func ("/cpu/infer-config/validate", test_validate);
   g_test_add_func ("/cpu/infer-config/key-table", test_key_table);
   g_test_add_func ("/cpu/infer-config/compat-matrix", test_compat_matrix);
