@@ -112,7 +112,8 @@ pipeline_deps = test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', re
 
 if rds_infer_enabled
   # The config parser on its own, against the corpus in check/infer-configs (and the rds-test3 sample's config, once
-  # YOLO11n's labels are fetched). It uses no GStreamer, so it gets the environment without plugin paths.
+  # YOLO11n's labels are fetched); also checks that docs/compat-matrix.md lists every config key as the key table
+  # does. It uses no GStreamer, so it gets the environment without plugin paths.
   test('infer_config', executable('infer_config', 'check' / 'infer_config.c',
       dependencies : [rdsinfer_core_dep],
       link_language : 'cpp',
@@ -121,6 +122,7 @@ if rds_infer_enabled
         '-DRDS_TEST_SAMPLE_PGIE_CONFIG="@0@"'.format(
           meson.project_source_root() / 'samples' / 'rds-test3' / 'rds_test3_pgie_config.yml'),
         '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
+        '-DRDS_COMPAT_MATRIX="@0@"'.format(meson.project_source_root() / 'docs' / 'compat-matrix.md'),
       ]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
   # The built-in YOLO parser and the detection post-processing, against hand-computed cases and a naive reference

@@ -100,7 +100,18 @@ Known gotchas:
 - MIGraphX compilation is slow on small GPUs (minutes; FP16 even slower). Always cache compiled programs (`.mxr`).
   YOLO11n FP32 at batch 1 on the gfx1036 iGPU: the first compile on a cold user cache (comgr's kernel cache in
   `$XDG_CACHE_HOME`, MIOpen's in `$HOME/.config/miopen`) takes ~70 s (~40 s with only comgr's cache cold), ~30 s
-  once both are warm.
+  once both are warm; batch 2 and 4 take ~80-85 s. Loading a cached program takes ~350 ms. `rdsinfer` and
+  `rds-compile` cache programs as `<onnx stem>_b<N>_<C>x<H>x<W>_<gfx>_<fp32|fp16>.mxr` next to the ONNX file (else in
+  `$XDG_CACHE_HOME/redstream/`), with a `.mxr.json` manifest (model hash, MIGraphX and HIP versions, device,
+  shapes, options) that must match for the program to load. Tests reuse these caches: never delete them casually,
+  and never run two YOLO11n tests in parallel (`is_parallel : false`, generous `timeout`s).
+- MIGraphX gives every symbolic ONNX dimension a default (1) when it parses a model, silently. Whether a dimension is
+  fixed or symbolic comes from our own reader (`rds-infer-onnx`), which reads the file's declared input dims.
+- MIGraphX's C++ exceptions always say "Failed to call function"; the real reason is on stderr. Error messages name
+  the MIGraphX call instead (`RDS_MGX_CHECK` in `rds-infer-engine.cpp`).
+- MIGraphX `dlopen`s its GPU target (`libmigraphx_gpu.so`) through its own `$ORIGIN` RUNPATH, which ASan's `dlopen`
+  interceptor defeats: ASan test runs set `LD_LIBRARY_PATH` to MIGraphX's `migraphx/lib` (done in
+  `tests/meson.build`).
 - Build HIP code with the GPU attached, or pass `--offload-arch` explicitly. Otherwise hipcc targets the wrong arch
   and kernels fail with "device kernel image is invalid".
 - rocDecode must be fed whole NAL units or access units (`h264parse ! ...,alignment=au`). Split NAL units decode
@@ -166,7 +177,8 @@ gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; refcounted ou
                    in tests/check/infer-configs, test parser modules built from tests/check/infer-parser-*. Optional
                    (-Dinfer, default auto): needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml
                    and json-glib
-docs/              compat-matrix.md: what the compat header and the elements map, with status and sources
+docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its rdsinfer
+                   config-key tables must match the key table: the infer_config test checks every row)
 samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
 tools/rds-compile/ rds-compile: pre-builds rdsinfer's program with its config parser and engine (exit 2: up to date)
 tests/check/       GLib unit, element and pipeline tests (suites cpu/gpu); test clips are encoded in-process
@@ -194,6 +206,8 @@ meson test -C build --suite cpu  # GPU-free subset (gpu tests also skip themselv
                                  # building still needs the ROCm headers and libamdhip64
 tests/media/make-test-media.sh   # generates .cache/media/*.h264 for manual runs, benchmarks and spikes
                                  # (the tests encode their own clips)
+tests/models/fetch-yolo11n.sh    # ON THE HOST (Docker + network): exports YOLO11n and its reference data into
+                                 # .cache/models; without it the YOLO11n tests skip
 # run our elements from the build tree
 GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-720p.h264 ! h264parse \
   ! rdsvideodec ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA,width=640,height=640" ! fakesink sync=false
@@ -239,6 +253,15 @@ meson test -C build-rel --print-errorlogs
   library register the same GTypes twice. They run with `internal_test_env`: no plugin paths and their own
   registry, so even an in-process scan loads no plugin.
 - Library symbols are hidden by default. Mark public API with `RDS_API` (from `rds/rds-prelude.h`).
+- **C++** is used only where MIGraphX and the parser ABI need it (`rds-infer-engine.cpp`, `rds-infer-parse.cpp`), in
+  the same layout as the C code. No exception crosses into C: every C-callable function catches at its boundary and
+  turns the exception into a `GError` (or a failed parse), and calls into user parser libraries are wrapped in
+  try/catch. Executables that link `rdsinfer-core` need `link_language : 'cpp'`.
+- **Test models.** The committed `tests/models/scale2*.onnx` are our own tiny models (`make-test-models.py`), so the
+  element tests run offline and compile in seconds. YOLO11n is AGPL-3.0: `tests/models/fetch-yolo11n.sh` exports it
+  (pinned versions and hashes, `PYTHONHASHSEED=0` for a reproducible export) into the git-ignored `.cache/models`,
+  with its test reference data. Never commit it or anything derived from it; tests that need it `g_test_skip` with
+  a message naming the script.
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
 - **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never
   waits on a stream. Library copies, memsets and staging syncs (`sync_for_cpu`/`sync_for_device`) are synchronous,

@@ -755,6 +755,88 @@ test_key_table (void)
   g_hash_table_unref (keys);
 }
 
+/* docs/compat-matrix.md lists every config key in the two "Config keys" tables, with the table's type, default,
+ * range, status and accepted values; and nothing else there. Rows are
+ * "| `KEY` | TYPE | `DEFAULT` (ours) or none | RANGE or empty | STATUS | notes |". */
+typedef struct
+{
+  GHashTable *rows;             /* "group/name" -> gchar ** cells (name, type, default, range, status, notes) */
+  guint n_bad;
+} MatrixCheck;
+
+static const gchar *const matrix_status[] = {
+  [RDS_INFER_KEY_SUPPORTED] = "supported",
+  [RDS_INFER_KEY_NOOP] = "accepted no-op",
+  [RDS_INFER_KEY_REJECTED] = "unsupported",
+};
+
+static void
+check_matrix_key (const RdsInferKeyDesc * key, gpointer user_data)
+{
+  MatrixCheck *mc = user_data;
+  gchar *id = g_strconcat (key->group, "/", key->name, NULL);
+  gchar *def = key->default_value ? g_strdup_printf ("`%s` (ours)", key->default_value) : g_strdup ("none");
+  gchar **cells = g_hash_table_lookup (mc->rows, id);
+  const gchar *range = key->range ? key->range : "";
+  const gchar *status = matrix_status[key->status];
+
+  if (!cells || strcmp (cells[1], key->type) != 0 || strcmp (cells[2], def) != 0 || strcmp (cells[3], range) != 0
+      || strcmp (cells[4], status) != 0 || (key->accepted && !strstr (cells[5], key->accepted))) {
+    g_test_message ("compat matrix, [%s] keys: %s %s; expected: | `%s` | %s | %s | %s | %s | %s%s%s%s |",
+        key->group, key->name, cells ? "differs" : "is missing", key->name, key->type, def, range, status,
+        key->accepted ? "accepted values: " : "", key->accepted ? key->accepted : "",
+        key->accepted && key->note ? "; " : "", key->note ? key->note : "");
+    mc->n_bad++;
+  }
+  g_hash_table_remove (mc->rows, id);
+  g_free (def);
+  g_free (id);
+}
+
+static void
+test_compat_matrix (void)
+{
+  MatrixCheck mc = { g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_strfreev), 0 };
+  gchar *text = NULL, **lines;
+  const gchar *group = NULL;
+  GHashTableIter it;
+  gpointer id;
+  GError *err = NULL;
+
+  g_assert_true (g_file_get_contents (RDS_COMPAT_MATRIX, &text, NULL, &err));
+  g_assert_no_error (err);
+  lines = g_strsplit (text, "\n", -1);
+  for (guint i = 0; lines[i]; i++) {
+    gchar **cells;
+
+    if (lines[i][0] == '#') {
+      group = strstr (lines[i], "Config keys: `[property]`") ? "property"
+          : strstr (lines[i], "Config keys: `[class-attrs-all]`") ? "class-attrs" : NULL;
+      continue;
+    }
+    if (!group || !g_str_has_prefix (lines[i], "| `"))
+      continue;
+    /* "| a | b |" splits into "", " a ", " b ", "" */
+    cells = g_strsplit (lines[i] + 1, "|", -1);
+    g_assert_cmpuint (g_strv_length (cells), ==, 7);
+    for (guint c = 0; cells[c]; c++)
+      g_strstrip (cells[c]);
+    g_assert_true (g_str_has_prefix (cells[0], "`") && g_str_has_suffix (cells[0], "`"));
+    cells[0][strlen (cells[0]) - 1] = '\0';
+    g_assert_true (g_hash_table_insert (mc.rows, g_strconcat (group, "/", cells[0] + 1, NULL), cells));
+  }
+  rds_infer_config_foreach_key (check_matrix_key, &mc);
+  g_hash_table_iter_init (&it, mc.rows);
+  while (g_hash_table_iter_next (&it, &id, NULL)) {
+    g_test_message ("compat matrix: %s is not in the key table", (const gchar *) id);
+    mc.n_bad++;
+  }
+  g_assert_cmpuint (mc.n_bad, ==, 0);
+  g_strfreev (lines);
+  g_free (text);
+  g_hash_table_unref (mc.rows);
+}
+
 /* The rds-test3 sample's YOLO11n config loads without warnings and resolves its paths into the source tree's
  * .cache/models. Loading reads the labels, so it needs tests/models/fetch-yolo11n.sh to have run. */
 static void
@@ -819,6 +901,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-config/engine-options", test_engine_options);
   g_test_add_func ("/cpu/infer-config/validate", test_validate);
   g_test_add_func ("/cpu/infer-config/key-table", test_key_table);
+  g_test_add_func ("/cpu/infer-config/compat-matrix", test_compat_matrix);
   g_test_add_func ("/cpu/infer-config/sample-test3", test_sample_test3);
   return g_test_run ();
 }

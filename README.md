@@ -2,9 +2,9 @@
 
 **GStreamer video and audio analytics on AMD GPUs: an open-source, ROCm-based functional equivalent of NVIDIA DeepStream.**
 
-> Status: **pre-alpha.** The core library `libgstrds` and the first four elements, `rdsvideodec`,
-> `rdsvideoconvert`, `rdsstreammux` and `rdsstreamdemux`, are in place (see "What works" below). APIs and element
-> names will change.
+> Status: **pre-alpha.** The core library `libgstrds` and the first five elements, `rdsvideodec`,
+> `rdsvideoconvert`, `rdsstreammux`, `rdsstreamdemux` and `rdsinfer`, are in place, with the `rds-compile` tool
+> (see "What works" below). APIs and element names will change.
 
 ## Why
 
@@ -50,8 +50,13 @@ Jetson-specific hardware blocks.
 - **`rdsstreamdemux`** (`nvstreamdemux`): splits a batch back into per-source streams without copying: each output
   buffer is a read-only view of its slot (a writer gets its own copy), with the source's own timestamps, segment and
   stream events.
+- **`rdsinfer`** (`nvinfer`): a primary detector on MIGraphX. It reads nvinfer config files (key file or YAML),
+  runs ONNX models (YOLO11n tested) on whole batches on the GPU, and attaches object meta and, optionally, tensor
+  output meta. Bounding boxes come from the built-in YOLO parser or from a DeepStream custom bbox parser library,
+  recompiled against `rds/rds_compat_infer.h`. Secondary mode and classifiers are not implemented yet.
+- **`rds-compile`** (`trtexec`): compiles and caches `rdsinfer`'s MIGraphX program ahead of time.
 - **Compat header** `rds/rds_compat.h`: DeepStream names for the above, plus runtime remapping of element names
-  (`nvv4l2decoder` → `rdsvideodec`, `nvstreammux` → `rdsstreammux`, …).
+  (`nvv4l2decoder` → `rdsvideodec`, `nvstreammux` → `rdsstreammux`, `nvinfer` → `rdsinfer`, …).
 
 [`docs/compat-matrix.md`](docs/compat-matrix.md) lists every mapped name and property with its status. Built from
 this repository (see "Getting started"; `tests/media/make-test-media.sh` generates the clips), a decode and convert
@@ -70,6 +75,17 @@ GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 rdsstreammux name=m batch-size=2 wi
   filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
   filesrc location=.cache/media/smpte-1366x768.h264 ! h264parse ! rdsvideodec ! m.sink_1 \
   d.src_0 ! queue ! fakesink sync=false  d.src_1 ! queue ! fakesink sync=false
+```
+
+Two sources batched and run through YOLO11n. Fetch the model first (see "Getting started"); the first run compiles
+it for batch 2, which takes a minute or two on a small GPU, and later runs load the cached program.
+`GST_DEBUG=rdsinfer:5` logs the number of objects in each frame:
+
+```bash
+GST_PLUGIN_PATH_1_0=build/gst GST_DEBUG=rdsinfer:5 gst-launch-1.0 rdsstreammux name=m batch-size=2 width=1280 \
+  height=720 ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=2 ! fakesink sync=false \
+  filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
+  filesrc location=.cache/media/smpte-1366x768.h264 ! h264parse ! rdsvideodec ! m.sink_1
 ```
 
 ## How it maps to DeepStream
@@ -111,6 +127,8 @@ video decode engines.
 Early numbers on a 2-CU Ryzen 9 7900X iGPU:
 - VA-API H.264 1080p decode: about 600 fps.
 - YOLO11n 640×640 FP16 via MIGraphX: about 60 inferences/s.
+- `rdsinfer` with YOLO11n FP32, four 720p sources at batch 4 (decode, batching, inference and post-processing):
+  about 50 fps.
 
 ## Getting started (development)
 
@@ -128,6 +146,14 @@ gst-inspect-1.0 hip
 gst-launch-1.0 filesrc location=sample.mkv ! matroskademux ! h264parse ! vah264dec \
   ! hipupload ! hipconvertscale ! "video/x-raw(memory:HIPMemory),format=RGBA,width=640,height=640" \
   ! fakesink sync=false
+```
+
+The YOLO11n tests and the detector example need the model, exported on your machine (on the host: it needs Docker
+and network access). YOLO11n is AGPL-3.0, so it goes into the git-ignored `.cache/models/` and is never committed;
+the tests that need it skip without it. See [`tests/models/README.md`](tests/models/README.md).
+
+```bash
+tests/models/fetch-yolo11n.sh
 ```
 
 Build and run the tests (inside the container):

@@ -19,6 +19,9 @@ RUN="docker run --rm --device=/dev/kfd --device=/dev/dri \
 $RUN bash -c 'rocminfo | grep -E "^\s+Name:\s+gfx"'          # non-interactive one-off command
 ```
 
+The image's last layer installs `libyaml-dev` (rdsinfer's YAML configs), after the ~20-minute GStreamer build, so
+adding packages there keeps the GStreamer layer cached; a rebuild after editing it takes seconds.
+
 Use `-it` only for interactive shells; agents should use one-off `bash -c` commands.
 Add `--user $(id -u):$(id -g) -e HOME=/tmp` so outputs aren't root-owned. From zsh, run the whole thing via
 `bash -c '...'`, because zsh doesn't word-split `$RUN`.
@@ -28,6 +31,10 @@ Add `--user $(id -u):$(id -g) -e HOME=/tmp` so outputs aren't root-owned. From z
 ```bash
 $RUN bash -c 'meson setup build --reconfigure 2>/dev/null || meson setup build; meson test -C build --print-errorlogs'
 $RUN tests/media/make-test-media.sh          # .cache/media/{ball-720p,smpte-1366x768,ball-1080p}.h264
+tests/models/fetch-yolo11n.sh               # on the HOST, not in $RUN (it starts its own python container; needs
+                                            # network): YOLO11n + reference data into .cache/models (AGPL: never commit)
+# the YOLO11n soak takes ~4 min; leave the soaks out of repeat runs
+$RUN meson test -C build --no-suite soak --print-errorlogs
 
 # ASan + UBSan (tests/lsan.supp, applied by meson test, hides HIP runtime leaks)
 $RUN bash -c 'meson setup build-asan --reconfigure -Db_sanitize=address,undefined -Db_lundef=false 2>/dev/null \
@@ -65,6 +72,14 @@ $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 rdsstreammux name=m b
   filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
   filesrc location=.cache/media/smpte-1366x768.h264 ! h264parse ! rdsvideodec ! m.sink_1 \
   d.src_0 ! queue ! fakesink sync=false  d.src_1 ! queue ! fakesink sync=false'
+# two sources -> rdsstreammux -> rdsinfer (YOLO11n; needs fetch-yolo11n.sh). The first run compiles batch 2 (~85 s
+# on a small iGPU), later runs load the cached .mxr; rdsinfer:5 logs the object count per frame
+$RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst GST_DEBUG=rdsinfer:5 gst-launch-1.0 rdsstreammux name=m batch-size=2 \
+  width=1280 height=720 ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=2 \
+  ! fakesink sync=false filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
+  filesrc location=.cache/media/smpte-1366x768.h264 ! h264parse ! rdsvideodec ! m.sink_1'
+# pre-build a program (exit 2: already up to date)
+$RUN build/tools/rds-compile -c samples/rds-test3/rds_test3_pgie_config.yml -b 4
 # autoplugging: -v shows GstRdsVideoDec inside the decodebin
 $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 -v uridecodebin uri=file:///src/.cache/media/ball-720p.h264 \
   ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA" ! fakesink sync=false | grep -o "GstRdsVideoDec:[a-z0-9]*"'
@@ -86,4 +101,9 @@ $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 -v uridecodebin uri=f
 | first frame of each rocDecode surface all zeros (small clips) | surfaces ≤ 1 MiB must be mapped before the first decode; `rdsvideodec` does it, a bare rocDecode program must too |
 | mux/demux pipeline hangs (in preroll or after a few frames), no error | a demux branch without a `queue`, or more branches pinning batches than `rdsstreammux`'s `buffer-pool-size` (leave it unset) |
 | test process crashes at exit in libamdhip64 TLS destructors | the test `main()` must end with `gst_deinit ()` |
+| YOLO11n tests `SKIP` ("run tests/models/fetch-yolo11n.sh") | run the fetch script on the host; outputs go to `.cache/models` |
+| MIOpen errors about `/dev/null/.config/miopen` in a GLib test | `G_TEST_OPTION_ISOLATE_DIRS` sets `HOME=/dev/null`: set `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR` and `AMD_COMGR_CACHE_DIR` to writable dirs |
+| ASan: MIGraphX can't load `libmigraphx_gpu.so` | ASan's `dlopen` ignores MIGraphX's `$ORIGIN` RUNPATH; `meson test` sets `LD_LIBRARY_PATH` (do the same when running a binary by hand) |
+| MIGraphX error says only "Failed to call function" | the real reason is printed on stderr just before it |
+| `rdsinfer`/`rds-compile` rebuild a program every time | read the "built … because …" message (`GST_DEBUG=rdsinfer:4`); the `.mxr.json` manifest field it names differs |
 | VA plugin has no `vah264dec` on the host (Fedora) | host Mesa lacks patented codecs → `mesa-va-drivers-freeworld`; the container is fine |
