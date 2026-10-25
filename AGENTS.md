@@ -140,12 +140,16 @@ gst/rdsvideo/      libgstrdsvideo plugin: rdsvideodec (rocDecode, gstrdsvideodec
                    (gstrdsvideoconvert.c), shared helpers in rds-video-util
 gst/rdsmux/        libgstrdsmux plugin: rdsstreammux (GstAggregator, gstrdsstreammux.c) and rdsstreamdemux
                    (gstrdsstreamdemux.c)
+gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (MIGraphX; skeleton so far). Optional (-Dinfer, default auto):
+                   needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml and json-glib
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources
 samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
 tests/check/       GLib unit, element and pipeline tests (suites cpu/gpu); test clips are encoded in-process
                    (rds-test-media.h, needs the VA encoder); soak memory probes in rds-test-soak.h
 tests/samples/     sample-level tests
 tests/media/       make-test-media.sh: generated H.264 clips (into git-ignored .cache/)
+tests/models/      committed tiny ONNX test models (make-test-models.py); fetch-yolo11n.sh exports YOLO11n into
+                   .cache/models (host, Docker; AGPL, never committed)
 spikes/            Phase 0 experiments (rocdec-hip, migraphx-devptr); reference code, not built by meson
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
 ```

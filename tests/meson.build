@@ -36,11 +36,16 @@ test_deps = [rds_dep, gst_check_dep, hip_dep]
 # needs the ROCm headers and libamdhip64.
 cpu_tests = ['compat_remap', 'compat_header', 'compat_header_nomacros', 'buf_surface', 'memory', 'surface_view', 'buffer_pool',
   'allocation', 'meta_batch', 'meta_children',
-  'meta_copy', 'event', 'compat_meta', 'compat_aliases', 'plugin_load', 'transform_params']
+  'meta_copy', 'event', 'compat_meta', 'compat_aliases', 'transform_params']
 foreach t : cpu_tests
   test(t, executable(t, 'check' / (t + '.c'), dependencies : test_deps),
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 endforeach
+
+# plugin_load also checks that rdsinfer is there exactly when the build has it.
+test('plugin_load', executable('plugin_load', 'check' / 'plugin_load.c', dependencies : test_deps,
+    c_args : ['-DRDS_HAVE_INFER=@0@'.format(rds_infer_enabled ? 1 : 0)]),
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
 # GPU-free tests that call private library symbols: they link only the static internal copy of libgstrds
 # (never rds_dep too, see internal_gpu_tests below).
@@ -51,11 +56,8 @@ foreach t : internal_cpu_tests
 endforeach
 
 # DeepStream apps are often C++: check that the compat header builds and works there too.
-if add_languages('cpp', required : false, native : false)
-  test('compat_cpp', executable('compat_cpp', 'check' / 'compat_cpp.cpp', dependencies : [rds_dep],
-      override_options : ['cpp_std=c++17']),
-    suite : 'cpu', env : test_env, protocol : 'tap')
-endif
+test('compat_cpp', executable('compat_cpp', 'check' / 'compat_cpp.cpp', dependencies : [rds_dep]),
+  suite : 'cpu', env : test_env, protocol : 'tap')
 
 # Tests that need a ROCm device; each skips itself when none is visible.
 gpu_tests = ['gpu_smoke', 'buf_surface_hip', 'memory_hip', 'buffer_pool_hip']
@@ -99,6 +101,11 @@ test('element_streammux_cpu', element_streammux_exe, args : ['-p', '/cpu/mux'],
 test('element_streammux', element_streammux_exe, args : ['-p', '/gpu/mux'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180, depends : rds_plugins)
 
+if rds_infer_enabled
+  test('element_infer_cpu', executable('element_infer', 'check' / 'element_infer.c', dependencies : test_deps),
+    suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+endif
+
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)])
 test('element_streamdemux_cpu', element_streamdemux_exe, args : ['-p', '/cpu/demux'],
@@ -126,10 +133,11 @@ test('pipeline_mux_soak', pipeline_mux_exe, args : ['-p', '/gpu/mux-soak'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
 # The dry run checks the compat mapping; gst-inspect-1.0 (when found) checks that the mapped decoder and
-# converter resolve to real elements from the build tree. Not in ASan builds: the uninstrumented gst-inspect-1.0
-# can't load sanitized plugins in-process (plugin_load covers loading there).
+# converter (and rdsinfer, when built) resolve to real elements from the build tree. Not in ASan builds: the
+# uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process (plugin_load covers loading there).
 gst_inspect = find_program('gst-inspect-1.0', required : false)
 test('rds_test3_dry_run',
   find_program('samples/rds_test3_dry_run.sh'),
-  args : [rds_test3_exe, gst_inspect.found() and not asan ? gst_inspect.full_path() : ''],
+  args : [rds_test3_exe, gst_inspect.found() and not asan ? gst_inspect.full_path() : '',
+    rds_infer_enabled ? 'infer' : ''],
   suite : 'cpu', env : test_env, depends : rds_plugins)

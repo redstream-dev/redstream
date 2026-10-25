@@ -2,3 +2,7 @@ option('rocm_path', type : 'string', value : '/opt/rocm',
   description : 'ROCm prefix holding include/hip and lib/libamdhip64.so')
 option('offload_arch', type : 'string', value : 'gfx10-3-generic,gfx11-generic,gfx12-generic',
   description : 'Comma-separated AMD GPU targets for HIP kernels (e.g. gfx1030 or gfx10-3-generic)')
+option('infer', type : 'feature', value : 'auto',
+  description : 'rdsinfer and rds-compile (needs MIGraphX, libyaml and json-glib)')
+option('migraphx_path', type : 'string', value : '',
+  description : 'MIGraphX prefix with include/migraphx and lib/libmigraphx_c.so (default: <rocm_path>/extras-10)')

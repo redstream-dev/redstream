@@ -4,6 +4,8 @@ build-asan/
 build-rel/
 *.mxr
 *.onnx
+# our own small test models (tests/models/make-test-models.py); fetched models stay in .cache/
+!tests/models/*.onnx
 *.engine
 *.mkv
 *.mp4

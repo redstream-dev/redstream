@@ -1,0 +1,52 @@
+# Pinned environment for export-yolo11n.py (Python 3.12, CPU-only torch). Installed with --no-deps, so this is the
+# complete list. Ultralytics asks for opencv-python, which needs X11/GL libraries that python:3.12-slim lacks; the
+# headless build of the same version replaces it. Regenerating: resolve the top-level pins (ultralytics, torch,
+# torchvision, onnx, onnxslim, onnxruntime, numpy, opencv-python, pillow) in a fresh venv, `pip freeze`, swap
+# opencv-python for opencv-python-headless, and check that the exported model hash is unchanged.
+certifi==2026.10.23
+charset-normalizer==3.5.2
+colorama==0.4.6
+coloredlogs==15.0.1
+contourpy==1.4.0
+cycler==0.12.1
+filelock==4.2.4
+flatbuffers==25.12.19
+fonttools==4.67.0
+fsspec==2026.9.0
+humanfriendly==10.0
+idna==3.20
+Jinja2==3.1.6
+kiwisolver==1.5.1
+MarkupSafe==3.0.4
+matplotlib==3.11.2
+ml_dtypes==0.6.0
+mpmath==1.3.0
+networkx==3.7
+numpy==2.5.4
+onnx==1.17.0
+onnxruntime==1.20.1
+onnxslim==0.1.98
+opencv-python-headless==5.0.0.93
+packaging==26.3
+pandas==3.1.0
+pillow==13.0.0
+protobuf==7.36.2
+psutil==7.2.2
+py-cpuinfo==9.0.0
+pyparsing==3.3.3
+python-dateutil==3.0.0
+PyYAML==6.0.3
+requests==2.34.2
+scipy==1.18.1
+seaborn==0.13.2
+setuptools==84.2.1
+six==1.17.0
+sympy==1.13.1
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu
+tqdm==4.70.1
+typing_extensions==4.16.0
+tzdata==2026.5
+ultralytics==8.3.40
+ultralytics-thop==2.2.3
+urllib3==2.8.0
