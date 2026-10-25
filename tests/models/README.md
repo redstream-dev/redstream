@@ -45,3 +45,36 @@ tests/models/fetch-yolo11n.sh    # on the host; needs Docker and network access
 - `PYTHONHASHSEED=0` is set for the export. onnxslim's shape inference fills `graph.value_info` depending on
   Python's hash randomisation, so unseeded exports differ from run to run. The nodes and weights are the same either
   way.
+
+## Fetched: reference data for the YOLO11n tests
+
+`fetch-yolo11n.sh` also writes the reference data for the `infer_engine_yolo`, `pipeline_infer` and
+`pipeline_infer_soak` tests into `.cache/models/`. It is made with YOLO11n (AGPL-3.0), so it is never committed
+either.
+
+**Photo:** [Traffic and pedestrians on Calle Velásquez near Catedral San Nicolás de Bari in Porlamar,
+Venezuela](https://commons.wikimedia.org/wiki/File:Traffic_and_pedestrians_on_Calle_Vel%C3%A1squez_near_Catedral_San_Nicol%C3%A1s_de_Bari_in_Porlamar,_Venezuela.jpg)
+by Wilfredor, Wikimedia Commons, released under
+[CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) (public domain dedication). It is downloaded
+from `upload.wikimedia.org` (2367×1374 JPEG, sha256 `2c97420ab515eda95204755d114c64a7f8a4acf47e7670e104e85a9cea5feca3`)
+into `.cache/yolo-export/`, not committed.
+
+| File | Contents |
+|---|---|
+| `street-1280x720.rgba` | the photo as raw RGBA 1280×720: Pillow `resize` (Lanczos) by min(1280 / 2367, 720 / 1374) to 1240×720, placed top-left, the 40 columns on the right opaque black |
+| `street-ref.json` | Ultralytics `predict` on that image with `yolo11n.onnx` (ONNX Runtime, CPU): `conf=0.25, iou=0.45, imgsz=640`. Per object: class id, label, confidence, and the box (left, top, width, height) in 1280×720 pixels |
+| `yolo-parity-in.f32` | 1×3×640×640 float32 (little-endian): the image through Ultralytics' own `LetterBox` (640×640, centred, padded with 114), RGB, scaled to [0, 1] |
+| `yolo-parity-out.f32` | 1×84×8400 float32: ONNX Runtime's CPU output (one thread) on that input |
+
+With the pinned environment the files are byte-identical from run to run. Their sha256 (x86-64; the ONNX Runtime
+outputs can differ in the last bits on another CPU, so the script only warns on a mismatch):
+
+```
+ebaab900765ef653d7336e237d5ce1daa1cd0b37d02b7a23a3e970429affacd4  street-1280x720.rgba
+fdf61dc33ff54c832120746e91a44367881cae29581fa023b246720668790f5a  street-ref.json
+43f0faad2edf5b161fef97304f6a5f53c16da4e1f9de761db35778e1e4d556b9  yolo-parity-in.f32
+bac1b23e05f85f6c8665cdfb05258f8a140922c04e177168d5933687d78f3fb9  yolo-parity-out.f32
+```
+
+The reference has 16 objects: 9 person, 3 car, and one each of truck, motorcycle, handbag and umbrella.
+`pipeline_infer` compares rdsinfer's detections with it per class, for the classes with at least 3 objects.

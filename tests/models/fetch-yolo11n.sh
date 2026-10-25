@@ -1,10 +1,12 @@
 #!/bin/sh
 # Downloads Ultralytics YOLO11n and exports it to .cache/models/yolo11n.onnx (+ coco-labels.txt) for the rdsinfer
-# tests. Runs on the host and needs Docker and network access. The export runs in a throwaway python:3.12-slim
-# container with the pins in export-requirements.txt; the venv and pip cache stay in .cache/yolo-export so re-runs
-# are fast. Outputs whose sha256 already matches are not redone.
+# tests, with their reference data: a public-domain street photo as raw RGBA, Ultralytics' detections on it, and an
+# input/output pair from ONNX Runtime for the engine parity test (see README.md). Runs on the host and needs Docker
+# and network access. The export runs in a throwaway python:3.12-slim container with the pins in
+# export-requirements.txt; the venv, pip cache and downloads stay in .cache/yolo-export so re-runs are fast. A model
+# whose sha256 already matches is not exported again; the reference data is rewritten unless all of it is there.
 #
-# YOLO11n is AGPL-3.0: the model is fetched and exported on your machine and never committed.
+# YOLO11n is AGPL-3.0: the model and everything made with it are generated on your machine and never committed.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -17,8 +19,10 @@ image=python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973
 
 if [ -f "$out/yolo11n.onnx" ] && [ -f "$out/coco-labels.txt" ] \
     && [ "$(sha256sum "$out/yolo11n.onnx" | cut -d' ' -f1)" = "$onnx_sha256" ] \
-    && [ "$(wc -l < "$out/coco-labels.txt")" -eq 80 ]; then
-  echo "$out/yolo11n.onnx is up to date"
+    && [ "$(wc -l < "$out/coco-labels.txt")" -eq 80 ] \
+    && [ -f "$out/street-1280x720.rgba" ] && [ -f "$out/street-ref.json" ] \
+    && [ -f "$out/yolo-parity-in.f32" ] && [ -f "$out/yolo-parity-out.f32" ]; then
+  echo "$out/yolo11n.onnx and its reference data are up to date"
   exit 0
 fi
 

@@ -741,9 +741,12 @@ attach_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set)
      * memory and would then get its results. */
     if (!g_list_find (bm->frame_meta_list, job->frame))
       continue;
-    if (cfg->network_type == 0)
+    if (cfg->network_type == 0) {
       for (guint i = 0; i < job->n_dets; i++)
         add_object (self, bm, job->frame, &g_array_index (self->dets, RdsInferDetection, job->det_start + i));
+      GST_DEBUG_OBJECT (self, "source %u frame %d: %u objects", job->frame->source_id, job->frame->frame_num,
+          job->n_dets);
+    }
     if (tensor_meta) {
       RdsUserMeta *um = rds_acquire_user_meta_from_pool (bm);
 

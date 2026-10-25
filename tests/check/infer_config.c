@@ -755,6 +755,47 @@ test_key_table (void)
   g_hash_table_unref (keys);
 }
 
+/* The rds-test3 sample's YOLO11n config loads without warnings and resolves its paths into the source tree's
+ * .cache/models. Loading reads the labels, so it needs tests/models/fetch-yolo11n.sh to have run. */
+static void
+test_sample_test3 (void)
+{
+  gchar *models = g_canonicalize_filename (RDS_TEST_CACHE_MODELS, NULL);
+  gchar *labels = g_build_filename (models, "coco-labels.txt", NULL);
+  gchar *onnx = g_build_filename (models, "yolo11n.onnx", NULL);
+  GError *err = NULL;
+  RdsInferConfig *cfg;
+
+  if (!g_file_test (labels, G_FILE_TEST_IS_REGULAR)) {
+    g_test_skip ("no coco-labels.txt in .cache/models (run tests/models/fetch-yolo11n.sh)");
+    goto out;
+  }
+  cfg = rds_infer_config_load (RDS_TEST_SAMPLE_PGIE_CONFIG, &err);
+  g_assert_no_error (err);
+  for (guint i = 0; i < cfg->warnings->len; i++)
+    g_test_message ("warning: %s", (const gchar *) g_ptr_array_index (cfg->warnings, i));
+  g_assert_cmpuint (cfg->warnings->len, ==, 0);
+  g_assert_cmpstr (cfg->onnx_file, ==, onnx);
+  g_assert_cmpstr (cfg->labelfile_path, ==, labels);
+  g_assert_cmpstr (cfg->parse_bbox_func_name, ==, "RdsInferParseYolo");
+  g_assert_null (cfg->custom_lib_path);
+  g_assert_cmpuint (cfg->num_detected_classes, ==, 80);
+  g_assert_cmpstr (cfg->labels[0], ==, "person");
+  g_assert_cmpint (cfg->network_type, ==, 0);
+  g_assert_cmpint (cfg->cluster_mode, ==, 2);
+  g_assert_true (cfg->has_infer_dims);
+  g_assert_cmpuint (cfg->infer_dims[1], ==, 640);
+  g_assert_cmpuint (cfg->infer_dims[2], ==, 640);
+  g_assert_true (cfg->maintain_aspect_ratio && cfg->symmetric_padding);
+  g_assert_cmpfloat_with_epsilon (cfg->class_attrs[0].pre_cluster_threshold, 0.25f, 1e-6);
+  g_assert_cmpfloat_with_epsilon (cfg->class_attrs[79].nms_iou_threshold, 0.45f, 1e-6);
+  rds_infer_config_free (cfg);
+out:
+  g_free (onnx);
+  g_free (labels);
+  g_free (models);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -778,5 +819,6 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-config/engine-options", test_engine_options);
   g_test_add_func ("/cpu/infer-config/validate", test_validate);
   g_test_add_func ("/cpu/infer-config/key-table", test_key_table);
+  g_test_add_func ("/cpu/infer-config/sample-test3", test_sample_test3);
   return g_test_run ();
 }

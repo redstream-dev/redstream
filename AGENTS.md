@@ -174,8 +174,9 @@ tests/check/       GLib unit, element and pipeline tests (suites cpu/gpu); test 
 tests/samples/     sample-level tests
 tests/tools/       tool tests (shell scripts)
 tests/media/       make-test-media.sh: generated H.264 clips (into git-ignored .cache/)
-tests/models/      committed tiny ONNX test models (make-test-models.py); fetch-yolo11n.sh exports YOLO11n into
-                   .cache/models (host, Docker; AGPL, never committed)
+tests/models/      committed tiny ONNX test models (make-test-models.py); fetch-yolo11n.sh exports YOLO11n and its
+                   test reference data (street photo, Ultralytics detections, parity tensors) into .cache/models
+                   (host, Docker; AGPL, never committed)
 spikes/            Phase 0 experiments (rocdec-hip, migraphx-devptr); reference code, not built by meson
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
 ```
@@ -221,9 +222,10 @@ meson test -C build-rel --print-errorlogs
 - Element tests load plugins from `build/gst` (`GST_PLUGIN_PATH_1_0`) next to the system plugins, with a private
   registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
   `gst-plugin-scanner` can't load sanitized plugins. ASan runs with `use_sigaltstack=0` (Mesa's LLVM, loaded by the
-  VA driver, installs its own alternate signal stack). The soak tests (`pipeline_soak`, `pipeline_mux_soak`) check
-  host memory growth on VmRSS, or under ASan on ASan's live heap (`__sanitizer_get_current_allocated_bytes`, which
-  leaves out the quarantine, so ASan keeps its default options); the normal build's VmRSS check covers memory that
+  VA driver, installs its own alternate signal stack). The soak tests (`pipeline_soak`, `pipeline_mux_soak`,
+  `pipeline_infer_soak`) check host memory growth on VmRSS, or under ASan on ASan's live heap
+  (`__sanitizer_get_current_allocated_bytes`, which leaves out the quarantine, so ASan keeps its default options);
+  the normal build's VmRSS check covers memory that
   bypasses malloc (HIP pinned memory). Their memory probes live in `tests/check/rds-test-soak.h`: host memory, and
   GPU memory from this process's DRM fdinfo (`drm-total-vram` +
   `drm-total-gtt` of its render-node fds, where HIP allocations are accounted), so other processes on the GPU don't

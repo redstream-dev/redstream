@@ -107,13 +107,21 @@ test('element_streammux_cpu', element_streammux_exe, args : ['-p', '/cpu/mux'],
 test('element_streammux', element_streammux_exe, args : ['-p', '/gpu/mux'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180, depends : rds_plugins)
 
+# shared by the pipeline tests
+pipeline_deps = test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)]
+
 if rds_infer_enabled
-  # The config parser on its own, against the corpus in check/infer-configs. It uses no GStreamer, so it gets the
-  # environment without plugin paths.
+  # The config parser on its own, against the corpus in check/infer-configs (and the rds-test3 sample's config, once
+  # YOLO11n's labels are fetched). It uses no GStreamer, so it gets the environment without plugin paths.
   test('infer_config', executable('infer_config', 'check' / 'infer_config.c',
       dependencies : [rdsinfer_core_dep],
       link_language : 'cpp',
-      c_args : ['-DRDS_INFER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'infer-configs')]),
+      c_args : [
+        '-DRDS_INFER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'infer-configs'),
+        '-DRDS_TEST_SAMPLE_PGIE_CONFIG="@0@"'.format(
+          meson.project_source_root() / 'samples' / 'rds-test3' / 'rds_test3_pgie_config.yml'),
+        '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
+      ]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
   # The built-in YOLO parser and the detection post-processing, against hand-computed cases and a naive reference
   # (check/infer-post-ref.h). Prints the parser and post-processing times on a YOLO11n-sized output.
@@ -201,6 +209,24 @@ if rds_infer_enabled
   test('element_infer', element_infer_exe, args : ['-p', '/gpu/infer'],
     suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300,
     depends : rds_plugins + [infer_parser_fixture])
+
+  # rdsinfer end to end with YOLO11n: detections on a street photo against Ultralytics, batch 4 against batch 1
+  # (pipeline_infer; skipped until tests/models/fetch-yolo11n.sh has run), and the four-source soak (its own entry,
+  # pipeline_infer_soak, about 4 min; with scale2 when YOLO11n isn't fetched, so the leak check always runs). The
+  # YOLO11n programs are cached in the build directory next to infer_engine's; a first compile takes about a minute at
+  # batch 1 and more at batch 4, so the timeouts are generous. Never in parallel: one compile or soak at a time.
+  pipeline_infer_exe = executable('pipeline_infer', 'check' / 'pipeline_infer.c',
+    dependencies : pipeline_deps + [json_glib_dep],
+    c_args : [
+      '-DRDS_TEST_MODELS="@0@"'.format(meson.current_source_dir() / 'models'),
+      '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
+      '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+    ])
+  test('pipeline_infer', pipeline_infer_exe, args : ['-p', '/gpu/infer-yolo'],
+    suite : ['gpu', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 900,
+    depends : rds_plugins)
+  test('pipeline_infer_soak', pipeline_infer_exe, args : ['-p', '/gpu/infer-soak'],
+    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800, depends : rds_plugins)
 endif
 
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',
@@ -213,7 +239,6 @@ test('element_streamdemux', element_streamdemux_exe, args : ['-p', '/gpu/demux']
 # Decode + convert integration: autoplugging, end to end against vah264dec + the CPU reference, and the soak.
 # The soak (3000 1280x720 frames, leak check) is its own test entry, `meson test -C build pipeline_soak`; it takes
 # about 9 s (also under ASan), so it stays in the gpu suite.
-pipeline_deps = test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)]
 pipeline_exe = executable('pipeline_decode_convert', 'check' / 'pipeline_decode_convert.c',
   dependencies : pipeline_deps)
 test('pipeline_decode_convert', pipeline_exe, args : ['-p', '/gpu/pipeline'],
