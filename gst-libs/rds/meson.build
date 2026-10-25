@@ -1,7 +1,7 @@
 rds_headers = files('rds-prelude.h', 'rds-compat-remap.h', 'rds_compat.h', 'rds-buf-surface.h',
   'rds-memory.h', 'rds-buffer-pool.h', 'rds-osd-types.h', 'rds-meta.h',
   'rds-gst-meta.h', 'rds-event.h', 'rds-transform.h', 'rds.h', 'rds-compat-aliases.h',
-  'rds-infer.h', 'rds-infer-custom-impl.h')
+  'rds-infer.h', 'rds-infer-custom-impl.h', 'rds_compat_infer.h')
 install_headers(rds_headers, subdir : 'redstream-' + api_version / 'rds')
 
 hip_arch_args = []

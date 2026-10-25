@@ -48,7 +48,7 @@ typedef struct
   const char *layerName;
   void *buffer;                 /* host memory: this image's slice of the layer */
   int isInput;                  /* non-zero for an input layer */
-  void *deviceBuffer;           /* ours: the same slice in device memory, or NULL */
+  void *deviceBuffer;           /* ours: the same slice on the element's GPU, or NULL */
 } RdsInferLayerInfo;
 
 /* The network input size. */

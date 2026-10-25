@@ -582,24 +582,34 @@ Not aliased: `GST_NVEVENT_UPDATE_CAPS` and `gst_nvevent_new_update_caps` (no Red
 ABI (C++). Their fields keep NVIDIA's documented names and order, so a DeepStream bbox parser recompiles unchanged.
 The types and the loader are in place; the `rdsinfer` element does not call parsers yet (hence **planned**).
 
+`rds/rds_compat.h` (C and C++) aliases only the C-compatible `NvDsInfer*` types below. The parser ABI names are in
+`rds/rds_compat_infer.h` (C++), the replacement for `nvdsinfer_custom_impl.h`, which also includes `rds_compat.h`:
+
 ```cpp
 #ifdef USE_REDSTREAM
-#include <rds/rds_compat.h>
+#include <rds/rds_compat_infer.h>
 #else
 #include "nvdsinfer_custom_impl.h"
 #endif
 ```
 
-- **Build parsers in the Redstream toolchain** (libstdc++, `_GLIBCXX_USE_CXX11_ABI=1`): the ABI passes `std::vector`.
-- Including the parser header (directly or through `rds_compat.h` in C++) defines a weak
-  `rds_infer_parser_abi_version()` in the library. `rdsinfer` checks it when it loads `custom-lib-path`: a library
-  without it, or with another version, fails to start with a message naming the library. The symbol is exported even
-  with `-fvisibility=hidden`; the parse functions then need `__attribute__ ((visibility ("default")))`.
-- The library is loaded with `RTLD_NOW | RTLD_LOCAL` and stays loaded until the element stops.
+- **Build parsers in the Redstream toolchain** (libstdc++, `_GLIBCXX_USE_CXX11_ABI=1`, never `-static-libstdc++`):
+  the ABI passes `std::vector`.
+- Including the parser header (`rds-infer-custom-impl.h` or `rds_compat_infer.h`) defines a weak
+  `rds_infer_parser_abi_version()` in the library; include it only in parser libraries. `rdsinfer` checks it when
+  it loads `custom-lib-path`: a library without its own copy (one from a library it depends on does not count), or
+  with another version, fails to start with a message naming the library. The symbol is exported even with
+  `-fvisibility=hidden` (the parse functions then need `__attribute__ ((visibility ("default")))`); with a version
+  script or `-Wl,--exclude-libs`, export it explicitly.
+- The library is loaded with `RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE`: it is never unloaded (GStreamer never unloads
+  plugins either), so HIP code objects, GTypes and threads in it stay valid.
 - A parse function that returns `false` or throws: that image gets no detections and `rdsinfer` posts a warning
-  (nothing is documented for this on DeepStream).
+  (nothing is documented for this on DeepStream). It must not call `exit()` or `abort()`.
+- The parse function is called from one thread at a time per loaded parser. `outputLayersInfo` and its buffers are
+  valid only during the call. `buffer` is host memory; `deviceBuffer` (ours) is the same layer's data on the
+  element's GPU (`gpu-id`); both are complete (synchronised) when the call starts.
 - The unprefixed `FLOAT`, `HALF`, `INT8`, `INT32`, `INT64` are C++ only (`constexpr` constants of
-  `RdsInferDataType`) and come only with `rds_compat.h`; in C, use `RDS_INFER_DATA_*`.
+  `RdsInferDataType`) and come only with `rds_compat_infer.h`; in C, use `RDS_INFER_DATA_*`.
 
 | DeepStream name | Redstream name | Status | Notes | Source |
 |---|---|---|---|---|
@@ -607,16 +617,25 @@ The types and the loader are in place; the `rdsinfer` element does not call pars
 | `NvDsInferDims` | `RdsInferDims` | planned | per image: no batch dimension; `numElements` is the per-image element count | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferDims.html) |
 | `NvDsInferDimsCHW` | `RdsInferDimsCHW` | planned |  | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferDimsCHW.html) |
 | `NvDsInferDataType` | `RdsInferDataType` | planned | `RDS_INFER_DATA_FLOAT` 0, `_HALF` 1, `_INT8` 2, `_INT32` 3, `_INT64` 4 | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
-| `FLOAT`, `HALF`, `INT8`, `INT32`, `INT64` | `RDS_INFER_DATA_FLOAT`, ... | planned | C++ only, see above | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
+| `FLOAT`, `HALF`, `INT8`, `INT32`, `INT64` | `RDS_INFER_DATA_FLOAT`, ... | planned | C++ only, `rds_compat_infer.h`, see above | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
 | `NvDsInferLayerInfo` | `RdsInferLayerInfo` | planned | `buffer` is host memory; ours, appended: `deviceBuffer`, the same data on the GPU (or NULL). `bindingIndex` is the layer's index among the program's outputs | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferLayerInfo.html) |
 | `NvDsInferNetworkInfo` | `RdsInferNetworkInfo` | planned |  | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferNetworkInfo.html) |
-| `NvDsInferParseDetectionParams` | `RdsInferParseDetectionParams` | planned | with the deprecated `perClassThreshold` reference to `perClassPreclusterThreshold`; ours: a copy constructor and assignment that keep it bound to the copy's own thresholds | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferParseDetectionParams.html) |
+| `NvDsInferParseDetectionParams` | `RdsInferParseDetectionParams` | planned | C++ only, `rds_compat_infer.h`; with the deprecated `perClassThreshold` reference to `perClassPreclusterThreshold`; ours: a copy constructor and assignment that keep it bound to the copy's own thresholds | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferParseDetectionParams.html) |
 | `NvDsInferObjectDetectionInfo` | `RdsInferObjectDetectionInfo` | planned | the DeepStream 9 layout, with `rotation_angle` (28 bytes); a non-zero angle is ignored with a warning. Coordinates in network-input pixels | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/9.1/sdk-api/structNvDsInferObjectDetectionInfo.html) |
 | `NvDsInferParseObjectInfo` | `RdsInferParseObjectInfo` | planned | the same type as `RdsInferObjectDetectionInfo` | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
-| `NvDsInferParseCustomFunc` | `RdsInferParseCustomFunc` | planned | C++ only | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
-| `CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | `RDS_CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | planned | C++ only; a mismatched signature fails to compile | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
+| `NvDsInferParseCustomFunc` | `RdsInferParseCustomFunc` | planned | C++ only, `rds_compat_infer.h` | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
+| `CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | `RDS_CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | planned | C++ only, `rds_compat_infer.h`; a mismatched signature fails to compile | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
 
-Not aliased: the deprecated `dims` member of `NvDsInferLayerInfo`'s union (not in the public docs),
-`getDimsCHWFromDims` / `getDimsHWCFromDims`, the instance-mask, classifier, semantic-segmentation and
-engine-create parser types and their check macros, `NvDsInferInitializeInputLayers`, and the TensorRT-specific
-functions (no Redstream counterpart yet, or none on ROCm).
+Not aliased (no Redstream counterpart yet, or none on ROCm):
+- the deprecated `dims` member of `NvDsInferLayerInfo`'s union (not in the public docs), `getDimsCHWFromDims`,
+  `getDimsHWCFromDims`;
+- `NvDsInferInstanceMaskInfo`, `NvDsInferAttribute`, and the instance-mask, classifier, semantic-segmentation and
+  engine-create parser types (`NvDsInferInstanceMaskParseCustomFunc`, `NvDsInferClassiferParseCustomFunc`,
+  `NvDsInferSemSegmentationParseCustomFunc`, `NvDsInferEngineCreateCustomFunc`) with their check macros;
+  `NvDsInferInitializeInputLayers`; the TensorRT-specific functions (`NvDsInferCreateModelParser`,
+  `NvDsInferPluginFactoryRuntimeGet` / `Destroy`, `NvDsInferCudaEngineGet`);
+- `NvDsInferStatus` and its `NVDSINFER_*` values, `NvDsInferStatus2Str`, `NvDsInferLogLevel`;
+- the `nvdsinfer_context.h` names: `NvDsInferNetworkMode`, `NvDsInferNetworkType`, `NvDsInferFormat`,
+  `NvDsInferTensorOrder`, `NvDsInferClusterMode`, `NvDsInferDetectionParams`, `_NvDsInferContextInitParams`,
+  `NVDSINFER_MAX_BATCH_SIZE`, `NVDSINFER_MAX_CHANNELS`, `NVDSINFER_PATH_MAX`, `NVDSINFER_MAX_STR_LENGTH` (the
+  element reads the same values from its config file).

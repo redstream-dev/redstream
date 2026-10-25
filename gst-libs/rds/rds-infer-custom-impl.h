@@ -3,16 +3,27 @@
  * A parser library is a shared object with one or more functions of type RdsInferParseCustomFunc, with C linkage.
  * rdsinfer loads the library named by custom-lib-path and calls the function named by parse-bbox-func-name once
  * per inferred image. Names and field order follow NVIDIA's public API reference, so a DeepStream parser builds
- * unchanged against rds/rds_compat.h (which adds the NvDsInfer* names).
+ * unchanged against rds/rds_compat_infer.h (which adds the NvDsInfer* names).
  *
- * Build parsers with the toolchain and C++ standard library ABI Redstream was built with (libstdc++,
- * _GLIBCXX_USE_CXX11_ABI=1): the ABI passes std::vector. Including this header defines
- * rds_infer_parser_abi_version() in the library (a weak symbol, so any number of files may include it), which
- * rdsinfer checks when it loads the library. A library built with -fvisibility=hidden still exports it, but its
- * parse functions need __attribute__ ((visibility ("default"))) to be found.
+ * Building a parser:
+ * - Use the toolchain and C++ standard library ABI Redstream was built with (libstdc++,
+ *   _GLIBCXX_USE_CXX11_ABI=1): the ABI passes std::vector. Link libstdc++ dynamically, never with
+ *   -static-libstdc++ (the vectors would be allocated and freed by two different copies of it).
+ * - Including this header defines rds_infer_parser_abi_version() in the library (a weak symbol, so any number of
+ *   files may include it), which rdsinfer checks when it loads the library. It must be the library's own: one that
+ *   comes from a library it depends on does not count. It is exported even with -fvisibility=hidden (the parse
+ *   functions then need __attribute__ ((visibility ("default"))) to be found); with a version script or
+ *   -Wl,--exclude-libs, export it explicitly.
+ * - rdsinfer loads the library with RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE: it is never unloaded, so HIP code
+ *   objects, GTypes and threads in it stay valid.
  *
- * The parse function must not let an exception escape: rdsinfer catches it, drops that image's detections and
- * posts a warning, as it does for a false return.
+ * Writing the parse function:
+ * - Never let an exception escape: rdsinfer catches it, drops that image's detections and posts a warning, as it
+ *   does for a false return. Never call exit() or abort().
+ * - It is called from one thread at a time for each loaded parser (it may be a different thread from call to call).
+ * - outputLayersInfo and the buffers it points to are valid only during the call: don't keep the pointers.
+ *   buffer is the layer's data in host memory; deviceBuffer (ours) is the same layer's data on the element's GPU
+ *   (gpu-id), or NULL. Both are complete (synchronised) when the call starts.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_INFER_CUSTOM_IMPL_H
 #define RDS_INFER_CUSTOM_IMPL_H

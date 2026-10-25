@@ -132,7 +132,8 @@ gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
   rds-meta*, rds-osd-types  batch/frame/object/user/display meta, pools, deep copy
   rds-gst-meta       RdsMeta GstMeta on buffers (gst_buffer_get_rds_batch_meta)
   rds-event          stream events (pad added/deleted, stream start/EOS/segment/reset)
-  rds_compat.h       DeepStream compat header (+ rds-compat-aliases.h, rds-compat-remap.c)
+  rds_compat.h       DeepStream compat header (+ rds-compat-aliases.h, rds-compat-remap.c); rds_compat_infer.h
+                     (C++) adds the custom parser ABI names, for parser libraries only
   rds-infer*.h       rdsinfer types (C) and the custom bbox parser ABI (rds-infer-custom-impl.h, C++); headers only
   rds-transform      rds_buf_surf_transform: batched crop/scale/colour conversion (NvBufSurfTransform-shaped)
   rds-transform-kernels.hip  its HIP kernels (amdclang++, linked in as an object)

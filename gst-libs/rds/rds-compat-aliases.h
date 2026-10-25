@@ -7,9 +7,6 @@
 
 #include <rds/rds.h>
 #include <rds/rds-infer.h>
-#ifdef __cplusplus
-#include <rds/rds-infer-custom-impl.h>
-#endif
 
 /* ---- NvBufSurface ---- */
 typedef RdsBufSurface NvBufSurface;
@@ -251,18 +248,6 @@ typedef RdsInferNetworkInfo NvDsInferNetworkInfo;
 typedef RdsInferObjectDetectionInfo NvDsInferObjectDetectionInfo;
 typedef RdsInferParseObjectInfo NvDsInferParseObjectInfo;
 
-#ifdef __cplusplus
-/* ---- Custom bbox parser ABI (nvdsinfer_custom_impl.h), C++ only ---- */
-/* Unscoped, unprefixed enumerators on DeepStream; constants of the Redstream enum here, so comparisons and switches
- * on dataType compile warning-free. Only code that includes this header sees them. */
-constexpr RdsInferDataType FLOAT = RDS_INFER_DATA_FLOAT;
-constexpr RdsInferDataType HALF = RDS_INFER_DATA_HALF;
-constexpr RdsInferDataType INT8 = RDS_INFER_DATA_INT8;
-constexpr RdsInferDataType INT32 = RDS_INFER_DATA_INT32;
-constexpr RdsInferDataType INT64 = RDS_INFER_DATA_INT64;
-typedef RdsInferParseDetectionParams NvDsInferParseDetectionParams;
-typedef RdsInferParseCustomFunc NvDsInferParseCustomFunc;
-#define CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE RDS_CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE
-#endif
+/* The custom bbox parser ABI aliases (nvdsinfer_custom_impl.h) are C++ and live in rds/rds_compat_infer.h. */
 
 #endif /* RDS_COMPAT_ALIASES_H */

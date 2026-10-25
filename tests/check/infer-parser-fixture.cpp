@@ -1,11 +1,13 @@
 /* Test parser module, written the way a DeepStream bbox parser is: only the NvDsInfer* names and
- * CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE, through rds/rds_compat.h (built with -DUSE_REDSTREAM). Not installed.
+ * CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE, through rds/rds_compat_infer.h (built with -DUSE_REDSTREAM). Not installed.
  * FixtureBoxes returns the boxes in infer-parser-fixture.h, FixtureThrow throws, FixtureFail returns false.
+ * FixtureVisible (in the second file) is FixtureBoxes marked with default visibility, for the build of these
+ * sources with -fvisibility=hidden.
  * The box table lives in a second translation unit (infer-parser-fixture-boxes.cpp), which includes the parser
  * header too: the module links two copies of its weak version symbol.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifdef USE_REDSTREAM
-#include <rds/rds_compat.h>
+#include <rds/rds_compat_infer.h>
 #else
 #include "nvdsinfer_custom_impl.h"
 #endif

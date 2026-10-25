@@ -114,16 +114,24 @@ if rds_infer_enabled
 
   # Test parser modules (never installed), loaded by path. The fixture is a DeepStream-style parser compiled against
   # the compat header, from two translation units that both include the parser header; the same sources are built
-  # again with hidden visibility. The no-ABI module lacks the version symbol; the bad-ABI one has a wrong version.
+  # again with hidden visibility. The no-ABI module lacks the version symbol, the bad-ABI one has a wrong version,
+  # and the dep-ABI one gets it only from a helper library it links. compat-only is C++ that includes only
+  # rds_compat.h.
   fixture_parser_src = files('check' / 'infer-parser-fixture.cpp', 'check' / 'infer-parser-fixture-boxes.cpp')
   fixture_parser_deps = [rds_dep.partial_dependency(compile_args : true, includes : true)]
+  noabi_src = files('check' / 'infer-parser-noabi.c')
   infer_parser_fixture = shared_module('infer-parser-fixture', fixture_parser_src,
     cpp_args : ['-DUSE_REDSTREAM'], dependencies : fixture_parser_deps)
   infer_parser_hidden = shared_module('infer-parser-hidden', fixture_parser_src,
     cpp_args : ['-DUSE_REDSTREAM'], dependencies : fixture_parser_deps, gnu_symbol_visibility : 'hidden')
-  infer_parser_noabi = shared_module('infer-parser-noabi', 'check' / 'infer-parser-noabi.c')
-  infer_parser_badabi = shared_module('infer-parser-badabi', 'check' / 'infer-parser-noabi.c',
-    c_args : ['-DRDS_TEST_ABI_VERSION=999'])
+  infer_parser_noabi = shared_module('infer-parser-noabi', noabi_src)
+  infer_parser_badabi = shared_module('infer-parser-badabi', noabi_src, c_args : ['-DRDS_TEST_ABI_VERSION=999'])
+  infer_parser_abihelper = shared_library('infer-parser-abihelper', noabi_src,
+    c_args : ['-DRDS_TEST_ABI_HELPER', '-DRDS_TEST_ABI_VERSION=1'])
+  infer_parser_depabi = shared_module('infer-parser-depabi', noabi_src, c_args : ['-DRDS_TEST_ABI_FROM_DEP'],
+    link_with : infer_parser_abihelper)
+  infer_compat_only = shared_module('infer-compat-only', 'check' / 'infer-compat-only.cpp',
+    dependencies : fixture_parser_deps)
   # export_dynamic: this executable's own copy of the version symbol is visible to dlsym, so the no-ABI test
   # checks that the loader looks only in the module.
   test('infer_abi', executable('infer_abi', 'check' / 'infer_abi.cpp', 'check' / 'infer_abi_noleak.cpp',
@@ -134,9 +142,12 @@ if rds_infer_enabled
         '-DRDS_TEST_PARSER_HIDDEN="@0@"'.format(infer_parser_hidden.full_path()),
         '-DRDS_TEST_PARSER_NOABI="@0@"'.format(infer_parser_noabi.full_path()),
         '-DRDS_TEST_PARSER_BADABI="@0@"'.format(infer_parser_badabi.full_path()),
+        '-DRDS_TEST_PARSER_DEPABI="@0@"'.format(infer_parser_depabi.full_path()),
+        '-DRDS_TEST_COMPAT_ONLY="@0@"'.format(infer_compat_only.full_path()),
       ]),
     suite : 'cpu', env : test_env, protocol : 'tap',
-    depends : [infer_parser_fixture, infer_parser_hidden, infer_parser_noabi, infer_parser_badabi])
+    depends : [infer_parser_fixture, infer_parser_hidden, infer_parser_noabi, infer_parser_badabi,
+      infer_parser_depabi, infer_compat_only])
 endif
 
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',

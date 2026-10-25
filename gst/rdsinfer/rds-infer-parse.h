@@ -16,19 +16,20 @@ G_GNUC_INTERNAL GQuark rds_infer_parser_error_quark (void);
 typedef enum
 {
   RDS_INFER_PARSER_ERROR_OPEN,          /* dlopen failed (the dlerror text follows) */
-  RDS_INFER_PARSER_ERROR_ABI,           /* no rds_infer_parser_abi_version, or a different version */
+  RDS_INFER_PARSER_ERROR_ABI,           /* no rds_infer_parser_abi_version of its own, or a different version */
   RDS_INFER_PARSER_ERROR_SYMBOL,        /* the parse function is not in the library */
   RDS_INFER_PARSER_ERROR_PARSE,         /* the parse function returned false or threw */
 } RdsInferParserError;
 
-/* A parse function of a loaded custom parser library, which stays open until rds_infer_parser_free. Not
- * thread-safe: call it from one thread at a time. */
+/* A parse function of a loaded custom parser library. Not thread-safe: call it from one thread at a time. Libraries
+ * are loaded with RTLD_NODELETE: rds_infer_parser_free drops the handle, the library stays mapped. */
 typedef struct _RdsInferParser RdsInferParser;
 
-/* Loads @lib_path (RTLD_NOW | RTLD_LOCAL), checks its parser ABI version and looks up @func_name. */
+/* Loads @lib_path (RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE), checks that it has its own rds_infer_parser_abi_version
+ * with this ABI version, and looks up @func_name. */
 G_GNUC_INTERNAL RdsInferParser *rds_infer_parser_open (const gchar * lib_path, const gchar * func_name,
     GError ** error);
-/* Closes the library. NULL is allowed. */
+/* Releases the library handle (the library stays loaded). NULL is allowed. */
 G_GNUC_INTERNAL void rds_infer_parser_free (RdsInferParser * parser);
 G_GNUC_INTERNAL const gchar *rds_infer_parser_get_func_name (const RdsInferParser * parser);
 

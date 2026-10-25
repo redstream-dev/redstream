@@ -1,7 +1,7 @@
 /* The custom bbox parser ABI (rds/rds-infer-custom-impl.h and its NvDsInfer* aliases) and rdsinfer's parser
  * loader, against the test modules in infer-parser-fixture.cpp and infer-parser-noabi.c.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
-#include <rds/rds_compat.h>
+#include <rds/rds_compat_infer.h>
 
 #include "rds-infer-parse.h"
 #include "infer-parser-fixture.h"
@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 #include <dlfcn.h>
 
 /* From infer_abi_noleak.cpp: the unprefixed names are free there. */
@@ -109,6 +110,14 @@ test_detection_params (void)
   assigned = p;
   g_assert_true (&assigned.perClassThreshold == &assigned.perClassPreclusterThreshold);
   g_assert_cmpuint (assigned.perClassThreshold.size (), ==, 2);
+
+  RdsInferParseDetectionParams moved (std::move (copy));
+  g_assert_true (&moved.perClassThreshold == &moved.perClassPreclusterThreshold);
+  g_assert_cmpfloat (moved.perClassThreshold[1], ==, 0.5f);
+  RdsInferParseDetectionParams move_assigned;
+  move_assigned = std::move (moved);
+  g_assert_true (&move_assigned.perClassThreshold == &move_assigned.perClassPreclusterThreshold);
+  g_assert_cmpuint (move_assigned.perClassThreshold.size (), ==, 2);
 }
 
 /* DeepStream parsers compare the data type with the unprefixed names; this file builds with -Werror. */
@@ -167,6 +176,21 @@ assert_open_fails (const char *path, const char *func, gint code, const char *co
   g_error_free (err);
 }
 
+/* @path appears once in the error from opening @path / @func (dlerror repeats it otherwise). */
+static void
+assert_path_once (const char *path, const char *func, const char *needle)
+{
+  GError *err = NULL;
+  const char *first;
+
+  g_assert_null (rds_infer_parser_open (path, func, &err));
+  g_assert_nonnull (err);
+  first = strstr (err->message, needle);
+  g_assert_true (first == err->message);
+  g_assert_null (strstr (first + 1, needle));
+  g_error_free (err);
+}
+
 static gboolean
 parse (RdsInferParser * parser, GArray * objects, GError ** err)
 {
@@ -218,9 +242,10 @@ test_fixture_boxes (void)
 static void
 test_missing_library (void)
 {
-  const char *want[] = { "/nonexistent/libparser.so", NULL };
+  const char *want[] = { "/nonexistent/libparser.so: ", "No such file", NULL };
 
   assert_open_fails ("/nonexistent/libparser.so", "FixtureBoxes", RDS_INFER_PARSER_ERROR_OPEN, want);
+  assert_path_once ("/nonexistent/libparser.so", "FixtureBoxes", "/nonexistent/libparser.so");
 }
 
 static void
@@ -229,13 +254,40 @@ test_wrong_symbol (void)
   const char *want[] = { RDS_TEST_PARSER_FIXTURE, "NoSuchParser", NULL };
 
   assert_open_fails (RDS_TEST_PARSER_FIXTURE, "NoSuchParser", RDS_INFER_PARSER_ERROR_SYMBOL, want);
+  assert_path_once (RDS_TEST_PARSER_FIXTURE, "NoSuchParser", RDS_TEST_PARSER_FIXTURE);
+}
+
+/* The version symbol must be the module's own, not one of a library it depends on. */
+static void
+test_abi_from_dependency (void)
+{
+  const char *want[] = { RDS_TEST_PARSER_DEPABI, "has no exported rds_infer_parser_abi_version",
+    "libinfer-parser-abihelper.so", NULL };
+
+  assert_open_fails (RDS_TEST_PARSER_DEPABI, "NoAbiParse", RDS_INFER_PARSER_ERROR_ABI, want);
+}
+
+/* C++ including only rds_compat.h defines its own unprefixed names and exports no version symbol. */
+static void
+test_compat_only (void)
+{
+  void *handle = dlopen (RDS_TEST_COMPAT_ONLY, RTLD_NOW | RTLD_LOCAL);
+  int (*sum) (void);
+
+  g_assert_nonnull (handle);
+  sum = reinterpret_cast<int (*)(void)> (dlsym (handle, "compat_only_sum"));
+  g_assert_nonnull (reinterpret_cast<void *> (sum));
+  g_assert_cmpint (sum (), ==, 1 + 2 + 3 + 4 + 5 + 0 + 8);
+  g_assert_null (dlsym (handle, "rds_infer_parser_abi_version"));
+  dlclose (handle);
 }
 
 /* This executable defines (and exports) the version symbol too: the check must look only in the module. */
 static void
 test_no_abi (void)
 {
-  const char *want[] = { RDS_TEST_PARSER_NOABI, "not built against", "rds-infer-custom-impl.h", NULL };
+  const char *want[] = { RDS_TEST_PARSER_NOABI, "has no exported rds_infer_parser_abi_version",
+    "rds/rds-infer-custom-impl.h", "rds/rds_compat_infer.h", "version script", NULL };
 
   g_assert_nonnull (dlsym (RTLD_DEFAULT, "rds_infer_parser_abi_version"));
   assert_open_fails (RDS_TEST_PARSER_NOABI, "NoAbiParse", RDS_INFER_PARSER_ERROR_ABI, want);
@@ -267,6 +319,17 @@ test_hidden_visibility (void)
   g_assert_null (dlsym (handle, "FixtureBoxes"));
   dlclose (handle);
   assert_open_fails (RDS_TEST_PARSER_HIDDEN, "FixtureBoxes", RDS_INFER_PARSER_ERROR_SYMBOL, want);
+
+  /* A parse function marked visibility ("default") loads and works. */
+  RdsInferParser *parser = open_ok (RDS_TEST_PARSER_HIDDEN, "FixtureVisible");
+  GArray *objects = g_array_new (FALSE, FALSE, sizeof (RdsInferObjectDetectionInfo));
+  GError *err = NULL;
+
+  g_assert_true (parse (parser, objects, &err));
+  g_assert_no_error (err);
+  g_assert_cmpuint (objects->len, ==, RDS_TEST_FIXTURE_N_BOXES);
+  g_array_unref (objects);
+  rds_infer_parser_free (parser);
 }
 
 static void
@@ -322,25 +385,29 @@ module_loaded (const char *path)
   return TRUE;
 }
 
-/* The loader keeps the module open while the parser lives, closes it on free and on every failed open. */
+/* Modules are loaded with RTLD_NODELETE: freeing the parser (or a failed open) releases the handle, but the module
+ * stays mapped and can be opened again. */
 static void
-test_closed_on_free (void)
+test_free_and_reopen (void)
 {
   GError *err = NULL;
   RdsInferParser *parser;
+  void *func;
 
-  g_assert_false (module_loaded (RDS_TEST_PARSER_FIXTURE));
   parser = open_ok (RDS_TEST_PARSER_FIXTURE, "FixtureBoxes");
   g_assert_true (module_loaded (RDS_TEST_PARSER_FIXTURE));
+  func = dlsym (RTLD_DEFAULT, "FixtureBoxes");
+  g_assert_null (func);         /* RTLD_LOCAL: not in the global scope */
   rds_infer_parser_free (parser);
-  g_assert_false (module_loaded (RDS_TEST_PARSER_FIXTURE));
+  g_assert_true (module_loaded (RDS_TEST_PARSER_FIXTURE));
+
+  parser = open_ok (RDS_TEST_PARSER_FIXTURE, "FixtureBoxes");
+  rds_infer_parser_free (parser);
 
   g_assert_null (rds_infer_parser_open (RDS_TEST_PARSER_FIXTURE, "NoSuchParser", &err));
   g_clear_error (&err);
-  g_assert_false (module_loaded (RDS_TEST_PARSER_FIXTURE));
   g_assert_null (rds_infer_parser_open (RDS_TEST_PARSER_NOABI, "NoAbiParse", &err));
   g_clear_error (&err);
-  g_assert_false (module_loaded (RDS_TEST_PARSER_NOABI));
   rds_infer_parser_free (NULL);
 }
 
@@ -358,6 +425,8 @@ main (int argc, char **argv)
   g_test_add_func ("/infer-parser/hidden-visibility", test_hidden_visibility);
   g_test_add_func ("/infer-parser/throw", test_throw);
   g_test_add_func ("/infer-parser/fail", test_fail);
-  g_test_add_func ("/infer-parser/closed-on-free", test_closed_on_free);
+  g_test_add_func ("/infer-parser/abi-from-dependency", test_abi_from_dependency);
+  g_test_add_func ("/infer-parser/compat-only", test_compat_only);
+  g_test_add_func ("/infer-parser/free-and-reopen", test_free_and_reopen);
   return g_test_run ();
 }
