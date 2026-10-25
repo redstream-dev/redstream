@@ -13,7 +13,6 @@
 G_DEFINE_QUARK (rds-infer-config-error-quark, rds_infer_config_error)
 
 #define MAX_CLASSES 65536       /* ours: bounds the per-class arrays */
-#define MAX_BATCH 1024          /* nvinfer's documented maximum batch size */
 #define MAX_OFFSETS 4           /* nvinfer's documented maximum channel count */
 G_STATIC_ASSERT (MAX_OFFSETS >= 3);     /* parse_value's vals[] also holds infer-dims */
 #define PROPERTY_GROUP "property"
@@ -90,8 +89,8 @@ static const KeyInfo keys[] = {
       .field = P (infer_dims)},
   {.name = "output-blob-names",.group = PROP,.type = TYPE_STRING_LIST,.status = SUP,
       .field = P (output_blob_names)},
-  {.name = "batch-size",.group = PROP,.type = TYPE_UINT,.status = SUP,.min = 1,.max = MAX_BATCH,.def = "1",
-      .field = P (batch_size)},
+  {.name = "batch-size",.group = PROP,.type = TYPE_UINT,.status = SUP,.min = 1,.max = RDS_INFER_MAX_BATCH_SIZE,
+      .def = "1",.field = P (batch_size)},
   {.name = "network-mode",.group = PROP,.type = TYPE_INT,.status = SUP,.min = 0,.max = 3,.def = "0",
         .field = P (network_mode),.accept = {0, 2},.n_accept = 2,
       .note = "only FP32 (0) and FP16 (2) are supported; INT8 (1) and BEST (3) are not"},
@@ -104,8 +103,8 @@ static const KeyInfo keys[] = {
       .note = "only primary mode (1) is supported; secondary mode (2) is not supported yet"},
   {.name = "gie-unique-id",.group = PROP,.type = TYPE_UINT,.status = SUP,.min = 1,.max = G_MAXUINT,.def = "1",
       .field = P (gie_unique_id)},
-  {.name = "interval",.group = PROP,.type = TYPE_UINT,.status = SUP,.min = 0,.max = 32,.def = "0",
-      .field = P (interval)},
+  {.name = "interval",.group = PROP,.type = TYPE_UINT,.status = SUP,.min = 0,.max = RDS_INFER_MAX_INTERVAL,
+      .def = "0",.field = P (interval)},
   {.name = "output-tensor-meta",.group = PROP,.type = TYPE_BOOL,.status = SUP,.def = "0",
       .field = P (output_tensor_meta)},
   /* preprocessing */

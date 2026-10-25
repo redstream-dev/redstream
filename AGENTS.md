@@ -13,8 +13,9 @@ metadata-traversal code via a compatibility header.
 Status: **pre-alpha.** Phase 0 spikes and the walking skeleton are done; the libgstrds core is in place (surfaces,
 `memory:RDS`, pools, metadata, events, read-only surface views, the `rds_buf_surf_transform` GPU transform). The
 elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
-`rdsstreammux` (the default scaling mux: batches of fixed-size slots) and `rdsstreamdemux` (zero-copy per-source
-views of the batch). Nothing here is stable.
+`rdsstreammux` (the default scaling mux: batches of fixed-size slots), `rdsstreamdemux` (zero-copy per-source
+views of the batch) and `rdsinfer` (MIGraphX primary detector: nvinfer configs, custom bbox parsers, object and
+tensor meta). Nothing here is stable.
 
 ## Architecture principles
 
@@ -143,7 +144,8 @@ gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
   rds-event          stream events (pad added/deleted, stream start/EOS/segment/reset)
   rds_compat.h       DeepStream compat header (+ rds-compat-aliases.h, rds-compat-remap.c); rds_compat_infer.h
                      (C++) adds the custom parser ABI names, for parser libraries only
-  rds-infer*.h       rdsinfer types (C) and the custom bbox parser ABI (rds-infer-custom-impl.h, C++); headers only
+  rds-infer*.h       rdsinfer types (C), its tensor output meta (rds-infer-meta.h) and the custom bbox parser ABI
+                     (rds-infer-custom-impl.h, C++); headers only
   rds-transform      rds_buf_surf_transform: batched crop/scale/colour conversion (NvBufSurfTransform-shaped)
   rds-transform-kernels.hip  its HIP kernels (amdclang++, linked in as an object); their device helpers
                      (sampling, BT.601 colour) are in rds-kernel-common.h, shared with rdsinfer's kernel
@@ -152,7 +154,8 @@ gst/rdsvideo/      libgstrdsvideo plugin: rdsvideodec (rocDecode, gstrdsvideodec
                    (gstrdsvideoconvert.c), shared helpers in rds-video-util
 gst/rdsmux/        libgstrdsmux plugin: rdsstreammux (GstAggregator, gstrdsstreammux.c) and rdsstreamdemux
                    (gstrdsstreamdemux.c)
-gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (MIGraphX; element skeleton so far). rds-infer-config parses
+gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; refcounted output sets and tensor meta in
+                   rds-infer-output; test hooks exported for element_infer). rds-infer-config parses
                    nvinfer key-file/YAML configs from one key table; rds-infer-parse loads custom parser libraries
                    (dlopen, ABI version check) and has the built-in YOLO parser; rds-infer-post does the detection
                    post-processing (letterbox geometry, NMS, ROI/size filters); rds-infer-engine compiles ONNX with

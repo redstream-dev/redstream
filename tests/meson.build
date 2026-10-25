@@ -108,8 +108,6 @@ test('element_streammux', element_streammux_exe, args : ['-p', '/gpu/mux'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180, depends : rds_plugins)
 
 if rds_infer_enabled
-  test('element_infer_cpu', executable('element_infer', 'check' / 'element_infer.c', dependencies : test_deps),
-    suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
   # The config parser on its own, against the corpus in check/infer-configs. It uses no GStreamer, so it gets the
   # environment without plugin paths.
   test('infer_config', executable('infer_config', 'check' / 'infer_config.c',
@@ -185,6 +183,24 @@ if rds_infer_enabled
     suite : 'cpu', env : test_env, protocol : 'tap',
     depends : [infer_parser_fixture, infer_parser_hidden, infer_parser_noabi, infer_parser_badabi,
       infer_parser_depabi, infer_compat_only])
+
+  # The element: properties and config overrides (cpu), then the scale2 model and the fixture parser (gpu). It
+  # links rdsinfer-core only for the config key table (no GTypes in it) and finds the plugin's test hooks with
+  # GModule. Programs are compiled into the build directory (element-infer/).
+  element_infer_exe = executable('element_infer', 'check' / 'element_infer.c',
+    dependencies : test_deps + [rdsinfer_core_dep, gst_app_dep, gst_video_dep, dependency('gmodule-2.0'),
+      cc.find_library('m', required : false)],
+    link_language : 'cpp',
+    c_args : [
+      '-DRDS_TEST_MODELS="@0@"'.format(meson.current_source_dir() / 'models'),
+      '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+      '-DRDS_TEST_PARSER_FIXTURE="@0@"'.format(infer_parser_fixture.full_path()),
+    ])
+  test('element_infer_cpu', element_infer_exe, args : ['-p', '/cpu/infer'],
+    suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+  test('element_infer', element_infer_exe, args : ['-p', '/gpu/infer'],
+    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300,
+    depends : rds_plugins + [infer_parser_fixture])
 endif
 
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',

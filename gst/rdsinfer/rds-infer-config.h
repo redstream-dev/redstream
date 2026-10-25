@@ -10,6 +10,10 @@
 
 G_BEGIN_DECLS
 
+/* Bounds of the keys the element also has as properties (the property ranges use them). */
+#define RDS_INFER_MAX_BATCH_SIZE 1024   /* nvinfer's documented maximum batch size */
+#define RDS_INFER_MAX_INTERVAL 32       /* the documented range of the interval property */
+
 #define RDS_INFER_CONFIG_ERROR (rds_infer_config_error_quark ())
 G_GNUC_INTERNAL GQuark rds_infer_config_error_quark (void);
 

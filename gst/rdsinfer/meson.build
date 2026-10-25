@@ -42,7 +42,7 @@ rdsinfer_preprocess_dep = declare_dependency(link_with : rdsinfer_preprocess,
   dependencies : [hip_dep])
 
 gstrdsinfer = library('gstrdsinfer',
-  files('plugin.c', 'gstrdsinfer.c'),
+  files('plugin.c', 'gstrdsinfer.c', 'rds-infer-output.c'),
   c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdsinfer"'],
   dependencies : [rds_dep, gst_dep, gst_base_dep, gst_video_dep, hip_dep, migraphx_dep, yaml_dep, json_glib_dep,
     rdsinfer_core_dep, rdsinfer_preprocess_dep],

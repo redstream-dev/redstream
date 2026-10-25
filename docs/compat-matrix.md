@@ -27,7 +27,7 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvvideoconvert` | `rdsvideoconvert` | supported | single frames (batch size 1); `memory:RDS` and system memory on either side; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideoconvert) |
 | `nvstreammux` | `rdsstreammux` | supported | the default (scaling) mux only; the new mux is not implemented yet. GstAggregator-based; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreammux) |
 | `nvstreamdemux` | `rdsstreamdemux` | supported | zero-copy read-only views of the batch slots; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreamdemux) |
-| `nvinfer` | `rdsinfer` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
+| `nvinfer` | `rdsinfer` | supported | primary detector only (`process-mode=1`, `network-type` 0 or 100) on MIGraphX; nvinfer config files (key file or YAML); properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
 | `nvtracker` | `rdstracker` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker) |
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
 | `nvdsosd` | `rdsosd` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
@@ -236,6 +236,78 @@ The demux returns the combination of its pads' results: NOT_LINKED only when eve
 FLUSHING or an error from one branch stops the streaming thread for all of them, so **block or unlink a branch
 before stopping it** (a sink set to NULL while still linked returns FLUSHING, which stops every branch). Give every branch a `queue`:
 otherwise the first sink to preroll blocks the others, which share the demux's streaming thread.
+
+### `rdsinfer` (`nvinfer`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvinfer.html))
+
+Names and types as on NVIDIA's nvinfer page (checked 2026-10-24). As documented, a property set explicitly overrides
+the config file; in Redstream that holds also when it is set to its default value. All properties can be changed
+only in NULL or READY: the config is read and the engine built or loaded when the element starts (READY to PAUSED),
+and every error there fails the state change with a message naming the file (or `element property`), the key and
+the value. Defaults are those of the config keys (**ours**, NVIDIA documents none) and apply only when the property
+is set.
+
+| Property | Type | Default | Status | Notes |
+|---|---|---|---|---|
+| `config-file-path` | string | none | supported | required; `.yml`/`.yaml` is read as YAML, anything else as a key file |
+| `unique-id` | uint | `1` (ours) | supported | overrides `gie-unique-id`; range 0..`G_MAXUINT` as documented (the config key starts at 1) |
+| `process-mode` | uint | `1` | supported | `1` only; `2` (secondary) fails at start naming the property |
+| `infer-on-gie-id` | uint | `0` | accepted no-op | secondary mode only; a warning when set |
+| `infer-on-class-ids` | string | none | accepted no-op | secondary mode only: colon-separated class ids (`1:2:4`, `-1` allowed), checked at start, then ignored with a warning |
+| `filter-out-class-ids` | string | none | supported | semicolon-separated class ids (`1;2`); replaces the file's list (an empty string clears it) |
+| `model-engine-file` | string | none | supported | a compiled MIGraphX program (`.mxr`), loaded when its manifest matches the model and the device, else rebuilt into the cache name; used as given (a config-file value is relative to the config file). A TensorRT `.engine` is ignored with a warning. Changing it while PLAYING (on-the-fly model update) is not supported |
+| `batch-size` | uint | `1` (ours) | supported | 1..1024. Frames of a batch go to the network image of their slot (`batch_id`); a frame in a slot at or above `batch-size` is an error |
+| `interval` | int | `0` (ours) | supported | 0..32: infer one batch, skip the next `interval` (they pass with `bInferDone` FALSE and no objects); the count restarts at start and after a flush (ours) |
+| `gpu-id` | uint | `0` | supported | the GPU for preprocessing and inference; the batch must be in GPU memory on it |
+| `output-tensor-meta` | boolean | `FALSE` | supported | one `RdsInferTensorMeta` per inferred frame (also always with `network-type=100`), see "Tensor output meta" |
+| `raw-output-file-write` | boolean | `FALSE` | accepted no-op | not implemented; a warning (once per element) when set |
+| `raw-output-generated-callback` | pointer | NULL | accepted no-op | the callback's signature isn't documented; a warning (once per element) when set |
+| `raw-output-generated-userdata` | pointer | NULL | accepted no-op |  |
+| `output-instance-mask` | boolean | `FALSE` | unsupported | `TRUE` fails at start (instance segmentation is not implemented) |
+| `input-tensor-meta` | boolean | `FALSE` | unsupported | `TRUE` fails at start (preprocessed tensor input is not implemented) |
+| `crop-objects-to-roi-boundary` | boolean | `FALSE` | accepted no-op | applies to preprocessed-tensor ROIs; a warning when `TRUE` |
+| `clip-object-outside-roi` | boolean | `FALSE` | accepted no-op | applies to preprocessed-tensor ROIs; a warning when `TRUE` |
+
+Not implemented: `classifier-type`, and the TensorRT-only `strongly-typed` and `dynamic-properties`.
+
+Config file paths: `onnx-file`, `model-engine-file`, `labelfile-path` and `custom-lib-path` from the file are relative
+to the config file's directory (documented for YAML, ours for key files). That includes a bare `custom-lib-path`
+name (no `/`): it is the file next to the config, not a library searched on the loader path. Use an absolute path
+(as NVIDIA's docs ask) for a library elsewhere.
+
+Pads: `sink` and `src`, `video/x-raw(memory:RDS)` NV12, RGBA, BGRA, RGBx or BGRx batches with an `RdsBatchMeta`
+(from `rdsstreammux`); buffers pass through unchanged (metadata only, pixels are never written). A buffer without
+batch meta is an error.
+
+#### Detector output (object meta)
+
+- Boxes are in the batch frame's pixels (the mux's `width`×`height`); `maintain-aspect-ratio` / `symmetric-padding`
+  scaling is undone (ours: the scaled frame sits at the top-left, or centred with `symmetric-padding`).
+  `detector_bbox_info.org_bbox_coords` is the unclipped box and `rect_params` the box clipped to the frame
+  (documented).
+- Fields set: `unique_component_id` (`gie-unique-id`), `class_id`, `confidence`, `object_id` =
+  `UNTRACKED_OBJECT_ID`, `obj_label` (the label, truncated to 127 bytes), `parent` NULL. Drawing defaults (ours):
+  `rect_params` border 3 px red, no background; `text_params` the label at the box's top-left, 20 px above it
+  (clamped to 0), "Serif" 10, white on black.
+- Frames that were inferred get `bInferDone` TRUE. Post-processing order and NMS are described with the config keys.
+- A parse function that returns `false` or throws: that frame gets no objects, and the element posts one warning
+  (then logs at debug level); the stream goes on. Invalid objects from a parser (class id out of range, non-finite
+  values, empty boxes) are dropped, and a non-zero `rotation_angle` is ignored: one warning each.
+
+#### Tensor output meta
+
+One `RdsUserMeta` per inferred frame on `frame_user_meta_list`, `meta_type` `RDS_INFER_TENSOR_OUTPUT_META`
+(`NVDSINFER_TENSOR_OUTPUT_META`), data `RdsInferTensorMeta`. `out_buf_ptrs_host[i]` (pinned host memory) and
+`out_buf_ptrs_dev[i]` point at the frame's slice of output layer `i`; the `buffer` pointers in
+`output_layers_info` are NULL (documented: not valid there). The buffers stay valid as long as the meta exists, in
+copies too (`rdsstreamdemux` outputs, `rds_batch_meta_copy`), also after the element has stopped. They are
+refcounted and reused once the last meta pointing at them is gone, so `tensor-meta-pool-size` has no effect.
+
+#### Processing
+
+One batch at a time, synchronously (ours; nvinfer's threading isn't documented): preprocessing and inference on the
+element's own non-blocking stream, one synchronization per batch, parsing on the CPU. Slots without a frame (a
+partial batch) are zeroed, not inferred on stale pixels. The batch's metadata lock is held only to read the frame
+list and to add the results, never during GPU work.
 
 ## NvBufSurface
 
@@ -504,6 +576,7 @@ tests compare the kernels with an independent CPU implementation of these rules.
 | `NVDS_CLASSIFIER_META` | `RDS_CLASSIFIER_META` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `NVDS_LABEL_INFO_META` | `RDS_LABEL_INFO_META` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `NVDS_USER_META` | `RDS_USER_META` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
+| `NVDSINFER_TENSOR_OUTPUT_META` | `RDS_INFER_TENSOR_OUTPUT_META` | supported | 12, its documented position in the enum | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `NVDS_RESERVED_META` | `RDS_RESERVED_META` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `NVDS_GST_CUSTOM_META` | `RDS_GST_CUSTOM_META` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2gstnvdsmeta_8h.html) |
 | `NVDS_BATCH_GST_META` | `RDS_BATCH_GST_META` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2gstnvdsmeta_8h.html) |
@@ -542,10 +615,11 @@ tests compare the kernels with an independent CPU implementation of these rules.
 | `nvds_remove_user_meta_from_object` | `rds_remove_user_meta_from_object` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `nvds_get_user_meta_type` | `rds_get_user_meta_type` | supported | takes `const gchar *`, but assigning it to a pointer with DeepStream's exact prototype does not compile | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `gst_buffer_get_nvds_batch_meta` | `gst_buffer_get_rds_batch_meta` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2gstnvdsmeta_8h.html) |
+| `NvDsInferTensorMeta` | `RdsInferTensorMeta` | supported | `rds/rds-infer-meta.h`; the documented fields in order; `priv_data` is rdsinfer's (it keeps the buffers alive). See the `rdsinfer` section | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferTensorMeta.html) |
 
 Not aliased: `gst_buffer_add_nvds_meta` (Redstream attaches the batch with `rds_buffer_add_batch_meta`;
 [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2gstnvdsmeta_8h.html)), and
-NvDs metadata types and functions Redstream doesn't implement yet (tensor, analytics, event message, audio).
+NvDs metadata types and functions Redstream doesn't implement yet (segmentation, analytics, event message, audio).
 
 ## Stream events (gst-nvevent)
 
@@ -580,7 +654,7 @@ Not aliased: `GST_NVEVENT_UPDATE_CAPS` and `gst_nvevent_new_update_caps` (no Red
 
 `rds/rds-infer.h` has the layer, network and object types (C and C++); `rds/rds-infer-custom-impl.h` has the parser
 ABI (C++). Their fields keep NVIDIA's documented names and order, so a DeepStream bbox parser recompiles unchanged.
-The types and the loader are in place; the `rdsinfer` element does not call parsers yet (hence **planned**).
+`rdsinfer` loads the parser named by `custom-lib-path` and `parse-bbox-func-name` and calls it on every inferred frame.
 
 `rds/rds_compat.h` (C and C++) aliases only the C-compatible `NvDsInfer*` types below. The parser ABI names are in
 `rds/rds_compat_infer.h` (C++), the replacement for `nvdsinfer_custom_impl.h`, which also includes `rds_compat.h`:
@@ -613,18 +687,18 @@ The types and the loader are in place; the `rdsinfer` element does not call pars
 
 | DeepStream name | Redstream name | Status | Notes | Source |
 |---|---|---|---|---|
-| `NVDSINFER_MAX_DIMS` | `RDS_INFER_MAX_DIMS` | planned | 8 | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
-| `NvDsInferDims` | `RdsInferDims` | planned | per image: no batch dimension; `numElements` is the per-image element count | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferDims.html) |
-| `NvDsInferDimsCHW` | `RdsInferDimsCHW` | planned |  | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferDimsCHW.html) |
-| `NvDsInferDataType` | `RdsInferDataType` | planned | `RDS_INFER_DATA_FLOAT` 0, `_HALF` 1, `_INT8` 2, `_INT32` 3, `_INT64` 4 | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
-| `FLOAT`, `HALF`, `INT8`, `INT32`, `INT64` | `RDS_INFER_DATA_FLOAT`, ... | planned | C++ only, `rds_compat_infer.h`, see above | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
-| `NvDsInferLayerInfo` | `RdsInferLayerInfo` | planned | `buffer` is host memory; ours, appended: `deviceBuffer`, the same data on the GPU (or NULL). `bindingIndex` is the layer's index among the program's outputs | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferLayerInfo.html) |
-| `NvDsInferNetworkInfo` | `RdsInferNetworkInfo` | planned |  | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferNetworkInfo.html) |
-| `NvDsInferParseDetectionParams` | `RdsInferParseDetectionParams` | planned | C++ only, `rds_compat_infer.h`; with the deprecated `perClassThreshold` reference to `perClassPreclusterThreshold`; ours: a copy constructor and assignment that keep it bound to the copy's own thresholds | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferParseDetectionParams.html) |
-| `NvDsInferObjectDetectionInfo` | `RdsInferObjectDetectionInfo` | planned | the DeepStream 9 layout, with `rotation_angle` (28 bytes); a non-zero angle is ignored with a warning. Coordinates in network-input pixels | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/9.1/sdk-api/structNvDsInferObjectDetectionInfo.html) |
-| `NvDsInferParseObjectInfo` | `RdsInferParseObjectInfo` | planned | the same type as `RdsInferObjectDetectionInfo` | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
-| `NvDsInferParseCustomFunc` | `RdsInferParseCustomFunc` | planned | C++ only, `rds_compat_infer.h` | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
-| `CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | `RDS_CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | planned | C++ only, `rds_compat_infer.h`; a mismatched signature fails to compile | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
+| `NVDSINFER_MAX_DIMS` | `RDS_INFER_MAX_DIMS` | supported | 8 | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
+| `NvDsInferDims` | `RdsInferDims` | supported | per image: no batch dimension; `numElements` is the per-image element count | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferDims.html) |
+| `NvDsInferDimsCHW` | `RdsInferDimsCHW` | supported |  | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferDimsCHW.html) |
+| `NvDsInferDataType` | `RdsInferDataType` | supported | `RDS_INFER_DATA_FLOAT` 0, `_HALF` 1, `_INT8` 2, `_INT32` 3, `_INT64` 4 | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
+| `FLOAT`, `HALF`, `INT8`, `INT32`, `INT64` | `RDS_INFER_DATA_FLOAT`, ... | supported | C++ only, `rds_compat_infer.h`, see above | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
+| `NvDsInferLayerInfo` | `RdsInferLayerInfo` | supported | `buffer` is host memory; ours, appended: `deviceBuffer`, the same data on the GPU (or NULL). `bindingIndex` is the layer's index among the program's outputs | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferLayerInfo.html) |
+| `NvDsInferNetworkInfo` | `RdsInferNetworkInfo` | supported |  | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferNetworkInfo.html) |
+| `NvDsInferParseDetectionParams` | `RdsInferParseDetectionParams` | supported | C++ only, `rds_compat_infer.h`; with the deprecated `perClassThreshold` reference to `perClassPreclusterThreshold`; ours: a copy constructor and assignment that keep it bound to the copy's own thresholds | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferParseDetectionParams.html) |
+| `NvDsInferObjectDetectionInfo` | `RdsInferObjectDetectionInfo` | supported | the DeepStream 9 layout, with `rotation_angle` (28 bytes); a non-zero angle is ignored with a warning. Coordinates in network-input pixels | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/9.1/sdk-api/structNvDsInferObjectDetectionInfo.html) |
+| `NvDsInferParseObjectInfo` | `RdsInferParseObjectInfo` | supported | the same type as `RdsInferObjectDetectionInfo` | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
+| `NvDsInferParseCustomFunc` | `RdsInferParseCustomFunc` | supported | C++ only, `rds_compat_infer.h` | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
+| `CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | `RDS_CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | supported | C++ only, `rds_compat_infer.h`; a mismatched signature fails to compile | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
 
 Not aliased (no Redstream counterpart yet, or none on ROCm):
 - the deprecated `dims` member of `NvDsInferLayerInfo`'s union (not in the public docs), `getDimsCHWFromDims`,
