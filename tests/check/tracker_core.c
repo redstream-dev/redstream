@@ -1,6 +1,6 @@
-/* rdstracker tracking core: target life cycle, IDs, frames without inference, rejections, IOU association, reset
- * modes, streams, determinism, and a timing printout. Scripted sequences: 100x100 boxes on one row unless a test says
- * otherwise; each detection's user pointer is a small tag.
+/* rdstracker tracking core: target life cycle, IDs, frames without inference, rejections, IOU association, NvSORT
+ * (cascade, Kalman prediction, reported boxes), reset modes, streams, determinism, and a timing printout. Scripted
+ * sequences: 100x100 boxes on one row unless a test says otherwise; each detection's user pointer is a small tag.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-tracker-core.h"
 
@@ -832,6 +832,293 @@ test_iou_positive (void)
   rds_tracker_core_free (core);
 }
 
+/* --- NvSORT --- */
+
+/* NvSORT with height-proportional noise and the aspect ratio, as in DeepStream's NvSORT sample; probationAge 0. */
+static RdsTrackerConfig *
+nvsort_config (void)
+{
+  RdsTrackerConfig *cfg = config_new ();
+
+  cfg->tracker_type = RDS_TRACKER_TYPE_NVSORT;
+  cfg->association_matcher_type = 1;
+  cfg->state_estimator_type = 2;
+  cfg->noise_weight_var4loc = 0.05f;
+  cfg->noise_weight_var4vel = 0.00625f;
+  cfg->use_aspect_ratio = TRUE;
+  cfg->use_prediction4assoc = TRUE;
+  cfg->probation_age = 0;
+  return cfg;
+}
+
+/* Stage 1 takes confirmed detections first, even over a better tentative one; stage 2 then lets a tentative
+ * detection (confidence below 0.5) keep an Active target, at minMatchingScore4TentativeIou, and never an Inactive
+ * one. */
+static void
+test_nvsort_stage2 (void)
+{
+  RdsTrackerConfig *cfg = nvsort_config ();
+  RdsTrackerCore *core;
+  const RdsTrackerFrameOut *fo;
+
+  cfg->min_matching_score4tentative_iou = 0.5f;
+  core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+  g_assert_cmpuint (id_of (STEP (core, 0, TRUE, sq (0, 1)), 1), ==, 0);
+  /* the confirmed detection (IOU 0.54) wins over the tentative one on the target's box (IOU 1) */
+  fo = STEP (core, 0, TRUE, det (0, 100, 100, 100, 0, 0.4f, 2), sq (30, 3));
+  g_assert_cmpuint (id_of (fo, 3), ==, 0);
+  assert_rejected (fo, 2, 0);
+  /* a tentative detection alone keeps the Active target */
+  fo = STEP (core, 0, TRUE, det (30, 100, 100, 100, 0, 0.4f, 4));
+  g_assert_cmpuint (id_of (fo, 4), ==, 0);
+  /* below minMatchingScore4TentativeIou (about 0.3 with the prediction): not matched, and no new target */
+  fo = STEP (core, 0, TRUE, det (100, 100, 100, 100, 0, 0.4f, 5));
+  g_assert_cmpuint (fo->n_targets, ==, 0);
+  assert_rejected (fo, 5, 0);
+  g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, 1);
+  /* the target is Inactive now: a tentative detection on its box doesn't bring it back */
+  fo = STEP (core, 0, TRUE, det (30, 100, 100, 100, 0, 0.4f, 6));
+  g_assert_cmpuint (fo->n_targets, ==, 0);
+  assert_rejected (fo, 6, 0);
+  /* a confirmed one does */
+  fo = STEP (core, 0, TRUE, sq (30, 7));
+  g_assert_cmpuint (id_of (fo, 7), ==, 0);
+  rds_tracker_core_free (core);
+}
+
+/* Stage 3 matches confirmed detections with Tentative targets on IOU alone, at minMatchingScore4TentativeIou: the
+ * joint minimum (minMatchingScore4Iou 0.9) doesn't apply there. Tentative detections never match Tentative targets. */
+static void
+test_nvsort_stage3 (void)
+{
+  RdsTrackerConfig *cfg = nvsort_config ();
+  RdsTrackerCore *core;
+  const RdsTrackerFrameOut *fo;
+
+  cfg->probation_age = 2;
+  cfg->min_matching_score4iou = 0.9f;
+  cfg->min_matching_score4tentative_iou = 0.5f;
+  core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+  STEP (core, 0, TRUE, sq (0, 1));
+  /* IOU 0.82: matched in stage 3, not a duplicate creating nothing */
+  fo = STEP (core, 0, TRUE, sq (10, 2));
+  assert_rejected (fo, 2, 0);
+  g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, 1);
+  fo = STEP (core, 0, TRUE, sq (20, 3));
+  g_assert_cmpuint (id_of (fo, 3), ==, 0);
+  g_assert_cmpuint (fo->targets[0].age, ==, 3);
+  rds_tracker_core_free (core);
+
+  /* a tentative detection on a Tentative target's box: no match, so the target misses frames and dies early */
+  cfg = nvsort_config ();
+  cfg->probation_age = 2;
+  cfg->early_termination_age = 2;
+  core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+  STEP (core, 0, TRUE, sq (0, 1));
+  assert_rejected (STEP (core, 0, TRUE, det (0, 100, 100, 100, 0, 0.4f, 2)), 2, 0);
+  assert_rejected (STEP (core, 0, TRUE, det (0, 100, 100, 100, 0, 0.4f, 3)), 3, 0);
+  g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, 0);
+  rds_tracker_core_free (core);
+}
+
+/* A tentative detection alone never creates a target (DeepStream 8.0 behaviour); the IOU tracker creates one. */
+static void
+test_nvsort_tentative_no_target (void)
+{
+  for (guint nvsort = 0; nvsort <= 1; nvsort++) {
+    RdsTrackerConfig *cfg = nvsort ? nvsort_config () : config_new ();
+    RdsTrackerCore *core;
+    const RdsTrackerFrameOut *fo = NULL;
+
+    cfg->probation_age = 0;
+    cfg->min_detector_confidence = 0.3f;
+    core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+    for (guint f = 0; f < 5; f++) {
+      fo = STEP (core, 0, TRUE, det (0, 100, 100, 100, 0, 0.4f, 1));
+      if (nvsort) {
+        g_assert_cmpuint (fo->n_targets, ==, 0);
+        assert_rejected (fo, 1, 0);
+      } else {
+        g_assert_cmpuint (id_of (fo, 1), ==, 0);
+      }
+    }
+    g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, nvsort ? 0 : 1);
+    /* at tentativeDetectorConfidence a detection is confirmed */
+    fo = STEP (core, 0, TRUE, det (500, 100, 100, 100, 0, 0.5f, 2));
+    g_assert_cmpuint (id_of (fo, 2), ==, nvsort ? 0 : 1);
+    rds_tracker_core_free (core);
+  }
+}
+
+/* A box moving 30 px a frame, detected on every frame for 10 frames, then on every 4th: 120 px between detections,
+ * more than its width. NvSORT's prediction keeps the ID; the IOU tracker, on the last matched box, starts a new
+ * target on every detection. */
+static void
+test_nvsort_interval_gap (void)
+{
+  for (guint nvsort = 0; nvsort <= 1; nvsort++) {
+    RdsTrackerConfig *cfg = nvsort ? nvsort_config () : config_new ();
+    RdsTrackerCore *core;
+    guint n_ids = 0;
+    guint64 last_id = G_MAXUINT64;
+
+    cfg->probation_age = 0;
+    core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+    for (guint f = 0; f < 40; f++) {
+      gboolean done = f < 10 || f % 4 == 0;
+      const RdsTrackerFrameOut *fo = done ? STEP (core, 0, TRUE, sq (30 * f, 1)) : EMPTY (core, 0, FALSE);
+
+      if (!done)
+        continue;
+      if (id_of (fo, 1) != last_id) {
+        last_id = id_of (fo, 1);
+        n_ids++;
+      }
+    }
+    g_test_message ("%s: %u IDs", nvsort ? "NvSORT" : "IOU", n_ids);
+    if (nvsort)
+      g_assert_cmpuint (n_ids, ==, 1);
+    else
+      g_assert_cmpuint (n_ids, >=, 7);
+    rds_tracker_core_free (core);
+  }
+}
+
+/* Matched frames report the detector box exactly (DeepStream 8.0 behaviour), while the filter takes it: the next
+ * frame without inference reports the prediction, which keeps moving with the object's velocity. */
+static void
+test_nvsort_reported_boxes (void)
+{
+  RdsTrackerCore *core = core_new (nvsort_config (), RDS_TRACKER_ID_RESET_ON_RESET);
+  const RdsTrackerFrameOut *fo;
+  gfloat x = 0;
+
+  for (guint f = 0; f < 12; f++) {
+    RdsTrackerDet d = det (40.25f + 10.5f * f, 200.75f - 2.25f * f, 80.5f + 0.5f * f, 120.25f + 0.25f * f, 0, 0.9f, 1);
+
+    fo = step (core, 0, TRUE, &d, 1);
+    g_assert_cmpuint (fo->n_targets, ==, 1);
+    assert_box (&fo->targets[0], d.x, d.y, d.w, d.h);
+  }
+  x = fo->targets[0].x;
+  for (guint f = 0; f < 3; f++) {
+    fo = EMPTY (core, 0, FALSE);
+    g_assert_cmpuint (fo->n_targets, ==, 1);
+    g_assert_null (fo->targets[0].associated_user);
+    g_test_message ("prediction %u: %.3f %.3f %.3f %.3f", f, fo->targets[0].x, fo->targets[0].y, fo->targets[0].w,
+        fo->targets[0].h);
+    /* about 10.5 px a frame to the right, 2.25 up */
+    g_assert_cmpfloat (fo->targets[0].x - x, >, 9);
+    g_assert_cmpfloat (fo->targets[0].x - x, <, 12);
+    g_assert_cmpfloat (fo->targets[0].y, <, 200.75f - 2.25f * (11 + f));
+    g_assert_cmpfloat (fo->targets[0].tracker_confidence, ==, 0.5f);
+    x = fo->targets[0].x;
+  }
+  /* back to the detector box on the next match */
+  fo = STEP (core, 0, TRUE, det (40.25f + 10.5f * 15, 200.75f - 2.25f * 15, 88, 124, 0, 0.9f, 2));
+  assert_box (reported (fo, 2), 40.25f + 10.5f * 15, 200.75f - 2.25f * 15, 88, 124);
+  rds_tracker_core_free (core);
+}
+
+/* A box accelerating to 60 px a frame: against the last matched box its IOU falls to 0.25, below
+ * minMatchingScore4Iou 0.3, so with usePrediction4Assoc 0 it gets a new ID; the prediction keeps it. */
+static void
+test_nvsort_use_prediction (void)
+{
+  for (guint use = 0; use <= 1; use++) {
+    RdsTrackerConfig *cfg = nvsort_config ();
+    RdsTrackerCore *core;
+    gfloat x = 0, speed = 0;
+    guint n_ids = 0;
+    guint64 last_id = G_MAXUINT64;
+
+    cfg->use_prediction4assoc = use;
+    cfg->min_matching_score4iou = 0.3f;
+    core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+    for (guint f = 0; f < 30; f++) {
+      const RdsTrackerFrameOut *fo = STEP (core, 0, TRUE, sq (x, 1));
+
+      if (id_of (fo, 1) != last_id) {
+        last_id = id_of (fo, 1);
+        n_ids++;
+      }
+      speed = MIN (speed + 5, 60);
+      x += speed;
+    }
+    g_test_message ("usePrediction4Assoc %u: %u IDs", use, n_ids);
+    if (use)
+      g_assert_cmpuint (n_ids, ==, 1);
+    else
+      g_assert_cmpuint (n_ids, >, 1);
+    rds_tracker_core_free (core);
+  }
+}
+
+/* Observed DeepStream 8.0 output for this scenario (a 100x100 box moving 10 px a frame, detected on even frames,
+ * inference every second frame, with the NvSORT config below): the predicted x on the odd frames 3 to 29. */
+static const gfloat ds80_predicted_x[] = {
+  121.2072f, 145.2672f, 168.7500f, 190.1781f, 210.5359f, 230.5069f, 250.3831f, 270.2644f, 290.1749f, 310.1136f,
+  330.0735f, 350.0477f, 370.0312f, 390.0207f,
+};
+
+/* A sanity check against DeepStream 8.0, not an exactness test: our predictions on the frames without inference
+ * are within 1 px of the observed ones on the first three and within 1.5 px after (the Kalman filter's matrices are
+ * not documented: ours follow DeepSORT). */
+static void
+test_nvsort_ds80_predictions (void)
+{
+  RdsTrackerConfig *cfg = nvsort_config ();
+  RdsTrackerCore *core;
+  gdouble worst = 0;
+
+  cfg->min_detector_confidence = 0.3f;
+  cfg->max_targets_per_stream = 30;
+  cfg->min_iou_diff4new_target = 0.5f;
+  cfg->probation_age = 1;
+  cfg->max_shadow_tracking_age = 1;
+  cfg->early_termination_age = 3;
+  cfg->check_class_match = TRUE;
+  cfg->min_matching_score4overall = 0;
+  cfg->min_matching_score4size_similarity = 0;
+  cfg->min_matching_score4iou = 0.1f;
+  cfg->matching_score_weight4size_similarity = 0;
+  cfg->matching_score_weight4iou = 1;
+  cfg->tentative_detector_confidence = 0.5f;
+  cfg->min_matching_score4tentative_iou = 0.3f;
+  core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+  for (guint f = 0; f < 30; f++) {
+    const RdsTrackerFrameOut *fo;
+
+    if (f % 2) {
+      fo = EMPTY (core, 0, FALSE);
+    } else {
+      RdsTrackerDet d = det (100 + 10 * f, 300, 100, 100, 0, 0.9f, 1);
+
+      fo = step (core, 0, TRUE, &d, 1);
+    }
+    /* Tentative on frames 0 and 1, ID 0 from frame 2 */
+    g_assert_cmpuint (fo->n_targets, ==, f < 2 ? 0 : 1);
+    if (f < 2)
+      continue;
+    g_assert_cmpuint (fo->targets[0].id, ==, 0);
+    if (f % 2 == 0) {
+      assert_box (&fo->targets[0], 100 + 10 * f, 300, 100, 100);
+    } else {
+      gdouble err = fo->targets[0].x - ds80_predicted_x[(f - 3) / 2];
+
+      g_test_message ("frame %u: x %.4f, DeepStream 8.0 %.4f, difference %+.4f", f, fo->targets[0].x,
+          ds80_predicted_x[(f - 3) / 2], err);
+      g_assert_cmpfloat (fabs (err), <, (f <= 7 ? 1.0 : 1.5));
+      worst = MAX (worst, fabs (err));
+      g_assert_cmpfloat (fabs (fo->targets[0].y - 300), <, 1e-3);
+      g_assert_cmpfloat (fabs (fo->targets[0].w - 100), <, 1e-3);
+      g_assert_cmpfloat (fabs (fo->targets[0].h - 100), <, 1e-3);
+    }
+  }
+  g_test_message ("largest difference: %.4f px", worst);
+  rds_tracker_core_free (core);
+}
+
 /* --- reset modes --- */
 
 static RdsTrackerCore *
@@ -1161,41 +1448,48 @@ test_determinism (void)
 {
   GString *log[2];
 
-  for (guint r = 0; r < 2; r++) {
-    RdsTrackerConfig *cfg = config_new ();
-    RdsTrackerCore *core;
+  for (guint nvsort = 0; nvsort <= 1; nvsort++) {
+    for (guint r = 0; r < 2; r++) {
+      RdsTrackerConfig *cfg = nvsort ? nvsort_config () : config_new ();
+      RdsTrackerCore *core;
 
-    cfg->probation_age = 3;
-    cfg->check_class_match = FALSE;
-    core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
-    log[r] = g_string_new (NULL);
-    run_scenario (core, 2, 30, 300, 99, TRUE, log_batch, log[r]);
-    rds_tracker_core_free (core);
+      cfg->probation_age = 3;
+      cfg->check_class_match = FALSE;
+      core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+      log[r] = g_string_new (NULL);
+      run_scenario (core, 2, 30, 300, 99, TRUE, log_batch, log[r]);
+      rds_tracker_core_free (core);
+    }
+    g_assert_cmpuint (log[0]->len, >, 10000);
+    g_assert_cmpstr (log[0]->str, ==, log[1]->str);
+    g_string_free (log[0], TRUE);
+    g_string_free (log[1], TRUE);
   }
-  g_assert_cmpuint (log[0]->len, >, 10000);
-  g_assert_cmpstr (log[0]->str, ==, log[1]->str);
-  g_string_free (log[0], TRUE);
-  g_string_free (log[1], TRUE);
 }
 
-/* Printed, not asserted: 4 streams of 50 objects for 1000 frames with the default config, room for every object. */
+/* Printed, not asserted: 4 streams of 50 objects for 1000 frames with the default config (IOU) and with NvSORT, room
+ * for every object. */
 static void
 test_timing (void)
 {
-  RdsTrackerConfig *cfg = config_new ();
-  RdsTrackerCore *core;
-  gint64 start;
-  gdouble ms;
+  for (guint nvsort = 0; nvsort <= 1; nvsort++) {
+    RdsTrackerConfig *cfg = nvsort ? nvsort_config () : config_new ();
+    RdsTrackerCore *core;
+    gint64 start;
+    gdouble ms;
 
-  cfg->max_targets_per_stream = 100;
-  core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
-  start = g_get_monotonic_time ();
-  run_scenario (core, 4, 50, 1000, 7, FALSE, NULL, NULL);
-  ms = (g_get_monotonic_time () - start) / 1000.0;
-  g_test_message ("4 streams x 50 objects x 1000 frames: %.1f ms, %.4f ms per batch (scenario included)", ms,
-      ms / 1000);
-  g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), >=, 40);
-  rds_tracker_core_free (core);
+    if (nvsort)
+      cfg->probation_age = 5;
+    cfg->max_targets_per_stream = 100;
+    core = core_new (cfg, RDS_TRACKER_ID_RESET_ON_RESET);
+    start = g_get_monotonic_time ();
+    run_scenario (core, 4, 50, 1000, 7, FALSE, NULL, NULL);
+    ms = (g_get_monotonic_time () - start) / 1000.0;
+    g_test_message ("%s, 4 streams x 50 objects x 1000 frames: %.1f ms, %.4f ms per batch (scenario included)",
+        nvsort ? "NvSORT" : "IOU", ms, ms / 1000);
+    g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), >=, 40);
+    rds_tracker_core_free (core);
+  }
 }
 
 int
@@ -1228,6 +1522,13 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/tracker-core/class-match", test_class_match);
   g_test_add_func ("/cpu/tracker-core/size-similarity", test_size_similarity);
   g_test_add_func ("/cpu/tracker-core/iou-positive", test_iou_positive);
+  g_test_add_func ("/cpu/tracker-core/nvsort-stage2", test_nvsort_stage2);
+  g_test_add_func ("/cpu/tracker-core/nvsort-stage3", test_nvsort_stage3);
+  g_test_add_func ("/cpu/tracker-core/nvsort-tentative-no-target", test_nvsort_tentative_no_target);
+  g_test_add_func ("/cpu/tracker-core/nvsort-interval-gap", test_nvsort_interval_gap);
+  g_test_add_func ("/cpu/tracker-core/nvsort-reported-boxes", test_nvsort_reported_boxes);
+  g_test_add_func ("/cpu/tracker-core/nvsort-use-prediction", test_nvsort_use_prediction);
+  g_test_add_func ("/cpu/tracker-core/nvsort-ds80-predictions", test_nvsort_ds80_predictions);
   g_test_add_func ("/cpu/tracker-core/reset-mode0", test_reset_mode0);
   g_test_add_func ("/cpu/tracker-core/reset-mode1", test_reset_mode1);
   g_test_add_func ("/cpu/tracker-core/reset-mode2", test_reset_mode2);

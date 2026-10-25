@@ -73,13 +73,15 @@ typedef struct
 
 typedef struct
 {
-  /* On a frame with inference, the Active targets matched on it, in their detections' input order. On a frame
-   * without inference, every Active target, newest ID first, with its last matched box and no associated_user. */
+  /* On a frame with inference, the Active targets matched on it, in their detections' input order, with the
+   * detection's box. On a frame without inference, every Active target, newest ID first, with no associated_user and
+   * its last matched box (IOU) or its Kalman prediction (NvSORT). */
   const RdsTrackerTarget *targets;
   guint n_targets;
   /* The user pointers of the frame's detections that have no reported target, in input order: an invalid box (not
    * finite, or no area), below minDetectorConfidence, matched to or creating a Tentative target, duplicates, over
-   * maxTargetsPerStream, and every detection of a frame without inference (DeepStream 8.0 behaviour). */
+   * maxTargetsPerStream, NvSORT's unmatched tentative detections (below tentativeDetectorConfidence), and every
+   * detection of a frame without inference (DeepStream 8.0 behaviour). */
   gpointer const *rejected;
   guint n_rejected;
 } RdsTrackerFrameOut;
@@ -93,8 +95,9 @@ typedef struct
 
 typedef struct _RdsTrackerCore RdsTrackerCore;
 
-/* Copies what it needs from @cfg. @opts NULL: reset mode 1, no user copies. The IOU tracker and NvSORT share this
- * core; cfg->tracker_type is kept for the NvSORT path, which associates as the IOU tracker for now. */
+/* Copies what it needs from @cfg. @opts NULL: reset mode 1, no user copies. The IOU tracker and NvSORT
+ * (cfg->tracker_type) share this core; NvSORT adds a Kalman filter per target (unless stateEstimatorType is 0) and
+ * the cascaded association. */
 G_GNUC_INTERNAL RdsTrackerCore *rds_tracker_core_new (const RdsTrackerConfig * cfg,
     const RdsTrackerCoreOptions * opts);
 G_GNUC_INTERNAL void rds_tracker_core_free (RdsTrackerCore * core);

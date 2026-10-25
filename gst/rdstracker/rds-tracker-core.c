@@ -1,9 +1,11 @@
 /* Redstream: the rdstracker tracking core. Per-stream target lists in a hash table keyed by stream ID; one ID counter
- * shared by all streams; greedy association (the IOU tracker) against each target's last matched box.
+ * shared by all streams; greedy association. The IOU tracker associates in one pass against each target's last matched
+ * box; NvSORT predicts every target with a Kalman filter and associates in three stages (the cascade).
  * Comments say "DeepStream 8.0 behaviour" for what matches observed DeepStream 8.0 behaviour and "ours" for our own
  * choices.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-tracker-core.h"
+#include "rds-tracker-kf.h"
 
 #include <math.h>
 
@@ -32,6 +34,10 @@ typedef struct
   guint age;                    /* 1 on the creation frame, +1 on every later frame of the stream */
   guint shadow_age;             /* consecutive frames with inference without a match */
   gfloat x, y, w, h;            /* the last matched box */
+  /* the box association and the duplicate check use on this frame: NvSORT's prediction with usePrediction4Assoc,
+   * else the last matched box; the detection's box once matched */
+  gfloat bx, by, bw, bh;
+  RdsTrackerKf kf;              /* NvSORT with a state estimator only */
   gint class_id;
   gpointer last_user;
   gint det;                     /* the detection matched on this frame, or -1 */
@@ -69,6 +75,10 @@ struct _RdsTrackerCore
   guint max_targets_per_stream, probation_age, max_shadow_tracking_age, early_termination_age;
   gfloat min_score_overall, min_score_size, min_score_iou, weight_size, weight_iou;
   gboolean need_overlap;        /* every minimum is 0: UNCONSTRAINED_MIN_IOU applies */
+  gboolean cascade;             /* NvSORT: three association stages, tentative detections create no target */
+  gfloat tentative_detector_confidence, min_score_tentative_iou;
+  gboolean has_kf, use_prediction;
+  RdsTrackerKfParams kf_params;
 
   RdsTrackerCoreOptions opts;
   guint32 upper;                /* useUniqueID's upper half, 0 when off */
@@ -79,6 +89,7 @@ struct _RdsTrackerCore
   /* scratch, reused from frame to frame */
   GArray *candidates;           /* Candidate */
   GArray *valid;                /* gboolean per detection: a finite box with an area, above minDetectorConfidence */
+  GArray *stage_dets;           /* gboolean per detection, twice: NvSORT's confirmed and tentative detections */
   GPtrArray *det_target;        /* per detection: the target it matched or created, or NULL */
   GPtrArray *sorted;            /* Target *, frames without inference */
 
@@ -179,6 +190,11 @@ rds_tracker_core_new (const RdsTrackerConfig * cfg, const RdsTrackerCoreOptions 
   core->weight_size = cfg->matching_score_weight4size_similarity;
   core->weight_iou = cfg->matching_score_weight4iou;
   core->need_overlap = core->min_score_overall <= 0 && core->min_score_size <= 0 && core->min_score_iou <= 0;
+  core->cascade = cfg->tracker_type == RDS_TRACKER_TYPE_NVSORT;
+  core->tentative_detector_confidence = cfg->tentative_detector_confidence;
+  core->min_score_tentative_iou = cfg->min_matching_score4tentative_iou;
+  core->has_kf = core->cascade && rds_tracker_kf_params_from_config (&core->kf_params, cfg);
+  core->use_prediction = core->has_kf && cfg->use_prediction4assoc;
   if (opts)
     core->opts = *opts;
   else
@@ -188,6 +204,7 @@ rds_tracker_core_new (const RdsTrackerConfig * cfg, const RdsTrackerCoreOptions 
   core->streams = g_hash_table_new_full (g_int64_hash, g_int64_equal, NULL, stream_free);
   core->candidates = g_array_new (FALSE, FALSE, sizeof (Candidate));
   core->valid = g_array_new (FALSE, FALSE, sizeof (gboolean));
+  core->stage_dets = g_array_new (FALSE, FALSE, sizeof (gboolean));
   core->det_target = g_ptr_array_new ();
   core->sorted = g_ptr_array_new ();
   core->spans = g_array_new (FALSE, FALSE, sizeof (FrameSpan));
@@ -205,6 +222,7 @@ rds_tracker_core_free (RdsTrackerCore * core)
   g_hash_table_unref (core->streams);
   g_array_unref (core->candidates);
   g_array_unref (core->valid);
+  g_array_unref (core->stage_dets);
   g_ptr_array_unref (core->det_target);
   g_ptr_array_unref (core->sorted);
   g_array_unref (core->spans);
@@ -250,37 +268,54 @@ candidate_cmp (gconstpointer pa, gconstpointer pb)
   return a->det < b->det ? -1 : a->det > b->det;
 }
 
-/* Greedy association (ours: the order of equal scores is not documented): candidates by score, best first, then the
- * older target, then the lower detection index; a pair is taken when both sides are still free. The IOU tracker
- * compares every target, whatever its state, with its last matched box in one pass. Sets Target.det and
- * core->det_target. */
+#define STATE_BIT(s) (1u << (s))
+#define ALL_STATES (STATE_BIT (STATE_TENTATIVE) | STATE_BIT (STATE_ACTIVE) | STATE_BIT (STATE_INACTIVE))
+
+/* One greedy pass (ours: the order of equal scores is not documented): candidates by score, best first, then the
+ * older target, then the lower detection index; a pair is taken when both sides are still free. It pairs the
+ * detections flagged in @use with the targets in @states, both still unmatched, on their association boxes. @joint:
+ * the weighted score with every minimum; otherwise IOU only, at least minMatchingScore4TentativeIou (NvSORT's
+ * tentative stages). Sets Target.det and core->det_target. */
 static void
-associate_iou (RdsTrackerCore * core, Stream * st, const RdsTrackerDet * dets, guint n_dets, const gboolean * valid)
+associate_stage (RdsTrackerCore * core, Stream * st, const RdsTrackerDet * dets, guint n_dets, const gboolean * use,
+    guint states, gboolean joint)
 {
   GArray *cands = core->candidates;
+  gboolean need_overlap = joint ? core->need_overlap : core->min_score_tentative_iou <= 0;
 
   g_array_set_size (cands, 0);
   for (guint ti = 0; ti < st->targets->len; ti++) {
     Target *t = g_ptr_array_index (st->targets, ti);
 
+    if (t->det >= 0 || !(states & STATE_BIT (t->state)))
+      continue;
     for (guint i = 0; i < n_dets; i++) {
       const RdsTrackerDet *d = &dets[i];
       gfloat iou, sim, score;
       Candidate c;
 
-      if (!valid[i] || (core->check_class_match && d->class_id != t->class_id))
+      if (!use[i] || g_ptr_array_index (core->det_target, i)
+          || (core->check_class_match && d->class_id != t->class_id))
         continue;
-      iou = box_iou (t->x, t->y, t->w, t->h, d->x, d->y, d->w, d->h);
-      if (iou < core->min_score_iou || (core->need_overlap && iou <= UNCONSTRAINED_MIN_IOU))
+      iou = box_iou (t->bx, t->by, t->bw, t->bh, d->x, d->y, d->w, d->h);
+      if (need_overlap && iou <= UNCONSTRAINED_MIN_IOU)
         continue;
-      sim = size_similarity (t->w, t->h, d->w, d->h);
-      if (sim < core->min_score_size)
-        continue;
-      score = core->weight_iou * iou + core->weight_size * sim;
-      /* valid boxes and weights in [0, 1] give a finite score; candidate_cmp needs one */
-      g_assert (!isnan (score));
-      if (score < core->min_score_overall)
-        continue;
+      if (joint) {
+        if (iou < core->min_score_iou)
+          continue;
+        sim = size_similarity (t->bw, t->bh, d->w, d->h);
+        if (sim < core->min_score_size)
+          continue;
+        score = core->weight_iou * iou + core->weight_size * sim;
+        /* valid boxes and weights in [0, 1] give a finite score; candidate_cmp needs one */
+        g_assert (!isnan (score));
+        if (score < core->min_score_overall)
+          continue;
+      } else {
+        if (iou < core->min_score_tentative_iou)
+          continue;
+        score = iou;
+      }
       c.score = score;
       c.serial = t->serial;
       c.det = i;
@@ -299,22 +334,38 @@ associate_iou (RdsTrackerCore * core, Stream * st, const RdsTrackerDet * dets, g
   }
 }
 
+/* The IOU tracker: one joint pass over every target, whatever its state. NvSORT's cascade (DeepStream's documented
+ * stages): confirmed detections (confidence >= tentativeDetectorConfidence) with the Active and Inactive targets on
+ * the joint score, then tentative detections (below it) with the remaining Active targets, then the remaining
+ * confirmed detections with the Tentative targets, both on IOU only. */
 static void
 associate (RdsTrackerCore * core, Stream * st, const RdsTrackerDet * dets, guint n_dets, const gboolean * valid)
 {
-  /* NvSORT runs as the IOU tracker's association until its own cascade is in place. */
-  associate_iou (core, st, dets, n_dets, valid);
+  gboolean *confirmed, *tentative;
+
+  if (!core->cascade) {
+    associate_stage (core, st, dets, n_dets, valid, ALL_STATES, TRUE);
+    return;
+  }
+  g_array_set_size (core->stage_dets, 2 * n_dets);
+  confirmed = (gboolean *) core->stage_dets->data;
+  tentative = confirmed + n_dets;
+  for (guint i = 0; i < n_dets; i++) {
+    confirmed[i] = valid[i] && dets[i].confidence >= core->tentative_detector_confidence;
+    tentative[i] = valid[i] && !confirmed[i];
+  }
+  associate_stage (core, st, dets, n_dets, confirmed, STATE_BIT (STATE_ACTIVE) | STATE_BIT (STATE_INACTIVE), TRUE);
+  associate_stage (core, st, dets, n_dets, tentative, STATE_BIT (STATE_ACTIVE), FALSE);
+  associate_stage (core, st, dets, n_dets, confirmed, STATE_BIT (STATE_TENTATIVE), FALSE);
 }
 
 /* Whether an unmatched detection may start a target, before the duplicate and cap checks. The IOU tracker creates
- * targets from any detection that passed minDetectorConfidence; this is where NvSORT's tentativeDetectorConfidence
- * rule goes. */
+ * targets from any detection that passed minDetectorConfidence. DeepStream 8.0 behaviour: NvSORT never creates one
+ * from a tentative detection (below tentativeDetectorConfidence); unmatched, it is rejected. */
 static gboolean
 may_create_target (RdsTrackerCore * core, const RdsTrackerDet * d)
 {
-  (void) core;
-  (void) d;
-  return TRUE;
+  return !core->cascade || d->confidence >= core->tentative_detector_confidence;
 }
 
 /* Ours: a detection the matcher may see: finite coordinates, a positive size, and a finite far corner and area.
@@ -327,7 +378,8 @@ det_box_valid (const RdsTrackerDet * d)
 }
 
 /* DeepStream 8.0 behaviour: the duplicate check compares with every target of the stream, ignoring class and
- * state. Ours: that includes targets created earlier on the same frame. */
+ * state. Ours: that includes targets created earlier on the same frame, and it uses each target's box of this frame
+ * (Target.bx...: for NvSORT, the matched detection or the association box). */
 static gfloat
 max_iou_with_targets (Stream * st, const RdsTrackerDet * d)
 {
@@ -336,7 +388,7 @@ max_iou_with_targets (Stream * st, const RdsTrackerDet * d)
   for (guint i = 0; i < st->targets->len; i++) {
     Target *t = g_ptr_array_index (st->targets, i);
 
-    best = MAX (best, box_iou (t->x, t->y, t->w, t->h, d->x, d->y, d->w, d->h));
+    best = MAX (best, box_iou (t->bx, t->by, t->bw, t->bh, d->x, d->y, d->w, d->h));
   }
   return best;
 }
@@ -360,7 +412,19 @@ activate (RdsTrackerCore * core, Stream * st, Target * t)
 }
 
 static void
-emit_target (RdsTrackerCore * core, const Target * t, gpointer associated_user)
+target_set_box (Target * t, const RdsTrackerDet * d)
+{
+  t->x = t->bx = d->x;
+  t->y = t->by = d->y;
+  t->w = t->bw = d->w;
+  t->h = t->bh = d->h;
+}
+
+/* DeepStream 8.0 behaviour: a matched target is reported with its detection's box, also by NvSORT (whose filter still
+ * takes the detection); on a frame without inference the IOU tracker reports the last matched box and NvSORT the
+ * prediction. */
+static void
+emit_target (RdsTrackerCore * core, const Target * t, gboolean matched, gpointer associated_user)
 {
   RdsTrackerTarget o = {
     .id = t->id,.x = t->x,.y = t->y,.w = t->w,.h = t->h,.class_id = t->class_id,
@@ -368,6 +432,8 @@ emit_target (RdsTrackerCore * core, const Target * t, gpointer associated_user)
     .age = t->age,
   };
 
+  if (!matched && core->has_kf)
+    rds_tracker_kf_get_box (&t->kf, &o.x, &o.y, &o.w, &o.h);
   g_array_append_val (core->targets_out, o);
 }
 
@@ -400,10 +466,9 @@ process_inferred (RdsTrackerCore * core, Stream * st, const RdsTrackerFrameIn * 
       const RdsTrackerDet *d = &in->dets[t->det];
 
       t->shadow_age = 0;
-      t->x = d->x;
-      t->y = d->y;
-      t->w = d->w;
-      t->h = d->h;
+      target_set_box (t, d);
+      if (core->has_kf)
+        rds_tracker_kf_update (&t->kf, d->x, d->y, d->w, d->h);
       if (!core->check_class_match)
         t->class_id = d->class_id;
       target_set_last_user (core, t, d->user);
@@ -446,10 +511,9 @@ process_inferred (RdsTrackerCore * core, Stream * st, const RdsTrackerFrameIn * 
     t->serial = core->n_created++;
     t->state = STATE_TENTATIVE;
     t->age = 1;
-    t->x = d->x;
-    t->y = d->y;
-    t->w = d->w;
-    t->h = d->h;
+    target_set_box (t, d);
+    if (core->has_kf)
+      rds_tracker_kf_init (&t->kf, &core->kf_params, d->x, d->y, d->w, d->h);
     t->class_id = d->class_id;
     t->det = k;
     target_set_last_user (core, t, d->user);
@@ -466,15 +530,16 @@ process_inferred (RdsTrackerCore * core, Stream * st, const RdsTrackerFrameIn * 
     if (t && t->state == STATE_TENTATIVE && t->age > core->probation_age)
       activate (core, st, t);
     if (t && t->state == STATE_ACTIVE)
-      emit_target (core, t, in->dets[k].user);
+      emit_target (core, t, TRUE, in->dets[k].user);
     else
       g_ptr_array_add (core->rejected_out, in->dets[k].user);
   }
 }
 
-/* A frame without inference: no association and no shadow aging; every Active target is reported with its last
- * matched box, newest ID first. Detections on such a frame are never tracked and are all rejected, even one on an
- * Active target's box (DeepStream 8.0 behaviour, and 7.1's: the objects are removed from the frame). */
+/* A frame without inference: no association and no shadow aging; every Active target is reported (with its last
+ * matched box, or NvSORT's prediction), newest ID first. Detections on such a frame are never tracked and are all
+ * rejected, even one on an Active target's box (DeepStream 8.0 behaviour, and 7.1's: the objects are removed from
+ * the frame). */
 static void
 process_uninferred (RdsTrackerCore * core, Stream * st, const RdsTrackerFrameIn * in)
 {
@@ -487,7 +552,7 @@ process_uninferred (RdsTrackerCore * core, Stream * st, const RdsTrackerFrameIn 
   }
   g_ptr_array_sort (core->sorted, newest_first);
   for (guint i = 0; i < core->sorted->len; i++)
-    emit_target (core, g_ptr_array_index (core->sorted, i), NULL);
+    emit_target (core, g_ptr_array_index (core->sorted, i), FALSE, NULL);
   for (guint k = 0; k < in->n_dets; k++)
     g_ptr_array_add (core->rejected_out, in->dets[k].user);
 }
@@ -520,11 +585,22 @@ rds_tracker_core_process (RdsTrackerCore * core, const RdsTrackerFrameIn * frame
 
     if (in->reset && reset_terminates (core))
       stream_terminate_all (st);
+    /* NvSORT predicts every target once per frame, with or without inference, before association */
     for (guint i = 0; i < st->targets->len; i++) {
       Target *t = g_ptr_array_index (st->targets, i);
 
       t->age++;
       t->det = -1;
+      if (core->has_kf)
+        rds_tracker_kf_predict (&t->kf);
+      if (core->use_prediction) {
+        rds_tracker_kf_get_box (&t->kf, &t->bx, &t->by, &t->bw, &t->bh);
+      } else {
+        t->bx = t->x;
+        t->by = t->y;
+        t->bw = t->w;
+        t->bh = t->h;
+      }
     }
     g_ptr_array_set_size (core->det_target, in->n_dets);
     for (guint k = 0; k < in->n_dets; k++)
