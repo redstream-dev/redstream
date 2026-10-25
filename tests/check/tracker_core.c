@@ -388,10 +388,17 @@ test_no_inference_report (void)
   }
   g_assert_true (fo->targets[0].last_user == TAG (4));
   g_assert_true (fo->targets[1].last_user == TAG (3));
-  /* detections on a frame without inference are not tracked: passed through, not rejected */
-  assert_rejected (fo, 0);
-  g_assert_cmpuint (fo->n_untracked, ==, 1);
-  g_assert_true (fo->untracked[0] == TAG (5));
+  /* detections on a frame without inference are not tracked: rejected */
+  assert_rejected (fo, 5, 0);
+  g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, 2);
+  /* even one on an Active target's exact box: the target is still reported, without it */
+  fo = STEP (core, 0, FALSE, sq (10, 6));
+  assert_rejected (fo, 6, 0);
+  g_assert_cmpuint (fo->n_targets, ==, 2);
+  g_assert_cmpuint (fo->targets[1].id, ==, 0);
+  assert_box (&fo->targets[1], 10, 100, 100, 100);
+  g_assert_null (fo->targets[1].associated_user);
+  g_assert_true (fo->targets[1].last_user == TAG (3));
   g_assert_cmpuint (rds_tracker_core_get_n_targets (core, 0), ==, 2);
   rds_tracker_core_free (core);
 }
@@ -936,7 +943,7 @@ test_reset_mode3 (void)
 typedef void (*FrameCheck) (const RdsTrackerFrameIn * in, guint n, const RdsTrackerBatchOut * bo, gpointer data);
 
 /* @n_streams streams of @n_objs objects on a grid, drifting right; each detection is missed 10% of the time, a
- * frame has no inference 20% of the time and, with @events, a stream gets a reset or an EOS now and then. */
+ * frame has no inference 20% of the time (its detections come from elsewhere: the core drops them) and, with @events, a stream gets a reset or an EOS now and then. */
 static void
 run_scenario (RdsTrackerCore * core, guint n_streams, guint n_objs, guint n_frames, guint32 seed, gboolean events,
     FrameCheck check, gpointer data)
@@ -958,8 +965,6 @@ run_scenario (RdsTrackerCore * core, guint n_streams, guint n_objs, guint n_fram
       }
       in[s] = (RdsTrackerFrameIn) {
       .stream_id = s,.frame_num = f,.detection_done = g_rand_int_range (rand, 0, 5) != 0,.dets = sd};
-      if (!in[s].detection_done)
-        continue;
       for (guint i = 0; i < n_objs; i++) {
         if (g_rand_int_range (rand, 0, 10) == 0)
           continue;
@@ -998,10 +1003,11 @@ check_ids (const RdsTrackerFrameIn * in, guint n, const RdsTrackerBatchOut * bo,
     const RdsTrackerFrameOut *fo = &bo->frames[s];
     GHashTable *frame = g_hash_table_new (g_int64_hash, g_int64_equal);
 
+    /* every detection is reported or rejected; on frames without inference, all are rejected */
     if (in[s].detection_done)
-      g_assert_cmpuint (fo->n_untracked, ==, 0);
+      g_assert_cmpuint (fo->n_targets + fo->n_rejected, ==, in[s].n_dets);
     else
-      g_assert_cmpuint (fo->n_rejected, ==, 0);
+      g_assert_cmpuint (fo->n_rejected, ==, in[s].n_dets);
     for (guint i = 0; i < fo->n_targets; i++) {
       const guint64 *id = &fo->targets[i].id;
 

@@ -58,7 +58,7 @@ typedef struct
 
 typedef struct
 {
-  guint first_target, n_targets, first_rejected, n_rejected, first_untracked, n_untracked;
+  guint first_target, n_targets, first_rejected, n_rejected;
 } FrameSpan;
 
 struct _RdsTrackerCore
@@ -87,7 +87,6 @@ struct _RdsTrackerCore
   GArray *frames_out;           /* RdsTrackerFrameOut */
   GArray *targets_out;          /* RdsTrackerTarget */
   GPtrArray *rejected_out;
-  GPtrArray *untracked_out;
 };
 
 static gboolean
@@ -195,7 +194,6 @@ rds_tracker_core_new (const RdsTrackerConfig * cfg, const RdsTrackerCoreOptions 
   core->frames_out = g_array_new (FALSE, TRUE, sizeof (RdsTrackerFrameOut));
   core->targets_out = g_array_new (FALSE, FALSE, sizeof (RdsTrackerTarget));
   core->rejected_out = g_ptr_array_new ();
-  core->untracked_out = g_ptr_array_new ();
   return core;
 }
 
@@ -213,7 +211,6 @@ rds_tracker_core_free (RdsTrackerCore * core)
   g_array_unref (core->frames_out);
   g_array_unref (core->targets_out);
   g_ptr_array_unref (core->rejected_out);
-  g_ptr_array_unref (core->untracked_out);
   g_free (core);
 }
 
@@ -476,8 +473,8 @@ process_inferred (RdsTrackerCore * core, Stream * st, const RdsTrackerFrameIn * 
 }
 
 /* A frame without inference: no association and no shadow aging; every Active target is reported with its last
- * matched box, newest ID first (DeepStream 8.0 behaviour). Ours: detections on such a frame did not come from the
- * skipped detector, so they are not tracked and are passed through untouched (the untracked list). */
+ * matched box, newest ID first. Detections on such a frame are never tracked and are all rejected, even one on an
+ * Active target's box (DeepStream 8.0 behaviour, and 7.1's: the objects are removed from the frame). */
 static void
 process_uninferred (RdsTrackerCore * core, Stream * st, const RdsTrackerFrameIn * in)
 {
@@ -492,7 +489,7 @@ process_uninferred (RdsTrackerCore * core, Stream * st, const RdsTrackerFrameIn 
   for (guint i = 0; i < core->sorted->len; i++)
     emit_target (core, g_ptr_array_index (core->sorted, i), NULL);
   for (guint k = 0; k < in->n_dets; k++)
-    g_ptr_array_add (core->untracked_out, in->dets[k].user);
+    g_ptr_array_add (core->rejected_out, in->dets[k].user);
 }
 
 static gboolean
@@ -515,14 +512,11 @@ rds_tracker_core_process (RdsTrackerCore * core, const RdsTrackerFrameIn * frame
   g_array_set_size (core->spans, 0);
   g_array_set_size (core->targets_out, 0);
   g_ptr_array_set_size (core->rejected_out, 0);
-  g_ptr_array_set_size (core->untracked_out, 0);
 
   for (guint f = 0; f < n_frames; f++) {
     const RdsTrackerFrameIn *in = &frames[f];
     Stream *st = get_stream (core, in->stream_id, TRUE);
-    FrameSpan span = {.first_target = core->targets_out->len,.first_rejected = core->rejected_out->len,
-      .first_untracked = core->untracked_out->len
-    };
+    FrameSpan span = {.first_target = core->targets_out->len,.first_rejected = core->rejected_out->len };
 
     if (in->reset && reset_terminates (core))
       stream_terminate_all (st);
@@ -543,7 +537,6 @@ rds_tracker_core_process (RdsTrackerCore * core, const RdsTrackerFrameIn * frame
 
     span.n_targets = core->targets_out->len - span.first_target;
     span.n_rejected = core->rejected_out->len - span.first_rejected;
-    span.n_untracked = core->untracked_out->len - span.first_untracked;
     g_array_append_val (core->spans, span);
   }
 
@@ -557,8 +550,6 @@ rds_tracker_core_process (RdsTrackerCore * core, const RdsTrackerFrameIn * frame
     fo->n_targets = span->n_targets;
     fo->rejected = span->n_rejected ? &g_ptr_array_index (core->rejected_out, span->first_rejected) : NULL;
     fo->n_rejected = span->n_rejected;
-    fo->untracked = span->n_untracked ? &g_ptr_array_index (core->untracked_out, span->first_untracked) : NULL;
-    fo->n_untracked = span->n_untracked;
   }
   out->frames = (const RdsTrackerFrameOut *) core->frames_out->data;
   out->n_frames = n_frames;

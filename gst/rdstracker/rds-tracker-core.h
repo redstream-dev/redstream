@@ -79,12 +79,9 @@ typedef struct
   guint n_targets;
   /* The user pointers of the frame's detections that have no reported target, in input order: an invalid box (not
    * finite, or no area), below minDetectorConfidence, matched to or creating a Tentative target, duplicates, over
-   * maxTargetsPerStream. Frames with inference only. */
+   * maxTargetsPerStream, and every detection of a frame without inference (DeepStream 8.0 behaviour). */
   gpointer const *rejected;
   guint n_rejected;
-  /* Every detection of a frame without inference, in input order: not tracked, to be left untouched (ours). */
-  gpointer const *untracked;
-  guint n_untracked;
 } RdsTrackerFrameOut;
 
 /* Owned by the core: valid until the next rds_tracker_core_process or rds_tracker_core_free. */
