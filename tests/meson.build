@@ -132,7 +132,8 @@ if rds_infer_enabled
     suite : 'gpu', env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 300)
   # The MIGraphX engine and its program cache on the committed scale2 models (gpu), and its ONNX reader (cpu). The
   # YOLO11n cases (their own entry) run only once tests/models/fetch-yolo11n.sh has fetched the model; they cache
-  # its programs in the build directory. A first YOLO11n compile takes about 30 s on a small GPU.
+  # its programs in the build directory. A first YOLO11n compile takes about 70 s on a small GPU with cold kernel
+  # caches, about 30 s warm (the test keeps the MIOpen and comgr caches in the build directory).
   infer_engine_exe = executable('infer_engine', 'check' / 'infer_engine.c',
     dependencies : [rdsinfer_core_dep, hip_dep, gst_dep, cc.find_library('m', required : false)],
     link_language : 'cpp',
@@ -144,7 +145,7 @@ if rds_infer_enabled
   test('infer_engine_cpu', infer_engine_exe, args : ['-p', '/cpu/infer-engine'],
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
   test('infer_engine', infer_engine_exe, args : ['-p', '/gpu/infer-engine'],
-    suite : 'gpu', env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 600)
+    suite : 'gpu', env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 120)
   test('infer_engine_yolo', infer_engine_exe, args : ['-p', '/gpu/infer-yolo'],
     suite : ['gpu', 'yolo'], env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 900)
 

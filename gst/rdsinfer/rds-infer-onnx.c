@@ -1,6 +1,7 @@
 /* Redstream: a minimal reader for the protobuf encoding of an ONNX ModelProto, for the graph's inputs and outputs.
  * Only the fields on the path ModelProto.graph -> GraphProto.{input, output, initializer} -> ValueInfoProto.type ->
- * TypeProto.tensor_type.{elem_type, shape} -> TensorShapeProto.dim -> {dim_value, dim_param} are decoded; every
+ * TypeProto.tensor_type.{elem_type, shape} -> TensorShapeProto.dim -> {dim_value, dim_param}, and the
+ * initializers' TensorProto.{name, external_data, data_location}, are decoded; every
  * other field is skipped by its wire type. Field numbers are from onnx.proto (ONNX IR, all versions).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-infer-onnx.h"
@@ -16,6 +17,9 @@
 #define GRAPH_OUTPUT 12
 /* TensorProto */
 #define TENSOR_NAME 8
+#define TENSOR_EXTERNAL_DATA 13
+#define TENSOR_DATA_LOCATION 14
+#define DATA_LOCATION_EXTERNAL 1
 /* ValueInfoProto */
 #define VALUE_NAME 1
 #define VALUE_TYPE 2
@@ -238,16 +242,32 @@ read_value (Reader r)
   return v;
 }
 
+/* Adds the initializer's name to @names; sets *external to it (once) if its data is in an external file. */
 static gboolean
-read_tensor_name (Reader r, GHashTable * names)
+read_initializer (Reader r, GHashTable * names, gchar ** external)
 {
   Field f;
-  gboolean ok;
+  gboolean ok, is_external = FALSE;
+  gchar *name = NULL;
 
-  while (next_field (&r, &f, &ok))
-    if (f.number == TENSOR_NAME && f.wire == WIRE_LEN)
-      g_hash_table_add (names, field_string (&f));
-  return ok;
+  while (next_field (&r, &f, &ok)) {
+    if (f.number == TENSOR_NAME && f.wire == WIRE_LEN) {
+      g_free (name);
+      name = field_string (&f);
+    } else if ((f.number == TENSOR_EXTERNAL_DATA && f.wire == WIRE_LEN)
+        || (f.number == TENSOR_DATA_LOCATION && f.wire == WIRE_VARINT && f.varint == DATA_LOCATION_EXTERNAL)) {
+      is_external = TRUE;
+    }
+  }
+  if (!ok) {
+    g_free (name);
+    return FALSE;
+  }
+  if (is_external && !*external)
+    *external = g_strdup (name ? name : "");
+  if (name)
+    g_hash_table_add (names, name);
+  return TRUE;
 }
 
 RdsInferOnnxInfo *
@@ -258,6 +278,7 @@ rds_infer_onnx_read_info (const guint8 * data, gsize len, GError ** error)
   GPtrArray *outputs = g_ptr_array_new_with_free_func ((GDestroyNotify) value_free);
   GHashTable *initializers = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
   RdsInferOnnxInfo *info;
+  gchar *external = NULL;
   const gchar *what = NULL;
   gboolean ok, have_graph = FALSE;
   Field f;
@@ -287,7 +308,7 @@ rds_infer_onnx_read_info (const guint8 * data, gsize len, GError ** error)
         goto fail;
       }
       g_ptr_array_add (f.number == GRAPH_INPUT ? inputs : outputs, v);
-    } else if (f.number == GRAPH_INITIALIZER && !read_tensor_name (f.bytes, initializers)) {
+    } else if (f.number == GRAPH_INITIALIZER && !read_initializer (f.bytes, initializers, &external)) {
       what = "malformed initializer";
       goto fail;
     }
@@ -308,10 +329,12 @@ rds_infer_onnx_read_info (const guint8 * data, gsize len, GError ** error)
   info = g_new (RdsInferOnnxInfo, 1);
   info->inputs = inputs;
   info->outputs = outputs;
+  info->external_tensor = external;
   return info;
 
 fail:
   g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL, "not a valid ONNX model: %s", what);
+  g_free (external);
   g_hash_table_unref (initializers);
   g_ptr_array_unref (inputs);
   g_ptr_array_unref (outputs);
@@ -325,5 +348,6 @@ rds_infer_onnx_info_free (RdsInferOnnxInfo * info)
     return;
   g_ptr_array_unref (info->inputs);
   g_ptr_array_unref (info->outputs);
+  g_free (info->external_tensor);
   g_free (info);
 }

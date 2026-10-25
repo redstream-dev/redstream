@@ -4,10 +4,11 @@
  * software that would compile it now. Inputs and outputs are the caller's device buffers. Plain C API: no MIGraphX
  * or HIP types, and no C++ exception leaves it. Plugin-internal, not installed.
  *
- * Cache file: <onnx stem>_b<batch>_<gfx>_<fp32|fp16>.mxr (+ .mxr.json), in the ONNX file's directory, or in
- * $XDG_CACHE_HOME/redstream/ when that isn't writable. <gfx> is the device's own architecture (from the kernel's
- * KFD topology, so HSA_OVERRIDE_GFX_VERSION doesn't change it), e.g. gfx1036. Building one cache entry from two
- * processes at once is not supported (they share the temporary file names).
+ * Cache file: <onnx stem>_b<batch>_<C>x<H>x<W>_<gfx>_<fp32|fp16>.mxr (+ .mxr.json), in the ONNX file's directory,
+ * or in $XDG_CACHE_HOME/redstream/ when that isn't writable. <gfx> is the device's own architecture (from the
+ * kernel's KFD topology, so HSA_OVERRIDE_GFX_VERSION doesn't change it), e.g. gfx1036. Both files are written
+ * through unique temporary files and renames, so two processes building the same entry both succeed (the last
+ * rename wins). Models that keep weights in external data files are refused: the manifest hashes the .onnx only.
  *
  * Threads: an engine may be opened on one thread and used on another, but only from one thread at a time.
  * Every call sets the engine's GPU as the calling thread's current device for its duration and restores the
@@ -73,7 +74,10 @@ G_GNUC_INTERNAL gsize rds_infer_engine_get_output_elements (RdsInferEngine * e, 
 
 /* Enqueues one run on @stream (a hipStream_t; not the null stream) and returns without waiting. @input and
  * @outputs[get_n_outputs] are device buffers of batch_size images; MIGraphX orders the run after earlier work on
- * @stream, and later work on @stream after it. */
+ * @stream, and later work on @stream after it. The buffers must stay valid until @stream has passed the run, and
+ * the engine must not be freed while a run is in flight (synchronize @stream first). The program's internal
+ * scratch memory is shared by all runs of one engine, so runs of one engine on different streams must not overlap:
+ * use one stream per engine. */
 G_GNUC_INTERNAL gboolean rds_infer_engine_run_async (RdsInferEngine * e, const float *input, float *const *outputs,
     void *stream, GError ** error);
 G_GNUC_INTERNAL void rds_infer_engine_free (RdsInferEngine * e);

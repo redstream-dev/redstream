@@ -64,19 +64,29 @@ remove_dir (const gchar * dir)
   g_assert_cmpint (g_rmdir (dir), ==, 0);
 }
 
-static gboolean
-dir_has_tmp (const gchar * dir)
+/* Temporary files left in @dir: anything with ".mxr." in its name that isn't a manifest (the engine's temporaries
+ * are PATH.XXXXXX), or ending in ".tmp". @keep (or NULL) are names planted by the test. */
+static guint
+count_stray (const gchar * dir, const gchar * const *keep)
 {
   GDir *d = g_dir_open (dir, 0, NULL);
   const gchar *name;
-  gboolean found = FALSE;
+  guint n = 0;
 
   g_assert_nonnull (d);
-  while ((name = g_dir_read_name (d)))
-    found |= g_str_has_suffix (name, ".tmp");
+  while ((name = g_dir_read_name (d))) {
+    if (keep && g_strv_contains (keep, name))
+      continue;
+    if ((strstr (name, ".mxr.") && !g_str_has_suffix (name, ".mxr.json")) || g_str_has_suffix (name, ".tmp")) {
+      g_test_message ("stray file %s", name);
+      n++;
+    }
+  }
   g_dir_close (d);
-  return found;
+  return n;
 }
+
+#define dir_has_tmp(dir) (count_stray ((dir), NULL) > 0)
 
 static gchar *
 read_file (const gchar * path)
@@ -334,7 +344,7 @@ test_build_and_cache (void)
   g_assert_cmpuint (rds_infer_engine_get_warnings (e)->len, ==, 0);
   base = g_path_get_basename (rds_infer_engine_get_program_path (e));
   g_test_message ("cache file %s", base);
-  g_assert_true (g_str_has_prefix (base, "scale2_b2_gfx"));
+  g_assert_true (g_str_has_prefix (base, "scale2_b2_3x64x48_gfx"));
   g_assert_true (g_str_has_suffix (base, "_fp32.mxr"));
   g_assert_true (g_str_has_prefix (rds_infer_engine_get_program_path (e), dir));
   g_assert_true (g_file_test (rds_infer_engine_get_program_path (e), G_FILE_TEST_IS_REGULAR));
@@ -422,7 +432,7 @@ test_invalidation (void)
   /* Another batch size is another program. */
   e = open_engine (onnx, NULL, 1, FALSE, dims_64x48, FALSE);
   g_assert_true (rds_infer_engine_was_built (e));
-  g_assert_nonnull (strstr (rds_infer_engine_get_program_path (e), "scale2_b1_"));
+  g_assert_nonnull (strstr (rds_infer_engine_get_program_path (e), "scale2_b1_3x64x48_"));
   check_scale2 (e, 1, 0.0f);
   rds_infer_engine_free (e);
 
@@ -478,7 +488,14 @@ test_engine_file (void)
   e = open_engine (onnx, custom, 1, FALSE, dims_64x48, FALSE);
   g_assert_true (rds_infer_engine_was_built (e));
   g_assert_nonnull (strstr (rds_infer_engine_get_build_reason (e), "batch_size"));
-  g_assert_nonnull (strstr (rds_infer_engine_get_program_path (e), "scale2_b1_"));
+  g_assert_nonnull (strstr (rds_infer_engine_get_program_path (e), "scale2_b1_3x64x48_"));
+  rds_infer_engine_free (e);
+  /* ... and next time that program is loaded, with a warning that model-engine-file was bypassed. */
+  e = open_engine (onnx, custom, 1, FALSE, dims_64x48, FALSE);
+  g_assert_false (rds_infer_engine_was_built (e));
+  g_assert_true (has_warning (e, custom));
+  g_assert_true (has_warning (e, "doesn't match"));
+  g_assert_nonnull (strstr (rds_infer_engine_get_program_path (e), "scale2_b1_3x64x48_"));
   rds_infer_engine_free (e);
 
   /* A TensorRT engine: ignored with a warning, built from the ONNX file, saved under the cache name. */
@@ -493,6 +510,10 @@ test_engine_file (void)
   /* ... and the next open finds that program (ours: the cache name is looked up after model-engine-file). */
   e = open_engine (onnx, trt, 2, FALSE, dims_64x48, FALSE);
   g_assert_false (rds_infer_engine_was_built (e));
+  g_assert_true (has_warning (e, "TensorRT"));
+  rds_infer_engine_free (e);
+  e = open_engine (onnx, trt, 2, FALSE, dims_64x48, TRUE);
+  g_assert_true (rds_infer_engine_was_built (e));
   g_assert_true (has_warning (e, "TensorRT"));
   rds_infer_engine_free (e);
   g_assert_cmpint (g_unlink (cache), ==, 0);
@@ -555,8 +576,8 @@ test_readonly_dir (void)
   g_free (onnx);
 }
 
-/* Stale temporary files (a crash before the rename) are ignored and overwritten; a program without a manifest (a
- * crash between the two renames) is rebuilt. */
+/* Stale temporary files (a crash before the rename) are ignored; a program without a manifest (a crash between the
+ * two renames) is rebuilt. */
 static void
 test_atomic_write (void)
 {
@@ -578,15 +599,26 @@ test_atomic_write (void)
     g_assert_cmpint (g_unlink (json), ==, 0);
     g_free (json);
   }
-  tmp = g_strconcat (cache, ".tmp", NULL);
-  json_tmp = g_strconcat (cache, ".json.tmp", NULL);
+  tmp = g_strconcat (cache, ".Zz9Zz9", NULL);
+  json_tmp = g_strconcat (cache, ".json.Zz9Zz9", NULL);
   write_file (tmp, "half a program", -1);
   write_file (json_tmp, "{\"format\":", -1);
   e = open_engine (onnx, NULL, 2, FALSE, dims_64x48, FALSE);
   g_assert_true (rds_infer_engine_was_built (e));
   check_scale2 (e, 2, 0.0f);
   rds_infer_engine_free (e);
-  g_assert_false (dir_has_tmp (dir));
+  {
+    gchar *keep[3] = { g_path_get_basename (tmp), g_path_get_basename (json_tmp), NULL };
+    gchar *stale = read_file (tmp);
+
+    g_assert_cmpuint (count_stray (dir, (const gchar * const *) keep), ==, 0);
+    g_assert_cmpstr (stale, ==, "half a program");
+    g_free (stale);
+    g_free (keep[0]);
+    g_free (keep[1]);
+  }
+  g_assert_cmpint (g_unlink (tmp), ==, 0);
+  g_assert_cmpint (g_unlink (json_tmp), ==, 0);
 
   /* Crash between the renames: a program (here: garbage) without a manifest. */
   {
@@ -618,6 +650,159 @@ test_atomic_write (void)
   g_free (onnx);
 }
 
+/* Two infer-dims on one model: two programs, each found again. */
+static void
+test_dims_keyed (void)
+{
+  static const guint dims_32[3] = { 3, 32, 32 };
+  gchar *onnx, *dir, *a, *b;
+  RdsInferEngine *e;
+
+  RDS_TEST_REQUIRE_GPU ();
+  dir = make_model_dir (SCALE2, &onnx);
+  e = open_engine (onnx, NULL, 1, FALSE, dims_64x48, FALSE);
+  a = g_strdup (rds_infer_engine_get_program_path (e));
+  rds_infer_engine_free (e);
+  e = open_engine (onnx, NULL, 1, FALSE, dims_32, FALSE);
+  g_assert_true (rds_infer_engine_was_built (e));
+  b = g_strdup (rds_infer_engine_get_program_path (e));
+  rds_infer_engine_free (e);
+  g_assert_nonnull (strstr (a, "_3x64x48_"));
+  g_assert_nonnull (strstr (b, "_3x32x32_"));
+  e = open_engine (onnx, NULL, 1, FALSE, dims_64x48, FALSE);
+  g_assert_false (rds_infer_engine_was_built (e));
+  g_assert_cmpstr (rds_infer_engine_get_program_path (e), ==, a);
+  check_scale2 (e, 1, 0.0f);
+  rds_infer_engine_free (e);
+  e = open_engine (onnx, NULL, 1, FALSE, dims_32, FALSE);
+  g_assert_false (rds_infer_engine_was_built (e));
+  g_assert_cmpstr (rds_infer_engine_get_program_path (e), ==, b);
+  rds_infer_engine_free (e);
+  g_assert_false (dir_has_tmp (dir));
+  g_free (a);
+  g_free (b);
+  remove_dir (dir);
+  g_free (dir);
+  g_free (onnx);
+}
+
+/* A hand-encoded model: input images [batch, 3, 4, 4], one initializer whose data is in an external file. */
+static void
+put_varint (GByteArray * b, guint64 v)
+{
+  do {
+    guint8 c = (v & 0x7f) | (v > 0x7f ? 0x80 : 0);
+
+    g_byte_array_append (b, &c, 1);
+    v >>= 7;
+  } while (v);
+}
+
+static void
+put_bytes (GByteArray * b, guint field, const void *data, gsize len)
+{
+  put_varint (b, (guint64) field << 3 | 2);
+  put_varint (b, len);
+  g_byte_array_append (b, data, len);
+}
+
+static void
+put_msg (GByteArray * b, guint field, GByteArray * msg)
+{
+  put_bytes (b, field, msg->data, msg->len);
+  g_byte_array_unref (msg);
+}
+
+static void
+put_int (GByteArray * b, guint field, guint64 v)
+{
+  put_varint (b, (guint64) field << 3);
+  put_varint (b, v);
+}
+
+static GByteArray *
+external_data_model (void)
+{
+  GByteArray *model = g_byte_array_new (), *graph = g_byte_array_new (), *input = g_byte_array_new ();
+  GByteArray *type = g_byte_array_new (), *tensor = g_byte_array_new (), *shape = g_byte_array_new ();
+  GByteArray *init = g_byte_array_new (), *entry = g_byte_array_new ();
+  GByteArray *dim = g_byte_array_new ();
+
+  put_bytes (dim, 2, "batch", 5);
+  put_msg (shape, 1, dim);
+  for (guint i = 0; i < 3; i++) {
+    dim = g_byte_array_new ();
+    put_int (dim, 1, i == 0 ? 3 : 4);
+    put_msg (shape, 1, dim);
+  }
+  put_int (tensor, 1, RDS_INFER_ONNX_FLOAT);
+  put_msg (tensor, 2, shape);
+  put_msg (type, 1, tensor);
+  put_bytes (input, 1, "images", 6);
+  put_msg (input, 2, type);
+  put_bytes (entry, 1, "location", 8);
+  put_bytes (entry, 2, "weights.bin", 11);
+  put_bytes (init, 8, "w", 1);
+  put_msg (init, 13, entry);
+  put_int (init, 14, 1);        /* data_location EXTERNAL */
+  put_msg (graph, 5, init);
+  put_msg (graph, 11, input);
+  put_int (model, 1, 8);
+  put_msg (model, 7, graph);
+  return model;
+}
+
+static void
+test_onnx_reader_external (void)
+{
+  GByteArray *model = external_data_model ();
+  GError *err = NULL;
+  RdsInferOnnxInfo *info = rds_infer_onnx_read_info (model->data, model->len, &err);
+
+  g_assert_no_error (err);
+  g_assert_cmpuint (info->inputs->len, ==, 1);
+  g_assert_cmpstr (info->external_tensor, ==, "w");
+  rds_infer_onnx_info_free (info);
+  g_byte_array_unref (model);
+
+  /* The committed model keeps its weights inside. */
+  {
+    gchar *data;
+    gsize len;
+
+    g_assert_true (g_file_get_contents (SCALE2, &data, &len, NULL));
+    info = rds_infer_onnx_read_info ((const guint8 *) data, len, &err);
+    g_assert_no_error (err);
+    g_assert_null (info->external_tensor);
+    rds_infer_onnx_info_free (info);
+    g_free (data);
+  }
+}
+
+/* Models with external data are refused (the manifest would not cover the weights). */
+static void
+test_external_data (void)
+{
+  GByteArray *model = external_data_model ();
+  gchar *dir, *onnx;
+  RdsInferEngineOptions opts = { NULL, NULL, 1, 0, FALSE, NULL, FALSE };
+  GError *err = NULL;
+
+  RDS_TEST_REQUIRE_GPU ();
+  dir = make_model_dir (SCALE2, &onnx);
+  write_file (onnx, (const gchar *) model->data, model->len);
+  opts.onnx_file = onnx;
+  g_assert_null (rds_infer_engine_open (&opts, &err));
+  g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL);
+  g_test_message ("%s", err->message);
+  g_assert_nonnull (strstr (err->message, "external"));
+  g_clear_error (&err);
+  g_byte_array_unref (model);
+  remove_dir (dir);
+  g_free (dir);
+  g_free (onnx);
+}
+
 static void
 test_fp16 (void)
 {
@@ -629,7 +814,7 @@ test_fp16 (void)
   e = open_engine (onnx, NULL, 1, TRUE, dims_64x48, FALSE);
   g_assert_true (rds_infer_engine_was_built (e));
   g_assert_true (g_str_has_suffix (rds_infer_engine_get_program_path (e), "_fp16.mxr"));
-  g_assert_nonnull (strstr (rds_infer_engine_get_program_path (e), "scale2_b1_"));
+  g_assert_nonnull (strstr (rds_infer_engine_get_program_path (e), "scale2_b1_3x64x48_"));
   check_scale2 (e, 1, 1e-2f);
   rds_infer_engine_free (e);
   e = open_engine (onnx, NULL, 1, TRUE, dims_64x48, FALSE);
@@ -846,15 +1031,21 @@ main (int argc, char **argv)
    * databases: keep them in the build directory. */
   g_setenv ("MIOPEN_USER_DB_PATH", RDS_TEST_BUILD_DIR "/miopen", FALSE);
   g_setenv ("MIOPEN_CUSTOM_CACHE_DIR", RDS_TEST_BUILD_DIR "/miopen", FALSE);
+  /* The isolated XDG_CACHE_HOME is fresh for every test, and comgr (the HIP kernel compiler MIGraphX uses) caches
+   * there by default: without its own cache directory every YOLO11n build compiles cold. */
+  g_setenv ("AMD_COMGR_CACHE_DIR", RDS_TEST_BUILD_DIR "/comgr", FALSE);
   g_test_init (&argc, &argv, G_TEST_OPTION_ISOLATE_DIRS, NULL);
   g_test_add_func ("/cpu/infer-engine/onnx-reader", test_onnx_reader);
   g_test_add_func ("/cpu/infer-engine/onnx-reader-truncated", test_onnx_reader_truncated);
+  g_test_add_func ("/cpu/infer-engine/onnx-reader-external", test_onnx_reader_external);
   g_test_add_func ("/cpu/infer-engine/invalid-options", test_invalid_options);
   g_test_add_func ("/gpu/infer-engine/build-and-cache", test_build_and_cache);
   g_test_add_func ("/gpu/infer-engine/invalidation", test_invalidation);
   g_test_add_func ("/gpu/infer-engine/engine-file", test_engine_file);
   g_test_add_func ("/gpu/infer-engine/readonly-dir", test_readonly_dir);
   g_test_add_func ("/gpu/infer-engine/atomic-write", test_atomic_write);
+  g_test_add_func ("/gpu/infer-engine/dims-keyed", test_dims_keyed);
+  g_test_add_func ("/gpu/infer-engine/external-data", test_external_data);
   g_test_add_func ("/gpu/infer-engine/fp16", test_fp16);
   g_test_add_func ("/gpu/infer-engine/fixed-batch", test_fixed_batch);
   g_test_add_func ("/gpu/infer-engine/errors", test_errors);

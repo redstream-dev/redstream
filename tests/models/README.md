@@ -6,7 +6,7 @@ Our own tiny models, so the rdsinfer element tests run offline and compile in se
 
 | File | Input | Output |
 |---|---|---|
-| `scale2.onnx` | `images` float `[batch, 3, height, width]` (all symbolic) | `output0 = images × 2.0` |
+| `scale2.onnx` | `images` float `[batch, 3, height, width]` (channels fixed at 3, the rest symbolic) | `output0 = images × 2.0` |
 | `scale2-b1.onnx` | the same with batch fixed to 1 | the same |
 
 Opset 17, IR version 8, one `Mul` by a scalar initializer: a real multiply, so an inference engine can't alias the

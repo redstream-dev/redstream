@@ -97,6 +97,9 @@ Known gotchas:
 - On machines with an NVIDIA GPU as well, VA-API may log `pci id for fd N: 10de:...`. This is harmless; the
   AMD render node is still picked.
 - MIGraphX compilation is slow on small GPUs (minutes; FP16 even slower). Always cache compiled programs (`.mxr`).
+  YOLO11n FP32 at batch 1 on the gfx1036 iGPU: the first compile on a cold user cache (comgr's kernel cache in
+  `$XDG_CACHE_HOME`, MIOpen's in `$HOME/.config/miopen`) takes ~70 s (~40 s with only comgr's cache cold), ~30 s
+  once both are warm.
 - Build HIP code with the GPU attached, or pass `--offload-arch` explicitly. Otherwise hipcc targets the wrong arch
   and kernels fail with "device kernel image is invalid".
 - rocDecode must be fed whole NAL units or access units (`h264parse ! ...,alignment=au`). Split NAL units decode
@@ -114,7 +117,8 @@ Known gotchas:
   The device's own architecture is the KFD topology's `gfx_target_version`; the engine's cache names use that one.
 - MIOpen (MIGraphX's convolutions) keeps its databases under `$HOME/.config/miopen`. GLib tests with
   `G_TEST_OPTION_ISOLATE_DIRS` set `HOME=/dev/null`, so such tests point `MIOPEN_USER_DB_PATH` and
-  `MIOPEN_CUSTOM_CACHE_DIR` somewhere writable (`infer_engine` uses the build directory).
+  `MIOPEN_CUSTOM_CACHE_DIR` somewhere writable, and `AMD_COMGR_CACHE_DIR` too, since the isolated
+  `XDG_CACHE_HOME` is fresh for each test (`infer_engine` uses the build directory).
 
 Useful checks:
 

@@ -17,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <exception>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -155,7 +156,7 @@ kfd_gfx_name (const hipDeviceProp_t * prop)
     return NULL;
   while (!result && (node = g_dir_read_name (dir))) {
     gchar *path = g_build_filename (base, node, "properties", NULL), *contents = NULL;
-    guint64 version = 0, location = G_MAXUINT64, domain = G_MAXUINT64;
+    guint64 version = 0, location = G_MAXUINT64, domain = 0;    /* no domain property: domain 0 */
 
     if (g_file_get_contents (path, &contents, NULL, NULL)) {
       gchar **lines = g_strsplit (contents, "\n", -1);
@@ -291,63 +292,67 @@ fsync_path (const gchar * path)
   return ok;
 }
 
-/* Writes @contents to PATH.tmp, syncs it and renames it to @path. */
-static gboolean
-write_atomic (const gchar * path, const gchar * contents, gsize len, GError ** error)
+static void
+set_errno_error (GError ** error, int e, const gchar * what, const gchar * path)
 {
-  gchar *tmp = g_strconcat (path, ".tmp", NULL);
-  gboolean ok = g_file_set_contents_full (tmp, contents, len, G_FILE_SET_CONTENTS_DURABLE, 0644, error);
-
-  if (ok && g_rename (tmp, path) != 0) {
-    int e = errno;
-
-    g_set_error (error, G_FILE_ERROR, g_file_error_from_errno (e), "can't rename %s: %s", tmp, g_strerror (e));
-    ok = FALSE;
-  }
-  if (!ok)
-    g_unlink (tmp);
-  g_free (tmp);
-  return ok;
+  g_set_error (error, G_FILE_ERROR, g_file_error_from_errno (e), "can't %s %s: %s", what, path, g_strerror (e));
 }
 
-/* Saves the program to @path and then the manifest to PATH.json, each through a temporary file and a rename, so a
- * manifest only ever describes a complete program. */
+/* Saves the program to @path and then the manifest to PATH.json. The program goes to a unique temporary file
+ * (PATH.XXXXXX) that is synced and renamed, then the directory is synced; the manifest is written the same way by
+ * g_file_set_contents_full. So a manifest only ever describes a complete program, and when two processes build the
+ * same entry, the last rename wins with a complete pair. */
 static gboolean
 save_program (const migraphx::program & program, JsonObject * manifest, const gchar * path, GError ** error)
 {
-  gchar *tmp = g_strconcat (path, ".tmp", NULL), *json_path = g_strconcat (path, ".json", NULL), *text;
+  gchar *tmp = g_strconcat (path, ".XXXXXX", NULL), *json_path = g_strconcat (path, ".json", NULL);
+  gchar *dir = g_path_get_dirname (path), *text;
   JsonNode *root = json_node_new (JSON_NODE_OBJECT);
   JsonGenerator *gen = json_generator_new ();
-  gboolean ok = FALSE;
+  gboolean ok = FALSE, have_tmp = FALSE;
   gsize len;
+  int fd;
 
   /* A manifest left over from an older program must not describe the new one if we stop half-way. */
   if (g_unlink (json_path) != 0 && errno != ENOENT) {
-    int e = errno;
-
-    g_set_error (error, G_FILE_ERROR, g_file_error_from_errno (e), "can't remove %s: %s", json_path,
-        g_strerror (e));
+    set_errno_error (error, errno, "remove", json_path);
     goto out;
   }
+  if ((fd = g_mkstemp_full (tmp, O_RDWR, 0644)) < 0) {
+    set_errno_error (error, errno, "create", tmp);
+    goto out;
+  }
+  close (fd);
+  have_tmp = TRUE;
   if (!RDS_MGX_CHECK ("migraphx::save", error, migraphx::save (program, tmp)))
     goto out;
-  if (!fsync_path (tmp) || g_rename (tmp, path) != 0) {
-    int e = errno;
-
-    g_set_error (error, G_FILE_ERROR, g_file_error_from_errno (e), "can't write %s: %s", path, g_strerror (e));
-    g_unlink (tmp);
+  if (!fsync_path (tmp)) {
+    set_errno_error (error, errno, "sync", tmp);
+    goto out;
+  }
+  if (g_rename (tmp, path) != 0) {
+    set_errno_error (error, errno, "rename to", path);
+    goto out;
+  }
+  have_tmp = FALSE;
+  if (!fsync_path (dir)) {
+    set_errno_error (error, errno, "sync", dir);
     goto out;
   }
   json_node_set_object (root, manifest);
   json_generator_set_root (gen, root);
   json_generator_set_pretty (gen, TRUE);
   text = json_generator_to_data (gen, &len);
-  ok = write_atomic (json_path, text, len, error);
+  ok = g_file_set_contents_full (json_path, text, len,
+      (GFileSetContentsFlags) (G_FILE_SET_CONTENTS_CONSISTENT | G_FILE_SET_CONTENTS_DURABLE), 0644, error);
   g_free (text);
 
 out:
+  if (have_tmp)
+    g_unlink (tmp);
   g_object_unref (gen);
   json_node_unref (root);
+  g_free (dir);
   g_free (json_path);
   g_free (tmp);
   return ok;
@@ -655,23 +660,61 @@ file_sha256 (const gchar * data, gsize len)
   return g_compute_checksum_for_data (G_CHECKSUM_SHA256, (const guchar *) data, len);
 }
 
+/* What engine_open owns while it runs; freed on every return, also when an exception unwinds. */
+struct OpenState
+{
+  gchar *onnx = NULL, *sha256 = NULL, *dir = NULL, *stem = NULL, *name = NULL, *xdg_dir = NULL;
+  gchar *candidates[2] = { NULL, NULL };
+  gsize onnx_len = 0;
+  RdsInferOnnxInfo *info = NULL;
+  DeviceInfo dev = { NULL, NULL, 0, NULL };
+  JsonObject *key = NULL;
+
+  ~OpenState ()
+  {
+    if (key)
+      json_object_unref (key);
+    for (gchar * c : candidates)
+      g_free (c);
+    g_free (xdg_dir);
+    g_free (name);
+    g_free (stem);
+    g_free (dir);
+    g_free (sha256);
+    rds_infer_onnx_info_free (info);
+    g_free (onnx);
+    device_info_clear (&dev);
+  }
+};
+
+struct EngineFree
+{
+  void operator () (RdsInferEngine * e) const
+  {
+    rds_infer_engine_free (e);
+  }
+};
+
+/* A GError from @err, prefixed with the model file, in RDS_INFER_ENGINE_ERROR_@code. */
+static void
+model_error (GError ** error, RdsInferEngineError code, const gchar * onnx_file, GError * err)
+{
+  g_set_error (error, RDS_INFER_ENGINE_ERROR, code, "%s: %s", onnx_file, err->message);
+  g_error_free (err);
+}
+
 static RdsInferEngine *
 engine_open (const RdsInferEngineOptions * opts, GError ** error)
 {
-  RdsInferEngine *e = NULL;
-  gchar *onnx = NULL, *sha256 = NULL, *dir = NULL, *stem = NULL, *name = NULL, *xdg_dir = NULL;
-  gchar *candidates[3] = { NULL, NULL, NULL };
-  gsize onnx_len = 0;
-  RdsInferOnnxInfo *info = NULL;
+  OpenState st;
+  std::unique_ptr < RdsInferEngine, EngineFree > e;
   RdsInferOnnxValue *in;
-  DeviceInfo dev = { NULL, NULL, 0, NULL };
-  JsonObject *key = NULL;
   std::vector<size_t> input_lens;
   std::vector<std::string> names;
-  GString *reason = NULL;
+  std::string reason;
+  gboolean need_build = TRUE, is_trt;
   int n_devices = 0;
   GError *err = NULL;
-  gboolean ok = FALSE;
 
   if (!opts || !opts->onnx_file || opts->batch_size == 0
       || (opts->infer_dims && (!opts->infer_dims[0] || !opts->infer_dims[1] || !opts->infer_dims[2]))) {
@@ -688,37 +731,40 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
     return NULL;
   }
   DeviceScope scope (opts->gpu_id);
-  if (!device_scope_ok (scope, opts->gpu_id, error) || !device_info_get (opts->gpu_id, &dev, error))
-    goto out;
+  if (!device_scope_ok (scope, opts->gpu_id, error) || !device_info_get (opts->gpu_id, &st.dev, error))
+    return NULL;
 
-  if (!g_file_get_contents (opts->onnx_file, &onnx, &onnx_len, &err)) {
+  if (!g_file_get_contents (opts->onnx_file, &st.onnx, &st.onnx_len, &err)) {
     g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_FILE, "%s", err->message);
     g_error_free (err);
-    goto out;
+    return NULL;
   }
-  if (!(info = rds_infer_onnx_read_info ((const guint8 *) onnx, onnx_len, &err))) {
-    g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL, "%s: %s", opts->onnx_file,
-        err->message);
-    g_error_free (err);
-    goto out;
+  if (!(st.info = rds_infer_onnx_read_info ((const guint8 *) st.onnx, st.onnx_len, &err))) {
+    model_error (error, RDS_INFER_ENGINE_ERROR_MODEL, opts->onnx_file, err);
+    return NULL;
   }
-  if (info->inputs->len != 1) {
+  /* The manifest hashes the .onnx file only, so weights in other files could change unnoticed. */
+  if (st.info->external_tensor) {
+    g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL,
+        "%s: initializer \"%s\" keeps its data in an external file; models with external data are not supported "
+        "(export the model with its weights inside the .onnx file)", opts->onnx_file, st.info->external_tensor);
+    return NULL;
+  }
+  if (st.info->inputs->len != 1) {
     g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL,
         "%s: the model has %u inputs; only models with one input are supported", opts->onnx_file,
-        info->inputs->len);
-    goto out;
+        st.info->inputs->len);
+    return NULL;
   }
-  in = (RdsInferOnnxValue *) g_ptr_array_index (info->inputs, 0);
+  in = (RdsInferOnnxValue *) g_ptr_array_index (st.info->inputs, 0);
   if (!input_lens_get (in, opts, input_lens, &err)) {
-    g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL, "%s: %s", opts->onnx_file,
-        err->message);
-    g_error_free (err);
-    goto out;
+    model_error (error, RDS_INFER_ENGINE_ERROR_MODEL, opts->onnx_file, err);
+    return NULL;
   }
-  for (guint i = 0; i < info->outputs->len; i++)
-    names.push_back (((RdsInferOnnxValue *) g_ptr_array_index (info->outputs, i))->name);
+  for (guint i = 0; i < st.info->outputs->len; i++)
+    names.push_back (((RdsInferOnnxValue *) g_ptr_array_index (st.info->outputs, i))->name);
 
-  e = new _RdsInferEngine ();
+  e.reset (new _RdsInferEngine ());
   e->warnings = g_ptr_array_new_with_free_func (g_free);
   e->batch = opts->batch_size;
   e->gpu_id = opts->gpu_id;
@@ -727,73 +773,76 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
   e->w = (guint) input_lens[3];
   e->input_name = in->name;
 
-  sha256 = file_sha256 (onnx, onnx_len);
-  key = manifest_key (sha256, &dev, opts->fp16, opts->batch_size, in->name, input_lens);
+  st.sha256 = file_sha256 (st.onnx, st.onnx_len);
+  st.key = manifest_key (st.sha256, &st.dev, opts->fp16, opts->batch_size, in->name, input_lens);
 
   /* The cache name, in the model's directory and in the user cache directory. */
-  dir = g_path_get_dirname (opts->onnx_file);
-  stem = g_path_get_basename (opts->onnx_file);
-  if (g_str_has_suffix (stem, ".onnx"))
-    stem[strlen (stem) - strlen (".onnx")] = '\0';
-  name = g_strdup_printf ("%s_b%u_%s_%s.mxr", stem, opts->batch_size, dev.gfx, opts->fp16 ? "fp16" : "fp32");
-  xdg_dir = g_build_filename (g_get_user_cache_dir (), "redstream", NULL);
-  candidates[0] = g_build_filename (dir, name, NULL);
-  candidates[1] = g_build_filename (xdg_dir, name, NULL);
+  st.dir = g_path_get_dirname (opts->onnx_file);
+  st.stem = g_path_get_basename (opts->onnx_file);
+  if (g_str_has_suffix (st.stem, ".onnx"))
+    st.stem[strlen (st.stem) - strlen (".onnx")] = '\0';
+  st.name = g_strdup_printf ("%s_b%u_%ux%ux%u_%s_%s.mxr", st.stem, opts->batch_size, e->c, e->h, e->w, st.dev.gfx,
+      opts->fp16 ? "fp16" : "fp32");
+  st.xdg_dir = g_build_filename (g_get_user_cache_dir (), "redstream", NULL);
+  st.candidates[0] = g_build_filename (st.dir, st.name, NULL);
+  st.candidates[1] = g_build_filename (st.xdg_dir, st.name, NULL);
 
-  reason = g_string_new (NULL);
+  is_trt = opts->engine_file && g_str_has_suffix (opts->engine_file, ".engine");
+  if (is_trt)
+    g_ptr_array_add (e->warnings, g_strdup_printf ("model-engine-file %s is a TensorRT engine; ignored, the "
+            "compiled program comes from the ONNX model", opts->engine_file));
   if (opts->force_rebuild) {
-    g_string_append (reason, "rebuild forced");
+    reason = "rebuild forced";
   } else {
-    gboolean loaded = FALSE;
     std::vector<const gchar *> paths;
+    std::string engine_file_reason;
 
-    if (opts->engine_file && g_str_has_suffix (opts->engine_file, ".engine"))
-      g_ptr_array_add (e->warnings, g_strdup_printf ("model-engine-file %s is a TensorRT engine; ignored, the "
-              "compiled program comes from the ONNX model", opts->engine_file));
-    else if (opts->engine_file)
+    if (opts->engine_file && !is_trt)
       paths.push_back (opts->engine_file);
-    paths.push_back (candidates[0]);
-    paths.push_back (candidates[1]);
-    for (size_t i = 0; i < paths.size () && !loaded; i++) {
+    paths.push_back (st.candidates[0]);
+    paths.push_back (st.candidates[1]);
+    for (size_t i = 0; i < paths.size () && need_build; i++) {
       gchar *why = NULL;
 
       /* engine_file may name a cache file itself. */
       if (i > 0 && opts->engine_file && strcmp (paths[i], opts->engine_file) == 0)
         continue;
-      if (try_load (e, paths[i], key, input_lens, names, &why)) {
-        loaded = TRUE;
+      if (try_load (e.get (), paths[i], st.key, input_lens, names, &why)) {
+        need_build = FALSE;
         e->program_path = g_strdup (paths[i]);
-      } else if (i == 0 || g_file_test (paths[i], G_FILE_TEST_EXISTS)) {
+      } else {
+        if (i == 0 && paths[0] == opts->engine_file)
+          engine_file_reason = why;
         /* The first candidate, and any other that exists, explain why nothing was loaded. */
-        if (reason->len)
-          g_string_append (reason, "; ");
-        g_string_append (reason, why);
+        if (i == 0 || g_file_test (paths[i], G_FILE_TEST_EXISTS)) {
+          if (!reason.empty ())
+            reason += "; ";
+          reason += why;
+        }
       }
       g_free (why);
     }
-    if (loaded) {
-      g_string_free (reason, TRUE);
-      reason = NULL;
-    }
+    if (!need_build && !engine_file_reason.empty ())
+      g_ptr_array_add (e->warnings, g_strdup_printf ("model-engine-file %s doesn't match (%s); using %s",
+              opts->engine_file, engine_file_reason.c_str (), e->program_path));
   }
 
-  if (reason) {
+  if (need_build) {
     gboolean saved = FALSE;
 
     e->built = TRUE;
-    e->build_reason = g_string_free (reason, FALSE);
-    reason = NULL;
-    if (!build_program (e, onnx, onnx_len, input_lens, opts->fp16, error)
-        || !read_parameters (e, input_lens, names, error))
-      goto out;
-    json_object_set_member (key, "outputs", outputs_node (e));
+    e->build_reason = g_strdup (reason.c_str ());
+    if (!build_program (e.get (), st.onnx, st.onnx_len, input_lens, opts->fp16, error)
+        || !read_parameters (e.get (), input_lens, names, error))
+      return NULL;
+    json_object_set_member (st.key, "outputs", outputs_node (e.get ()));
     for (guint i = 0; i < 2 && !saved; i++) {
-      gchar *d = g_path_get_dirname (candidates[i]);
+      gchar *d = g_path_get_dirname (st.candidates[i]);
 
       if (dir_writable (d)) {
-        if (save_program (e->program, key, candidates[i], &err)) {
+        if (save_program (e->program, st.key, st.candidates[i], &err)) {
           saved = TRUE;
-          e->program_path = g_strdup (candidates[i]);
+          e->program_path = g_strdup (st.candidates[i]);
         } else {
           g_ptr_array_add (e->warnings, g_strdup_printf ("can't save the compiled program: %s", err->message));
           g_clear_error (&err);
@@ -803,38 +852,20 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
     }
     if (!saved)
       g_ptr_array_add (e->warnings, g_strdup_printf ("the compiled program is not cached: neither %s nor %s is "
-              "writable", dir, xdg_dir));
+              "writable", st.dir, st.xdg_dir));
   }
   if (e->program_path)
     e->manifest_path = g_strconcat (e->program_path, ".json", NULL);
-  ok = warm_up (e, error);
-
-out:
-  if (reason)
-    g_string_free (reason, TRUE);
-  if (key)
-    json_object_unref (key);
-  for (gchar * c : candidates)
-    g_free (c);
-  g_free (xdg_dir);
-  g_free (name);
-  g_free (stem);
-  g_free (dir);
-  g_free (sha256);
-  rds_infer_onnx_info_free (info);
-  g_free (onnx);
-  device_info_clear (&dev);
-  if (!ok && e) {
-    rds_infer_engine_free (e);
-    e = NULL;
-  }
-  return e;
+  if (!warm_up (e.get (), error))
+    return NULL;
+  return e.release ();
 }
 
 RdsInferEngine *
 rds_infer_engine_open (const RdsInferEngineOptions * opts, GError ** error)
 {
-  /* MIGraphX calls are checked one by one; this catches the rest (std::bad_alloc from our own containers). */
+  /* MIGraphX calls are checked one by one; this catches the rest (std::bad_alloc from our own containers). What
+   * engine_open owns is freed by its destructors on the way out. */
   try {
     return engine_open (opts, error);
   }
@@ -947,8 +978,12 @@ rds_infer_engine_free (RdsInferEngine * e)
   {
     /* The program's GPU resources are released on its device. */
     DeviceScope scope (e->gpu_id);
+    GError *err = NULL;
 
-    e->program = migraphx::program ();
+    if (!RDS_MGX_CHECK ("migraphx::program::~program", &err, e->program = migraphx::program ())) {
+      g_warning ("%s", err->message);
+      g_error_free (err);
+    }
   }
   g_free (e->program_path);
   g_free (e->manifest_path);

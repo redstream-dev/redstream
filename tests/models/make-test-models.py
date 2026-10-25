@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Writes the small ONNX test models next to this script (deterministic: re-running gives identical bytes).
 
-  scale2.onnx     images float[batch,3,height,width] -> output0 = images * 2.0 (all dims symbolic)
+  scale2.onnx     images float[batch,3,height,width] -> output0 = images * 2.0 (batch, height and width
+                  symbolic; the channel dim is fixed at 3)
   scale2-b1.onnx  the same with batch fixed to 1
 
 A real multiply, so an inference engine cannot alias the output to the input. Needs the `onnx` package

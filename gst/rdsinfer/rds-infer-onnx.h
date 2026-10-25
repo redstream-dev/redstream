@@ -25,9 +25,10 @@ typedef struct
 {
   GPtrArray *inputs;            /* RdsInferOnnxValue: the graph inputs that are not initializers, in file order */
   GPtrArray *outputs;           /* RdsInferOnnxValue: the graph outputs, in file order */
+  gchar *external_tensor;       /* the first initializer whose data is in an external file, or NULL */
 } RdsInferOnnxInfo;
 
-/* Reads ModelProto.graph's inputs, outputs and initializer names from the serialized model @data. Errors
+/* Reads ModelProto.graph's inputs, outputs, initializer names and whether initializers use external data from the serialized model @data. Errors
  * (RDS_INFER_ENGINE_ERROR_MODEL) say where the encoding is broken; the message doesn't name the file. */
 G_GNUC_INTERNAL RdsInferOnnxInfo *rds_infer_onnx_read_info (const guint8 * data, gsize len, GError ** error);
 G_GNUC_INTERNAL void rds_infer_onnx_info_free (RdsInferOnnxInfo * info);
