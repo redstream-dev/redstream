@@ -546,6 +546,17 @@ test_copy_lists_same_batch (void)
   g_assert_cmpuint (f->num_obj_meta, ==, 2);
   g_assert_true (obj_at (f, 1)->parent == obj_at (f, 0));
   g_assert_cmpuint (g_list_length (f->display_meta_list), ==, 1);
+
+  /* a frame's lists into themselves: each entry once more, the copies' parents among the copies */
+  rds_copy_obj_meta_list (f->obj_meta_list, f);
+  rds_copy_display_meta_list (f->display_meta_list, f);
+  g_assert_cmpuint (f->num_obj_meta, ==, 4);
+  g_assert_cmpuint (g_list_length (f->obj_meta_list), ==, 4);
+  g_assert_true (obj_at (f, 1)->parent == obj_at (f, 0));
+  g_assert_true (obj_at (f, 3)->parent == obj_at (f, 2));
+  g_assert_true (obj_at (f, 2) != obj_at (f, 0));
+  g_assert_cmpstr (obj_at (f, 2)->text_params.display_text, ==, "car");
+  g_assert_cmpuint (g_list_length (f->display_meta_list), ==, 2);
   rds_destroy_batch_meta (b);
   g_assert_cmpint (released, ==, created + copied);
 }

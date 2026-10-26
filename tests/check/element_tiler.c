@@ -1066,6 +1066,86 @@ test_out_of_grid_before_caps (void)
   tiler_clear (&t);
 }
 
+/* rows and columns changed while playing: the next batch uses them, cached pixels move to their new cells; a value
+ * whose cells would be empty is ignored with one warning (ours). */
+static void
+test_live_grid_change (void)
+{
+  const guint both[] = { 0, 1 }, first[] = { 0 };
+  Tiler t;
+  GstBuffer *out;
+  Out o;
+
+  RDS_TEST_REQUIRE_GPU ();
+  tiler_init (&t, "rows=1 columns=2 width=640 height=180", "RGBA");
+  gst_buffer_unref (tile (&t, both, 2, 0));
+
+  g_object_set (t.h->element, "rows", 2u, "columns", 1u, NULL);
+  out = tile (&t, first, 1, 1);
+  out_snapshot (out, &o);
+  g_assert_true (rect_is (&o, 0, 0, 640, 90, SLOT_VALUE (0)));
+  g_assert_true (rect_is (&o, 0, 90, 640, 90, SLOT_VALUE (1)));
+  host_image_clear (&o.img);
+  assert_object_in (only_frame (out), 1, 0, 90, 640, 90);
+  gst_buffer_unref (out);
+
+  /* 640 / 10000 columns: no cells. Kept 2 x 1, warned once over several batches */
+  g_object_set (t.h->element, "columns", 10000u, NULL);
+  for (guint k = 2; k < 5; k++) {
+    out = tile (&t, both, 2, k);
+    out_snapshot (out, &o);
+    g_assert_true (rect_is (&o, 0, 0, 640, 90, SLOT_VALUE (0)));
+    g_assert_true (rect_is (&o, 0, 90, 640, 90, SLOT_VALUE (1)));
+    host_image_clear (&o.img);
+    g_assert_cmpuint (only_frame (out)->num_obj_meta, ==, 2);
+    gst_buffer_unref (out);
+  }
+  g_assert_cmpuint (count_messages (t.bus, GST_MESSAGE_WARNING), ==, 1);
+  g_assert_cmpuint (count_messages (t.bus, GST_MESSAGE_ERROR), ==, 0);
+
+  /* a working value again */
+  g_object_set (t.h->element, "columns", 2u, "rows", 1u, NULL);
+  out = tile (&t, first, 1, 5);
+  out_snapshot (out, &o);
+  g_assert_true (rect_is (&o, 0, 0, 320, 180, SLOT_VALUE (0)));
+  g_assert_true (rect_is (&o, 320, 0, 320, 180, SLOT_VALUE (1)));
+  host_image_clear (&o.img);
+  gst_buffer_unref (out);
+  g_assert_cmpuint (count_messages (t.bus, GST_MESSAGE_WARNING | GST_MESSAGE_ERROR), ==, 0);
+  tiler_clear (&t);
+}
+
+/* width changed while playing: the output caps are renegotiated, and an absent source's pixels follow. */
+static void
+test_live_size_change (void)
+{
+  const guint both[] = { 0, 1 }, first[] = { 0 };
+  Tiler t;
+  GstBuffer *out;
+  GstCaps *caps;
+  Out o;
+  gint w;
+
+  RDS_TEST_REQUIRE_GPU ();
+  tiler_init (&t, "rows=1 columns=2 width=640 height=180", "NV12");
+  gst_buffer_unref (tile (&t, both, 2, 0));
+  g_object_set (t.h->element, "width", 320u, NULL);
+  out = tile (&t, first, 1, 1);
+  caps = gst_pad_get_current_caps (t.h->sinkpad);
+  g_assert_true (gst_structure_get_int (gst_caps_get_structure (caps, 0), "width", &w));
+  g_assert_cmpint (w, ==, 320);
+  gst_caps_unref (caps);
+  out_snapshot (out, &o);
+  g_assert_cmpuint (o.width, ==, 320);
+  g_assert_true (rect_is (&o, 0, 0, 160, 180, SLOT_VALUE (0)));
+  g_assert_true (rect_is (&o, 160, 0, 160, 180, SLOT_VALUE (1)));
+  host_image_clear (&o.img);
+  assert_object_in (only_frame (out), 1, 160, 0, 160, 180);
+  gst_buffer_unref (out);
+  g_assert_cmpuint (count_messages (t.bus, GST_MESSAGE_WARNING | GST_MESSAGE_ERROR), ==, 0);
+  tiler_clear (&t);
+}
+
 /* 500 batches of 4 pads, each present with a fixed pseudo-random pattern; every output keeps the last pixels of
  * every pad and one tag object per pad seen, except the empty batches, which are black and empty. */
 static void
@@ -1143,6 +1223,8 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/tiler/flush", test_flush);
   g_test_add_func ("/gpu/tiler/system-memory", test_system_memory);
   g_test_add_func ("/gpu/tiler/out-of-grid-before-caps", test_out_of_grid_before_caps);
+  g_test_add_func ("/gpu/tiler/live-grid-change", test_live_grid_change);
+  g_test_add_func ("/gpu/tiler/live-size-change", test_live_size_change);
   g_test_add_func ("/gpu/tiler/run-500", test_run_500);
   ret = g_test_run ();
 

@@ -6,7 +6,8 @@
  * Pixels: the element keeps a canvas, the last tiled grid. Each batch composites its frames into their cells
  * (frame meta pad_index -> cell, pixels from the slot at batch_id), so a source missing from a batch keeps its last
  * pixels until its rds-stream-eos clears the cell; the output buffer gets a copy of the canvas. With show-source the
- * chosen frame is composited straight into the output instead (the canvas is still updated).
+ * chosen frame is composited straight into the output instead; the canvas is still composited every batch (one
+ * extra composite), so going back to the grid shows every source's last pixels.
  *
  * Meta: the output carries one fresh frame meta holding a copy of every object and display meta of the batch,
  * scaled into the cells. Each source's last frame meta is kept too (one copy per pad), so an absent source's meta
@@ -100,6 +101,7 @@ struct _GstRdsMultiStreamTiler
   RdsBufSurface *canvas;
   RdsBufSurface *black;
   gboolean out_of_grid_warned;
+  gboolean bad_layout_warned;   /* set while rows/columns/size changed live cannot be laid out */
   GArray *pending_pads;         /* guint: pads added before the caps, grown into at set_caps */
 };
 
@@ -421,12 +423,26 @@ ensure_canvas (GstRdsMultiStreamTiler * self)
   guint k = 0;
   gboolean ok = TRUE;
 
-  /* n_pads only grows to sizes that fit (grow_for_pad), and n 0 or 1 always fits a 16 x 16 output */
+  /* rows, columns, square-seq-grid and the output size can change while playing; a combination with empty cells
+   * (columns=10000, say) is ignored with one warning and the current layout kept (ours). Without a layout yet
+   * there is nothing to keep. */
   if (!layout_for (self, self->n_pads, &l)) {
-    GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot lay out %u sources on %dx%d", self->n_pads,
-            GST_VIDEO_INFO_WIDTH (&self->out_info), GST_VIDEO_INFO_HEIGHT (&self->out_info)), (NULL));
-    return FALSE;
+    if (old == NULL) {
+      GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot lay out %u sources on %dx%d", MAX (self->n_pads, 1),
+              GST_VIDEO_INFO_WIDTH (&self->out_info), GST_VIDEO_INFO_HEIGHT (&self->out_info)),
+          ("the cells of the grid would be empty: fewer rows or columns, or a larger output"));
+      return FALSE;
+    }
+    if (!self->bad_layout_warned) {
+      self->bad_layout_warned = TRUE;
+      GST_ELEMENT_WARNING (self, STREAM, FAILED, ("Cannot lay out %u sources on %dx%d with the current settings; "
+              "keeping the %ux%u grid", MAX (self->n_pads, 1), GST_VIDEO_INFO_WIDTH (&self->out_info),
+              GST_VIDEO_INFO_HEIGHT (&self->out_info), self->layout.rows, self->layout.columns),
+          ("the cells would be empty (logged once until a layout works again)"));
+    }
+    return TRUE;
   }
+  self->bad_layout_warned = FALSE;
   if (old != NULL && memcmp (&l, &self->layout, sizeof l) == 0 && old->surfaceList[0].colorFormat == self->format)
     return TRUE;
 
@@ -712,6 +728,7 @@ gst_rds_multi_stream_tiler_start (GstBaseTransform * trans)
   self->stream_gpu = gpu_id;
   self->n_pads = 0;
   self->out_of_grid_warned = FALSE;
+  self->bad_layout_warned = FALSE;
   return TRUE;
 }
 
@@ -777,6 +794,12 @@ gst_rds_multi_stream_tiler_transform (GstBaseTransform * trans, GstBuffer * inbu
         ("the input batch must be in device-accessible memory:RDS memory (device, pinned or unified)"));
     goto done;
   }
+  if (n_slots > 0 && (in->memType == RDS_BUF_MEM_DEFAULT || in->memType == RDS_BUF_MEM_HIP_DEVICE)
+      && in->gpuId != self->stream_gpu) {
+    GST_ELEMENT_ERROR (self, STREAM, FAILED, ("The input batch is on GPU %u, the tiler on GPU %u", in->gpuId,
+            self->stream_gpu), ("set the tiler's gpu-id to the GPU of its input (device memory is not shared)"));
+    goto done;
+  }
   if (rds_buffer_get_surface (outbuf) == NULL || !gst_buffer_map (outbuf, &out_map, GST_MAP_WRITE))
     goto map_failed;
   out_mapped = TRUE;
@@ -804,44 +827,9 @@ gst_rds_multi_stream_tiler_transform (GstBaseTransform * trans, GstBuffer * inbu
     if (grow_for_pad (self, e.pad))
       g_array_append_val (entries, e);
   }
-  if (!ensure_canvas (self))
-    goto unlock;
 
-  /* Ended pads' cells go black (unless the pad is back in this batch: it is drawn over anyway). */
-  for (guint pad = 0; pad < self->n_pads; pad++) {
-    PadState *ps = pad_state (self, pad);
-
-    if (ps->clear) {
-      g_array_append_val (cleared, pad);
-      ps->clear = FALSE;
-    }
-  }
-  if (!clear_cells (self, (const guint *) cleared->data, cleared->len))
-    goto unlock;
-
-  /* This batch's frames into their cells of the canvas, in batch order (a pad twice: the later one on top). */
-  if (entries->len > 0) {
-    params = g_new (RdsBufSurfaceParams, entries->len);
-    src_rects = g_new (RdsBufSurfTransformRect, entries->len);
-    dst_rects = g_new (RdsBufSurfTransformRect, entries->len);
-    for (k = 0; k < entries->len; k++) {
-      Entry *e = &g_array_index (entries, Entry, k);
-      RdsTilerRect cell;
-
-      (void) rds_tiler_layout_cell (&self->layout, e->pad, &cell);
-      params[k] = in->surfaceList[e->slot];
-      src_rects[k] = (RdsBufSurfTransformRect) {
-      0, 0, params[k].width, params[k].height};
-      dst_rects[k] = to_transform_rect (&cell);
-    }
-    src = (RdsBufSurface) {
-    .gpuId = in->gpuId,.batchSize = entries->len,.numFilled = entries->len,.memType = in->memType,.surfaceList =
-          params};
-    if (!composite (self, &src, self->canvas, src_rects, dst_rects, filter))
-      goto unlock;
-  }
-
-  /* Each pad's last meta, for when it is absent. */
+  /* Each pad's last meta, for when it is absent; then the input meta is not needed any more (no lock held across
+   * the GPU work). */
   for (k = 0; k < entries->len; k++) {
     Entry *e = &g_array_index (entries, Entry, k);
     PadState *ps = pad_state (self, e->pad);
@@ -853,11 +841,52 @@ gst_rds_multi_stream_tiler_transform (GstBaseTransform * trans, GstBuffer * inbu
       ps->cached = TRUE;
       ps->frame_width = in->surfaceList[e->slot].width;
       ps->frame_height = in->surfaceList[e->slot].height;
+    } else {
+      GST_WARNING_OBJECT (self, "cannot copy the frame meta of pad %u: its meta is left out", e->pad);
+    }
+    e->meta = NULL;
+  }
+  if (in_bm != NULL)
+    rds_release_meta_lock (in_bm);
+
+  if (!ensure_canvas (self))
+    goto done;
+
+  /* Ended pads' cells go black (unless the pad is back in this batch: it is drawn over anyway). */
+  for (guint pad = 0; pad < self->n_pads; pad++) {
+    PadState *ps = pad_state (self, pad);
+
+    if (ps->clear) {
+      g_array_append_val (cleared, pad);
+      ps->clear = FALSE;
     }
   }
-  if (in_bm != NULL) {
-    rds_release_meta_lock (in_bm);
-    in_bm = NULL;
+  if (!clear_cells (self, (const guint *) cleared->data, cleared->len))
+    goto done;
+
+  /* This batch's frames into their cells of the canvas, in batch order (a pad twice: the later one on top). */
+  if (entries->len > 0) {
+    params = g_new (RdsBufSurfaceParams, entries->len);
+    src_rects = g_new (RdsBufSurfTransformRect, entries->len);
+    dst_rects = g_new (RdsBufSurfTransformRect, entries->len);
+    guint n = 0;
+
+    for (k = 0; k < entries->len; k++) {
+      Entry *e = &g_array_index (entries, Entry, k);
+      RdsTilerRect cell;
+
+      /* a kept layout (see ensure_canvas) may lack the cell of a pad added since */
+      if (!rds_tiler_layout_cell (&self->layout, e->pad, &cell))
+        continue;
+      params[n] = in->surfaceList[e->slot];
+      src_rects[n] = (RdsBufSurfTransformRect) {
+      0, 0, params[n].width, params[n].height};
+      dst_rects[n++] = to_transform_rect (&cell);
+    }
+    src = (RdsBufSurface) {
+    .gpuId = in->gpuId,.batchSize = n,.numFilled = n,.memType = in->memType,.surfaceList = params};
+    if (n > 0 && !composite (self, &src, self->canvas, src_rects, dst_rects, filter))
+      goto done;
   }
 
   /* The output: one fresh frame meta (DeepStream 8.0 behaviour: all of its ids, sizes and timestamps 0). */
@@ -924,11 +953,7 @@ gst_rds_multi_stream_tiler_transform (GstBaseTransform * trans, GstBuffer * inbu
   out->numFilled = 1;
   /* composites, copies and memsets are synchronous: the output is ready when it is pushed */
   ret = GST_FLOW_OK;
-  goto done;
 
-unlock:
-  if (in_bm != NULL)
-    rds_release_meta_lock (in_bm);
 done:
   g_free (dst_rects);
   g_free (src_rects);
@@ -996,7 +1021,8 @@ gst_rds_multi_stream_tiler_set_property (GObject * object, guint prop_id, const 
         self->memory_type = g_value_get_enum (value);
       break;
     case PROP_COMPUTE_HW:
-      self->compute_hw = g_value_get_enum (value);
+      if (check_mutable (self, pspec))
+        self->compute_hw = g_value_get_enum (value);
       break;
     case PROP_INTERPOLATION_METHOD:
       self->interpolation_method = g_value_get_enum (value);
@@ -1142,7 +1168,7 @@ gst_rds_multi_stream_tiler_class_init (GstRdsMultiStreamTilerClass * klass)
           GST_TYPE_RDS_TILER_MEMORY_TYPE, DEFAULT_MEMORY_TYPE, flags | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_COMPUTE_HW,
       g_param_spec_enum ("compute-hw", "Compute hardware", "Engine that scales the frames",
-          GST_TYPE_RDS_TILER_COMPUTE_HW, DEFAULT_COMPUTE_HW, flags));
+          GST_TYPE_RDS_TILER_COMPUTE_HW, DEFAULT_COMPUTE_HW, flags | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_INTERPOLATION_METHOD,
       g_param_spec_enum ("interpolation-method", "Interpolation method", "Filter used for scaling",
           GST_TYPE_RDS_TILER_INTERPOLATION_METHOD, DEFAULT_INTERPOLATION_METHOD, flags));
