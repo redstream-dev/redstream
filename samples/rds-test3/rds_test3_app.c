@@ -264,7 +264,18 @@ run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const
   for (guint i = 0; i < n_factories; i++) {
     elements[i] = gst_element_factory_make (factories[i], NULL);
     if (elements[i] == NULL) {
-      g_printerr ("Element %s (%s) is not available\n", factories[i], rds_compat_map_factory_name (factories[i]));
+      const gchar *name = rds_compat_map_factory_name (factories[i]);
+
+      g_printerr ("Element %s (%s) is not available\n", factories[i], name);
+      /* the optional plugins: the meson setup log says which dependency was missing */
+      if (g_strcmp0 (name, "rdsosd") == 0)
+        g_printerr ("Redstream was built without rdsosd (-Dosd: needs cairo and pangocairo)\n");
+      else if (g_strcmp0 (name, "rdsinfer") == 0)
+        g_printerr ("Redstream was built without rdsinfer (-Dinfer: needs MIGraphX, libyaml and json-glib)\n");
+      else if (g_strcmp0 (name, "rdstracker") == 0)
+        g_printerr ("Redstream was built without rdstracker (-Dtracker: needs libyaml)\n");
+      else if (g_str_has_prefix (name, "rds"))
+        g_printerr ("Is GST_PLUGIN_PATH_1_0 set to the build tree's gst/ directory?\n");
       gst_object_unref (pipeline);
       return 1;
     }

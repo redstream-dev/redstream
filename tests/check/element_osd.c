@@ -1,7 +1,7 @@
 /* rdsosd: factory, properties, caps and accepted no-ops (cpu); drawing through the element on memory:RDS device
  * surfaces: single frames, batches (each frame on its own surface), demuxed read-only views (drawn on a private
- * copy, the batch untouched), tracker-created objects, the clock, clamped borders (gpu, skipped without a ROCm
- * device).
+ * copy, the batch untouched), tracker-created objects, the clock, clamped borders, two instances drawing at once
+ * (gpu, skipped without a ROCm device).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-surface.h"
@@ -790,6 +790,133 @@ test_timing (void)
       view_ms, view_ms - owned_ms, copy_ms, copy_sync_ms);
 }
 
+/* Two rdsosd instances drawing at the same time, each pushed from its own thread (so each draws on that thread, as
+ * on two demux branches), with text in different fonts: every output equals the one drawn alone. Cairo, Pango and
+ * fontconfig are shared by both. */
+#define C_FRAMES 40
+#define C_OBJECTS 8
+
+static const gchar *const concurrent_fonts[] = { "Sans", "Serif" };
+
+/* A grey device frame with C_OBJECTS labelled boxes, placed and labelled per @who and @frame. */
+static GstBuffer *
+make_concurrent_frame (guint who, guint frame)
+{
+  RdsBufSurfaceCreateParams cp = {.width = W,.height = H,.layout = RDS_BUF_LAYOUT_PITCH,
+    .colorFormat = RDS_BUF_COLOR_FORMAT_RGBA
+  };
+  GstBuffer *buf = gst_buffer_new ();
+  RdsBatchMeta *bm = rds_create_batch_meta (1);
+  RdsFrameMeta *fm = rds_acquire_frame_meta_from_pool (bm);
+  RdsBufSurface *s;
+
+  gst_buffer_append_memory (buf, rds_allocator_alloc_surface (dev_alloc, 1, &cp));
+  s = rds_buffer_get_surface (buf);
+  g_assert_cmpint (rds_buf_surface_memset (s, 0, 0, GREY), ==, 0);
+  rds_add_frame_meta_to_batch (bm, fm);
+  for (guint k = 0; k < C_OBJECTS; k++) {
+    RdsObjectMeta *om = rds_acquire_obj_meta_from_pool (bm);
+    RdsOSD_TextParams *tp = &om->text_params;
+    gfloat l = 10 + (k % 4) * 75 + who * 3, t = 40 + (k / 4) * 100 + frame % 7;
+
+    om->rect_params = box_at (l, t, 2);
+    om->object_id = k;
+    om->confidence = 0.8f;
+    tp->display_text = g_strdup_printf ("%s %u.%u", who ? "car" : "person", frame, k);
+    tp->x_offset = (guint) l;
+    tp->y_offset = (guint) t - 20;
+    tp->font_params.font_name = (gchar *) concurrent_fonts[who];
+    tp->font_params.font_size = 10 + who;
+    tp->font_params.font_color = (RdsOSD_ColorParams) {
+    1, 1, 1, 1};
+    tp->set_bg_clr = 1;
+    tp->text_bg_clr = (RdsOSD_ColorParams) {
+    0, 0, 0, 1};
+    rds_add_obj_meta_to_frame (fm, om, NULL);
+  }
+  s->numFilled = 1;
+  g_assert_nonnull (rds_buffer_add_batch_meta (buf, bm));
+  GST_BUFFER_PTS (buf) = frame * GST_SECOND / 25;
+  return buf;
+}
+
+typedef struct
+{
+  guint who;
+  HostImage *ref;               /* C_FRAMES images drawn alone */
+  gint *start;                  /* both threads spin on it, so they draw together */
+  guint n_diff, n_errors;
+} ConcurrentRun;
+
+static gpointer
+concurrent_worker (gpointer data)
+{
+  ConcurrentRun *run = data;
+  Osd o;
+
+  osd_init (&o, NULL);
+  while (!g_atomic_int_get (run->start))
+    g_thread_yield ();
+  for (guint f = 0; f < C_FRAMES; f++) {
+    GstBuffer *out = osd_run (&o, make_concurrent_frame (run->who, f));
+    HostImage img;
+
+    snapshot (rds_buffer_get_surface (out), 0, &img);
+    if (max_diff (&img, &run->ref[f], FALSE) != 0)
+      run->n_diff++;
+    host_image_clear (&img);
+    gst_buffer_unref (out);
+  }
+  run->n_errors = count_messages (o.bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING);
+  osd_clear (&o);
+  return NULL;
+}
+
+static void
+test_concurrent (void)
+{
+  ConcurrentRun runs[2];
+  GThread *threads[2];
+  gint start = 0;
+
+  RDS_TEST_REQUIRE_GPU ();
+  /* the references, drawn one instance at a time */
+  for (guint who = 0; who < 2; who++) {
+    Osd o;
+
+    runs[who] = (ConcurrentRun) {.who = who,.ref = g_new0 (HostImage, C_FRAMES),.start = &start };
+    osd_init (&o, NULL);
+    for (guint f = 0; f < C_FRAMES; f++) {
+      GstBuffer *out = osd_run (&o, make_concurrent_frame (who, f));
+
+      snapshot (rds_buffer_get_surface (out), 0, &runs[who].ref[f]);
+      gst_buffer_unref (out);
+    }
+    osd_clear (&o);
+    /* the labels were drawn: light (antialiased white) glyph pixels in the first label's box */
+    {
+      guint light = 0;
+
+      for (guint y = 20; y <= 38; y++)
+        for (guint x = 10; x <= 70; x++)
+          light += pixel (&runs[who].ref[0], x, y)[1] > 160;
+      g_assert_cmpuint (light, >, 20);
+    }
+  }
+
+  for (guint who = 0; who < 2; who++)
+    threads[who] = g_thread_new ("osd-concurrent", concurrent_worker, &runs[who]);
+  g_atomic_int_set (&start, 1);
+  for (guint who = 0; who < 2; who++) {
+    g_thread_join (threads[who]);
+    g_assert_cmpuint (runs[who].n_diff, ==, 0);
+    g_assert_cmpuint (runs[who].n_errors, ==, 0);
+    for (guint f = 0; f < C_FRAMES; f++)
+      host_image_clear (&runs[who].ref[f]);
+    g_free (runs[who].ref);
+  }
+}
+
 int
 main (int argc, char **argv)
 {
@@ -814,6 +941,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/osd-element/batch-id-outside", test_batch_id_outside);
   g_test_add_func ("/gpu/osd-element/border-clamped", test_border_clamped);
   g_test_add_func ("/gpu/osd-element/switches", test_switches);
+  g_test_add_func ("/gpu/osd-element/concurrent", test_concurrent);
   g_test_add_func ("/gpu/osd-element/timing", test_timing);
   ret = g_test_run ();
 

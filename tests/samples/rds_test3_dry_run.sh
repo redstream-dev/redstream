@@ -1,7 +1,7 @@
 #!/bin/sh
-# Usage: rds_test3_dry_run.sh <path-to-rds-test3> [<path-to-gst-inspect-1.0> [infer] [tracker]]
-# The third and fourth arguments are 'infer' and 'tracker' when the build has rdsinfer and rdstracker: then they are
-# inspected too.
+# Usage: rds_test3_dry_run.sh <path-to-rds-test3> [<path-to-gst-inspect-1.0> [infer] [tracker] [osd]]
+# The third, fourth and fifth arguments are 'infer', 'tracker' and 'osd' when the build has rdsinfer, rdstracker and
+# rdsosd: then they are inspected too.
 set -eu
 out=$("$1" --dry-run file:///dev/null file:///dev/null)
 echo "$out"
@@ -35,16 +35,19 @@ if "$1" --dry-run --tracker-config '' file:///dev/null >/dev/null 2>&1; then
   exit 1
 fi
 
-# nvv4l2decoder, nvvideoconvert and (when built) nvinfer and nvtracker now map to real elements of the build tree
-# (GST_PLUGIN_PATH_1_0 comes from the test environment).
+# nvv4l2decoder, nvvideoconvert, nvmultistreamtiler, nveglglessink and (when built) nvinfer, nvtracker and nvdsosd
+# map to real elements of the build tree (GST_PLUGIN_PATH_1_0 comes from the test environment).
 if [ -n "${2:-}" ]; then
   # one element per call: given several names, gst-inspect-1.0 only looks at the last one
-  elements='rdsvideodec rdsvideoconvert'
+  elements='rdsvideodec rdsvideoconvert rdsmultistreamtiler rdsvideosink'
   if [ "${3:-}" = infer ]; then
     elements="$elements rdsinfer"
   fi
   if [ "${4:-}" = tracker ]; then
     elements="$elements rdstracker"
+  fi
+  if [ "${5:-}" = osd ]; then
+    elements="$elements rdsosd"
   fi
   for e in $elements; do
     "$2" "$e" >/dev/null || exit 1

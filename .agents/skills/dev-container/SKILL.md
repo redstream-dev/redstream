@@ -19,7 +19,8 @@ RUN="docker run --rm --device=/dev/kfd --device=/dev/dri \
 $RUN bash -c 'rocminfo | grep -E "^\s+Name:\s+gfx"'          # non-interactive one-off command
 ```
 
-The image's last layer installs `libyaml-dev` (rdsinfer's YAML configs), after the ~20-minute GStreamer build, so
+The image's last layer installs `libyaml-dev` (rdsinfer's and rdstracker's YAML configs) and `fonts-dejavu-core`
+(distinct Sans, Serif and Mono families for rdsosd's tests), after the ~20-minute GStreamer build, so
 adding packages there keeps the GStreamer layer cached; a rebuild after editing it takes seconds.
 
 Use `-it` only for interactive shells; agents should use one-off `bash -c` commands.

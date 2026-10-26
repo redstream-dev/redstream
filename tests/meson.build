@@ -428,21 +428,21 @@ test('rds_compile', find_program('tools/rds_compile.sh'), args : rds_compile_arg
   depends : rds_compile_depends)
 
 # The dry run checks the compat mapping, the default PGIE config and --tracker-config; gst-inspect-1.0 (when found)
-# checks that the mapped decoder and converter (and rdsinfer and rdstracker, when built) resolve to real elements from
-# the build tree. Not in ASan builds: the uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process
+# checks that the mapped decoder, converter, tiler and display sink (and rdsinfer, rdstracker and rdsosd, when built)
+# resolve to real elements from the build tree. Not in ASan builds: the uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process
 # (plugin_load covers loading there).
 gst_inspect = find_program('gst-inspect-1.0', required : false)
 test('rds_test3_dry_run',
   find_program('samples/rds_test3_dry_run.sh'),
   args : [rds_test3_exe, gst_inspect.found() and not asan ? gst_inspect.full_path() : '',
-    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : ''],
+    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
   suite : 'cpu', env : test_env, depends : rds_plugins)
 
 # rds-test3 end to end on four copies of the street clip with YOLO11n and the NvSORT tracker, --no-display (gpu; skips
-# without a device, rdsinfer, rdstracker, YOLO11n or the clip). Never in parallel with the other YOLO11n tests; the
+# without a device, rdsinfer, rdstracker, rdsosd, YOLO11n or the clip). Never in parallel with the other YOLO11n tests; the
 # first run compiles the batch-4 program.
 test('rds_test3_run',
   find_program('samples/rds_test3_run.sh'),
   args : [rds_test3_exe, meson.project_source_root(), meson.current_build_dir(),
-    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : ''],
+    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
   suite : ['gpu', 'yolo'], env : test_env, is_parallel : false, timeout : 900, depends : rds_plugins)

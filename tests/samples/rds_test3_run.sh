@@ -1,9 +1,9 @@
 #!/bin/bash
-# Usage: rds_test3_run.sh <rds-test3> <source dir> <work dir> [infer] [tracker]
+# Usage: rds_test3_run.sh <rds-test3> <source dir> <work dir> [infer] [tracker] [osd]
 # rds-test3 end to end: four copies of the street clip, YOLO11n, the NvSORT tracker, tiler, OSD and fakesink
 # (--no-display). Checks the exit status, one count line per frame of each source, and that most frames have objects;
-# prints the frame rate. Skips (77) without a ROCm device, without rdsinfer or rdstracker in the build (the 4th and 5th
-# arguments are 'infer' and 'tracker' when it has them), without YOLO11n (tests/models/fetch-yolo11n.sh) or without
+# prints the frame rate. Skips (77) without a ROCm device, without rdsinfer, rdstracker or rdsosd in the build (the 4th,
+# 5th and 6th arguments are 'infer', 'tracker' and 'osd' when it has them), without YOLO11n (tests/models/fetch-yolo11n.sh) or without
 # the street clip (tests/models/fetch-tracker-clip.sh). The output is kept in <work dir>/rds-test3-run.log.
 # bash for seq and date +%N (GNU coreutils). The clip's path goes into file:// URIs unescaped: source trees whose path
 # has spaces or '%' are not supported.
@@ -15,8 +15,8 @@ CLIP_FRAMES=1356
 SOURCES=4
 clip=$src/.cache/media/crosswalk-720p.h264
 
-if [ "${4:-}" != infer ] || [ "${5:-}" != tracker ]; then
-  echo 'built without rdsinfer or rdstracker: skipped'
+if [ "${4:-}" != infer ] || [ "${5:-}" != tracker ] || [ "${6:-}" != osd ]; then
+  echo 'built without rdsinfer, rdstracker or rdsosd: skipped'
   exit 77
 fi
 if [ ! -e /dev/kfd ]; then
