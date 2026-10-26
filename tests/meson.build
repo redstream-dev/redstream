@@ -337,6 +337,18 @@ test('element_tiler_cpu', element_tiler_exe, args : ['-p', '/cpu/tiler'],
 test('element_tiler', element_tiler_exe, args : ['-p', '/gpu/tiler'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180, depends : rds_plugins)
 
+# rdslogger: properties and the **PERF lines on scripted batches, driven by the harness's test clock (cpu).
+test('element_logger', executable('element_logger', 'check' / 'element_logger.c', dependencies : test_deps),
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+
+# rdsvideosink: properties, forwarding and start errors (cpu); RDS frames into the inner sink, batched input (gpu).
+element_videosink_exe = executable('element_videosink', 'check' / 'element_videosink.c',
+  dependencies : test_deps + [gst_video_dep])
+test('element_videosink_cpu', element_videosink_exe, args : ['-p', '/cpu/videosink'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_videosink', element_videosink_exe, args : ['-p', '/gpu/videosink'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)])
 test('element_streamdemux_cpu', element_streamdemux_exe, args : ['-p', '/cpu/demux'],

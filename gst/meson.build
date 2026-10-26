@@ -4,6 +4,7 @@ subdir('common')
 subdir('rdsvideo')
 subdir('rdsmux')
 subdir('rdstiler')
+subdir('rdssink')
 if rds_infer_enabled
   subdir('rdsinfer')
 endif

@@ -32,9 +32,9 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | supported | NV12 and RGBA `memory:RDS` batches into one tiled frame of the same format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
 | `nvdsosd` | `rdsosd` | supported | RGBA `memory:RDS` frames (single or batched), drawn on the CPU with Cairo and Pango in the geometry of DeepStream 8.0's default GPU mode; masks and blur not yet; optional (`-Dosd`, needs cairo and pangocairo); properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
 | `nvdsanalytics` | `rdsanalytics` | planned | M2 | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsanalytics) |
-| `nvdslogger` | `rdslogger` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
-| `nveglglessink` | `rdsvideosink` | planned | display sink | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
-| `nv3dsink` | `rdsvideosink` | planned | display sink | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
+| `nvdslogger` | `rdslogger` | supported | passthrough, any caps; prints each stream's frame rate to stdout in DeepStream 8.0's `**PERF` line format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
+| `nveglglessink` | `rdsvideosink` | supported | display bin: `rdsvideoconvert` to system-memory BGRx, then a stock GStreamer sink (`video-sink`, default `autovideosink`); one frame per buffer; properties and behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
+| `nv3dsink` | `rdsvideosink` | supported | as `nveglglessink` (nv3dsink's properties are a subset of nveglglessink's) | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nvv4l2h264enc` | `rdsh264enc` | planned | VA (VCN) encode, M2 | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nvv4l2h265enc` | `rdsh265enc` | planned | VA (VCN) encode, M2 | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 
@@ -354,6 +354,91 @@ where the docs are silent, or **ours**: where 8.0 settles nothing or is clearly 
 | `has_color_info`, `color_id` | ours | ignored (Jetson colour table) |
 | `process-mode` | ours | both values draw on the CPU with the GPU mode's geometry |
 | Ready on push | ours | the CPU/GPU syncs are synchronous; the frame is complete when pushed |
+
+### `rdslogger` (`nvdslogger`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger.md))
+
+Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0 (the 8.0 guide has no page for
+the element; the 9.2 page lists `show-fps`, `show-latency` and an underscored interval name that 8.0 does not have).
+DeepStream 8.0's nvdslogger has identity's properties plus the interval.
+
+| Property | Type | Default | Status | Notes |
+|---|---|---|---|---|
+| `fps-measurement-interval-sec` | uint | `5` | supported | seconds of running time per printed rate; 0: nothing printed. Changeable while playing (restarts the measurement) |
+| `silent` | boolean | `TRUE` | supported | `FALSE` adds two lines per buffer (below) |
+| `signal-handoffs` | boolean | `TRUE` | supported | emits `handoff` (identity's signature) for every buffer |
+| `last-message` | string, read-only | NULL | accepted | always NULL |
+| `qos` | boolean | `FALSE` | supported | GstBaseTransform's |
+| `check-imperfect-offset`, `check-imperfect-timestamp`, `drop-allocation`, `dump`, `single-segment`, `sync` | boolean | `FALSE` | accepted no-op | a non-default value logs one warning per property |
+| `datarate` | int 0..2147483647 | `0` | accepted no-op | as above |
+| `drop-buffer-flags` | flags `GstBufferFlags` | `0` | accepted no-op | as above |
+| `drop-probability` | float 0..1 | `0` | accepted no-op | as above |
+| `error-after` | int | `-1` | accepted no-op | as above |
+| `latency`, `sleep-time` | uint | `0` | accepted no-op | as above |
+| `ts-offset` | int64 | `0` | accepted no-op | as above |
+
+Pads: `sink` and `src`, ANY caps; buffers pass through untouched.
+
+#### Logging behaviour
+
+Each row is either **matches nvdslogger (DeepStream 8.0)**: observed DeepStream 8.0 behaviour where the docs are
+silent, or **ours**: where 8.0 settles nothing or is clearly broken.
+
+| Behaviour | Status | Notes |
+|---|---|---|
+| Output | matches nvdslogger (DeepStream 8.0) | stdout (`g_print`), one line per interval: `**PERF : ` then `FPS_<source_id> (<rate>)` and a tab per stream, then a newline (`**PERF : FPS_0 (29.97)\tFPS_1 (30.00)\t`); printed whatever `silent` is |
+| Rate format | matches nvdslogger (DeepStream 8.0) | two decimals, always with `.` (ours: whatever the locale) |
+| Streams | matches nvdslogger (DeepStream 8.0) | one entry per `source_id` of the frame metas, by ascending id, listed from the stream's first frame on and kept after its `rds-stream-eos` (0.00 from then on); forgotten when the element goes back to READY |
+| Timing | matches nvdslogger (DeepStream 8.0) | a periodic id on the pipeline clock fires at every interval of running time from PLAYING; the first one only starts the count, so the first line comes two intervals in; paused, no time passes. A run shorter than two intervals prints nothing |
+| Rate value | ours | frames counted since the previous line / the interval (8.0's numbers drift above the true rate for a while after a stream joins or leaves) |
+| `fps-measurement-interval-sec=0` | ours | nothing printed (8.0 prints `FPS_0 (0.00)` in a busy loop) |
+| Interval changed while playing | ours | the measurement restarts: one interval to start the count, then a line every interval |
+| A buffer without batch meta | ours | one frame of stream 0 |
+| No stream seen yet | ours | nothing printed |
+| `silent=false` | matches nvdslogger (DeepStream 8.0) | per buffer `<name> BUF_PTS : <pts> element time <running time now> elem-buf=<now − pts, ms> ms buf=<address> buffer_pts_to_running_time = <pts running time>rdslogger base time = <base time>buffer dur <duration>` (no separators before `rdslogger` and `buffer dur`, as in 8.0, whose label reads `nvdslogger base time`), then `BUFFER PTS is lesser than ELEMENT TIME, IT's LATE` or `BUFFER PTS is greater than ELEMENT TIME, IT's EARLY` (equal counts as early: ours); without a clock or PTS, the times print as `99:99:99.999999999` and the second line is left out (ours) |
+| Latency output | ours | none (8.0 printed none either without `NVDS_ENABLE_LATENCY_MEASUREMENT`) |
+
+### `rdsvideosink` (`nveglglessink`, `nv3dsink`) properties
+
+Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0's nveglglessink (nv3dsink has
+the same base-sink properties and the window geometry, with `window-x`/`window-y` defaulting to 0). Neither element
+has a page in the 8.0 guide. "Forwarded": set on the inner sink, and on the sinks inside it when it is a bin (as
+`autovideosink` is), whenever it has a writable property of that name and the value fits its range; the values are
+applied when the inner sink is created and on every change. A property the inner sink lacks is stored and does nothing,
+silently (ours: with `autovideosink` the real sink is known only at READY).
+
+| Property | Type | Default | Status | Notes |
+|---|---|---|---|---|
+| `video-sink` | string | `autovideosink` | ours | factory name of the GStreamer sink that shows the frames; NULL or empty: `autovideosink`; an unknown name keeps the current sink with a warning. Changeable only in NULL or READY |
+| `sync` | boolean | `TRUE` | forwarded | |
+| `qos` | boolean | `TRUE` | forwarded | |
+| `max-lateness` | int64 −1.. | `5000000` | forwarded | nanoseconds |
+| `processing-deadline` | uint64 | `15000000` | forwarded | nanoseconds |
+| `async` | boolean | `TRUE` | forwarded | |
+| `window-x`, `window-y` | uint 0..2147483647 | `10` | forwarded | nveglglessink's defaults (nv3dsink's are 0); none of the stock sinks in the dev image has them |
+| `window-width`, `window-height` | uint 0..2147483647 | `0` | forwarded | 0: the video's size; writable only on sinks that have them writable (not `ximagesink`, where they are read-only) |
+| `force-aspect-ratio` | boolean | `TRUE` | forwarded | |
+| `create-window` | boolean | `TRUE` | forwarded | |
+| `gpu-id` | uint | `0` | forwarded | also `rdsvideoconvert`'s `gpu-id` (the GPU that copies the frames). Changeable only in NULL or READY |
+| `blocksize`, `enable-last-sample`, `max-bitrate`, `render-delay`, `show-preroll-frame`, `throttle-time`, `ts-offset` | as GstBaseSink | as GstBaseSink | forwarded | the base-sink properties both DeepStream sinks show |
+| `rows`, `columns` | uint 1..2147483647 | `1` | accepted no-op | a non-default value logs one warning per property (what 8.0 does with them was not determined) |
+| `profile` | uint | `0` | accepted no-op | as above |
+| `display` | pointer | NULL | accepted no-op | as above |
+| `do-transform` | boolean | `TRUE` | accepted no-op | as above |
+| `winsys` | string | `x11` | accepted no-op | Jetson's nveglglessink (`x11` or `wayland`); as above |
+
+Pads: `sink` (a ghost pad of `rdsvideoconvert`'s): `memory:RDS` or system memory, `NV12`, `I420`, `RGBA`, `BGRA`,
+`RGBx`, `BGRx`, `RGB`, `BGR`, `GRAY8`. Inside: `rdsvideoconvert ! video/x-raw,format=BGRx ! videoconvert !
+<video-sink>`. The stock sinks in the dev image are `ximagesink`, `kmssink`, `autovideosink` and `fpsdisplaysink`;
+from a container, X11 needs `DISPLAY`, the X socket and the Xauthority file.
+
+#### Display behaviour
+
+| Behaviour | Status | Notes |
+|---|---|---|
+| Rendering path | ours | frames copied to system memory (BGRx) and shown by a stock GStreamer sink; no GL interop yet |
+| Batched input | ours | a buffer with more than one frame (`numFilled` above 1, or more than one frame meta) is an element error "rdsvideosink takes one frame per buffer: add a tiler or a demuxer" (8.0 accepts the caps, then fails the first buffer without a message, and the pipeline hangs) |
+| No display | ours | the inner sink's own error reaches the bus (`ximagesink`: "Could not initialise X output"); a sink that fails to start without posting an error gets one from `rdsvideosink` naming it and the `video-sink` property (8.0's nveglglessink fails the state change without a bus message; nv3dsink posts "state change failed and some element failed to post a proper error message") |
+| `autovideosink` without a display | ours | it may pick `kmssink`, which can start without showing anything; set `video-sink` for a definite sink |
 
 ### `rdsinfer` (`nvinfer`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvinfer.html))
 
