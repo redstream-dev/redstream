@@ -2,10 +2,10 @@
  * cell rects and the scaling of object and display meta into a cell. Plain C with GLib only (the meta structs are
  * read from the libgstrds headers, nothing is linked): no GStreamer, no GPU.
  *
- * DeepStream 8.0 behaviour throughout. The output width and height are rounded up to a multiple of 4. A cell is
- * W / columns by H / rows (integer division), each rounded down to even; cell (r, c) sits at (c·cell_width,
- * r·cell_height), so a strip at the right and bottom may belong to no cell. Cells are indexed row-major by the
- * frame's pad_index.
+ * DeepStream 8.0 behaviour, except where marked ours. The output width and height are rounded up to a multiple of
+ * 4. A cell is W / columns by H / rows (integer division), each rounded down to even; cell (r, c) sits at
+ * (c·cell_width, r·cell_height), so a strip at the right and bottom may belong to no cell. Cells are indexed
+ * row-major by the frame's pad_index.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_TILER_LAYOUT_H
 #define RDS_TILER_LAYOUT_H
@@ -36,7 +36,8 @@ void rds_tiler_grid (guint rows, guint columns, gboolean square_seq_grid, guint 
     guint * out_columns);
 
 /* Fills @layout for @n sources on a @width × @height output (the property values: rounded here). FALSE, with
- * @layout untouched, when a cell would be empty (narrower or lower than 2 pixels). */
+ * @layout untouched, when a cell would be empty (narrower or lower than 2 pixels; ours: DeepStream 8.0 has no such
+ * check). */
 gboolean rds_tiler_layout_init (RdsTilerLayout * layout, guint rows, guint columns, gboolean square_seq_grid,
     guint n, guint width, guint height);
 

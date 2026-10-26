@@ -16,9 +16,12 @@
 #define SLOT_VALUE(i) ((guint8) (40 + 30 * (i)))
 
 static GstAllocator *dev_alloc;
+/* what make_batch allocates from: dev_alloc unless a test switches it */
+static GstAllocator *batch_alloc;
 
 /* A device batch: slot i holds the frame of pad @pads[i] (batch_id i), filled with SLOT_VALUE (i). Every frame gets
- * one tag object rect [100,100,200,100] (object_id 100 + pad, label "p<pad>", detector box [1,2,3,4]) and a display
+ * one tag object rect [100,100,200,100] (object_id 100 + pad, label "p<pad>", detector box [1,2,3,4], misc_obj_info[0]
+ * the slot) and a display
  * meta with one rect [10,20,30,40], one label at (40,60) and one circle (160,90) r 20. */
 static GstBuffer *
 make_batch (const gchar * format, const guint * pads, guint n, guint64 seq)
@@ -31,7 +34,7 @@ make_batch (const gchar * format, const guint * pads, guint n, guint64 seq)
   RdsBatchMeta *bm = rds_create_batch_meta (MAX (n, 1));
   RdsBufSurface *s;
 
-  gst_buffer_append_memory (buf, rds_allocator_alloc_surface (dev_alloc, MAX (n, 1), &cp));
+  gst_buffer_append_memory (buf, rds_allocator_alloc_surface (batch_alloc, MAX (n, 1), &cp));
   s = rds_buffer_get_surface (buf);
   g_assert_nonnull (s);
   for (guint i = 0; i < n; i++) {
@@ -70,6 +73,7 @@ make_batch (const gchar * format, const guint * pads, guint n, guint64 seq)
     om->object_id = 100 + pads[i];
     om->class_id = (gint) pads[i];
     om->confidence = 0.5f;
+    om->misc_obj_info[0] = i;
     g_snprintf (om->obj_label, sizeof om->obj_label, "p%u", pads[i]);
     rds_add_obj_meta_to_frame (fm, om, NULL);
 
@@ -100,12 +104,11 @@ typedef struct
   const gchar *format;
 } Tiler;
 
+/* A started harness without input caps yet: tiler_set_caps () sends them. */
 static void
-tiler_init (Tiler * t, const gchar * props, const gchar * format)
+tiler_init_no_caps (Tiler * t, const gchar * props, const gchar * format)
 {
   gchar *desc = g_strdup_printf ("rdsmultistreamtiler %s", props != NULL ? props : "");
-  gchar *caps = g_strdup_printf ("video/x-raw(memory:RDS),format=%s,width=%d,height=%d,framerate=25/1", format,
-      SLOT_W, SLOT_H);
   GError *err = NULL;
   GstElement *e = gst_parse_launch (desc, &err);
 
@@ -115,9 +118,24 @@ tiler_init (Tiler * t, const gchar * props, const gchar * format)
   t->h = gst_harness_new_with_element (e, "sink", "src");
   gst_object_unref (e);
   t->format = format;
+  g_free (desc);
+}
+
+static void
+tiler_set_caps (Tiler * t)
+{
+  gchar *caps = g_strdup_printf ("video/x-raw(memory:RDS),format=%s,width=%d,height=%d,framerate=25/1", t->format,
+      SLOT_W, SLOT_H);
+
   gst_harness_set_src_caps_str (t->h, caps);
   g_free (caps);
-  g_free (desc);
+}
+
+static void
+tiler_init (Tiler * t, const gchar * props, const gchar * format)
+{
+  tiler_init_no_caps (t, props, format);
+  tiler_set_caps (t);
 }
 
 static void
@@ -386,6 +404,23 @@ test_pads (void)
   gst_object_unref (f);
 }
 
+/* compute-hw=2 (VIC) fails at start, before any GPU work. */
+static void
+test_compute_hw_vic (void)
+{
+  GstElement *e = gst_element_factory_make ("rdsmultistreamtiler", NULL);
+  GstBus *bus = gst_bus_new ();
+
+  gst_element_set_bus (e, bus);
+  g_object_set (e, "compute-hw", 2, NULL);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_PAUSED), ==, GST_STATE_CHANGE_FAILURE);
+  g_assert_cmpuint (count_messages (bus, GST_MESSAGE_ERROR), ==, 1);
+  gst_element_set_state (e, GST_STATE_NULL);
+  gst_element_set_bus (e, NULL);
+  gst_object_unref (bus);
+  gst_object_unref (e);
+}
+
 /* ---- gpu ---- */
 
 /* 2 x 2 grid of 640 x 360: cell by pad_index, pixels from slot batch_id (pads given out of order). */
@@ -493,7 +528,7 @@ check_unused (const gchar * format)
   gint w, h;
 
   tiler_init (&t, "rows=2 columns=3 width=1000 height=700", format);
-  /* twice: the second output comes from a reused pool buffer */
+  /* several times: the later outputs come from reused pool buffers */
   for (guint k = 0; k < 7; k++) {
     out = tile (&t, pads, 2, k);
     out_snapshot (out, &o);
@@ -839,11 +874,12 @@ test_out_of_grid (void)
   tiler_clear (&t);
 }
 
-/* An empty batch (no frames) gives a black frame with one empty frame meta (ours). Cached sources still show. */
+/* An empty batch (no frames) clears the output: black with one empty frame meta (DeepStream's docs: the mux sends
+ * one to clear the tiler's output). The caches stay: the next batch still repeats absent sources. */
 static void
 test_empty_batch (void)
 {
-  const guint first[] = { 0 };
+  const guint first[] = { 0 }, second[] = { 1 };
   Tiler t;
   GstBuffer *out;
   RdsFrameMeta *fm;
@@ -857,10 +893,126 @@ test_empty_batch (void)
   host_image_clear (&o.img);
   fm = only_frame (out);
   g_assert_cmpuint (fm->num_obj_meta, ==, 0);
+  g_assert_null (fm->display_meta_list);
   gst_buffer_unref (out);
 
   gst_buffer_unref (tile (&t, first, 1, 1));
   out = tile (&t, NULL, 0, 2);
+  out_snapshot (out, &o);
+  g_assert_true (rect_is (&o, 0, 0, 640, 180, -1));
+  host_image_clear (&o.img);
+  fm = only_frame (out);
+  g_assert_cmpuint (fm->num_obj_meta, ==, 0);
+  g_assert_null (fm->display_meta_list);
+  gst_buffer_unref (out);
+
+  /* pad 0 absent from the next batch: its last pixels and meta are back */
+  out = tile (&t, second, 1, 3);
+  out_snapshot (out, &o);
+  g_assert_true (rect_is (&o, 0, 0, 320, 180, SLOT_VALUE (0)));
+  g_assert_true (rect_is (&o, 320, 0, 320, 180, SLOT_VALUE (0)));
+  host_image_clear (&o.img);
+  fm = only_frame (out);
+  g_assert_cmpuint (fm->num_obj_meta, ==, 2);
+  assert_object_in (fm, 0, 0, 0, 320, 180);
+  gst_buffer_unref (out);
+  tiler_clear (&t);
+}
+
+/* rds-pad-deleted alone ends a pad, as stream-eos does. */
+static void
+test_pad_deleted (void)
+{
+  const guint both[] = { 0, 1 }, first[] = { 0 };
+  Tiler t;
+  GstBuffer *out;
+  RdsFrameMeta *fm;
+  Out o;
+
+  RDS_TEST_REQUIRE_GPU ();
+  tiler_init (&t, "rows=1 columns=2 width=640 height=180", "RGBA");
+  gst_buffer_unref (tile (&t, both, 2, 0));
+  g_assert_true (gst_harness_push_event (t.h, rds_event_new_pad_deleted (1)));
+  out = tile (&t, first, 1, 1);
+  out_snapshot (out, &o);
+  g_assert_true (rect_is (&o, 0, 0, 320, 180, SLOT_VALUE (0)));
+  g_assert_true (rect_is (&o, 320, 0, 320, 180, -1));
+  host_image_clear (&o.img);
+  fm = only_frame (out);
+  g_assert_cmpuint (fm->num_obj_meta, ==, 1);
+  g_assert_null (find_object (fm, 1));
+  g_assert_null (find_display (fm, 1));
+  gst_buffer_unref (out);
+  tiler_clear (&t);
+}
+
+/* Two frames of one pad in a batch: both drawn, the later on top, and only the later one's meta kept (ours). */
+static void
+test_duplicate_pad (void)
+{
+  const guint pads[] = { 0, 0 };
+  Tiler t;
+  GstBuffer *out;
+  RdsFrameMeta *fm;
+  Out o;
+
+  RDS_TEST_REQUIRE_GPU ();
+  tiler_init (&t, "rows=1 columns=2 width=640 height=180", "RGBA");
+  out = tile (&t, pads, 2, 0);
+  out_snapshot (out, &o);
+  g_assert_true (rect_is (&o, 0, 0, 320, 180, SLOT_VALUE (1)));
+  host_image_clear (&o.img);
+  fm = only_frame (out);
+  g_assert_cmpuint (fm->num_obj_meta, ==, 1);
+  g_assert_cmpint (((RdsObjectMeta *) fm->obj_meta_list->data)->misc_obj_info[0], ==, 1);
+  g_assert_cmpuint (g_list_length (fm->display_meta_list), ==, 1);
+  gst_buffer_unref (out);
+  tiler_clear (&t);
+}
+
+/* The merged lists are in pad order (ours), whatever the batch order. */
+static void
+test_merged_order (void)
+{
+  const guint pads[] = { 2, 0, 3, 1 };
+  Tiler t;
+  GstBuffer *out;
+  RdsFrameMeta *fm;
+  GList *l;
+  guint i;
+
+  RDS_TEST_REQUIRE_GPU ();
+  tiler_init (&t, "rows=2 columns=2 width=640 height=360", "RGBA");
+  out = tile (&t, pads, 4, 0);
+  fm = only_frame (out);
+  for (l = fm->obj_meta_list, i = 0; l != NULL; l = l->next, i++)
+    g_assert_cmpuint (((RdsObjectMeta *) l->data)->object_id, ==, 100 + i);
+  g_assert_cmpuint (i, ==, 4);
+  for (l = fm->display_meta_list, i = 0; l != NULL; l = l->next, i++)
+    g_assert_cmpint (((RdsDisplayMeta *) l->data)->misc_osd_data[0], ==, i);
+  g_assert_cmpuint (i, ==, 4);
+  gst_buffer_unref (out);
+  tiler_clear (&t);
+}
+
+/* A flush forgets every cached cell and meta (ours). */
+static void
+test_flush (void)
+{
+  const guint both[] = { 0, 1 }, first[] = { 0 };
+  Tiler t;
+  GstBuffer *out;
+  GstSegment seg;
+  Out o;
+
+  RDS_TEST_REQUIRE_GPU ();
+  tiler_init (&t, "rows=1 columns=2 width=640 height=180", "RGBA");
+  gst_buffer_unref (tile (&t, both, 2, 0));
+  g_assert_true (gst_harness_push_event (t.h, gst_event_new_flush_start ()));
+  g_assert_true (gst_harness_push_event (t.h, gst_event_new_flush_stop (TRUE)));
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  g_assert_true (gst_harness_push_event (t.h, gst_event_new_segment (&seg)));
+  out = tile (&t, first, 1, 1);
   out_snapshot (out, &o);
   g_assert_true (rect_is (&o, 0, 0, 320, 180, SLOT_VALUE (0)));
   g_assert_true (rect_is (&o, 320, 0, 320, 180, -1));
@@ -870,8 +1022,52 @@ test_empty_batch (void)
   tiler_clear (&t);
 }
 
+/* A system-memory batch is an element error (ours). */
+static void
+test_system_memory (void)
+{
+  const guint first[] = { 0 };
+  GstAllocator *sys_alloc;
+  Tiler t;
+
+  RDS_TEST_REQUIRE_GPU ();
+  sys_alloc = rds_allocator_new (0, RDS_BUF_MEM_SYSTEM);
+  batch_alloc = sys_alloc;
+  tiler_init (&t, "width=320 height=180", "RGBA");
+  g_assert_cmpint (gst_harness_push (t.h, make_batch ("RGBA", first, 1, 0)), ==, GST_FLOW_ERROR);
+  g_assert_cmpuint (count_messages (t.bus, GST_MESSAGE_ERROR), ==, 1);
+  tiler_clear (&t);
+  batch_alloc = dev_alloc;
+  gst_object_unref (sys_alloc);
+}
+
+/* A pad announced before the caps that the grid cannot hold: skipped with one warning, like one seen later. */
+static void
+test_out_of_grid_before_caps (void)
+{
+  const guint first[] = { 0 };
+  Tiler t;
+  GstBuffer *out;
+  Out o;
+
+  RDS_TEST_REQUIRE_GPU ();
+  tiler_init_no_caps (&t, "rows=1 columns=1 width=16 height=16", "RGBA");
+  g_assert_true (gst_harness_push_event (t.h, gst_event_new_stream_start ("tiler-test")));
+  g_assert_true (gst_harness_push_event (t.h, rds_event_new_pad_added (0)));
+  g_assert_true (gst_harness_push_event (t.h, rds_event_new_pad_added (1000)));
+  tiler_set_caps (&t);
+  out = tile (&t, first, 1, 0);
+  out_snapshot (out, &o);
+  g_assert_true (rect_is (&o, 0, 0, 16, 16, SLOT_VALUE (0)));
+  host_image_clear (&o.img);
+  gst_buffer_unref (out);
+  g_assert_cmpuint (count_messages (t.bus, GST_MESSAGE_WARNING), ==, 1);
+  g_assert_cmpuint (count_messages (t.bus, GST_MESSAGE_ERROR), ==, 0);
+  tiler_clear (&t);
+}
+
 /* 500 batches of 4 pads, each present with a fixed pseudo-random pattern; every output keeps the last pixels of
- * every pad and one tag object per pad seen. */
+ * every pad and one tag object per pad seen, except the empty batches, which are black and empty. */
 static void
 test_run_500 (void)
 {
@@ -897,16 +1093,17 @@ test_run_500 (void)
       seen[pads[i]] = TRUE;
     }
     out = tile (&t, pads, n, k);
-    if (k % 50 == 0 || k == 499) {
+    if (k % 50 == 0 || k == 499 || n == 0) {
       out_snapshot (out, &o);
       for (guint p = 0; p < 4; p++)
-        g_assert_true (seen[p] ? pixel_is (&o, (p % 2) * 160 + 80, (p / 2) * 90 + 45, last[p]) :
+        g_assert_true (seen[p] && n > 0 ? pixel_is (&o, (p % 2) * 160 + 80, (p / 2) * 90 + 45, last[p]) :
             pixel_is_black (&o, (p % 2) * 160 + 80, (p / 2) * 90 + 45));
       host_image_clear (&o.img);
     }
     for (guint p = 0; p < 4; p++)
       n_seen += seen[p];
-    g_assert_cmpuint (only_frame (out)->num_obj_meta, ==, n_seen);
+    /* an empty batch clears the output */
+    g_assert_cmpuint (only_frame (out)->num_obj_meta, ==, n > 0 ? n_seen : 0);
     gst_buffer_unref (out);
   }
   g_assert_cmpuint (count_messages (t.bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING), ==, 0);
@@ -921,9 +1118,11 @@ main (int argc, char **argv)
   gst_init (&argc, &argv);
   g_test_init (&argc, &argv, NULL);
   dev_alloc = rds_allocator_new (0, RDS_BUF_MEM_DEFAULT);
+  batch_alloc = dev_alloc;
 
   g_test_add_func ("/cpu/tiler/properties", test_properties);
   g_test_add_func ("/cpu/tiler/pads", test_pads);
+  g_test_add_func ("/cpu/tiler/compute-hw-vic", test_compute_hw_vic);
   g_test_add_func ("/gpu/tiler/grid-rgba", test_grid_rgba);
   g_test_add_func ("/gpu/tiler/grid-nv12", test_grid_nv12);
   g_test_add_func ("/gpu/tiler/input-meta-untouched", test_input_meta_untouched);
@@ -938,6 +1137,12 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/tiler/show-source-nv12", test_show_source_nv12);
   g_test_add_func ("/gpu/tiler/out-of-grid", test_out_of_grid);
   g_test_add_func ("/gpu/tiler/empty-batch", test_empty_batch);
+  g_test_add_func ("/gpu/tiler/pad-deleted", test_pad_deleted);
+  g_test_add_func ("/gpu/tiler/duplicate-pad", test_duplicate_pad);
+  g_test_add_func ("/gpu/tiler/merged-order", test_merged_order);
+  g_test_add_func ("/gpu/tiler/flush", test_flush);
+  g_test_add_func ("/gpu/tiler/system-memory", test_system_memory);
+  g_test_add_func ("/gpu/tiler/out-of-grid-before-caps", test_out_of_grid_before_caps);
   g_test_add_func ("/gpu/tiler/run-500", test_run_500);
   ret = g_test_run ();
 

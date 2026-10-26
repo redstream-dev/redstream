@@ -100,6 +100,7 @@ struct _GstRdsMultiStreamTiler
   RdsBufSurface *canvas;
   RdsBufSurface *black;
   gboolean out_of_grid_warned;
+  GArray *pending_pads;         /* guint: pads added before the caps, grown into at set_caps */
 };
 
 #define RDS_TILER_FORMATS "{ NV12, RGBA }"
@@ -232,9 +233,10 @@ layout_for (GstRdsMultiStreamTiler * self, guint n, RdsTilerLayout * layout)
       GST_VIDEO_INFO_HEIGHT (&self->out_info));
 }
 
-/* Grows n_pads to hold @pad (DeepStream 8.0 behaviour: n is the highest pad index seen + 1, from rds-pad-added
- * events and frame metas). A pad the grid cannot hold (its cells would vanish) is refused with one warning (ours:
- * DeepStream 8.0 fails with a fatal composite error). FALSE if refused. */
+/* Grows n_pads to hold @pad: n is the highest pad index seen + 1, from rds-pad-added events (DeepStream 8.0
+ * behaviour) and from frame metas (ours: DeepStream 8.0 fails on a pad index only a frame meta has). A pad the grid
+ * cannot hold (its cells would vanish) is refused with one warning (ours: DeepStream 8.0 fails with a fatal composite
+ * error). FALSE if refused. Before the caps (no output size yet) the pad waits in pending_pads until set_caps. */
 static gboolean
 grow_for_pad (GstRdsMultiStreamTiler * self, guint pad)
 {
@@ -242,8 +244,11 @@ grow_for_pad (GstRdsMultiStreamTiler * self, guint pad)
 
   if (pad < self->n_pads)
     return TRUE;
-  /* before caps (no output size yet) the grid is checked at the first batch */
-  if (pad == G_MAXUINT || (GST_VIDEO_INFO_WIDTH (&self->out_info) > 0 && !layout_for (self, pad + 1, &l))) {
+  if (GST_VIDEO_INFO_WIDTH (&self->out_info) == 0) {
+    g_array_append_val (self->pending_pads, pad);
+    return TRUE;
+  }
+  if (pad == G_MAXUINT || !layout_for (self, pad + 1, &l)) {
     if (!self->out_of_grid_warned) {
       self->out_of_grid_warned = TRUE;
       GST_ELEMENT_WARNING (self, STREAM, FAILED, ("Source pad %u does not fit in the tiled output; its frames are "
@@ -551,6 +556,9 @@ gst_rds_multi_stream_tiler_set_caps (GstBaseTransform * trans, GstCaps * incaps,
     rds_buf_surface_destroy (self->black);
     self->black = NULL;
   }
+  for (guint i = 0; i < self->pending_pads->len; i++)
+    (void) grow_for_pad (self, g_array_index (self->pending_pads, guint, i));
+  g_array_set_size (self->pending_pads, 0);
   GST_DEBUG_OBJECT (self, "%" GST_PTR_FORMAT " -> %" GST_PTR_FORMAT, incaps, outcaps);
   return TRUE;
 }
@@ -717,6 +725,8 @@ gst_rds_multi_stream_tiler_stop (GstBaseTransform * trans)
     rds_buf_surface_destroy (self->black);
   self->black = NULL;
   g_ptr_array_set_size (self->pads, 0);
+  g_array_set_size (self->pending_pads, 0);
+  gst_video_info_init (&self->out_info);
   self->n_pads = 0;
   if (self->stream != NULL) {
     if (hipStreamDestroy (self->stream) != hipSuccess)
@@ -746,7 +756,7 @@ gst_rds_multi_stream_tiler_transform (GstBaseTransform * trans, GstBuffer * inbu
   RdsBufSurfTransformRect *src_rects = NULL, *dst_rects = NULL;
   GArray *entries = g_array_new (FALSE, FALSE, sizeof (Entry));
   GArray *cleared = g_array_new (FALSE, FALSE, sizeof (guint));
-  gboolean in_mapped = FALSE, out_mapped = FALSE;
+  gboolean in_mapped = FALSE, out_mapped = FALSE, empty;
   gint show_source;
   RdsBufSurfTransform_Inter filter;
   GstFlowReturn ret = GST_FLOW_ERROR;
@@ -781,6 +791,7 @@ gst_rds_multi_stream_tiler_transform (GstBaseTransform * trans, GstBuffer * inbu
   /* The frames that have a cell; the grid grows for new pads first. */
   if (in_bm != NULL)
     rds_acquire_meta_lock (in_bm);
+  empty = in_bm == NULL || in_bm->frame_meta_list == NULL;
   for (GList * l = in_bm != NULL ? in_bm->frame_meta_list : NULL; l != NULL; l = l->next) {
     RdsFrameMeta *fm = l->data;
     Entry e = {.pad = fm->pad_index,.slot = fm->batch_id,.meta = fm };
@@ -855,7 +866,14 @@ gst_rds_multi_stream_tiler_transform (GstBaseTransform * trans, GstBuffer * inbu
   rds_add_frame_meta_to_batch (out_bm, out_fm);
   rds_buffer_add_batch_meta (outbuf, out_bm);
 
-  if (show_source < 0) {
+  if (show_source < 0 && empty) {
+    /* An empty batch clears the output: DeepStream's docs say the muxer sends one to clear the tiler's output (8.0
+     * crashes on it). Black with the empty frame meta; the caches stay for the next batch (ours). */
+    if (!fill_black (out)) {
+      GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot clear the output frame"), (NULL));
+      goto done;
+    }
+  } else if (show_source < 0) {
     /* the grid: the canvas, with every cached pad's meta in its cell (pad order: ours) */
     if (rds_buf_surface_copy (self->canvas, out) != 0) {
       GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot copy the tiled frame"), (NULL));
@@ -876,8 +894,9 @@ gst_rds_multi_stream_tiler_transform (GstBaseTransform * trans, GstBuffer * inbu
             self->layout.rows * self->layout.columns));
     goto done;
   } else {
-    /* one pad stretched to the whole output with only its meta; black and no meta when it has no frame in this
-     * batch (DeepStream 8.0 behaviour: no cached frame here) */
+    /* one pad stretched to the whole output with only its meta (DeepStream 8.0 behaviour). Black and no meta when
+     * it has no frame in this batch: DeepStream 8.0 behaviour for a pad that never had one or has ended; ours for a
+     * live pad missing from this batch (the grid repeats such a pad instead). */
     RdsTilerRect all = { 0, 0, GST_VIDEO_INFO_WIDTH (&self->out_info), GST_VIDEO_INFO_HEIGHT (&self->out_info) };
     Entry *shown = NULL;
 
@@ -1061,6 +1080,7 @@ gst_rds_multi_stream_tiler_finalize (GObject * object)
   GstRdsMultiStreamTiler *self = GST_RDS_MULTI_STREAM_TILER (object);
 
   g_ptr_array_unref (self->pads);
+  g_array_unref (self->pending_pads);
   G_OBJECT_CLASS (gst_rds_multi_stream_tiler_parent_class)->finalize (object);
 }
 
@@ -1079,6 +1099,7 @@ gst_rds_multi_stream_tiler_init (GstRdsMultiStreamTiler * self)
   self->square_seq_grid = DEFAULT_SQUARE_SEQ_GRID;
   self->buffer_pool_size = DEFAULT_BUFFER_POOL_SIZE;
   self->pads = g_ptr_array_new_with_free_func (pad_state_free);
+  self->pending_pads = g_array_new (FALSE, FALSE, sizeof (guint));
   gst_video_info_init (&self->out_info);
 }
 
