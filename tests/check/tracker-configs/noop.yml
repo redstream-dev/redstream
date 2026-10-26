@@ -1,0 +1,18 @@
+%YAML:1.0
+# Accepted no-op keys, each set to something other than its default: one warning each.
+BaseConfig:
+  useBatchNumForFrameId: 1
+
+TargetManagement:
+  preserveStreamUpdateOrder: 1
+  enableBboxUnClipping: 1
+  outputTerminatedTracks: 1
+  outputShadowTracks: 1
+  outputVisibility: 1
+  terminatedTrackFilename: dump/track
+
+TrajectoryManagement:
+  enableReAssoc: 1
+  minTrajectoryLength4Projection: 30
+  trajectoryProjectionLength: 60
+  reidExtractionInterval: -1

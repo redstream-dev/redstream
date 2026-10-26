@@ -6,3 +6,5 @@ option('infer', type : 'feature', value : 'auto',
   description : 'rdsinfer and rds-compile (needs MIGraphX, libyaml and json-glib)')
 option('migraphx_path', type : 'string', value : '',
   description : 'MIGraphX prefix with include/migraphx and lib/libmigraphx_c.so (default: <rocm_path>/extras-10)')
+option('tracker', type : 'feature', value : 'auto',
+  description : 'rdstracker (needs libyaml)')

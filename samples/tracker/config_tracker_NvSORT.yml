@@ -1,0 +1,37 @@
+%YAML:1.0
+# rdstracker (nvtracker's ll-config-file): an NvSORT tracker, a Kalman filter per target and the cascaded
+# association. Tuned on a 720p street clip with YOLO11n detections; keys left out keep their defaults.
+BaseConfig:
+  # detections below this confidence are dropped before association
+  minDetectorConfidence: 0.25
+
+TargetManagement:
+  maxTargetsPerStream: 150
+  # a new target needs IOU below this against every existing target
+  minIouDiff4NewTarget: 0.5
+  # frames a new target is tracked before it is reported and gets its ID
+  probationAge: 3
+  # frames an unmatched target is kept (not reported) before it ends
+  maxShadowTrackingAge: 30
+  earlyTerminationAge: 1
+
+DataAssociator:
+  associationMatcherType: 1
+  checkClassMatch: 1
+  minMatchingScore4Overall: 0.2
+  minMatchingScore4SizeSimilarity: 0.3
+  minMatchingScore4Iou: 0.1
+  matchingScoreWeight4SizeSimilarity: 0.4
+  matchingScoreWeight4Iou: 0.6
+  # detections below this only extend existing targets
+  tentativeDetectorConfidence: 0.4
+  minMatchingScore4TentativeIou: 0.3
+  usePrediction4Assoc: 1
+
+StateEstimator:
+  # 2: regular Kalman filter (position, size and their velocities)
+  stateEstimatorType: 2
+  processNoiseVar4Loc: 2.0
+  processNoiseVar4Size: 1.0
+  processNoiseVar4Vel: 0.1
+  measurementNoiseVar4Detector: 4.0

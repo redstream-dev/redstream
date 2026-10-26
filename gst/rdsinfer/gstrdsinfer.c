@@ -22,6 +22,7 @@
 #include "rds-infer-parse.h"
 #include "rds-infer-post.h"
 #include "rds-infer-preprocess.h"
+#include "rds-object-style.h"
 
 #include <rds/rds.h>
 #include <rds/rds-infer-meta.h>
@@ -42,12 +43,6 @@ GST_DEBUG_CATEGORY (gst_rds_infer_debug);
 #define DEFAULT_BATCH_SIZE 1
 #define DEFAULT_INTERVAL 0
 #define DEFAULT_GPU_ID 0
-
-/* Object drawing defaults (ours: nvinfer documents none). */
-#define BORDER_WIDTH 3
-#define TEXT_FONT "Serif"
-#define TEXT_FONT_SIZE 10
-#define TEXT_Y_ABOVE 20
 
 enum
 {
@@ -700,21 +695,9 @@ add_object (GstRdsInfer * self, RdsBatchMeta * bm, RdsFrameMeta * fm, const RdsI
   om->rect_params.top = d->rect.top;
   om->rect_params.width = d->rect.width;
   om->rect_params.height = d->rect.height;
-  om->rect_params.border_width = BORDER_WIDTH;
-  om->rect_params.border_color = (RdsOSD_ColorParams) {
-  1.0, 0.0, 0.0, 1.0};
-  om->rect_params.has_bg_color = 0;
+  rds_object_meta_set_drawing_defaults (om);
   g_strlcpy (om->obj_label, label, sizeof (om->obj_label));
   tp->display_text = g_strdup (label);
-  tp->x_offset = (guint) d->rect.left;
-  tp->y_offset = d->rect.top > TEXT_Y_ABOVE ? (guint) (d->rect.top - TEXT_Y_ABOVE) : 0;
-  tp->font_params.font_name = (gchar *) TEXT_FONT;
-  tp->font_params.font_size = TEXT_FONT_SIZE;
-  tp->font_params.font_color = (RdsOSD_ColorParams) {
-  1.0, 1.0, 1.0, 1.0};
-  tp->set_bg_clr = 1;
-  tp->text_bg_clr = (RdsOSD_ColorParams) {
-  0.0, 0.0, 0.0, 1.0};
   rds_add_obj_meta_to_frame (fm, om, NULL);
 }
 

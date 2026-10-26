@@ -40,6 +40,10 @@ test_cpp_aliases (void)
 
   NvOSD_Arrow_Head_Direction head = BOTH_HEAD;
   g_assert_cmpint (head, ==, RDS_OSD_ARROW_BOTH_HEAD);
+
+  /* the tracker state type alias, with Redstream's enumerators */
+  TRACKER_STATE state = RDS_TRACKER_STATE_ACTIVE;
+  g_assert_cmpint (state, ==, 1);
 }
 
 /* A DeepStream-style transform call compiled as C++. The source batch is empty (numFilled = 0), so the call fails

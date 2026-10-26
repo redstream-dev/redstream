@@ -1,0 +1,8 @@
+# Undocumented re-association keys seen in a published NvDCF sample: accepted quietly.
+TrajectoryManagement:
+  enableVanishingTrackletReconstruction: 1
+  minInclusionRatio4DuplicateTrackletRemoval: 0.25
+  minIou4DuplicateTrackletRemoval: 0.6
+  minMatchRatio4ValidTrackletDetermination: 0.15
+  minVisibility4VanishingTrackletReconstruction: 0.3
+  visibilityThreshold4VanishingTrackletDetection: 0.05

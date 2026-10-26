@@ -121,13 +121,13 @@ static void
 test_parse_launch_error_names_rds (void)
 {
   GError *err = NULL;
-  GstElement *pipeline = rds_compat_parse_launch ("nvtracker ! fakesink", &err);
+  GstElement *pipeline = rds_compat_parse_launch ("nvdsanalytics ! fakesink", &err);
 
   /* gst_parse_launch may return a partial pipeline even when it sets an error. */
   if (pipeline != NULL)
     gst_object_unref (pipeline);
   g_assert_true (g_error_matches (err, GST_PARSE_ERROR, GST_PARSE_ERROR_NO_SUCH_ELEMENT));
-  g_assert_nonnull (strstr (err->message, "rdstracker"));
+  g_assert_nonnull (strstr (err->message, "rdsanalytics"));
   g_error_free (err);
 }
 

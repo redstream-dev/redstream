@@ -1,0 +1,39 @@
+%YAML:1.0
+# An NvSORT tracker with every supported key set to something other than its default.
+BaseConfig:
+  minDetectorConfidence: 0.05
+  checkClassMatch: 0
+
+TargetManagement:
+  maxTargetsPerStream: 200
+  minIouDiff4NewTarget: 0.7
+  probationAge: 4
+  maxShadowTrackingAge: 40
+  earlyTerminationAge: 3
+  minTrackerConfidence: 0.75
+
+TrajectoryManagement:
+  useUniqueID: 1
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1
+  minMatchingScore4Overall: 0.15
+  minMatchingScore4SizeSimilarity: 0.25
+  minMatchingScore4Iou: 0.35
+  matchingScoreWeight4SizeSimilarity: 0.3
+  matchingScoreWeight4Iou: 0.6
+  tentativeDetectorConfidence: 0.125
+  minMatchingScore4TentativeIou: 0.45
+  usePrediction4Assoc: 0
+
+StateEstimator:
+  stateEstimatorType: 2
+  processNoiseVar4Loc: 3.5
+  processNoiseVar4Size: 1.5
+  processNoiseVar4Vel: 0.25
+  measurementNoiseVar4Detector: 5.0
+  measurementNoiseVar4Tracker: 12.0
+  noiseWeightVar4Loc: 0.08
+  noiseWeightVar4Vel: 0.005
+  useAspectRatio: 1

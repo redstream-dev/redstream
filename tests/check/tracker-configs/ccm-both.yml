@@ -1,0 +1,4 @@
+BaseConfig:
+  checkClassMatch: false
+DataAssociator:
+  checkClassMatch: 0

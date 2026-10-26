@@ -488,6 +488,8 @@ test_numbers (void)
       "net-scale-factor: inf: ", "not a finite number", NULL);
   text_fails ("pgie.txt", DETECTOR_TXT "net-scale-factor=nan\n", RDS_INFER_CONFIG_ERROR_INVALID,
       "net-scale-factor: nan: ", "not a finite number", NULL);
+  text_fails ("pgie.txt", DETECTOR_TXT "net-scale-factor=1e400\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "net-scale-factor: 1e400: ", "out of range", NULL);
   text_fails ("pgie.txt", DETECTOR_TXT "net-scale-factor=1e-310\n", RDS_INFER_CONFIG_ERROR_INVALID,
       "net-scale-factor: 1e-310: ", "out of range", NULL);
   text_fails ("pgie.txt", DETECTOR_TXT "net-scale-factor=1e39\n", RDS_INFER_CONFIG_ERROR_INVALID,

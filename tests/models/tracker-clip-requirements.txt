@@ -1,0 +1,3 @@
+# PyAV for decode-tracker-clip.py (fetch-tracker-clip.sh): the clip on Wikimedia Commons is VP8, which the dev image
+# can't decode. The wheel bundles its FFmpeg; installed with --require-hashes (CPython 3.12, x86-64).
+av==15.1.0 --hash=sha256:11326f197e7001c4ca53a83b2dbc67fd39ddff8cdf62ce6be3b22d9f3f9338bd

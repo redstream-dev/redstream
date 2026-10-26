@@ -1,0 +1,15 @@
+%YAML:1.0
+# The same no-op keys at their defaults: no warnings.
+BaseConfig:
+  useBatchNumForFrameId: 0
+
+TargetManagement:
+  preserveStreamUpdateOrder: 0
+  enableBboxUnClipping: 0
+  outputTerminatedTracks: 0
+  outputShadowTracks: 0
+  outputVisibility: 0
+  terminatedTrackFilename: ""
+
+TrajectoryManagement:
+  enableReAssoc: 0

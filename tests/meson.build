@@ -48,9 +48,10 @@ foreach t : cpu_tests
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 endforeach
 
-# plugin_load also checks that rdsinfer loads when the build has it.
+# plugin_load also checks that rdsinfer and rdstracker load when the build has them.
 test('plugin_load', executable('plugin_load', 'check' / 'plugin_load.c', dependencies : test_deps,
-    c_args : ['-DRDS_HAVE_INFER=@0@'.format(rds_infer_enabled ? 1 : 0)]),
+    c_args : ['-DRDS_HAVE_INFER=@0@'.format(rds_infer_enabled ? 1 : 0),
+      '-DRDS_HAVE_TRACKER=@0@'.format(rds_tracker_enabled ? 1 : 0)]),
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
 # GPU-free tests that call private library symbols: they link only the static internal copy of libgstrds
@@ -233,6 +234,80 @@ if rds_infer_enabled
     depends : rds_plugins)
 endif
 
+if rds_tracker_enabled
+  # The core's sources, ';'-separated: tracker_replay checks the IDs pipeline_tracker saved against their hash, so
+  # only a change to the tracking code (not a rebuild with other flags) makes the replay skip.
+  rdstracker_core_files = []
+  foreach f : rdstracker_core_hashed
+    rdstracker_core_files += f.full_path()
+  endforeach
+  rdstracker_core_files = ';'.join(rdstracker_core_files)
+  # The config parser on its own, against the corpus in check/tracker-configs; it also tests the shared YAML reader's
+  # handling of the OpenCV-style "%YAML:1.0" line, and checks that docs/compat-matrix.md lists every config key as
+  # the key table does. It uses no GStreamer, so it gets the environment without plugin paths.
+  test('tracker_config', executable('tracker_config', 'check' / 'tracker_config.c',
+      dependencies : [rdstracker_core_dep],
+      c_args : [
+        '-DRDS_TRACKER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'tracker-configs'),
+        '-DRDS_COMPAT_MATRIX="@0@"'.format(meson.project_source_root() / 'docs' / 'compat-matrix.md'),
+      ]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap')
+  # The tracking core on scripted sequences (life cycle, IDs, IOU and NvSORT association, reset modes); prints a
+  # 4 x 50 x 1000 timing for both.
+  test('tracker_core', executable('tracker_core', 'check' / 'tracker_core.c',
+      dependencies : [rdstracker_core_dep, cc.find_library('m', required : false)]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap')
+  # The Kalman filter against a reference written in the test.
+  test('tracker_kf', executable('tracker_kf', 'check' / 'tracker_kf.c',
+      dependencies : [rdstracker_core_dep, cc.find_library('m', required : false)]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap')
+  # The element: registration, properties, and tracking on scripted system-memory batches (write-back, created and
+  # removed objects, events, start errors, a seeded random run; cpu).
+  element_tracker_exe = executable('element_tracker', 'check' / 'element_tracker.c',
+    dependencies : test_deps,
+    c_args : ['-DRDS_TRACKER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'tracker-configs')])
+  test('element_tracker_cpu', element_tracker_exe, args : ['-p', '/cpu/tracker'],
+    suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+  # The tracking core replaying the street clip's detections that pipeline_tracker saves (skipped until it has run)
+  # against the element's IDs, and a scripted scene with known identities, both with the sample configs. With
+  # RDS_TRACKER_GRID=1 it also runs the parameter grid the sample configs were tuned with.
+  test('tracker_replay', executable('tracker_replay', 'check' / 'tracker_replay.c',
+      dependencies : [rdstracker_core_dep, cc.find_library('m', required : false)],
+      c_args : [
+        '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
+        '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+        '-DRDS_TEST_TRACKER_CORE="@0@"'.format(rdstracker_core_files),
+      ]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 300)
+endif
+
+if rds_tracker_enabled and rds_infer_enabled
+  # rdstracker end to end on a public street clip with YOLO11n (pipeline_tracker; skipped until
+  # tests/models/fetch-tracker-clip.sh and fetch-yolo11n.sh have run), and the four-source soak (its own entry,
+  # pipeline_tracker_soak, also in the soak suite; with scale2 and scripted objects without YOLO11n, and a generated
+  # clip without the street clip, so the leak check always runs). The YOLO11n programs are shared with infer_engine
+  # and pipeline_infer. Never in parallel: one compile or soak at a time.
+  # It links rdstracker-core for the config parser only (no GTypes in it), and records the hash of the core's sources
+  # with the detections it saves, for tracker_replay.
+  pipeline_tracker_exe = executable('pipeline_tracker', 'check' / 'pipeline_tracker.c',
+    dependencies : pipeline_deps + [rdstracker_core_dep],
+    c_args : [
+      '-DRDS_TEST_MODELS="@0@"'.format(meson.current_source_dir() / 'models'),
+      '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
+      '-DRDS_TEST_CACHE_MEDIA="@0@"'.format(meson.project_source_root() / '.cache' / 'media'),
+      '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
+      '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+      '-DRDS_TEST_TRACKER_CORE="@0@"'.format(rdstracker_core_files),
+    ])
+  # two runs of up to 600 s each (a first YOLO11n compile in the first)
+  test('pipeline_tracker', pipeline_tracker_exe, args : ['-p', '/gpu/tracker-yolo'],
+    suite : ['gpu', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1500,
+    depends : rds_plugins)
+  test('pipeline_tracker_soak', pipeline_tracker_exe, args : ['-p', '/gpu/tracker-soak'],
+    suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,
+    depends : rds_plugins)
+endif
+
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)])
 test('element_streamdemux_cpu', element_streamdemux_exe, args : ['-p', '/cpu/demux'],
@@ -281,12 +356,13 @@ test('rds_compile', find_program('tools/rds_compile.sh'), args : rds_compile_arg
   }),
   depends : rds_compile_depends)
 
-# The dry run checks the compat mapping; gst-inspect-1.0 (when found) checks that the mapped decoder and
-# converter (and rdsinfer, when built) resolve to real elements from the build tree. Not in ASan builds: the
-# uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process (plugin_load covers loading there).
+# The dry run checks the compat mapping, the default PGIE config and --tracker-config; gst-inspect-1.0 (when found)
+# checks that the mapped decoder and converter (and rdsinfer and rdstracker, when built) resolve to real elements from
+# the build tree. Not in ASan builds: the uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process
+# (plugin_load covers loading there).
 gst_inspect = find_program('gst-inspect-1.0', required : false)
 test('rds_test3_dry_run',
   find_program('samples/rds_test3_dry_run.sh'),
   args : [rds_test3_exe, gst_inspect.found() and not asan ? gst_inspect.full_path() : '',
-    rds_infer_enabled ? 'infer' : ''],
+    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : ''],
   suite : 'cpu', env : test_env, depends : rds_plugins)

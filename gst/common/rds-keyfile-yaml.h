@@ -12,8 +12,14 @@ G_BEGIN_DECLS
  * null group is an empty one; sequences are joined with ';' (the key-file list separator), so an item containing
  * ';' is an error. Anything nested deeper, and group or key names with control characters, are errors. Errors are
  * G_FILE_ERROR (can't read @path) or G_KEY_FILE_ERROR_PARSE, with "PATH:LINE: " in front of the message, like
- * g_key_file_load_from_file. Only the first document is read. */
+ * g_key_file_load_from_file. Only the first document is read. A UTF-8 byte order mark is skipped, and so is an
+ * OpenCV-style "%YAML:1.0" first line (tracker configs), like a comment. */
 G_GNUC_INTERNAL GKeyFile *rds_keyfile_from_yaml (const gchar * path, GError ** error);
+/* The same, except that in the groups named in @lenient_groups (NULL-terminated) a nested value (a mapping, or a
+ * sequence holding non-scalars) is skipped: the key is left out and a warning "PATH:GROUP.KEY: ..." is added to
+ * @warnings (g_free'd strings). For sections of modules the caller ignores anyway. */
+G_GNUC_INTERNAL GKeyFile *rds_keyfile_from_yaml_full (const gchar * path, const gchar * const *lenient_groups,
+    GPtrArray * warnings, GError ** error);
 
 G_END_DECLS
 

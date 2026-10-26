@@ -1,0 +1,11 @@
+%YAML:1.0
+BaseConfig:
+  minDetectorConfidence: 0.3
+  noSuchKey: 1
+
+MysterySection:
+  someKey: 2
+  otherKey: 3
+
+TargetManagement:
+  anotherUnknownKey: x

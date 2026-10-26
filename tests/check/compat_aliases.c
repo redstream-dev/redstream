@@ -4,6 +4,8 @@
 
 /* The unprefixed nvinfer data-type names (FLOAT, HALF, ...) are C++ only: in C they stay free. */
 static const int FLOAT = 0, HALF = 1, INT8 = 2, INT32 = 3, INT64 = 4;
+/* The bare tracker state names (EMPTY, ACTIVE, ...) are not aliased: they stay free too. */
+static const int EMPTY = 0, ACTIVE = 1, INACTIVE = 2, TENTATIVE = 3, PROJECTED = 4, QUASIACTIVE = 5;
 
 /* Each DeepStream type name must be the Redstream type (pointer assignment fails on a mismatch under -Werror). */
 static void
@@ -66,6 +68,7 @@ test_types (void)
   { RdsInferObjectDetectionInfo *r = NULL; NvDsInferObjectDetectionInfo *n = r; g_assert_null (n); }
   { RdsInferObjectDetectionInfo *r = NULL; NvDsInferParseObjectInfo *n = r; g_assert_null (n); }
   { RdsInferTensorMeta *r = NULL; NvDsInferTensorMeta *n = r; g_assert_null (n); }
+  { RdsTrackerState *r = NULL; TRACKER_STATE *n = r; g_assert_null (n); }
 }
 
 /* The transform structs keep DeepStream's field names and the documented field types, so designated initializers
@@ -276,6 +279,34 @@ test_constants (void)
   g_assert_true ((gint64) NVDSINFER_TENSOR_OUTPUT_META == (gint64) RDS_INFER_TENSOR_OUTPUT_META);
   /* the documented position in NvDsMetaType */
   g_assert_cmpint (RDS_INFER_TENSOR_OUTPUT_META, ==, 12);
+  g_assert_true ((gint64) NVDS_TRACKER_PAST_FRAME_META == (gint64) RDS_TRACKER_PAST_FRAME_META);
+  g_assert_true ((gint64) NVDS_TRACKER_BATCH_REID_META == (gint64) RDS_TRACKER_BATCH_REID_META);
+  g_assert_true ((gint64) NVDS_TRACKER_OBJ_REID_META == (gint64) RDS_TRACKER_OBJ_REID_META);
+  g_assert_true ((gint64) NVDS_TRACKER_TERMINATED_LIST_META == (gint64) RDS_TRACKER_TERMINATED_LIST_META);
+  g_assert_true ((gint64) NVDS_TRACKER_SHADOW_LIST_META == (gint64) RDS_TRACKER_SHADOW_LIST_META);
+  g_assert_true ((gint64) NVDS_OBJ_VISIBILITY == (gint64) RDS_OBJ_VISIBILITY);
+  g_assert_true ((gint64) NVDS_OBJ_IMAGE_FOOT_LOCATION == (gint64) RDS_OBJ_IMAGE_FOOT_LOCATION);
+  g_assert_true ((gint64) NVDS_OBJ_WORLD_FOOT_LOCATION == (gint64) RDS_OBJ_WORLD_FOOT_LOCATION);
+  g_assert_true ((gint64) NVDS_OBJ_IMAGE_CONVEX_HULL == (gint64) RDS_OBJ_IMAGE_CONVEX_HULL);
+  /* the tracker's documented positions in NvDsMetaType */
+  g_assert_cmpint (RDS_TRACKER_PAST_FRAME_META, ==, 15);
+  g_assert_cmpint (RDS_TRACKER_BATCH_REID_META, ==, 16);
+  g_assert_cmpint (RDS_TRACKER_OBJ_REID_META, ==, 17);
+  g_assert_cmpint (RDS_TRACKER_TERMINATED_LIST_META, ==, 18);
+  g_assert_cmpint (RDS_TRACKER_SHADOW_LIST_META, ==, 19);
+  g_assert_cmpint (RDS_OBJ_VISIBILITY, ==, 20);
+  g_assert_cmpint (RDS_OBJ_IMAGE_FOOT_LOCATION, ==, 21);
+  g_assert_cmpint (RDS_OBJ_WORLD_FOOT_LOCATION, ==, 22);
+  g_assert_cmpint (RDS_OBJ_IMAGE_CONVEX_HULL, ==, 23);
+  /* tracker target states: only the type name is aliased (the bare enumerators would clash with user code) */
+  g_assert_cmpint (RDS_TRACKER_STATE_EMPTY, ==, 0);
+  g_assert_cmpint (RDS_TRACKER_STATE_ACTIVE, ==, 1);
+  g_assert_cmpint (RDS_TRACKER_STATE_INACTIVE, ==, 2);
+  g_assert_cmpint (RDS_TRACKER_STATE_TENTATIVE, ==, 3);
+  g_assert_cmpint (RDS_TRACKER_STATE_PROJECTED, ==, 4);
+  g_assert_cmpint (RDS_TRACKER_STATE_QUASIACTIVE, ==, 5);
+  g_assert_cmpuint (sizeof (TRACKER_STATE), ==, sizeof (RdsTrackerState));
+  g_assert_cmpint (EMPTY + ACTIVE + INACTIVE + TENTATIVE + PROJECTED + QUASIACTIVE, ==, 15);
   g_assert_true ((gint64) NVDS_RESERVED_META == (gint64) RDS_RESERVED_META);
   g_assert_true ((gint64) NVDS_GST_CUSTOM_META == (gint64) RDS_GST_CUSTOM_META);
   g_assert_true ((gint64) NVDS_BATCH_GST_META == (gint64) RDS_BATCH_GST_META);

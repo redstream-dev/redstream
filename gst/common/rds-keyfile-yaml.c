@@ -44,9 +44,23 @@ scalar (const yaml_node_t * node)
   return is_null (node) ? "" : (const gchar *) node->data.scalar.value;
 }
 
+/* A mapping, or a sequence holding anything but scalars. */
+static gboolean
+is_nested (yaml_document_t * doc, const yaml_node_t * v)
+{
+  if (v->type == YAML_MAPPING_NODE)
+    return TRUE;
+  if (v->type == YAML_SEQUENCE_NODE)
+    for (yaml_node_item_t * it = v->data.sequence.items.start; it < v->data.sequence.items.top; it++)
+      if (yaml_document_get_node (doc, *it)->type != YAML_SCALAR_NODE)
+        return TRUE;
+  return FALSE;
+}
+
+/* With @warnings (a lenient group), nested values are skipped with a warning instead of failing. */
 static gboolean
 add_group (GKeyFile * kf, yaml_document_t * doc, const gchar * path, const gchar * group, yaml_node_t * map,
-    GError ** error)
+    GPtrArray * warnings, GError ** error)
 {
   if (is_null (map))
     return TRUE;                /* "group:" or "group: ~", with nothing under it */
@@ -58,6 +72,13 @@ add_group (GKeyFile * kf, yaml_document_t * doc, const gchar * path, const gchar
 
     if (k->type != YAML_SCALAR_NODE || !valid_name (scalar (k), FALSE))
       return fail (error, path, k, "a key must be a plain name (no '=', '[', ']' or control characters)");
+    if (warnings && is_nested (doc, v)) {
+      g_ptr_array_add (warnings, g_strdup_printf ("%s:%s.%s: a nested value (line %lu), ignored", path, group,
+              scalar (k), (gulong) k->start_mark.line + 1));
+      continue;
+    }
+    /* A sequence becomes its ';'-joined items, so a one-element list given to a scalar key reads as that scalar
+     * (the same for every config read through here). */
     if (v->type == YAML_SCALAR_NODE) {
       if (!g_utf8_validate (scalar (v), -1, NULL))
         return fail (error, path, v, "a value must be valid UTF-8");
@@ -92,7 +113,14 @@ add_group (GKeyFile * kf, yaml_document_t * doc, const gchar * path, const gchar
 GKeyFile *
 rds_keyfile_from_yaml (const gchar * path, GError ** error)
 {
-  gchar *text = NULL;
+  return rds_keyfile_from_yaml_full (path, NULL, NULL, error);
+}
+
+GKeyFile *
+rds_keyfile_from_yaml_full (const gchar * path, const gchar * const *lenient_groups, GPtrArray * warnings,
+    GError ** error)
+{
+  gchar *text = NULL, *start;
   gsize len = 0;
   yaml_parser_t parser;
   yaml_document_t doc;
@@ -102,8 +130,17 @@ rds_keyfile_from_yaml (const gchar * path, GError ** error)
 
   if (!g_file_get_contents (path, &text, &len, error))
     return NULL;
+  /* OpenCV's FileStorage starts files with "%YAML:1.0", which is not a valid YAML directive, and often has no "---"
+   * after it: read that line as a comment (line numbers stay the same). */
+  start = text;
+  if (g_str_has_prefix (start, "\xEF\xBB\xBF")) {   /* UTF-8 byte order mark */
+    start += 3;
+    len -= 3;
+  }
+  if (g_str_has_prefix (start, "%YAML:"))
+    start[0] = '#';
   yaml_parser_initialize (&parser);
-  yaml_parser_set_input_string (&parser, (const guchar *) text, len);
+  yaml_parser_set_input_string (&parser, (const guchar *) start, len);
   if (!yaml_parser_load (&parser, &doc)) {
     if (parser.context)
       g_set_error (error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_PARSE, "%s:%lu: %s (%s at line %lu)", path,
@@ -129,7 +166,8 @@ rds_keyfile_from_yaml (const gchar * path, GError ** error)
       if (k->type != YAML_SCALAR_NODE || !valid_name (scalar (k), TRUE))
         ok = fail (error, path, k, "a group name must be a plain name (no '[', ']' or control characters)");
       else
-        ok = add_group (kf, &doc, path, scalar (k), yaml_document_get_node (&doc, pair->value), error);
+        ok = add_group (kf, &doc, path, scalar (k), yaml_document_get_node (&doc, pair->value),
+            lenient_groups && g_strv_contains (lenient_groups, scalar (k)) ? warnings : NULL, error);
     }
   }
   yaml_document_delete (&doc);

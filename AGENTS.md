@@ -14,8 +14,9 @@ Status: **pre-alpha.** Phase 0 spikes and the walking skeleton are done; the lib
 `memory:RDS`, pools, metadata, events, read-only surface views, the `rds_buf_surf_transform` GPU transform). The
 elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
 `rdsstreammux` (the default scaling mux: batches of fixed-size slots), `rdsstreamdemux` (zero-copy per-source
-views of the batch) and `rdsinfer` (MIGraphX primary detector: nvinfer configs, custom bbox parsers, object and
-tensor meta). Nothing here is stable.
+views of the batch), `rdsinfer` (MIGraphX primary detector: nvinfer configs, custom bbox parsers, object and
+tensor meta) and `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs).
+Nothing here is stable.
 
 ## Architecture principles
 
@@ -42,7 +43,7 @@ tensor meta). Nothing here is stable.
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | |
 | `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` | default (scaling) mux done; the zero-copy new mux and its config file come later |
 | `nvinfer` | `rdsinfer` | primary + secondary, custom parser ABI, tensor meta |
-| `nvtracker` | `rdstracker` | IOU/SORT-class first |
+| `nvtracker` | `rdstracker` | IOU and NvSORT done (CPU); NvDCF / NvDeepSORT later |
 | `nvdsosd` | `rdsosd` | bbox, text, lines, circles |
 | `nvdsanalytics` | `rdsanalytics` | ROI, line crossing, direction, overcrowding (M2) |
 | `nveglglessink` / `nv3dsink` | `rdsvideosink` | display sink |
@@ -177,9 +178,21 @@ gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; refcounted ou
                    in tests/check/infer-configs, test parser modules built from tests/check/infer-parser-*. Optional
                    (-Dinfer, default auto): needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml
                    and json-glib
+gst/common/        static rds-plugin-common, shared by the plugins: rds-keyfile-yaml (YAML config -> GKeyFile, with the
+                   OpenCV-style "%YAML:1.0" line), rds-config-parse (number and bool parsing for the key tables),
+                   rds-object-style.h (the drawing defaults of the object metas rdsinfer and rdstracker create).
+                   Built when libyaml is found
+gst/rdstracker/    libgstrdstracker plugin: rdstracker (gstrdstracker.c: write-back of IDs and boxes, created and
+                   removed objects, stream events). rds-tracker-config parses NvMultiObjectTracker YAML configs from
+                   one key table; rds-tracker-core is the tracking core (targets, life cycle, IDs, greedy and NvSORT
+                   cascaded matching; GLib only, no GStreamer or GPU); rds-tracker-kf the Kalman filter. These three
+                   are the static rdstracker-core library, which the tests link directly. Optional (-Dtracker,
+                   default auto): needs only libyaml, not MIGraphX
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its rdsinfer
-                   config-key tables must match the key table: the infer_config test checks every row)
-samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run)
+                   and rdstracker config-key tables must match the key tables: the infer_config and tracker_config
+                   tests check every row)
+samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run and --tracker-config)
+samples/tracker/   our IOU and NvSORT low-level tracker configs for rdstracker (tuned on the street clip)
 tools/rds-compile/ rds-compile: pre-builds rdsinfer's program with its config parser and engine (exit 2: up to date)
 tests/check/       GLib unit, element and pipeline tests (suites cpu/gpu); test clips are encoded in-process
                    (rds-test-media.h, needs the VA encoder); soak memory probes in rds-test-soak.h
@@ -188,7 +201,8 @@ tests/tools/       tool tests (shell scripts)
 tests/media/       make-test-media.sh: generated H.264 clips (into git-ignored .cache/)
 tests/models/      committed tiny ONNX test models (make-test-models.py); fetch-yolo11n.sh exports YOLO11n and its
                    test reference data (street photo, Ultralytics detections, parity tensors) into .cache/models
-                   (host, Docker; AGPL, never committed)
+                   (host, Docker; AGPL, never committed); fetch-tracker-clip.sh transcodes a CC0 street clip for
+                   the tracker tests into .cache/media (host, Docker, GPU)
 spikes/            Phase 0 experiments (rocdec-hip, migraphx-devptr); reference code, not built by meson
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
 ```
@@ -208,6 +222,7 @@ tests/media/make-test-media.sh   # generates .cache/media/*.h264 for manual runs
                                  # (the tests encode their own clips)
 tests/models/fetch-yolo11n.sh    # ON THE HOST (Docker + network): exports YOLO11n and its reference data into
                                  # .cache/models; without it the YOLO11n tests skip
+tests/models/fetch-tracker-clip.sh  # ON THE HOST (Docker + network + GPU): the street clip for pipeline_tracker
 # run our elements from the build tree
 GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-720p.h264 ! h264parse \
   ! rdsvideodec ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA,width=640,height=640" ! fakesink sync=false
@@ -237,14 +252,14 @@ meson test -C build-rel --print-errorlogs
   registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
   `gst-plugin-scanner` can't load sanitized plugins. ASan runs with `use_sigaltstack=0` (Mesa's LLVM, loaded by the
   VA driver, installs its own alternate signal stack). The soak tests (`pipeline_soak`, `pipeline_mux_soak`,
-  `pipeline_infer_soak`) check host memory growth on VmRSS, or under ASan on ASan's live heap
+  `pipeline_infer_soak`, `pipeline_tracker_soak`) check host memory growth on VmRSS, or under ASan on ASan's live heap
   (`__sanitizer_get_current_allocated_bytes`, which leaves out the quarantine, so ASan keeps its default options);
   the normal build's VmRSS check covers memory that bypasses malloc (HIP pinned memory). They are also in the `soak`
   suite; `pipeline_infer_soak` takes about 4 min with YOLO11n (3000 batches of 4 at ~50 fps on a small iGPU, also
-  under ASan), so `meson test --no-suite soak` leaves the soaks out. Their memory probes live in
-  `tests/check/rds-test-soak.h`: host memory, and GPU memory from this process's DRM fdinfo (`drm-total-vram` +
-  `drm-total-gtt` of its render-node fds, where HIP allocations are accounted), so other processes on the GPU don't
-  skew it; `hipMemGetInfo` is device-wide.
+  under ASan) and `pipeline_tracker_soak` about 6 min with the street clip (4068 batches of 4), so
+  `meson test --no-suite soak` leaves the soaks out. Their memory probes live in `tests/check/rds-test-soak.h`: host
+  memory, and GPU memory from this process's DRM fdinfo (`drm-total-vram` + `drm-total-gtt` of its render-node fds,
+  where HIP allocations are accounted), so other processes on the GPU don't skew it; `hipMemGetInfo` is device-wide.
 - Element and pipeline test `main()`s end with `gst_deinit ()` after `g_test_run ()`. Without it, a test process can
   crash at exit in libamdhip64's thread-local destructors on a GStreamer task-pool thread (seen under parallel ASan
   load).
@@ -263,8 +278,19 @@ meson test -C build-rel --print-errorlogs
   with its test reference data. Never commit it or anything derived from it; tests that need it `g_test_skip` with
   a message naming the script.
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
-- The compat-matrix lint (`/cpu/infer-config/compat-matrix`) runs only in builds with rdsinfer: a build without
-  MIGraphX, such as a hosted CI runner, doesn't check `docs/compat-matrix.md` against the key table.
+- The compat-matrix lints (`/cpu/infer-config/compat-matrix`, `/cpu/tracker-config/compat-matrix`) run only in
+  builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
+  check the rdsinfer key tables in `docs/compat-matrix.md`. A new or changed config key needs its row there; the
+  test's message prints the expected row.
+- **Tracker behaviour.** Where NVIDIA's docs are silent, `rdstracker` matches observed DeepStream 8.0 behaviour,
+  except where 8.0 is clearly broken; there it does the sane thing. Code comments say "DeepStream 8.0 behaviour" or
+  "ours", and every such choice has a row in the compat matrix's "Tracking behaviour" table: keep them in step.
+- **The street clip** (`tests/models/fetch-tracker-clip.sh`, CC0 from Wikimedia Commons) is VP8, which nothing in
+  `redstream:dev` decodes: the script decodes it with a pinned PyAV in a throwaway Python container and encodes it
+  with `vah264enc` in the dev image. The encoding depends on the GPU and driver (another hash is only a warning), and
+  `pipeline_tracker`'s budgets come from a run on the encoding with the recorded hash. `pipeline_tracker` saves the
+  clip's detections for `tracker_replay`, stamped with a hash of the `rdstracker-core` sources: a change to the
+  tracking code makes the replay skip until `pipeline_tracker` runs again.
 - **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never
   waits on a stream. Library copies, memsets and staging syncs (`sync_for_cpu`/`sync_for_device`) are synchronous,
   on the calling thread's per-thread stream (`hipStreamPerThread`), so they don't wait for other streams' work. The

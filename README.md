@@ -2,9 +2,9 @@
 
 **GStreamer video and audio analytics on AMD GPUs: an open-source, ROCm-based functional equivalent of NVIDIA DeepStream.**
 
-> Status: **pre-alpha.** The core library `libgstrds` and the first five elements, `rdsvideodec`,
-> `rdsvideoconvert`, `rdsstreammux`, `rdsstreamdemux` and `rdsinfer`, are in place, with the `rds-compile` tool
-> (see "What works" below). APIs and element names will change.
+> Status: **pre-alpha.** The core library `libgstrds` and the first six elements, `rdsvideodec`,
+> `rdsvideoconvert`, `rdsstreammux`, `rdsstreamdemux`, `rdsinfer` and `rdstracker`, are in place, with the
+> `rds-compile` tool (see "What works" below). APIs and element names will change.
 
 ## Why
 
@@ -54,9 +54,14 @@ Jetson-specific hardware blocks.
   runs ONNX models (YOLO11n tested) on whole batches on the GPU, and attaches object meta and, optionally, tensor
   output meta. Bounding boxes come from the built-in YOLO parser or from a DeepStream custom bbox parser library,
   recompiled against `rds/rds_compat_infer.h`. Secondary mode and classifiers are not implemented yet.
+- **`rdstracker`** (`nvtracker`): gives detected objects persistent IDs with the IOU and NvSORT trackers of
+  NvMultiObjectTracker, on the CPU, reading the same YAML low-level config files (NvDCF and NvDeepSORT configs run
+  as NvSORT). Where NVIDIA's docs leave behaviour open, it follows observed DeepStream 8.0 behaviour, and the compat
+  matrix lists every point where it differs. Our own tuned configs are in `samples/tracker/`.
 - **`rds-compile`** (`trtexec`): compiles and caches `rdsinfer`'s MIGraphX program ahead of time.
 - **Compat header** `rds/rds_compat.h`: DeepStream names for the above, plus runtime remapping of element names
-  (`nvv4l2decoder` → `rdsvideodec`, `nvstreammux` → `rdsstreammux`, `nvinfer` → `rdsinfer`, …).
+  (`nvv4l2decoder` → `rdsvideodec`, `nvstreammux` → `rdsstreammux`, `nvinfer` → `rdsinfer`, `nvtracker` →
+  `rdstracker`, …).
 
 [`docs/compat-matrix.md`](docs/compat-matrix.md) lists every mapped name and property with its status. Built from
 this repository (see "Getting started"; `tests/media/make-test-media.sh` generates the clips), a decode and convert
@@ -90,6 +95,21 @@ GST_PLUGIN_PATH_1_0=build/gst GST_DEBUG=rdsinfer:5 gst-launch-1.0 rdsstreammux n
 
 The generated test clips (a bouncing ball, SMPTE bars) contain nothing YOLO11n detects, so expect 0 objects per
 frame: this checks that the pipeline runs, not what it finds.
+
+To see tracking, fetch the street clip (see "Getting started") and add `rdstracker` with the sample NvSORT config.
+`GST_DEBUG=rdstracker:5` logs, per frame, the tracks reported, the objects removed and the targets kept:
+
+```bash
+GST_DEBUG=rdstracker:5 GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 rdsstreammux name=m batch-size=2 width=1280 \
+  height=720 ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=2 \
+  ! rdstracker ll-config-file=samples/tracker/config_tracker_NvSORT.yml ! fakesink sync=false \
+  filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
+  filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse ! rdsvideodec ! m.sink_1
+```
+
+On that clip (56 s of a busy crosswalk, YOLO11n detections) the NvSORT sample config keeps 98.8 % of the confident
+detections tracked, with 4 ID switches over 283 tracks; the tracker itself takes about 0.01 ms per batch on the CPU,
+so the pipeline runs at the detector's speed (about 48 fps for four 720p sources at batch 4 on the iGPU below).
 
 ## How it maps to DeepStream
 
@@ -131,7 +151,7 @@ Early numbers on a 2-CU Ryzen 9 7900X iGPU:
 - VA-API H.264 1080p decode: about 600 fps.
 - YOLO11n 640×640 FP16 via MIGraphX: about 60 inferences/s.
 - `rdsinfer` with YOLO11n FP32, four 720p sources at batch 4 (decode, batching, inference and post-processing):
-  about 50 fps.
+  about 50 fps; about 48 fps with `rdstracker` (NvSORT) after it.
 
 ## Getting started (development)
 
@@ -157,6 +177,14 @@ the tests that need it skip without it. See [`tests/models/README.md`](tests/mod
 
 ```bash
 tests/models/fetch-yolo11n.sh
+```
+
+The tracker tests and the tracking example use a public-domain (CC0) street clip from Wikimedia Commons, transcoded
+to 720p H.264 on your machine (on the host: it needs Docker, network access and the GPU). It goes into the
+git-ignored `.cache/media/` and is never committed; the tests that need it skip without it.
+
+```bash
+tests/models/fetch-tracker-clip.sh
 ```
 
 Build and run the tests (inside the container):

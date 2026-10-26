@@ -57,6 +57,10 @@ rocdecode_dep = declare_dependency(
 rocm_path_norm = rocm_path.endswith('/') and rocm_path != '/' ? rocm_path.substring(0, -1) : rocm_path
 rds_install_rpath = rocm_path_norm == '/opt/rocm' ? '' : rocm_path_norm / 'lib'
 
+# libyaml reads the YAML configs of rdsinfer (nvinfer-style) and rdstracker (low-level tracker configs), through the
+# shared reader in gst/common.
+yaml_dep = dependency('yaml-0.1', required : false)
+
 # rdsinfer needs MIGraphX (C++ API over libmigraphx_c), libyaml (nvinfer-style YAML configs) and json-glib (compiled
 # program manifests). With -Dinfer=auto, a missing one disables rdsinfer, rds-compile and their tests.
 infer_opt = get_option('infer')
@@ -80,7 +84,6 @@ if not infer_opt.disabled()
   if not migraphx_dep.found()
     infer_missing += 'MIGraphX (include/migraphx/migraphx.hpp + libmigraphx_c; set -Dmigraphx_path)'
   endif
-  yaml_dep = dependency('yaml-0.1', required : false)
   if not yaml_dep.found()
     infer_missing += 'libyaml (yaml-0.1)'
   endif
@@ -98,6 +101,19 @@ if not infer_opt.disabled()
     error('rdsinfer: missing ' + ', '.join(infer_missing))
   else
     message('rdsinfer disabled: missing ' + ', '.join(infer_missing))
+  endif
+endif
+
+# rdstracker needs only libyaml. With -Dtracker=auto, a missing libyaml disables rdstracker and its tests.
+tracker_opt = get_option('tracker')
+rds_tracker_enabled = false
+if not tracker_opt.disabled()
+  if yaml_dep.found()
+    rds_tracker_enabled = true
+  elif tracker_opt.enabled()
+    error('rdstracker: missing libyaml (yaml-0.1)')
+  else
+    message('rdstracker disabled: missing libyaml (yaml-0.1)')
   endif
 endif
 

@@ -24,6 +24,19 @@ test_infer_plugin (void)
 }
 #endif
 
+/* RDS_HAVE_TRACKER comes from the build: rdstracker is optional (libyaml). */
+#if RDS_HAVE_TRACKER
+static void
+test_tracker_plugin (void)
+{
+  GstPlugin *plugin = gst_registry_find_plugin (gst_registry_get (), "rdstracker");
+
+  g_assert_nonnull (plugin);
+  g_assert_cmpstr (gst_plugin_get_license (plugin), ==, "LGPL");
+  gst_object_unref (plugin);
+}
+#endif
+
 int
 main (int argc, char **argv)
 {
@@ -32,6 +45,9 @@ main (int argc, char **argv)
   g_test_add_func ("/plugin/loads", test_plugin_loads);
 #if RDS_HAVE_INFER
   g_test_add_func ("/plugin/infer", test_infer_plugin);
+#endif
+#if RDS_HAVE_TRACKER
+  g_test_add_func ("/plugin/tracker", test_tracker_plugin);
 #endif
   return g_test_run ();
 }
