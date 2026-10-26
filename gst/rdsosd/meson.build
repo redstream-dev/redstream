@@ -3,7 +3,7 @@
 # blend must round as the same code does compiled for the GPU (rds-osd-shapes.h). GCC ignores the header's
 # contraction pragma, so everything that includes it (through rdsosd_core_dep too) builds with -ffp-contract=off.
 rdsosd_core = static_library('rdsosd-core',
-  files('rds-osd-draw.c', 'rds-osd-shapes.c'),
+  files('rds-osd-draw.c', 'rds-osd-plan.c', 'rds-osd-shapes.c'),
   c_args : ['-DG_LOG_DOMAIN="rdsosd"', '-ffp-contract=off'],
   dependencies : [dependency('glib-2.0'), rds_dep.partial_dependency(includes : true), cairo_dep, pangocairo_dep,
     cc.find_library('m', required : false)],

@@ -195,8 +195,10 @@ gst/rdstiler/      libgstrdstiler plugin: rdsmultistreamtiler (gstrdsmultistream
                    built
 gst/rdsosd/        libgstrdsosd plugin: rdsosd (gstrdsosd.c: in place on RGBA memory:RDS, each frame meta drawn on its
                    batch_id slot, synced to the CPU and back; views and shared memory are drawn on a private copy).
-                   rds-osd-draw is the drawing core (metas -> draw commands, text rasterized by Pango into A8 masks;
-                   GLib, Cairo and Pango only); rds-osd-shapes.h the commands and their per-pixel coverage and blend
+                   rds-osd-plan is the draw planner (a batch's metas -> draw commands in draw order, text rasterized by
+                   Pango into A8 masks cached in an 8 MiB heap, split into passes when a batch's masks overflow it,
+                   commands binned into 32x32 tiles for the GPU; GLib, Cairo and Pango only); rds-osd-draw draws a
+                   frame on the CPU from its plan; rds-osd-shapes.h the commands and their per-pixel coverage and blend
                    (plain C that also compiles as HIP device code: exact integer coverage, no FMA in the blend);
                    together the static rdsosd-core the tests link. Optional (-Dosd, default auto): needs cairo
                    and pangocairo

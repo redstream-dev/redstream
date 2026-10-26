@@ -41,7 +41,7 @@ typedef enum
 
 typedef struct _RdsOsdDraw RdsOsdDraw;
 
-/* A drawing context: font map, layout, font cache and scratch memory. Not thread-safe: one per streaming thread. */
+/* A drawing context: a draw planner (fonts, layouts, the text-mask cache). Not thread-safe: one per streaming thread. */
 RdsOsdDraw *rds_osd_draw_new (void);
 void rds_osd_draw_free (RdsOsdDraw * draw);
 

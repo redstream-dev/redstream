@@ -330,6 +330,9 @@ if rds_osd_enabled
   # rdsosd's shared shapes (the coverage and blend the CPU path and the GPU kernel share) on host buffers.
   test('osd_shapes', executable('osd_shapes', 'check' / 'osd_shapes.c', dependencies : [rdsosd_core_dep]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
+  # rdsosd's draw planner (command order, tile binning, the text-mask cache and passes) on host buffers.
+  test('osd_plan', executable('osd_plan', 'check' / 'osd_plan.c', dependencies : [rdsosd_core_dep]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
   # rdsosd: properties (cpu); drawing on memory:RDS batches and demuxed views (gpu).
   element_osd_exe = executable('element_osd', 'check' / 'element_osd.c', dependencies : test_deps)
   test('element_osd_cpu', element_osd_exe, args : ['-p', '/cpu/osd-element'],
