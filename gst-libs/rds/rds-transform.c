@@ -465,6 +465,7 @@ build_job (const RdsBufSurface * src, const RdsBufSurface * dst, const RdsBufSur
     job->dh = bottom - job->dt;
   }
   job->cl = job->dl, job->ct = job->dt, job->cw = job->dw, job->ch = job->dh;
+  job->entry = i;
 }
 
 /* A same-format, same-size job whose result is a plain copy of the source rect: hipMemcpy2DAsync per plane gives
@@ -531,7 +532,7 @@ run_jobs (const RdsKernelJob * jobs, guint n, const RdsBufSurfTransformConfigPar
       if (!copy_rect (&jobs[i], stream))
         ret = RdsBufSurfTransformError_Execution_Error;
     } else if (rds_transform_launch (&jobs[i], stream) != 0) {
-      GST_ERROR ("kernel launch failed for job %u (library built for another GPU architecture?)", i);
+      GST_ERROR ("kernel launch failed for entry %u (library built for another GPU architecture?)", jobs[i].entry);
       ret = RdsBufSurfTransformError_Execution_Error;
     }
   }
@@ -574,6 +575,16 @@ rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst, RdsBufSurfTran
   return ret;
 }
 
+/* TRUE when the pixel memory of @a and @b overlaps: [dataPtr, dataPtr + dataSize), with a dataSize of 0 (possible
+ * in a hand-built surface) counting as one byte. */
+static gboolean
+pixels_overlap (const RdsBufSurfaceParams * a, const RdsBufSurfaceParams * b)
+{
+  guintptr a0 = (guintptr) a->dataPtr, b0 = (guintptr) b->dataPtr;
+
+  return a0 < b0 + MAX (b->dataSize, 1u) && b0 < a0 + MAX (a->dataSize, 1u);
+}
+
 /* Checks the arguments of rds_buf_surf_transform_composite (), like rds_transform_validate () does for the
  * transform, plus the NULL pixel pointers. */
 static RdsBufSurfTransform_Error
@@ -582,7 +593,6 @@ composite_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
 {
   const RdsBufSurfTransformConfigParams *session;
   RdsBufSurfTransform_Error ret;
-  gpointer dp;
   guint n;
 
   g_return_val_if_fail (src != NULL, RdsBufSurfTransformError_Invalid_Params);
@@ -629,16 +639,15 @@ composite_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
     return RdsBufSurfTransformError_Invalid_Params;
   }
 
-  dp = dst->surfaceList[0].dataPtr;
-  if (dp == NULL) {
+  if (dst->surfaceList[0].dataPtr == NULL) {
     GST_ERROR ("dst surface 0 has no pixel memory (dataPtr is NULL)");
     return RdsBufSurfTransformError_Invalid_Params;
   }
   for (guint i = 0; i < n; i++) {
-    gpointer sp = src->surfaceList[i].dataPtr;
+    const RdsBufSurfaceParams *sp = &src->surfaceList[i];
 
-    if (sp == NULL || sp == dp) {
-      GST_ERROR ("src surface %u: pixel memory %p is NULL or the destination's", i, sp);
+    if (sp->dataPtr == NULL || pixels_overlap (sp, &dst->surfaceList[0])) {
+      GST_ERROR ("src surface %u: pixel memory %p is NULL or overlaps the destination's", i, sp->dataPtr);
       return RdsBufSurfTransformError_Invalid_Params;
     }
   }
@@ -679,6 +688,7 @@ build_composite_job (const RdsBufSurface * src, const RdsBufSurface * dst,
   job->sl = sl, job->st = st, job->sw = sr - sl, job->sh = sb - st;
   job->dl = dl, job->dt = dt, job->dw = dr - dl, job->dh = db - dt;
   job->cl = dl, job->ct = dt, job->cw = MIN (dr, dp->width) - dl, job->ch = MIN (db, dp->height) - dt;
+  job->entry = i;
   return TRUE;
 }
 

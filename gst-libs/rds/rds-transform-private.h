@@ -54,6 +54,7 @@ typedef struct
   unsigned dl, dt, dw, dh;
   unsigned cl, ct, cw, ch;
   int bilinear;                 /* 0 nearest, 1 bilinear (after the filter mapping) */
+  unsigned entry;               /* the caller's surface or composite entry index, for log messages */
 } RdsKernelJob;
 
 /* Launches one surface's transform asynchronously on stream (a hipStream_t, NULL for the null stream) on the

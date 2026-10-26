@@ -40,8 +40,7 @@ typedef enum
 
 typedef enum
 {
-  RdsBufSurfTransformError_ROI_Error = -4,     /* rds_buf_surf_transform: a rect is empty or not
-                                                * inside its surface (never clamped) */
+  RdsBufSurfTransformError_ROI_Error = -4,     /* rect empty or outside its surface (transform), too big (composite) */
   RdsBufSurfTransformError_Invalid_Params = -3,
   RdsBufSurfTransformError_Execution_Error = -2,
   RdsBufSurfTransformError_Unsupported = -1,
@@ -132,7 +131,7 @@ RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform (RdsBufSurface * src, R
  * scaling and only its part inside the surface is drawn; an empty rect, or one wholly outside, draws nothing. On a
  * 4:2:0 destination a rect's odd left or top edge is rounded up to even and an odd right or bottom edge (not on the
  * surface edge) rounded down. Synchronous, on the session's stream, with the same surface requirements as
- * rds_buf_surf_transform (dst only needs one surface); no source may share dst's pixel memory. dst->numFilled is
+ * rds_buf_surf_transform (dst only needs one surface); no source's pixel memory may overlap dst's. dst->numFilled is
  * not changed. On error dst is not modified, apart from pixels if the GPU work itself fails. */
 RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_composite (RdsBufSurface * src, RdsBufSurface * dst,
     RdsBufSurfTransformCompositeParams * composite_params);

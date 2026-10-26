@@ -1008,7 +1008,7 @@ matches observed DeepStream 8.0 behaviour; rows marked "ours" are Redstream's ow
 | Odd destination rect on NV12 or I420 | left and top rounded up to even, an odd right or bottom edge rounded down unless it is the surface edge; the source is scaled onto that rect | origin: DeepStream 8.0 behaviour; odd right or bottom edge: ours |
 | Odd destination rect on an RGB-family or GRAY8 surface | used as given | ours (8.0 also rounds RGBA rects to even) |
 | `dst->numFilled` | not changed | ours |
-| Other arguments | the transform's rules for memory types, the session GPU, formats, layouts and plane geometry (the destination needs one surface); `numFilled` 0 or above `src->batchSize`, an out-of-range filter, a NULL `dataPtr` or a source sharing the destination's `dataPtr` is `Invalid_Params` | ours |
+| Other arguments | the transform's rules for memory types, the session GPU, formats, layouts and plane geometry (the destination needs one surface); `numFilled` 0 or above `src->batchSize`, an out-of-range filter, a NULL `dataPtr` or a source whose pixel memory (`dataPtr`, `dataSize` bytes) overlaps the destination's is `Invalid_Params` | ours |
 | Execution | synchronous, on the session's stream and GPU, like `NvBufSurfTransform` | ours (no async variant) |
 
 ## OSD parameter structs

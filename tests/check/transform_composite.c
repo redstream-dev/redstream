@@ -554,6 +554,60 @@ test_clip (void)
   sources_clear (&s);
 }
 
+/* Clipping with bilinear sampling from an NV12 source: the visible part of a clipped entry equals the per-entry
+ * transform of the cut source rect into a large enough surface at the same (aligned) destination rect. */
+static void
+test_clip_bilinear (void)
+{
+  static const RdsBufSurfaceColorFormat dfmts[] = { RDS_BUF_COLOR_FORMAT_RGBA, RDS_BUF_COLOR_FORMAT_NV12 };
+  static const RdsBufSurfaceColorFormat nv12[N_SRC] = {
+    RDS_BUF_COLOR_FORMAT_NV12, RDS_BUF_COLOR_FORMAT_NV12, RDS_BUF_COLOR_FORMAT_NV12, RDS_BUF_COLOR_FORMAT_NV12,
+  };
+  Sources s;
+
+  RDS_TEST_REQUIRE_GPU ();
+  sources_init (&s, nv12, W, H);
+  fill_random (s.single[0], 0, 81);
+  sources_sync (&s);
+  s.batch.numFilled = 1;
+
+  for (guint d = 0; d < G_N_ELEMENTS (dfmts); d++) {
+    gboolean yuv = is_yuv420 (dfmts[d]);
+    RdsBufSurface *dst = create_surf (dfmts[d], W, H, 1), *big = create_surf (dfmts[d], 2 * W, 2 * H, 1);
+    /* source rect past the bottom-right corner of the source, destination rect past the destination's */
+    RdsBufSurfTransformRect sr = rect (1000, 500, 600, 400), dr = rect (1001, 601, 640, 361);
+    RdsBufSurfTransformRect cut = rect (1000, 500, W - 1000, H - 500);
+    /* NV12: origin rounded up, odd right and bottom edges rounded down */
+    RdsBufSurfTransformRect at = yuv ? rect (1002, 602, 638, 360) : dr;
+    RdsBufSurfTransformRect drawn = rect (at.left, at.top, W - at.left, H - at.top);
+    RdsBufSurfTransformCompositeParams cp = composite_params (&sr, &dr, RdsBufSurfTransformInter_Bilinear);
+    HostImage before, got, want;
+
+    fill_random (dst, 0, 82);
+    snapshot (dst, 0, &before);
+    g_assert_cmpint (rds_buf_surf_transform_composite (&s.batch, dst, &cp), ==, RdsBufSurfTransformError_Success);
+    reference (&s, 1, big, &cut, &at, RdsBufSurfTransformInter_Bilinear);
+    snapshot (dst, 0, &got);
+    snapshot (big, 0, &want);
+    for (guint y = drawn.top; y < H; y++) {
+      for (guint x = drawn.left; x < W; x++) {
+        Px a = pixel_at (&got, x, y), b = pixel_at (&want, x, y);
+
+        if (memcmp (a.c, b.c, 4) != 0)
+          g_error ("pixel (%u, %u): got %u %u %u %u, want %u %u %u %u", x, y, a.c[0], a.c[1], a.c[2], a.c[3],
+              b.c[0], b.c[1], b.c[2], b.c[3]);
+      }
+    }
+    assert_untouched (&got, &before, &drawn, 1);
+    host_image_clear (&before);
+    host_image_clear (&got);
+    host_image_clear (&want);
+    g_assert_cmpint (rds_buf_surface_destroy (dst), ==, 0);
+    g_assert_cmpint (rds_buf_surface_destroy (big), ==, 0);
+  }
+  sources_clear (&s);
+}
+
 /* An odd origin on a 4:2:0 destination is rounded up to even (DeepStream 8.0 behaviour) and an odd right or bottom
  * edge rounded down unless it is the surface edge (ours); the source is scaled onto that rect. RGB destinations take
  * odd rects as given (ours). */
@@ -566,8 +620,8 @@ test_odd_origin (void)
     guint w, h;
     RdsBufSurfTransformRect dr[3], want[3];
   } cases[] = {
-    /* odd origins, then odd right and bottom edges inside the surface: [602, 700) x [402, 450), [802, 900) x
-     * [502, 550) */
+    /* odd origins, then odd right and bottom edges inside the surface: [602, 700) x [402, 450); the third rect's
+     * right and bottom edges are even: [802, 902) x [502, 552) */
     {RDS_BUF_COLOR_FORMAT_NV12, W, H,
         {{51, 101, 333, 201}, {401, 601, 100, 50}, {501, 801, 101, 51}},
         {{52, 102, 332, 200}, {402, 602, 98, 48}, {502, 802, 100, 50}}},
@@ -667,6 +721,9 @@ test_invalid (void)
   s.list[2].dataPtr = dst->surfaceList[0].dataPtr;
   g_assert_cmpint (rds_buf_surf_transform_composite (&s.batch, dst, &cp), ==,
       RdsBufSurfTransformError_Invalid_Params);
+  s.list[2].dataPtr = (guint8 *) dst->surfaceList[0].dataPtr + 100;      /* inside the destination's bytes */
+  g_assert_cmpint (rds_buf_surf_transform_composite (&s.batch, dst, &cp), ==,
+      RdsBufSurfTransformError_Invalid_Params);
   s.list[2].dataPtr = NULL;
   g_assert_cmpint (rds_buf_surf_transform_composite (&s.batch, dst, &cp), ==,
       RdsBufSurfTransformError_Invalid_Params);
@@ -697,6 +754,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/composite/untouched", test_untouched);
   g_test_add_func ("/gpu/composite/overlap", test_overlap);
   g_test_add_func ("/gpu/composite/clip", test_clip);
+  g_test_add_func ("/gpu/composite/clip-bilinear", test_clip_bilinear);
   g_test_add_func ("/gpu/composite/odd-origin", test_odd_origin);
   g_test_add_func ("/gpu/composite/invalid", test_invalid);
   return g_test_run ();
