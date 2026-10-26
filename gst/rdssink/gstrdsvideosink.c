@@ -198,7 +198,7 @@ gst_rds_video_sink_deep_element_added (GstBin * bin, GstBin * sub_bin, GstElemen
 {
   GstRdsVideoSink *self = GST_RDS_VIDEO_SINK (bin);
 
-  if (sub_bin != bin && GST_OBJECT_FLAG_IS_SET (child, GST_ELEMENT_FLAG_SINK))
+  if (GST_OBJECT_FLAG_IS_SET (child, GST_ELEMENT_FLAG_SINK))
     forward_tree (self, child, -1);
   if (GST_BIN_CLASS (gst_rds_video_sink_parent_class)->deep_element_added != NULL)
     GST_BIN_CLASS (gst_rds_video_sink_parent_class)->deep_element_added (bin, sub_bin, child);
@@ -206,28 +206,63 @@ gst_rds_video_sink_deep_element_added (GstBin * bin, GstBin * sub_bin, GstElemen
 
 /* ---- the inner sink ---- */
 
-/* Replaces the inner sink by a new element of factory @name (FALSE: no such element, nothing changed). */
+static void
+set_sink_pointer (GstRdsVideoSink * self, GstElement * sink)
+{
+  GST_OBJECT_LOCK (self);
+  self->sink = sink;
+  GST_OBJECT_UNLOCK (self);
+}
+
+/* Puts @s in the bin as the inner sink, linked after videoconvert, with the current values, in the bin's state. */
+static gboolean
+attach_sink (GstRdsVideoSink * self, GstElement * s)
+{
+  gst_bin_add (GST_BIN (self), s);
+  set_sink_pointer (self, s);
+  if (!gst_element_link (self->videoconvert, s))
+    return FALSE;
+  forward (self, -1);
+  return gst_element_sync_state_with_parent (s);
+}
+
+static void
+detach_sink (GstRdsVideoSink * self, GstElement * s)
+{
+  set_sink_pointer (self, NULL);
+  gst_element_set_locked_state (s, TRUE);
+  gst_element_set_state (s, GST_STATE_NULL);
+  gst_bin_remove (GST_BIN (self), s);
+}
+
+/* Replaces the inner sink by a new element of factory @name. FALSE: no such element, or it does not link or start;
+ * the old sink is back in place. Called with the state lock held (or from init). */
 static gboolean
 set_inner_sink (GstRdsVideoSink * self, const gchar * name)
 {
-  GstElement *s = gst_element_factory_make (name, NULL), *old;
+  GstElement *s, *old = self->sink;
 
-  if (s == NULL)
+  if (self->videoconvert == NULL || (s = gst_element_factory_make (name, NULL)) == NULL)
     return FALSE;
-  GST_OBJECT_LOCK (self);
-  old = self->sink;
-  self->sink = s;
-  GST_OBJECT_UNLOCK (self);
   if (old != NULL) {
-    gst_element_set_locked_state (old, TRUE);
-    gst_element_set_state (old, GST_STATE_NULL);
-    gst_bin_remove (GST_BIN (self), old);
+    gst_object_ref (old);
+    detach_sink (self, old);
   }
-  gst_bin_add (GST_BIN (self), s);
-  if (self->videoconvert != NULL && !gst_element_link (self->videoconvert, s))
-    g_warning ("%s: cannot link videoconvert to the video sink '%s'", GST_OBJECT_NAME (self), name);
-  forward (self, -1);
-  gst_element_sync_state_with_parent (s);
+  gst_object_ref (s);
+  if (!attach_sink (self, s)) {
+    detach_sink (self, s);
+    if (old != NULL) {
+      gst_element_set_locked_state (old, FALSE);
+      if (!attach_sink (self, old))
+        GST_WARNING_OBJECT (self, "cannot restore the previous video sink");
+      gst_object_unref (old);
+    }
+    gst_object_unref (s);
+    return FALSE;
+  }
+  gst_object_unref (s);
+  if (old != NULL)
+    gst_object_unref (old);
   return TRUE;
 }
 
@@ -254,14 +289,21 @@ static GstPadProbeReturn
 on_buffer (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
   GstRdsVideoSink *self = GST_RDS_VIDEO_SINK (user_data);
-  GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info);
-  guint n = frames_in (buf);
+  guint n = 0;
 
+  if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+    GstBufferList *list = GST_PAD_PROBE_INFO_BUFFER_LIST (info);
+
+    for (guint i = 0; i < gst_buffer_list_length (list); i++)
+      n = MAX (n, frames_in (gst_buffer_list_get (list, i)));
+  } else {
+    n = frames_in (GST_PAD_PROBE_INFO_BUFFER (info));
+  }
   if (n <= 1)
     return GST_PAD_PROBE_OK;
   GST_ELEMENT_ERROR (self, STREAM, WRONG_TYPE,
       ("rdsvideosink takes one frame per buffer: add a tiler or a demuxer"), ("%u frames in the buffer", n));
-  gst_buffer_unref (buf);
+  gst_mini_object_unref (GST_PAD_PROBE_INFO_DATA (info));
   GST_PAD_PROBE_INFO_DATA (info) = NULL;
   GST_PAD_PROBE_INFO_FLOW_RETURN (info) = GST_FLOW_ERROR;
   return GST_PAD_PROBE_HANDLED;
@@ -275,6 +317,24 @@ gst_rds_video_sink_handle_message (GstBin * bin, GstMessage * message)
   if (GST_MESSAGE_TYPE (message) == GST_MESSAGE_ERROR)
     g_atomic_int_set (&self->child_error, 1);
   GST_BIN_CLASS (gst_rds_video_sink_parent_class)->handle_message (bin, message);
+}
+
+/* The child that did not reach @target: the inner sink when it is one of them (the bin changes the sinks first),
+ * else the first one found. NULL: none. */
+static GstElement *
+child_left_behind (GstRdsVideoSink * self, GstState target)
+{
+  GstElement *found = NULL;
+
+  GST_OBJECT_LOCK (self);
+  if (self->sink != NULL && GST_STATE (self->sink) < target)
+    found = gst_object_ref (self->sink);
+  for (GList * l = GST_BIN_CHILDREN (self); l != NULL && found == NULL; l = l->next) {
+    if (GST_STATE (l->data) < target)
+      found = gst_object_ref (l->data);
+  }
+  GST_OBJECT_UNLOCK (self);
+  return found;
 }
 
 static GstStateChangeReturn
@@ -301,14 +361,23 @@ gst_rds_video_sink_change_state (GstElement * element, GstStateChange transition
    * nveglglessink fails without a bus message when there is no display) */
   if (ret == GST_STATE_CHANGE_FAILURE && GST_STATE_TRANSITION_NEXT (transition) >
       GST_STATE_TRANSITION_CURRENT (transition) && !g_atomic_int_get (&self->child_error)) {
+    GstElement *behind = child_left_behind (self, GST_STATE_TRANSITION_NEXT (transition));
+
     GST_OBJECT_LOCK (self);
     name = g_strdup (self->video_sink);
     GST_OBJECT_UNLOCK (self);
-    GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
-        ("The video sink '%s' could not start: check the display (DISPLAY), or choose another sink with the "
-            "video-sink property", name), ("%s failed without an error message",
-            gst_state_change_get_name (transition)));
+    if (behind == NULL || behind == self->sink)
+      GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
+          ("The video sink '%s' could not start: check the display (DISPLAY), or choose another sink with the "
+              "video-sink property", name), ("%s failed without an error message",
+              gst_state_change_get_name (transition)));
+    else
+      GST_ELEMENT_ERROR (self, CORE, STATE_CHANGE, ("An element inside rdsvideosink failed %s",
+              gst_state_change_get_name (transition)), ("%s failed without an error message",
+              GST_OBJECT_NAME (behind)));
     g_free (name);
+    if (behind != NULL)
+      gst_object_unref (behind);
   }
   return ret;
 }
@@ -337,26 +406,30 @@ gst_rds_video_sink_set_property (GObject * object, guint prop_id, const GValue *
   gchar *old;
 
   if (prop_id == PROP_VIDEO_SINK) {
+    /* the state lock keeps the state from changing between the check and the swap */
+    GST_STATE_LOCK (self);
     GST_OBJECT_LOCK (self);
     ok = check_mutable (self, pspec);
     GST_OBJECT_UNLOCK (self);
-    if (!ok)
-      return;
     name = g_value_get_string (value);
     if (name == NULL || *name == '\0')
       name = DEFAULT_VIDEO_SINK;
-    if (!set_inner_sink (self, name)) {
+    if (ok && !set_inner_sink (self, name)) {
       GST_OBJECT_LOCK (self);
       old = g_strdup (self->video_sink);
       GST_OBJECT_UNLOCK (self);
-      g_warning ("%s: no element '%s'; keeping the video sink '%s'", GST_OBJECT_NAME (self), name, old);
+      g_warning ("%s: no element '%s', or it does not link or start; keeping the video sink '%s'",
+          GST_OBJECT_NAME (self), name, old);
       g_free (old);
-      return;
+      ok = FALSE;
     }
-    GST_OBJECT_LOCK (self);
-    g_free (self->video_sink);
-    self->video_sink = g_strdup (name);
-    GST_OBJECT_UNLOCK (self);
+    if (ok) {
+      GST_OBJECT_LOCK (self);
+      g_free (self->video_sink);
+      self->video_sink = g_strdup (name);
+      GST_OBJECT_UNLOCK (self);
+    }
+    GST_STATE_UNLOCK (self);
     return;
   }
 
@@ -422,6 +495,15 @@ gst_rds_video_sink_finalize (GObject * object)
   G_OBJECT_CLASS (gst_rds_video_sink_parent_class)->finalize (object);
 }
 
+/* Releases a new element that was never added to the bin. */
+static void
+drop_floating (GstElement ** e)
+{
+  if (*e != NULL)
+    gst_object_unref (gst_object_ref_sink (*e));
+  *e = NULL;
+}
+
 static void
 gst_rds_video_sink_init (GstRdsVideoSink * self)
 {
@@ -452,9 +534,9 @@ gst_rds_video_sink_init (GstRdsVideoSink * self)
       g_warning ("%s: cannot link rdsvideoconvert, capsfilter and videoconvert", GST_OBJECT_NAME (self));
     target = gst_element_get_static_pad (self->convert, "sink");
   } else {
-    g_clear_object (&self->convert);
-    g_clear_object (&self->filter);
-    g_clear_object (&self->videoconvert);
+    drop_floating (&self->convert);
+    drop_floating (&self->filter);
+    drop_floating (&self->videoconvert);
     target = NULL;
   }
   ghost = gst_ghost_pad_new_no_target_from_template ("sink",
@@ -463,7 +545,7 @@ gst_rds_video_sink_init (GstRdsVideoSink * self)
     gst_ghost_pad_set_target (GST_GHOST_PAD (ghost), target);
     gst_object_unref (target);
   }
-  gst_pad_add_probe (ghost, GST_PAD_PROBE_TYPE_BUFFER, on_buffer, self, NULL);
+  gst_pad_add_probe (ghost, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, on_buffer, self, NULL);
   gst_element_add_pad (GST_ELEMENT (self), ghost);
 
   if (self->videoconvert != NULL && !set_inner_sink (self, DEFAULT_VIDEO_SINK))

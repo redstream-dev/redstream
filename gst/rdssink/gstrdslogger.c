@@ -11,7 +11,10 @@
  * after PLAYING starts, then every interval). The first boundary only starts the count, so the first line comes two
  * intervals in, as in DeepStream 8.0; each later line gives the frames counted since the previous boundary divided by
  * the interval (ours: DeepStream 8.0's numbers drift after streams join or leave). Paused, the clock id is
- * unscheduled and the boundaries resume in running time. Lines are written with g_print, from the clock's thread.
+ * unscheduled and the time left to the next boundary is kept, so the boundaries resume in running time; a flush that
+ * resets the running time starts the measurement again. Lines are written with g_print, from the clock's thread.
+ * A new clock is only handed out on the way to PLAYING (PAUSED to PLAYING arms the id on the current clock), so
+ * there is no set_clock override.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdslogger.h"
 
@@ -86,7 +89,9 @@ struct _GstRdsLogger
   guint interval;               /* seconds; 0: off */
   gboolean playing;
   GstClockID clock_id;          /* periodic, one per interval boundary; NULL when not measuring */
-  GstClockTime next_rt;         /* running time of the next boundary; NONE: one interval from now */
+  GstClockTime next;            /* clock time of the next boundary, while clock_id is armed */
+  GstClockTime remaining;       /* time left to the next boundary while disarmed; NONE: one interval */
+  gboolean clock_failed;        /* waiting on the clock failed: not retried until the measurement restarts */
   guint ticks;                  /* boundaries since the measurement started */
   GArray *streams;              /* Stream, ascending ids; every stream seen since start, ended ones too */
 };
@@ -154,7 +159,7 @@ on_boundary (G_GNUC_UNUSED GstClock * clock, G_GNUC_UNUSED GstClockTime time, Gs
     g_mutex_unlock (&self->lock);
     return TRUE;
   }
-  self->next_rt += (GstClockTime) self->interval * GST_SECOND;
+  self->next += (GstClockTime) self->interval * GST_SECOND;
   /* the first boundary only starts the count (DeepStream 8.0 behaviour: the first line ≈2 intervals in) */
   if (self->ticks++ > 0)
     line = perf_line_locked (self);
@@ -172,38 +177,46 @@ on_boundary (G_GNUC_UNUSED GstClock * clock, G_GNUC_UNUSED GstClockTime time, Gs
 static void
 schedule_locked (GstRdsLogger * self)
 {
-  GstClockTime interval_ns = (GstClockTime) self->interval * GST_SECOND, base;
+  GstClockTime interval_ns = (GstClockTime) self->interval * GST_SECOND;
   GstClock *clock;
 
-  if (!self->playing || self->interval == 0 || self->clock_id != NULL)
+  if (!self->playing || self->interval == 0 || self->clock_id != NULL || self->clock_failed)
     return;
   clock = gst_element_get_clock (GST_ELEMENT (self));
   if (clock == NULL)
     return;
-  base = gst_element_get_base_time (GST_ELEMENT (self));
-  if (!GST_CLOCK_TIME_IS_VALID (self->next_rt)) {
-    GstClockTime now = gst_clock_get_time (clock);
-
-    self->next_rt = (now > base ? now - base : 0) + interval_ns;
-  }
-  GST_DEBUG_OBJECT (self, "next boundary at running time %" GST_TIME_FORMAT ", every %u s",
-      GST_TIME_ARGS (self->next_rt), self->interval);
-  self->clock_id = gst_clock_new_periodic_id (clock, base + self->next_rt, interval_ns);
+  self->next = gst_clock_get_time (clock) +
+      (GST_CLOCK_TIME_IS_VALID (self->remaining) ? self->remaining : interval_ns);
+  self->remaining = GST_CLOCK_TIME_NONE;
+  GST_DEBUG_OBJECT (self, "next boundary at clock time %" GST_TIME_FORMAT ", every %u s",
+      GST_TIME_ARGS (self->next), self->interval);
+  self->clock_id = gst_clock_new_periodic_id (clock, self->next, interval_ns);
   if (gst_clock_id_wait_async (self->clock_id, on_boundary, gst_object_ref (self), gst_object_unref)
       != GST_CLOCK_OK) {
     GST_WARNING_OBJECT (self, "cannot wait on the clock: no frame rates printed");
     gst_clock_id_unref (self->clock_id);
     self->clock_id = NULL;
+    self->clock_failed = TRUE;
   }
   gst_object_unref (clock);
 }
 
+/* Disarms the clock id, keeping the time left to the next boundary (paused, no running time passes). */
 static void
 unschedule_locked (GstRdsLogger * self)
 {
+  GstClock *clock;
+
   if (self->clock_id == NULL)
     return;
+  clock = gst_clock_id_get_clock (self->clock_id);
   gst_clock_id_unschedule (self->clock_id);
+  if (clock != NULL) {
+    GstClockTime now = gst_clock_get_time (clock);
+
+    self->remaining = self->next > now ? self->next - now : 0;
+    gst_object_unref (clock);
+  }
   gst_clock_id_unref (self->clock_id);
   self->clock_id = NULL;
 }
@@ -214,7 +227,8 @@ restart_locked (GstRdsLogger * self)
 {
   unschedule_locked (self);
   self->ticks = 0;
-  self->next_rt = GST_CLOCK_TIME_NONE;
+  self->remaining = GST_CLOCK_TIME_NONE;
+  self->clock_failed = FALSE;
   reset_counts_locked (self);
   schedule_locked (self);
 }
@@ -287,6 +301,24 @@ gst_rds_logger_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   return GST_FLOW_OK;
 }
 
+static gboolean
+gst_rds_logger_sink_event (GstBaseTransform * trans, GstEvent * event)
+{
+  GstRdsLogger *self = GST_RDS_LOGGER (trans);
+  gboolean reset_time = FALSE;
+
+  if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP) {
+    gst_event_parse_flush_stop (event, &reset_time);
+    if (reset_time) {
+      /* the running time starts again: so does the measurement (streams stay listed) */
+      g_mutex_lock (&self->lock);
+      restart_locked (self);
+      g_mutex_unlock (&self->lock);
+    }
+  }
+  return GST_BASE_TRANSFORM_CLASS (gst_rds_logger_parent_class)->sink_event (trans, event);
+}
+
 static GstStateChangeReturn
 gst_rds_logger_change_state (GstElement * element, GstStateChange transition)
 {
@@ -298,7 +330,8 @@ gst_rds_logger_change_state (GstElement * element, GstStateChange transition)
       /* streams are forgotten only here: an ended stream stays listed with 0.00 (DeepStream 8.0 behaviour) */
       g_array_set_size (self->streams, 0);
       self->ticks = 0;
-      self->next_rt = GST_CLOCK_TIME_NONE;
+      self->remaining = GST_CLOCK_TIME_NONE;
+      self->clock_failed = FALSE;
       break;
     case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
       self->playing = TRUE;
@@ -424,7 +457,7 @@ gst_rds_logger_init (GstRdsLogger * self)
   }
   g_mutex_init (&self->lock);
   self->interval = DEFAULT_FPS_INTERVAL;
-  self->next_rt = GST_CLOCK_TIME_NONE;
+  self->remaining = GST_CLOCK_TIME_NONE;
   self->streams = g_array_new (FALSE, FALSE, sizeof (Stream));
   gst_base_transform_set_passthrough (GST_BASE_TRANSFORM (self), TRUE);
   gst_base_transform_set_in_place (GST_BASE_TRANSFORM (self), TRUE);
@@ -495,5 +528,6 @@ gst_rds_logger_class_init (GstRdsLoggerClass * klass)
 
   element_class->change_state = GST_DEBUG_FUNCPTR (gst_rds_logger_change_state);
   trans_class->transform_ip = GST_DEBUG_FUNCPTR (gst_rds_logger_transform_ip);
+  trans_class->sink_event = GST_DEBUG_FUNCPTR (gst_rds_logger_sink_event);
   trans_class->transform_ip_on_passthrough = TRUE;
 }

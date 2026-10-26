@@ -394,6 +394,71 @@ test_restart (void)
 }
 
 static void
+test_pause_resume (void)
+{
+  GstHarness *h = logger_new ("fps-measurement-interval-sec=1");
+  GstTestClock *clock = gst_harness_get_testclock (h);
+  GstClockID id;
+
+  crank (h);
+  push_frames (h, 0, 4);
+  /* paused 300 ms into the interval: no boundary pending, and no running time passes */
+  gst_test_clock_set_time (clock, 1300 * GST_MSECOND);
+  g_assert_cmpint (gst_element_set_state (h->element, GST_STATE_PAUSED), ==, GST_STATE_CHANGE_SUCCESS);
+  g_assert_cmpuint (gst_test_clock_peek_id_count (clock), ==, 0);
+  gst_test_clock_set_time (clock, 5 * GST_SECOND);
+  /* playing again: the boundary is due at the old one (2 s) plus the 3.7 s paused */
+  g_assert_cmpint (gst_element_set_state (h->element, GST_STATE_PLAYING), ==, GST_STATE_CHANGE_SUCCESS);
+  g_assert_cmpuint (gst_test_clock_peek_id_count (clock), ==, 1);
+  g_assert_true (gst_test_clock_peek_next_pending_id (clock, &id));
+  g_assert_cmpuint (gst_clock_id_get_time (id), ==, 5700 * GST_MSECOND);
+  gst_clock_id_unref (id);
+  push_frames (h, 0, 2);
+  crank (h);
+  assert_output ("**PERF : FPS_0 (6.00)\t\n");
+  gst_object_unref (clock);
+  logger_free (h);
+}
+
+static void
+test_flush_reset (void)
+{
+  GstHarness *h = logger_new ("fps-measurement-interval-sec=1");
+  GstTestClock *clock = gst_harness_get_testclock (h);
+  GstSegment seg;
+  GstClockID id;
+
+  crank (h);
+  push_frames (h, 0, 5);
+  gst_test_clock_set_time (clock, 1500 * GST_MSECOND);
+  /* a flush that resets the running time starts the measurement again: the frames counted so far are dropped, the
+   * next boundary is one interval away and only starts the count (without it, 2 s would print 5.00) */
+  g_assert_true (gst_harness_push_event (h, gst_event_new_flush_start ()));
+  g_assert_true (gst_harness_push_event (h, gst_event_new_flush_stop (TRUE)));
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  g_assert_true (gst_harness_push_event (h, gst_event_new_segment (&seg)));
+  g_assert_true (gst_test_clock_peek_next_pending_id (clock, &id));
+  g_assert_cmpuint (gst_clock_id_get_time (id), ==, 2500 * GST_MSECOND);
+  gst_clock_id_unref (id);
+  crank (h);
+  assert_output ("");
+  push_frames (h, 0, 3);
+  crank (h);
+  assert_output ("**PERF : FPS_0 (3.00)\t\n");
+
+  /* a flush that keeps the running time changes nothing */
+  push_frames (h, 0, 2);
+  g_assert_true (gst_harness_push_event (h, gst_event_new_flush_start ()));
+  g_assert_true (gst_harness_push_event (h, gst_event_new_flush_stop (FALSE)));
+  g_assert_true (gst_harness_push_event (h, gst_event_new_segment (&seg)));
+  push_frames (h, 0, 1);
+  crank (h);
+  assert_output ("**PERF : FPS_0 (3.00)\t\n");
+  gst_object_unref (clock);
+  logger_free (h);
+}
+
+static void
 test_silent_false (void)
 {
   GstHarness *h = logger_new ("fps-measurement-interval-sec=1 silent=false name=log7");
@@ -456,6 +521,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/logger/no-batch-meta", test_no_batch_meta);
   g_test_add_func ("/cpu/logger/nothing-seen", test_nothing_seen);
   g_test_add_func ("/cpu/logger/restart", test_restart);
+  g_test_add_func ("/cpu/logger/pause-resume", test_pause_resume);
+  g_test_add_func ("/cpu/logger/flush-reset", test_flush_reset);
   g_test_add_func ("/cpu/logger/silent-false", test_silent_false);
   ret = g_test_run ();
 

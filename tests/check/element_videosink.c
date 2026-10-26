@@ -210,13 +210,12 @@ test_forwarding_nested (void)
   gint64 lateness;
   gchar *f;
 
-  /* the default autovideosink is a bin: the sinks inside it get the values too (here its placeholder fakesink) */
+  /* the default autovideosink is a bin: the sinks inside it get the values too (before READY, its placeholder) */
   s = inner_sink (e);
   f = factory_of (s);
   g_assert_cmpstr (f, ==, "autovideosink");
   g_free (f);
-  child = gst_bin_get_by_name (GST_BIN (s), "fake-video-sink");
-  g_assert_nonnull (child);
+  child = inner_sink (s);
   g_object_get (child, "max-lateness", &lateness, NULL);
   g_assert_cmpint (lateness, ==, 5 * GST_MSECOND);
   g_object_set (e, "max-lateness", (gint64) 9, NULL);
@@ -273,6 +272,16 @@ test_video_sink_unknown (void)
   g_assert_cmpstr (vs, ==, "fakesink");
   g_free (vs);
   gst_object_unref (s);
+  /* an element that does not link (no sink pad): the old sink is put back */
+  g_test_expect_message ("rdssink", G_LOG_LEVEL_WARNING, "*fakesrc*does not link*keeping*fakesink*");
+  g_object_set (e, "video-sink", "fakesrc", NULL);
+  g_test_assert_expected_messages ();
+  s = inner_sink (e);
+  vs = factory_of (s);
+  g_assert_cmpstr (vs, ==, "fakesink");
+  g_free (vs);
+  g_assert_true (gst_pad_is_linked (GST_ELEMENT_CAST (s)->sinkpads->data));
+  gst_object_unref (s);
   /* NULL or empty: back to the default */
   g_object_set (e, "video-sink", NULL, NULL);
   g_object_get (e, "video-sink", &vs, NULL);
@@ -327,6 +336,7 @@ test_no_display (void)
   GstMessage *m;
   GstStateChangeReturn r;
   GError *err = NULL;
+  gchar *display;
   guint n = 0;
 
   if (!gst_registry_check_feature_version (gst_registry_get (), "ximagesink", 1, 0, 0)) {
@@ -334,6 +344,7 @@ test_no_display (void)
     return;
   }
   /* no X display: ximagesink's own error reaches the bus, and only that one */
+  display = g_strdup (g_getenv ("DISPLAY"));
   g_unsetenv ("DISPLAY");
   p = gst_pipeline_new (NULL);
   e = gst_element_factory_make ("rdsvideosink", NULL);
@@ -356,6 +367,9 @@ test_no_display (void)
   gst_element_set_state (p, GST_STATE_NULL);
   gst_object_unref (bus);
   gst_object_unref (p);
+  if (display != NULL)
+    g_setenv ("DISPLAY", display, TRUE);
+  g_free (display);
 }
 
 /* ---- gpu ---- */
@@ -473,6 +487,7 @@ test_batched (void)
   GstMessage *m;
   GError *err = NULL;
   gchar *dbg = NULL;
+  GstBufferList *list;
 
   RDS_TEST_REQUIRE_GPU ();
   /* more than one frame per buffer: an element error (ours: DeepStream 8.0 fails the first buffer silently) */
@@ -486,6 +501,20 @@ test_batched (void)
   g_assert_nonnull (strstr (dbg, "2 frames"));
   g_clear_error (&err);
   g_free (dbg);
+  gst_message_unref (m);
+  sink_clear (&k);
+
+  /* in a buffer list too */
+  sink_init (&k, NULL);
+  list = gst_buffer_list_new ();
+  gst_buffer_list_add (list, make_frames (1));
+  gst_buffer_list_add (list, make_frames (2));
+  g_assert_cmpint (gst_pad_push_list (k.h->srcpad, list), ==, GST_FLOW_ERROR);
+  m = pop_error (k.bus);
+  g_assert_nonnull (m);
+  gst_message_parse_error (m, &err, NULL);
+  g_assert_cmpstr (err->message, ==, "rdsvideosink takes one frame per buffer: add a tiler or a demuxer");
+  g_clear_error (&err);
   gst_message_unref (m);
   sink_clear (&k);
 }

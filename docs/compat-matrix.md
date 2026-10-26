@@ -392,6 +392,7 @@ silent, or **ours**: where 8.0 settles nothing or is clearly broken.
 | Rate value | ours | frames counted since the previous line / the interval (8.0's numbers drift above the true rate for a while after a stream joins or leaves) |
 | `fps-measurement-interval-sec=0` | ours | nothing printed (8.0 prints `FPS_0 (0.00)` in a busy loop) |
 | Interval changed while playing | ours | the measurement restarts: one interval to start the count, then a line every interval |
+| Flush that resets the running time | ours | the measurement restarts as above (the frames counted so far are dropped; streams stay listed); a flush that keeps the running time changes nothing |
 | A buffer without batch meta | ours | one frame of stream 0 |
 | No stream seen yet | ours | nothing printed |
 | `silent=false` | matches nvdslogger (DeepStream 8.0) | per buffer `<name> BUF_PTS : <pts> element time <running time now> elem-buf=<now − pts, ms> ms buf=<address> buffer_pts_to_running_time = <pts running time>rdslogger base time = <base time>buffer dur <duration>` (no separators before `rdslogger` and `buffer dur`, as in 8.0, whose label reads `nvdslogger base time`), then `BUFFER PTS is lesser than ELEMENT TIME, IT's LATE` or `BUFFER PTS is greater than ELEMENT TIME, IT's EARLY` (ours: only the LATE line was observed in 8.0, so the EARLY wording is inferred; equal counts as early); without a clock or PTS, the times print as `99:99:99.999999999` and the second line is left out (ours) |
@@ -408,7 +409,7 @@ silently (ours: with `autovideosink` the real sink is known only at READY).
 
 | Property | Type | Default | Status | Notes |
 |---|---|---|---|---|
-| `video-sink` | string | `autovideosink` | ours | a factory name (string) of the GStreamer sink that shows the frames; an element instance is not accepted; NULL or empty: `autovideosink`; an unknown name keeps the current sink with a warning. Changeable only in NULL or READY |
+| `video-sink` | string | `autovideosink` | ours | a factory name (string) of the GStreamer sink that shows the frames; an element instance is not accepted; NULL or empty: `autovideosink`; an unknown name, or an element that does not link or start, keeps the current sink with a warning. Changeable only in NULL or READY |
 | `sync` | boolean | `TRUE` | forwarded | |
 | `qos` | boolean | `TRUE` | forwarded | |
 | `max-lateness` | int64 −1.. | `5000000` | forwarded | nanoseconds |
@@ -436,8 +437,8 @@ from a container, X11 needs `DISPLAY`, the X socket and the Xauthority file.
 | Behaviour | Status | Notes |
 |---|---|---|
 | Rendering path | ours | frames copied to system memory (BGRx) and shown by a stock GStreamer sink; no GL interop yet |
-| Batched input | ours | a buffer with more than one frame (`numFilled` above 1, or more than one frame meta) is an element error "rdsvideosink takes one frame per buffer: add a tiler or a demuxer" (8.0 accepts the caps, then fails the first buffer without a message, and the pipeline hangs) |
-| No display | ours | the inner sink's own error reaches the bus (`ximagesink`: "Could not initialise X output"); a sink that fails to start without posting an error gets one from `rdsvideosink` naming it and the `video-sink` property (8.0's nveglglessink fails the state change without a bus message; nv3dsink posts "state change failed and some element failed to post a proper error message") |
+| Batched input | ours | a buffer with more than one frame (`numFilled` above 1, or more than one frame meta) is an element error "rdsvideosink takes one frame per buffer: add a tiler or a demuxer" (buffer lists are checked buffer by buffer) (8.0 accepts the caps, then fails the first buffer without a message, and the pipeline hangs) |
+| No display | ours | the inner sink's own error reaches the bus (`ximagesink`: "Could not initialise X output"); a sink that fails to start without posting an error gets one from `rdsvideosink` naming it and the `video-sink` property (another element of the bin failing silently: "An element inside rdsvideosink failed <transition>") (8.0's nveglglessink fails the state change without a bus message; nv3dsink posts "state change failed and some element failed to post a proper error message") |
 | `autovideosink` without a display | ours | it may pick `kmssink`, which can start without showing anything; set `video-sink` for a definite sink |
 
 ### `rdsinfer` (`nvinfer`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvinfer.html))
