@@ -2,8 +2,8 @@
  *
  * A frame is drawn as a batch of one: the planner (rds-osd-plan.h) turns its metas into draw commands in draw order
  * and rasterizes the text masks into its heap; then rds_osd_shade_commands blends each shape over its bounding box
- * into the RGBA plane, pass by pass. The coverage and blend live in rds-osd-shapes.h, plain C written to compile for
- * the planned GPU kernel too, so that both paths can draw the same bytes. The frame's own bytes, alpha included, are
+ * into the RGBA plane, pass by pass. The coverage and blend live in rds-osd-shapes.h, plain C that the GPU kernel
+ * (rds-osd-gpu.hip) compiles too, so that both paths draw the same bytes. The frame's own bytes, alpha included, are
  * only ever read and blended, never reinterpreted, and only the pixels a command covers are touched.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-osd-draw.h"

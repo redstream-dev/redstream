@@ -346,8 +346,10 @@ rds_osd_plan_add_frame (RdsOsdPlan * p, const RdsOsdDrawOptions * opt, guint slo
     return 0;
   /* ours: larger frames are not drawn (tile numbers are 16-bit, and a frame's tile counts stay bounded) */
   if (width > RDS_OSD_MAX_PLAN_FRAME || height > RDS_OSD_MAX_PLAN_FRAME
-      || (guint64) TILES (width) * TILES (height) > RDS_OSD_MAX_PLAN_TILES)
+      || (guint64) TILES (width) * TILES (height) > RDS_OSD_MAX_PLAN_TILES) {
+    g_debug ("frame of %dx%d on slot %u is larger than rdsosd draws: not drawn", width, height, slot);
     return 0;
+  }
   for (guint i = 0; i < p->frames->len; i++) {
     const RdsOsdPlanFrame *f = &g_array_index (p->frames, RdsOsdPlanFrame, i);
 
@@ -357,8 +359,11 @@ rds_osd_plan_add_frame (RdsOsdPlan * p, const RdsOsdDrawOptions * opt, guint slo
       return 0;
     }
   }
-  bf = (RdsOsdPlanFrame) {
-  slot, width, height, p->n_cmds, 0};
+  bf.slot = slot;
+  bf.width = width;
+  bf.height = height;
+  bf.first = p->n_cmds;
+  bf.n_cmds = 0;
   p->width = width;
   p->height = height;
 

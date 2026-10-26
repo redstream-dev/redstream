@@ -109,7 +109,7 @@ gboolean rds_osd_plan_next_pass (RdsOsdPlan * plan, RdsOsdPass * pass);
  * lost or reallocated). */
 void rds_osd_plan_drop_masks (RdsOsdPlan * plan);
 
-/* The binning budget of a pass in 32-bit words (RDS_OSD_PASS_BUDGET by default; smaller in tests). */
+/* (tests) The binning budget of a pass in 32-bit words (RDS_OSD_PASS_BUDGET by default). */
 void rds_osd_plan_set_pass_budget (RdsOsdPlan * plan, guint64 words);
 
 /* Fills @pass's work items and lists: for each slot in the order of its first frame, its non-empty tiles in row

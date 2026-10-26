@@ -200,8 +200,10 @@ gst/rdsosd/        libgstrdsosd plugin: rdsosd (gstrdsosd.c: in place on RGBA me
                    commands binned into 32x32 tiles for the GPU; GLib, Cairo and Pango only); rds-osd-draw draws a
                    frame on the CPU from its plan; rds-osd-shapes.h the commands and their per-pixel coverage and blend
                    (plain C that also compiles as HIP device code: exact integer coverage, no FMA in the blend);
-                   together the static rdsosd-core the tests link. Optional (-Dosd, default auto): needs cairo
-                   and pangocairo
+                   together the static rdsosd-core the tests link. rds-osd-gpu draws a pass on the GPU, byte for byte
+                   as the CPU path (one upload a pass, a block per tile; kernel in rds-osd-gpu.hip, built with
+                   -ffp-contract=off), the static rdsosd-gpu; the element does not use it yet. Optional (-Dosd,
+                   default auto): needs cairo and pangocairo
 gst/rdssink/       libgstrdssink plugin: rdslogger (gstrdslogger.c: passthrough, counts frames per source_id and prints
                    the **PERF line on a periodic pipeline-clock id) and rdsvideosink (gstrdsvideosink.c: a bin of
                    rdsvideoconvert, BGRx videoconvert and the video-sink factory; forwards the DeepStream sink

@@ -24,3 +24,28 @@ gstrdsosd = library('gstrdsosd',
   install : true,
   install_dir : get_option('libdir') / 'gstreamer-1.0')
 rds_plugins += gstrdsosd
+
+# The GPU drawing kernels, built like rdsinfer's (gst/rdsinfer/meson.build), with contraction off: the kernel blends
+# with the same code as the CPU path and must round alike (amdclang's default is fast-honor-pragmas). The context
+# (rds-osd-gpu.c) and the kernel object make the static rdsosd-gpu, for the plugin and the tests.
+rdsosd_kernels_raw = custom_target('rds-osd-gpu-raw',
+  input : 'rds-osd-gpu.hip',
+  output : 'rds-osd-gpu-raw.o',
+  depfile : 'rds-osd-gpu-raw.d',
+  depend_files : files('rds-osd-gpu.h', 'rds-osd-shapes.h'),
+  command : [amdclang, '-x', 'hip', hip_arch_args, '-fPIC', '-O2', '-std=c++17', '-fvisibility=hidden',
+    '-ffp-contract=off', '-D__HIP_PLATFORM_AMD__', '-I' + meson.current_source_dir(), '-MD', '-MF', '@DEPFILE@',
+    '-c', '@INPUT@', '-o', '@OUTPUT@'])
+rdsosd_kernels = custom_target('rds-osd-gpu-kernels',
+  input : rdsosd_kernels_raw,
+  output : 'rds-osd-gpu-kernels.o',
+  command : [objcopy, '--wildcard', '--localize-symbol=__hip_cuid_*', '@INPUT@', '@OUTPUT@'])
+rdsosd_gpu = static_library('rdsosd-gpu',
+  files('rds-osd-gpu.c'),
+  objects : rdsosd_kernels,
+  c_args : ['-DG_LOG_DOMAIN="rdsosd"'],
+  dependencies : [rdsosd_core_dep, hip_dep],
+  gnu_symbol_visibility : 'hidden',
+  pic : true)
+rdsosd_gpu_dep = declare_dependency(link_with : rdsosd_gpu,
+  dependencies : [rdsosd_core_dep, hip_dep])

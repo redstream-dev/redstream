@@ -333,6 +333,9 @@ if rds_osd_enabled
   # rdsosd's draw planner (command order, tile binning, the text-mask cache and passes) on host buffers.
   test('osd_plan', executable('osd_plan', 'check' / 'osd_plan.c', dependencies : [rdsosd_core_dep]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
+  # rdsosd's GPU drawing against the CPU path, byte for byte; prints the draw time of a 720p frame and a 1080p batch.
+  test('osd_gpu', executable('osd_gpu', 'check' / 'osd_gpu.c', dependencies : [rdsosd_gpu_dep, gst_dep]),
+    suite : 'gpu', env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 300)
   # rdsosd: properties (cpu); drawing on memory:RDS batches and demuxed views (gpu).
   element_osd_exe = executable('element_osd', 'check' / 'element_osd.c', dependencies : test_deps)
   test('element_osd_cpu', element_osd_exe, args : ['-p', '/cpu/osd-element'],

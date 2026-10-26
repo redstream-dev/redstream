@@ -146,9 +146,10 @@ rds_osd_cmd_coverage (const RdsOsdCmd * c, int32_t x, int32_t y, const uint8_t *
     case RDS_OSD_CMD_SEGMENT:{
       const RdsOsdSegment *s = &c->segment;
       /* Within RDS_OSD_MAX_SHAPE_FRAME and the builders' clipping, |px|, |py| < 2^30 (~1.07e9) and |dx|, |dy| < 1.4e9:
-       * each product stays below 1.5e18 and their sum and difference below 3e18, inside int64. */
-      int64_t px = (int64_t) x * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2 - s->ax;
-      int64_t py = (int64_t) y * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2 - s->ay;
+       * px and py fit in 32 bits (so the products are 32 × 32 → 64-bit multiplies, cheaper on the GPU), each product
+       * stays below 1.5e18 and their sum and difference below 3e18, inside int64. */
+      int32_t px = x * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2 - s->ax;
+      int32_t py = y * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2 - s->ay;
       int64_t cross = (int64_t) s->dx * py - (int64_t) s->dy * px;
       int64_t dot = (int64_t) s->dx * px + (int64_t) s->dy * py;
 
@@ -156,13 +157,15 @@ rds_osd_cmd_coverage (const RdsOsdCmd * c, int32_t x, int32_t y, const uint8_t *
     }
     case RDS_OSD_CMD_TRIANGLE:{
       const RdsOsdTriangle *t = &c->triangle;
-      int64_t px = (int64_t) x * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2;
-      int64_t py = (int64_t) y * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2;
+      /* arrow heads: corners within RDS_OSD_MAX_COORD plus a stroke of up to 2^21 + 1 px, so below 2^29 + 2^28 in
+       * fixed point, and pixel centres below 2^28: every difference fits in 32 bits, every product in 60 */
+      int32_t px = x * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2;
+      int32_t py = y * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2;
       int neg = 0, pos = 0;
 
       for (int i = 0; i < 3; i++) {
         int j = i == 2 ? 0 : i + 1;
-        int64_t e = ((int64_t) t->x[j] - t->x[i]) * (py - t->y[i]) - ((int64_t) t->y[j] - t->y[i]) * (px - t->x[i]);
+        int64_t e = (int64_t) (t->x[j] - t->x[i]) * (py - t->y[i]) - (int64_t) (t->y[j] - t->y[i]) * (px - t->x[i]);
 
         neg |= e < 0;
         pos |= e > 0;
@@ -171,7 +174,9 @@ rds_osd_cmd_coverage (const RdsOsdCmd * c, int32_t x, int32_t y, const uint8_t *
     }
     case RDS_OSD_CMD_RING:{
       const RdsOsdRing *r = &c->ring;
-      int64_t dx = (int64_t) x - r->xc, dy = (int64_t) y - r->yc, d2 = dx * dx + dy * dy;
+      /* centres within RDS_OSD_MAX_COORD: the differences fit in 32 bits */
+      int32_t dx = x - r->xc, dy = y - r->yc;
+      int64_t d2 = (int64_t) dx * dx + (int64_t) dy * dy;
 
       return d2 >= r->d2_lo && d2 <= r->d2_hi ? 255 : 0;
     }
