@@ -290,6 +290,13 @@ RDS_API RdsBatchMeta *rds_batch_meta_copy (RdsBatchMeta * src);
  * copy rules as rds_batch_meta_copy otherwise. Returns the copy, or NULL if src does not belong to a batch.
  * Locks src's batch, then dst: never call it with dst's lock held unless you also hold src's. */
 RDS_API RdsFrameMeta *rds_copy_frame_meta_to_batch (RdsFrameMeta * src, RdsBatchMeta * dst);
+/* Deep-copy every object (display) meta of @src_list into @dst_frame_meta's pools and append the copies to its
+ * obj_meta_list (display_meta_list), after what it already holds; num_obj_meta counts them. Object parents are
+ * remapped within @src_list: a parent outside it becomes NULL. Same copy rules as rds_batch_meta_copy otherwise.
+ * NULL lists copy nothing. The source metas may be in @dst_frame_meta's own batch. Locks the source batch, then the
+ * destination's. */
+RDS_API void rds_copy_obj_meta_list (RdsObjectMetaList * src_list, RdsFrameMeta * dst_frame_meta);
+RDS_API void rds_copy_display_meta_list (RdsDisplayMetaList * src_list, RdsFrameMeta * dst_frame_meta);
 
 G_END_DECLS
 

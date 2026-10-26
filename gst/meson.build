@@ -3,6 +3,7 @@ rds_plugins = []
 subdir('common')
 subdir('rdsvideo')
 subdir('rdsmux')
+subdir('rdstiler')
 if rds_infer_enabled
   subdir('rdsinfer')
 endif

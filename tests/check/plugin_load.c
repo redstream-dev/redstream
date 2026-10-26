@@ -11,6 +11,20 @@ test_plugin_loads (void)
   gst_object_unref (plugin);
 }
 
+/* The tiler plugin is always built. */
+static void
+test_tiler_plugin (void)
+{
+  GstPlugin *plugin = gst_registry_find_plugin (gst_registry_get (), "rdstiler");
+  GstElementFactory *f = gst_element_factory_find ("rdsmultistreamtiler");
+
+  g_assert_nonnull (plugin);
+  g_assert_cmpstr (gst_plugin_get_license (plugin), ==, "LGPL");
+  g_assert_nonnull (f);
+  gst_object_unref (f);
+  gst_object_unref (plugin);
+}
+
 /* RDS_HAVE_INFER comes from the build: rdsinfer is optional (MIGraphX, libyaml, json-glib). */
 #if RDS_HAVE_INFER
 static void
@@ -43,6 +57,7 @@ main (int argc, char **argv)
   gst_init (&argc, &argv);
   g_test_init (&argc, &argv, NULL);
   g_test_add_func ("/plugin/loads", test_plugin_loads);
+  g_test_add_func ("/plugin/tiler", test_tiler_plugin);
 #if RDS_HAVE_INFER
   g_test_add_func ("/plugin/infer", test_infer_plugin);
 #endif

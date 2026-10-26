@@ -206,6 +206,71 @@ rds_copy_frame_meta_to_batch (RdsFrameMeta * src, RdsBatchMeta * dst)
   return f;
 }
 
+/* The batches of the first meta of @src_list and of @dst_frame_meta, or FALSE (with a warning) when either is
+ * missing. */
+static gboolean
+list_batches (GList * src_list, RdsFrameMeta * dst_frame_meta, RdsBatchMeta ** sb, RdsBatchMeta ** db)
+{
+  *sb = ((RdsBaseMeta *) src_list->data)->batch_meta;
+  *db = dst_frame_meta->base_meta.batch_meta;
+  if (*sb == NULL || *db == NULL) {
+    GST_WARNING ("list %p or frame meta %p has no batch (released?); not copied", src_list, dst_frame_meta);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+void
+rds_copy_obj_meta_list (RdsObjectMetaList * src_list, RdsFrameMeta * dst_frame_meta)
+{
+  RdsBatchMeta *sb, *db;
+  GHashTable *map;
+
+  g_return_if_fail (dst_frame_meta != NULL);
+  if (src_list == NULL || !list_batches (src_list, dst_frame_meta, &sb, &db))
+    return;
+
+  g_rec_mutex_lock (&sb->meta_mutex);
+  g_rec_mutex_lock (&db->meta_mutex);
+  /* parents outside the list become NULL */
+  map = g_hash_table_new (g_direct_hash, g_direct_equal);
+  for (GList * l = src_list; l != NULL; l = l->next) {
+    RdsObjectMeta *o = copy_obj (l->data, db);
+
+    if (rds_meta_attach (db, &dst_frame_meta->obj_meta_list, o, "object", dst_frame_meta)) {
+      dst_frame_meta->num_obj_meta++;
+      g_hash_table_insert (map, l->data, o);
+    } else {
+      rds_meta_release_obj (db, o);
+    }
+  }
+  remap_parents (db, src_list, map);
+  g_hash_table_unref (map);
+  g_rec_mutex_unlock (&db->meta_mutex);
+  g_rec_mutex_unlock (&sb->meta_mutex);
+}
+
+void
+rds_copy_display_meta_list (RdsDisplayMetaList * src_list, RdsFrameMeta * dst_frame_meta)
+{
+  RdsBatchMeta *sb, *db;
+
+  g_return_if_fail (dst_frame_meta != NULL);
+  if (src_list == NULL || !list_batches (src_list, dst_frame_meta, &sb, &db))
+    return;
+
+  g_rec_mutex_lock (&sb->meta_mutex);
+  g_rec_mutex_lock (&db->meta_mutex);
+  for (GList * l = src_list; l != NULL; l = l->next) {
+    RdsDisplayMeta *d = copy_display (l->data, db);
+
+    if (!rds_meta_attach (db, &dst_frame_meta->display_meta_list, d, "display", dst_frame_meta))
+      rds_meta_release_display (db, d);
+  }
+  g_rec_mutex_unlock (&db->meta_mutex);
+  g_rec_mutex_unlock (&sb->meta_mutex);
+}
+
 RdsBatchMeta *
 rds_batch_meta_copy (RdsBatchMeta * src)
 {

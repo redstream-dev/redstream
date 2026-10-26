@@ -237,6 +237,8 @@ typedef RdsTrackerState TRACKER_STATE;
 #define nvds_remove_user_meta_from_frame rds_remove_user_meta_from_frame
 #define nvds_remove_user_meta_from_object rds_remove_user_meta_from_object
 #define nvds_get_user_meta_type rds_get_user_meta_type
+#define nvds_copy_obj_meta_list rds_copy_obj_meta_list
+#define nvds_copy_display_meta_list rds_copy_display_meta_list
 #define gst_buffer_get_nvds_batch_meta gst_buffer_get_rds_batch_meta
 
 /* ---- Stream events (gst-nvevent) ---- */

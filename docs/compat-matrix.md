@@ -29,7 +29,7 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvstreamdemux` | `rdsstreamdemux` | supported | zero-copy read-only views of the batch slots; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreamdemux) |
 | `nvinfer` | `rdsinfer` | supported | primary detector only (`process-mode=1`, `network-type` 0 or 100) on MIGraphX; nvinfer config files (key file or YAML); properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
 | `nvtracker` | `rdstracker` | supported | the IOU and NvSORT trackers of NvMultiObjectTracker, on the CPU, with its YAML config files; NvDCF and NvDeepSORT configs run as NvSORT. Matches observed DeepStream 8.0 behaviour where the docs are silent; properties, config keys and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker) |
-| `nvmultistreamtiler` | `rdsmultistreamtiler` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
+| `nvmultistreamtiler` | `rdsmultistreamtiler` | supported | NV12 and RGBA `memory:RDS` batches into one tiled frame of the same format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
 | `nvdsosd` | `rdsosd` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
 | `nvdsanalytics` | `rdsanalytics` | planned | M2 | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsanalytics) |
 | `nvdslogger` | `rdslogger` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
@@ -236,6 +236,55 @@ The demux returns the combination of its pads' results: NOT_LINKED only when eve
 FLUSHING or an error from one branch stops the streaming thread for all of them, so **block or unlink a branch
 before stopping it** (a sink set to NULL while still linked returns FLUSHING, which stops every branch). Give every branch a `queue`:
 otherwise the first sink to preroll blocks the others, which share the demux's streaming thread.
+
+### `rdsmultistreamtiler` (`nvmultistreamtiler`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler))
+
+Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0 (the 8.0 page omits
+`buffer-pool-size` and `interpolation-method`). Enum nicks are Redstream's.
+
+| Property | Type | Default | Status | Notes |
+|---|---|---|---|---|
+| `rows` | uint 1.. | `1` | supported | grown when the sources do not fit (see behaviour) |
+| `columns` | uint 1.. | `1` | supported | as `rows` |
+| `width` | uint 16.. | `1920` | supported | rounded up to a multiple of 4; a change renegotiates the output caps |
+| `height` | uint 16.. | `1080` | supported | as `width` |
+| `show-source` | int -1.. | `-1` | supported | a pad index: that source alone, scaled to the whole output; read on every batch |
+| `square-seq-grid` | boolean | `FALSE` | supported | a ⌈√n⌉ × ⌈√n⌉ grid; `rows` and `columns` are ignored. Cells are still by pad index |
+| `interpolation-method` | enum 0..6 | `6` (`default`) | supported | filters as in "Transform semantics" (`default` is nearest) |
+| `buffer-pool-size` | uint 4..10 | `5` | supported | buffers in the output pool; changeable only in NULL or READY |
+| `nvbuf-memory-type` | enum 0..3 | `2` (`nvbuf-mem-cuda-device`) | supported | memory of the output buffers; changeable only in NULL or READY |
+| `gpu-id` | uint | `0` | supported | changeable only in NULL or READY |
+| `compute-hw` | enum 0..2 | `0` | supported | `2` (VIC) fails at start |
+| `custom-tile-config` | pointer, write-only | NULL | accepted no-op | reserved in DeepStream too; a non-NULL value logs one warning |
+| `qos` | boolean | `FALSE` | supported | GstBaseTransform's |
+
+Pads: `sink` and `src`, `video/x-raw(memory:RDS)` NV12 or RGBA. The output has the input's format and framerate (no
+conversion) and `width` × `height`, rounded. The input batch must be in device-accessible memory (device, pinned or
+unified); a system-memory batch is an element error (ours).
+
+#### Tiling behaviour
+
+Each row is either **matches nvmultistreamtiler (DeepStream 8.0)**: observed DeepStream 8.0 behaviour where the docs
+are silent, or **ours**: where 8.0 settles nothing or is clearly broken.
+
+| Behaviour | Status | Notes |
+|---|---|---|
+| Cell of a frame | matches nvmultistreamtiler (DeepStream 8.0) | the frame meta's `pad_index`, row-major from the top left; `source_id` plays no part. The pixels come from the batch slot at the frame's `batch_id` |
+| Grid | matches nvmultistreamtiler (DeepStream 8.0) | n = highest pad index seen + 1, from `rds-pad-added` events and frame metas. `rows` × `columns` while n fits; otherwise ⌊√n⌋ rows and ⌈n / rows⌉ columns (2: 1×2, 3: 1×3, 5: 2×3, 7: 2×4). Recomputed when a pad is added |
+| Grid after a source leaves | ours | never shrunk (8.0 not observed) |
+| Cell geometry | matches nvmultistreamtiler (DeepStream 8.0) | output size rounded up to a multiple of 4 (1001×701 gives 1004×704); cells ⌊W / columns⌋ × ⌊H / rows⌋, each rounded down to even, at (column·cell width, row·cell height) |
+| Scaling | matches nvmultistreamtiler (DeepStream 8.0) | each frame stretched over its whole cell (no letterbox), with its own size |
+| Unused cells and the strip right and below the cells | matches nvmultistreamtiler (DeepStream 8.0) | black on every output frame: NV12 Y 16, U/V 128; RGBA all bytes 0 (ours for the alpha byte, as `rdsvideoconvert`'s fill) |
+| Output meta | matches nvmultistreamtiler (DeepStream 8.0) | a batch meta with one fresh frame meta (`num_frames_in_batch` and `max_frames_in_batch` 1) holding a copy of every object and display meta of the batch; its `pad_index`, `source_id`, `batch_id`, `frame_num`, `buf_pts`, `ntp_timestamp`, `source_frame_*`, `pipeline_*` and `surface_index` are 0. Frame user meta and batch user meta are not carried. Per-source counts belong before the tiler |
+| Order of the merged objects | ours | by pad index, each pad's objects (then display metas) in its list order |
+| Meta coordinates | matches nvmultistreamtiler (DeepStream 8.0) | `rect_params` of objects and display rects: x' = cell x + x·sx, y' = cell y + y·sy, w·sx, h·sy as floats (sx = cell width / frame width); text offsets, line and arrow end points and circle centres the same, truncated to integers; circle radius × min (sx, sy), truncated. Unchanged: `font_size`, all widths, `detector_bbox_info`, `tracker_bbox_info`, `mask_params`, ids, class, confidence, labels. Not clipped to the cell |
+| A source missing from a batch | matches nvmultistreamtiler (DeepStream 8.0) | its cell keeps its last pixels and its last objects and display metas are repeated, until its `rds-stream-eos` (or `rds-pad-deleted`); then the cell is black and its meta gone. Its pixels survive a grid change (moved into the new cell) |
+| Two frames of one pad in a batch | ours | both drawn, the later on top; the later one's meta is kept |
+| `show-source` | matches nvmultistreamtiler (DeepStream 8.0) | by pad index: that frame stretched to the output with only its meta, scaled to the output; no frame for it in the batch (absent or ended): black and an empty frame meta; a value of at least rows × columns: element error on the next batch. Changes apply from the next batch. The grid keeps its cached cells meanwhile (ours) |
+| A pad the grid cannot hold | ours | a pad index whose grid would have empty cells (narrower or lower than 2 pixels) is skipped, with one element warning (8.0: fatal composite error) |
+| Empty batch | ours | no frames: the grid as it stands (cached cells, black elsewhere) with an empty frame meta (8.0 crashes on it, per the docs' troubleshooting page) |
+| Events | ours | every event goes downstream unchanged; FLUSH_STOP forgets every cached cell and meta |
+| Ready on push | ours | the composite, copies and clears are synchronous on the element's own HIP stream; the output is complete when pushed |
 
 ### `rdsinfer` (`nvinfer`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvinfer.html))
 
@@ -1100,6 +1149,8 @@ matches observed DeepStream 8.0 behaviour; rows marked "ours" are Redstream's ow
 | `nvds_remove_user_meta_from_frame` | `rds_remove_user_meta_from_frame` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `nvds_remove_user_meta_from_object` | `rds_remove_user_meta_from_object` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `nvds_get_user_meta_type` | `rds_get_user_meta_type` | supported | takes `const gchar *`, but assigning it to a pointer with DeepStream's exact prototype does not compile | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
+| `nvds_copy_obj_meta_list` | `rds_copy_obj_meta_list` | supported | appends deep copies to the frame; parents are remapped within the list (a parent outside it becomes NULL) | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
+| `nvds_copy_display_meta_list` | `rds_copy_display_meta_list` | supported | appends deep copies to the frame | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
 | `gst_buffer_get_nvds_batch_meta` | `gst_buffer_get_rds_batch_meta` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2gstnvdsmeta_8h.html) |
 | `NvDsInferTensorMeta` | `RdsInferTensorMeta` | supported | `rds/rds-infer-meta.h`; the documented fields in order; `priv_data` is rdsinfer's (it keeps the buffers alive). See the `rdsinfer` section | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferTensorMeta.html) |
 

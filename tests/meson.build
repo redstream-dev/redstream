@@ -62,6 +62,10 @@ foreach t : internal_cpu_tests
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
 endforeach
 
+# rdsmultistreamtiler's layout core: grids, cells and meta scaling (no GStreamer, no GPU).
+test('tiler_layout', executable('tiler_layout', 'check' / 'tiler_layout.c', dependencies : [rdstiler_core_dep]),
+  suite : 'cpu', env : internal_test_env, protocol : 'tap')
+
 # DeepStream apps are often C++: check that the compat header builds and works there too.
 test('compat_cpp', executable('compat_cpp', 'check' / 'compat_cpp.cpp', dependencies : [rds_dep]),
   suite : 'cpu', env : test_env, protocol : 'tap')
@@ -312,6 +316,13 @@ if rds_tracker_enabled and rds_infer_enabled
     suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,
     depends : rds_plugins)
 endif
+
+# rdsmultistreamtiler: properties and pads (cpu); tiling device batches with scripted meta (gpu).
+element_tiler_exe = executable('element_tiler', 'check' / 'element_tiler.c', dependencies : test_deps)
+test('element_tiler_cpu', element_tiler_exe, args : ['-p', '/cpu/tiler'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_tiler', element_tiler_exe, args : ['-p', '/gpu/tiler'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180, depends : rds_plugins)
 
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)])

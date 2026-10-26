@@ -15,8 +15,8 @@ Status: **pre-alpha.** Phase 0 spikes and the walking skeleton are done; the lib
 elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
 `rdsstreammux` (the default scaling mux: batches of fixed-size slots), `rdsstreamdemux` (zero-copy per-source
 views of the batch), `rdsinfer` (MIGraphX primary detector: nvinfer configs, custom bbox parsers, object and
-tensor meta) and `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs).
-Nothing here is stable.
+tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs) and
+`rdsmultistreamtiler` (batches into one tiled frame). Nothing here is stable.
 
 ## Architecture principles
 
@@ -179,6 +179,10 @@ gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; refcounted ou
                    in tests/check/infer-configs, test parser modules built from tests/check/infer-parser-*. Optional
                    (-Dinfer, default auto): needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml
                    and json-glib
+gst/rdstiler/      libgstrdstiler plugin: rdsmultistreamtiler (gstrdsmultistreamtiler.c: a canvas of the last tiled
+                   grid, per-pad cached meta, composite with rds_buf_surf_transform_composite). rds-tiler-layout is the
+                   layout core (grid, cells, meta scaling; GLib only), the static rdstiler-core the tests link. Always
+                   built
 gst/common/        static rds-plugin-common, shared by the plugins: rds-keyfile-yaml (YAML config -> GKeyFile, with the
                    OpenCV-style "%YAML:1.0" line), rds-config-parse (number and bool parsing for the key tables),
                    rds-object-style.h (the drawing defaults of the object metas rdsinfer and rdstracker create).
