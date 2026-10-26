@@ -195,7 +195,7 @@ test_order (void)
   Frame f;
   RdsObjectMeta *om;
   RdsDisplayMeta *dm;
-  /* expected (id, type, flags) in draw order */
+  /* expected (id, type, union flag) in draw order */
   struct
   {
     guint id;
@@ -265,9 +265,9 @@ test_order (void)
   g_assert_cmpuint (pass.n_cmds, ==, n);
   for (guint i = 0; i < n; i++) {
     if (cmd_id (&pass.cmds[i]) != want[i].id || pass.cmds[i].type != want[i].type
-        || pass.cmds[i].flags != want[i].flags)
+        || (pass.cmds[i].flags & RDS_OSD_CMD_UNION_NEXT) != want[i].flags)
       g_error ("command %u: id %u type %u flags %u, expected id %u type %u flags %u", i, cmd_id (&pass.cmds[i]),
-          pass.cmds[i].type, pass.cmds[i].flags, want[i].id, want[i].type, want[i].flags);
+          pass.cmds[i].type, pass.cmds[i].flags & RDS_OSD_CMD_UNION_NEXT, want[i].id, want[i].type, want[i].flags);
   }
   g_assert_cmpuint (pass.n_frames, ==, 1);
   g_assert_cmpuint (pass.frames[0].slot, ==, 0);
@@ -518,15 +518,46 @@ shape_box (const RdsOsdCmd * cmds, guint32 n, guint32 i, gint * x0, gint * y0, g
   }
 }
 
-/* Checks @pass's work items against brute force: for each slot and tile, the commands of the slot's frames (in
- * order) whose shape's box touches the tile; no item for an empty tile; items in slot, then row order. */
+/* The first and last command of the shape cmds[i] belongs to. */
 static void
+shape_range (const RdsOsdCmd * cmds, guint32 n, guint32 i, guint32 * s, guint32 * e)
+{
+  for (*s = i; *s > 0 && (cmds[*s - 1].flags & RDS_OSD_CMD_UNION_NEXT); (*s)--);
+  for (*e = i; *e + 1 < n && (cmds[*e].flags & RDS_OSD_CMD_UNION_NEXT); (*e)++);
+}
+
+/* Whether the shape cmds[s .. e] covers a pixel of the @w × @h frame in [tx0, tx1] × [ty0, ty1] (a mask: whether its
+ * box touches them; the heap is not at hand). */
+static gboolean
+shape_covers (const RdsOsdCmd * cmds, guint32 s, guint32 e, gint w, gint h, gint tx0, gint ty0, gint tx1, gint ty1)
+{
+  for (guint32 c = s; c <= e; c++) {
+    gint x0 = MAX (tx0, cmds[c].x0), x1 = MIN (MIN (tx1, cmds[c].x1), w - 1);
+    gint y0 = MAX (ty0, cmds[c].y0), y1 = MIN (MIN (ty1, cmds[c].y1), h - 1);
+
+    if (x0 > x1 || y0 > y1)
+      continue;
+    if (cmds[c].type == RDS_OSD_CMD_MASK)
+      return TRUE;
+    for (gint y = y0; y <= y1; y++)
+      for (gint x = x0; x <= x1; x++)
+        if (rds_osd_cmd_coverage (&cmds[c], x, y, NULL) != 0)
+          return TRUE;
+  }
+  return FALSE;
+}
+
+/* Checks @pass's work items against brute force: for each slot and tile, in order, the shapes of the slot's frames
+ * that cover a pixel of the tile, and only shapes whose box touches it, each whole; an item only for a tile with a
+ * shape; items in slot, then row order. Returns the number of shapes binned to tiles they don't cover. */
+static guint
 check_binning (const RdsOsdPass * pass, const Img * imgs, guint n_slots)
 {
   guint32 item = 0, list_end = 0;
   gboolean seen[8] = { FALSE };
-  guint order[8], n_order = 0;
-  GArray *want = g_array_new (FALSE, FALSE, sizeof (guint32));
+  guint order[8], n_order = 0, extra = 0;
+  GArray *boxed = g_array_new (FALSE, FALSE, sizeof (guint32)), *covered = g_array_new (FALSE, FALSE,
+      sizeof (gboolean));
 
   g_assert_cmpuint (n_slots, <=, G_N_ELEMENTS (seen));
   for (guint32 i = 0; i < pass->n_frames; i++)
@@ -537,15 +568,21 @@ check_binning (const RdsOsdPass * pass, const Img * imgs, guint n_slots)
 
   for (guint k = 0; k < n_order; k++) {
     guint slot = order[k];
-    gint tiles_x = (imgs[slot].width + RDS_OSD_TILE_SIZE - 1) / RDS_OSD_TILE_SIZE;
-    gint tiles_y = (imgs[slot].height + RDS_OSD_TILE_SIZE - 1) / RDS_OSD_TILE_SIZE;
+    gint w = imgs[slot].width, h = imgs[slot].height;
+    gint tiles_x = (w + RDS_OSD_TILE_SIZE - 1) / RDS_OSD_TILE_SIZE;
+    gint tiles_y = (h + RDS_OSD_TILE_SIZE - 1) / RDS_OSD_TILE_SIZE;
 
     for (gint ty = 0; ty < tiles_y; ty++)
       for (gint tx = 0; tx < tiles_x; tx++) {
         gint tx0 = tx * RDS_OSD_TILE_SIZE, ty0 = ty * RDS_OSD_TILE_SIZE;
         gint tx1 = tx0 + RDS_OSD_TILE_SIZE - 1, ty1 = ty0 + RDS_OSD_TILE_SIZE - 1;
+        gboolean any = FALSE;
+        guint32 at = 0, b = 0;
+        const RdsOsdWorkItem *wi;
 
-        g_array_set_size (want, 0);
+        /* the commands whose shape's box touches the tile, in order, and whether that shape covers a pixel of it */
+        g_array_set_size (boxed, 0);
+        g_array_set_size (covered, 0);
         for (guint32 fi = 0; fi < pass->n_frames; fi++) {
           const RdsOsdPlanFrame *fr = &pass->frames[fi];
 
@@ -553,33 +590,61 @@ check_binning (const RdsOsdPass * pass, const Img * imgs, guint n_slots)
             continue;
           for (guint32 c = fr->first; c < fr->first + fr->n_cmds; c++) {
             gint x0, y0, x1, y1;
+            guint32 s, e;
+            gboolean cov;
 
             shape_box (pass->cmds, pass->n_cmds, c, &x0, &y0, &x1, &y1);
-            if (x0 <= tx1 && x1 >= tx0 && y0 <= ty1 && y1 >= ty0)
-              g_array_append_val (want, c);
+            if (!(x0 <= tx1 && x1 >= tx0 && y0 <= ty1 && y1 >= ty0))
+              continue;
+            shape_range (pass->cmds, pass->n_cmds, c, &s, &e);
+            cov = shape_covers (pass->cmds, s, e, w, h, tx0, ty0, tx1, ty1);
+            any |= cov;
+            g_array_append_val (boxed, c);
+            g_array_append_val (covered, cov);
           }
         }
-        if (want->len == 0)
+        wi = item < pass->n_items ? &pass->items[item] : NULL;
+        if (wi == NULL || wi->slot != slot || wi->tile_x != tx || wi->tile_y != ty) {
+          if (any)
+            g_error ("slot %u tile %d,%d: no work item", slot, tx, ty);
           continue;
-        if (item >= pass->n_items)
-          g_error ("slot %u tile %d,%d: no work item", slot, tx, ty);
-        g_assert_cmpuint (pass->items[item].slot, ==, slot);
-        g_assert_cmpuint (pass->items[item].tile_x, ==, tx);
-        g_assert_cmpuint (pass->items[item].tile_y, ==, ty);
-        g_assert_cmpuint (pass->items[item].count, ==, want->len);
-        g_assert_cmpuint (pass->items[item].list_offset + pass->items[item].count, <=, pass->n_lists);
-        g_assert_cmpuint (memcmp (pass->lists + pass->items[item].list_offset, want->data,
-                want->len * sizeof (guint32)), ==, 0);
-        /* never ends inside a shape */
-        g_assert_false (pass->cmds[pass->lists[pass->items[item].list_offset + want->len - 1]].flags &
-            RDS_OSD_CMD_UNION_NEXT);
-        list_end = MAX (list_end, pass->items[item].list_offset + pass->items[item].count);
+        }
+        g_assert_cmpuint (wi->count, >, 0);
+        g_assert_cmpuint (wi->list_offset + wi->count, <=, pass->n_lists);
+        /* the list: a subsequence of the boxed commands, whole shapes, every covering one */
+        while (at < wi->count) {
+          guint32 c = pass->lists[wi->list_offset + at], s, e;
+
+          while (b < boxed->len && g_array_index (boxed, guint32, b) != c) {
+            if (g_array_index (covered, gboolean, b))
+              g_error ("slot %u tile %d,%d: command %u covers the tile but is not listed", slot, tx, ty,
+                  g_array_index (boxed, guint32, b));
+            b++;
+          }
+          if (b == boxed->len)
+            g_error ("slot %u tile %d,%d: command %u listed out of order or off its box", slot, tx, ty, c);
+          shape_range (pass->cmds, pass->n_cmds, c, &s, &e);
+          g_assert_cmpuint (c, ==, s);
+          g_assert_cmpuint (at + (e - s), <, wi->count);
+          for (guint32 m = s; m <= e; m++, at++, b++) {
+            g_assert_cmpuint (pass->lists[wi->list_offset + at], ==, m);
+            g_assert_cmpuint (g_array_index (boxed, guint32, b), ==, m);
+          }
+          extra += !g_array_index (covered, gboolean, b - 1);
+        }
+        for (; b < boxed->len; b++)
+          if (g_array_index (covered, gboolean, b))
+            g_error ("slot %u tile %d,%d: command %u covers the tile but is not listed", slot, tx, ty,
+                g_array_index (boxed, guint32, b));
+        list_end = MAX (list_end, wi->list_offset + wi->count);
         item++;
       }
   }
   g_assert_cmpuint (item, ==, pass->n_items);
   g_assert_cmpuint (list_end, ==, pass->n_lists);
-  g_array_unref (want);
+  g_array_unref (boxed);
+  g_array_unref (covered);
+  return extra;
 }
 
 static void
@@ -676,6 +741,46 @@ test_empty_tiles (void)
   g_assert_false (rds_osd_plan_next_pass (plan, &pass));
   frame_clear (&f);
   frame_clear (&g);
+  rds_osd_plan_free (plan);
+}
+
+/* A long diagonal line and a large ring are binned to the tiles they cover, not every tile of their boxes. */
+static void
+test_culled_tiles (void)
+{
+  RdsOsdPlan *plan = rds_osd_plan_new (RDS_OSD_MASK_HEAP_SIZE);
+  RdsOsdDrawOptions opt = options ();
+  RdsOsdPass pass;
+  Frame f;
+  RdsDisplayMeta *dm;
+  Img im;
+  guint extra;
+
+  img_init (&im, 1920, 1080);
+  frame_init (&f);
+  dm = frame_add_display (&f);
+  dm->num_lines = 1;
+  dm->line_params[0] = line (0, 0, 1919, 1079, 3, BLUE);
+  g_assert_true (plan_one (plan, &opt, &f, 1920, 1080, &pass, NULL));
+  rds_osd_plan_bin (plan, &pass);
+  extra = check_binning (&pass, &im, 1);
+  g_test_message ("diagonal line: %u tiles (box: 60 x 34), %u covering none", pass.n_items, extra);
+  /* about two tiles a column of the 60 × 34 grid */
+  g_assert_cmpuint (pass.n_items, <, 3 * 60);
+
+  dm->num_lines = 0;
+  dm->num_circles = 1;
+  dm->circle_params[0] = (RdsOSD_CircleParams) {.xc = 960,.yc = 540,.radius = 500,.circle_width = 3,.circle_color =
+        BLUE
+  };
+  g_assert_true (plan_one (plan, &opt, &f, 1920, 1080, &pass, NULL));
+  rds_osd_plan_bin (plan, &pass);
+  extra = check_binning (&pass, &im, 1);
+  g_test_message ("ring of radius 500: %u tiles (box: 33 x 34), %u covering none", pass.n_items, extra);
+  /* the circumference is ~100 tiles long */
+  g_assert_cmpuint (pass.n_items, <, 250);
+  frame_clear (&f);
+  img_clear (&im);
   rds_osd_plan_free (plan);
 }
 
@@ -1153,6 +1258,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/osd-plan/clamps", test_clamps);
   g_test_add_func ("/cpu/osd-plan/binning", test_binning);
   g_test_add_func ("/cpu/osd-plan/empty-tiles", test_empty_tiles);
+  g_test_add_func ("/cpu/osd-plan/culled-tiles", test_culled_tiles);
   g_test_add_func ("/cpu/osd-plan/text-cache", test_text_cache);
   g_test_add_func ("/cpu/osd-plan/text-keys", test_text_keys);
   g_test_add_func ("/cpu/osd-plan/slot-size", test_slot_size);

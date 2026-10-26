@@ -57,6 +57,7 @@ cmd_init (RdsOsdCmd * out, RdsOsdCmdType type, int64_t x0, int64_t y0, int64_t x
   out->x1 = (int32_t) x1;
   out->y1 = (int32_t) y1;
   out->color = *c;
+  out->flags = rds_osd_color_is_whole (c) ? RDS_OSD_CMD_WHOLE_COLOR : 0;
   return 1;
 }
 
@@ -381,7 +382,7 @@ static const uint8_t (*lut_for (LutCache * cache, const RdsOsdColor * c))[4]
   cache->color[k] = *c;
   for (unsigned d = 0; d < 256; d++) {
     cache->lut[k][d][0] = cache->lut[k][d][1] = cache->lut[k][d][2] = cache->lut[k][d][3] = (uint8_t) d;
-    rds_osd_blend (cache->lut[k][d], c, 255);
+    rds_osd_blend (cache->lut[k][d], c, 255, rds_osd_color_is_whole (c));
   }
   return (const uint8_t (*)[4]) cache->lut[k];
 }
@@ -525,7 +526,7 @@ rds_osd_shade_commands (const RdsOsdCmd * cmds, uint32_t n, const uint8_t * mask
           if (*cov == 255)
             lut_blend (px, lut);
           else if (*cov != 0)
-            rds_osd_blend (px, &cmds[i].color, *cov);
+            rds_osd_blend (px, &cmds[i].color, *cov, cmds[i].flags & RDS_OSD_CMD_WHOLE_COLOR);
         continue;
       }
       if (i == j) {
@@ -537,7 +538,8 @@ rds_osd_shade_commands (const RdsOsdCmd * cmds, uint32_t n, const uint8_t * mask
             uint8_t coverage = rds_osd_cmd_coverage (&cmds[i], (int32_t) x, y, masks);
 
             if (coverage != 0)
-              rds_osd_blend (data + (size_t) y * stride + 4 * (size_t) x, &cmds[i].color, coverage);
+              rds_osd_blend (data + (size_t) y * stride + 4 * (size_t) x, &cmds[i].color, coverage,
+                  cmds[i].flags & RDS_OSD_CMD_WHOLE_COLOR);
           }
         continue;
       }
@@ -550,7 +552,7 @@ rds_osd_shade_commands (const RdsOsdCmd * cmds, uint32_t n, const uint8_t * mask
           coverage = MAX2 (coverage, v);
         }
         if (coverage != 0)
-          rds_osd_blend (px, &cmds[j].color, coverage);
+          rds_osd_blend (px, &cmds[j].color, coverage, cmds[j].flags & RDS_OSD_CMD_WHOLE_COLOR);
       }
     }
   }

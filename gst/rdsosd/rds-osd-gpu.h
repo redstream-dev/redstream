@@ -8,7 +8,8 @@
  * and the mask bytes scattered from there into the device mask heap, a mirror of the plan's host heap (MASK commands
  * hold heap offsets). Full coverage blends through the colour's table, 256 × 4 bytes filled by rds_osd_blend as the
  * CPU path fills its own: the same bytes without the per-pixel double-precision blend (slow on small GPUs); partial
- * coverage (text edges) still blends in double precision.
+ * coverage (text edges) still blends in double precision, or in integers for opaque colours with whole channel values
+ * (rds_osd_blend); an opaque colour is stored at full coverage without a table.
  *
  * The part shared with the kernels (rds-osd-gpu.hip) is plain C with no GLib and no HIP types (streams are void *);
  * the C API below it is hidden from the HIP compiler.
@@ -49,15 +50,28 @@ typedef struct
   uint32_t src, dst, size, reserved;
 } RdsOsdGpuCopy;
 
-/* A pass in device memory. lut_of[i]: the blend table of cmds[i] (RDS_OSD_GPU_NO_LUT: none), luts: 1024 bytes a
- * table, indexed [value][channel]. */
+/* How a command's colour blends at full coverage: @solid when RDS_OSD_GPU_SOLID (an opaque colour: every pixel
+ * becomes the same), else through table @lut (RDS_OSD_GPU_NO_LUT: rds_osd_blend). */
+typedef struct
+{
+  uint32_t solid;               /* RGBA bytes in memory order */
+  uint16_t lut, flags;
+} RdsOsdGpuBlend;
+
+enum
+{
+  RDS_OSD_GPU_SOLID = 1 << 0,
+};
+
+/* A pass in device memory. blends[i]: the full-coverage blend of cmds[i]; luts: 1024 bytes a table, indexed
+ * [value][channel]. */
 typedef struct
 {
   const RdsOsdCmd *cmds;
   const uint32_t *lists;
   const RdsOsdGpuItem *items;
   const RdsOsdGpuSurface *surfaces;     /* indexed by slot */
-  const uint16_t *lut_of;
+  const RdsOsdGpuBlend *blends;
   const uint8_t *luts;
   uint32_t n_items;
   const RdsOsdGpuCopy *copies;
@@ -67,7 +81,7 @@ typedef struct
 } RdsOsdGpuJob;
 
 /* Queues the job's mask copies (if any), then the draw of its work items, on @stream (a hipStream_t) on the current
- * device. Returns 0, or -1 if a launch failed. */
+ * device. Returns 0 (hipSuccess), or the hipError_t of the launch that failed. */
 __attribute__ ((visibility ("hidden"))) int rds_osd_gpu_launch (const RdsOsdGpuJob * job, void *stream);
 
 #ifdef __cplusplus

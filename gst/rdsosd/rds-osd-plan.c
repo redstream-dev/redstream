@@ -606,6 +606,62 @@ shape_tiles (const RdsOsdCmd * cmds, const RdsOsdPlanFrame * f, guint32 i, guint
   return j;
 }
 
+/* Whether command @c can cover a pixel of tile (tx, ty): conservative (a tile with a covered pixel is never left
+ * out), exact for boxes. Segments: the ranges of d × p and d · p over the corners of the tile's pixel centres (both
+ * are linear in p) against the stroke's; rings: the nearest and farthest pixel of the tile against the band. Masks
+ * and triangles (arrow-head joins, small): their box. */
+static gboolean
+cmd_in_tile (const RdsOsdCmd * c, guint32 tx, guint32 ty)
+{
+  /* the tile's pixels inside the command's box (itself inside the frame) */
+  gint64 x0 = MAX ((gint64) tx * RDS_OSD_TILE_SIZE, c->x0), x1 = MIN ((gint64) tx * RDS_OSD_TILE_SIZE +
+      RDS_OSD_TILE_SIZE - 1, c->x1);
+  gint64 y0 = MAX ((gint64) ty * RDS_OSD_TILE_SIZE, c->y0), y1 = MIN ((gint64) ty * RDS_OSD_TILE_SIZE +
+      RDS_OSD_TILE_SIZE - 1, c->y1);
+
+  if (x0 > x1 || y0 > y1)
+    return FALSE;
+  switch (c->type) {
+    case RDS_OSD_CMD_SEGMENT:{
+      const RdsOsdSegment *sg = &c->segment;
+      gint64 cross_lo = G_MAXINT64, cross_hi = G_MININT64, dot_lo = G_MAXINT64, dot_hi = G_MININT64;
+
+      /* pixel centres of the frame: the products stay within the bounds of rds_osd_cmd_coverage */
+      for (guint k = 0; k < 4; k++) {
+        gint64 px = ((k & 1) ? x1 : x0) * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2 - sg->ax;
+        gint64 py = ((k & 2) ? y1 : y0) * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2 - sg->ay;
+        gint64 cross = sg->dx * py - sg->dy * px, dot = sg->dx * px + sg->dy * py;
+
+        cross_lo = MIN (cross_lo, cross);
+        cross_hi = MAX (cross_hi, cross);
+        dot_lo = MIN (dot_lo, dot);
+        dot_hi = MAX (dot_hi, dot);
+      }
+      return cross_hi >= -sg->t && cross_lo <= sg->t && dot_hi >= sg->dot_lo && dot_lo <= sg->dot_hi;
+    }
+    case RDS_OSD_CMD_RING:{
+      const RdsOsdRing *rg = &c->ring;
+      gint64 dx0 = x0 - rg->xc, dx1 = x1 - rg->xc, dy0 = y0 - rg->yc, dy1 = y1 - rg->yc;
+      gint64 nx = dx0 > 0 ? dx0 : dx1 < 0 ? -dx1 : 0, ny = dy0 > 0 ? dy0 : dy1 < 0 ? -dy1 : 0;
+      gint64 fx = MAX (ABS (dx0), ABS (dx1)), fy = MAX (ABS (dy0), ABS (dy1));
+
+      return nx * nx + ny * ny <= rg->d2_hi && fx * fx + fy * fy >= rg->d2_lo;
+    }
+    default:
+      return TRUE;
+  }
+}
+
+/* Whether the shape cmds[i .. j] can cover a pixel of tile (tx, ty): any of its commands can. */
+static gboolean
+shape_in_tile (const RdsOsdCmd * cmds, guint32 i, guint32 j, guint32 tx, guint32 ty)
+{
+  for (guint32 k = i; k <= j; k++)
+    if (cmd_in_tile (&cmds[k], tx, ty))
+      return TRUE;
+  return FALSE;
+}
+
 gboolean
 rds_osd_plan_next_pass (RdsOsdPlan * p, RdsOsdPass * pass)
 {
@@ -729,7 +785,7 @@ rds_osd_plan_bin (RdsOsdPlan * p, RdsOsdPass * pass)
   tiles = (guint32 *) p->tiles->data;
   memset (tiles, 0, n_tiles * sizeof (guint32));
 
-  /* each tile's count; a shape's commands go to every tile its union box touches */
+  /* each tile's count; a shape's commands go to every tile of its union box it can cover a pixel of */
   for (guint32 k = 0; k < pass->n_frames; k++) {
     const RdsOsdPlanFrame *f = &pass->frames[k];
     const Grid *g = &g_array_index (p->grids, Grid, g_array_index (p->grid_of, guint, k));
@@ -738,7 +794,8 @@ rds_osd_plan_bin (RdsOsdPlan * p, RdsOsdPass * pass)
       j = shape_tiles (pass->cmds, f, i, t);
       for (guint32 ty = t[2]; ty <= t[3]; ty++)
         for (guint32 tx = t[0]; tx <= t[1]; tx++)
-          tiles[g->base + ty * g->tiles_x + tx] += j - i + 1;
+          if (shape_in_tile (pass->cmds, i, j, tx, ty))
+            tiles[g->base + ty * g->tiles_x + tx] += j - i + 1;
     }
   }
   /* the work items of the non-empty tiles; each tile's count becomes its list's write position */
@@ -774,6 +831,8 @@ rds_osd_plan_bin (RdsOsdPlan * p, RdsOsdPass * pass)
         for (guint32 tx = t[0]; tx <= t[1]; tx++) {
           guint32 *pos = &tiles[g->base + ty * g->tiles_x + tx];
 
+          if (!shape_in_tile (pass->cmds, i, j, tx, ty))
+            continue;
           for (guint32 c = i; c <= j; c++)
             lists[(*pos)++] = c;
         }

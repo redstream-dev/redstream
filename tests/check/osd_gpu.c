@@ -361,6 +361,90 @@ test_no_luts (void)
   random_batches (FALSE, 12, 5);
 }
 
+/* Text in opaque colours with whole channel values (integer partial blends) and in others, over random bytes, with
+ * and without the tables. */
+static void
+test_whole_text (void)
+{
+  static const RdsOSD_ColorParams colors[] = { {1, 1, 1, 1}, {1, 0, 0, 1}, {0, 1, 0, 1}, {1, 1, 0, 1},
+  {0, 0, 0, 1}, {128 / 255.0, 64 / 255.0, 1, 1}, {0.3, 0.6, 0.9, 1}, {1, 1, 1, 0.7}
+  };
+  RdsOsdPlan *plan;
+  RdsOsdGpu *gpu;
+  RdsOsdDrawOptions opt = options ();
+  GRand *r;
+  const guint slots[1] = { 0 };
+
+  RDS_TEST_REQUIRE_GPU ();
+  plan = rds_osd_plan_new (RDS_OSD_MASK_HEAP_SIZE);
+  gpu = new_gpu ();
+  r = g_rand_new_with_seed (41);
+  for (guint luts = 0; luts <= 1; luts++) {
+    Frame f;
+    Slot img;
+
+    rds_osd_gpu_set_luts (gpu, luts);
+    slot_init (r, &img, 640, 480);
+    frame_init (&f);
+    for (guint i = 0; i < 48; i++) {
+      RdsObjectMeta *om = frame_add_object (&f);
+
+      g_snprintf (f.labels[i], sizeof f.labels[0], "Wg%u ÄQ", rnd (r, 0, 999));
+      set_text (&om->text_params, f.labels[i], rnd (r, 0, 600), rnd (r, 0, 460), rnd (r, 8, 30),
+          colors[i % G_N_ELEMENTS (colors)], i % 5 == 0, colors[(i + 3) % G_N_ELEMENTS (colors)]);
+    }
+    draw_batch (plan, gpu, &opt, &f, slots, 1, &img, 1, NULL);
+    check_slot (&img, 0, luts ? "whole-colour text" : "whole-colour text (no tables)");
+    slot_clear (&img);
+    frame_clear (&f);
+  }
+  g_rand_free (r);
+  rds_osd_gpu_free (gpu);
+  rds_osd_plan_free (plan);
+}
+
+/* More colours in a pass than tables (RDS_OSD_GPU_MAX_LUTS): the rest blend without one, the same bytes. */
+static void
+test_many_colors (void)
+{
+  RdsOsdPlan *plan;
+  RdsOsdGpu *gpu;
+  RdsOsdDrawOptions opt = options ();
+  GRand *r;
+  Frame f[6];
+  Slot img;
+  const guint slots[6] = { 0, 0, 0, 0, 0, 0 };
+
+  RDS_TEST_REQUIRE_GPU ();
+  plan = rds_osd_plan_new (RDS_OSD_MASK_HEAP_SIZE);
+  gpu = new_gpu ();
+  r = g_rand_new_with_seed (43);
+  slot_init (r, &img, 800, 600);
+  /* 6 × 50 overlapping filled boxes, every one its own colour, a third of them opaque */
+  for (guint k = 0; k < 6; k++) {
+    frame_init (&f[k]);
+    for (guint i = 0; i < 50; i++) {
+      RdsObjectMeta *om = frame_add_object (&f[k]);
+      RdsOSD_ColorParams c = { g_rand_double (r), g_rand_double (r), g_rand_double (r),
+        i % 3 == 0 ? 1.0 : g_rand_double_range (r, 0.1, 0.9)
+      };
+
+      om->rect_params = (RdsOSD_RectParams) {.left = rnd (r, 0, 700),.top = rnd (r, 0, 500),.width =
+            rnd (r, 20, 100),.height = rnd (r, 20, 100),.has_bg_color = 1,.bg_color = c,.border_width =
+            2,.border_color = random_color (r)
+      };
+    }
+  }
+  draw_batch (plan, gpu, &opt, f, slots, 6, &img, 1, NULL);
+  check_slot (&img, 0, "600 colours");
+  slot_clear (&img);
+  for (guint k = 0; k < 6; k++)
+    frame_clear (&f[k]);
+  g_rand_free (r);
+  rds_osd_gpu_free (gpu);
+  rds_osd_plan_free (plan);
+}
+
 /* A second identical batch finds every mask in the device heap: nothing is uploaded, the pixels still match. */
 static void
 test_mask_reuse (void)
@@ -577,9 +661,43 @@ shapes_frame (GRand * r, Frame * f, gint w, gint h)
   }
 }
 
-/* The median wall time of drawing @n_slots frames on the GPU (and on the CPU path, for comparison) of @n_boxes
- * labelled boxes each, or of lines, arrows and circles when 0, with a warm mask cache (the same batch again, as from
- * frame to frame of a video); planning excluded. */
+/* Plans @frames (frame k on slot k) and draws every pass, on the GPU or on the CPU path; returns the drawing time in
+ * ms, planning excluded. */
+static double
+draw_timed (RdsOsdPlan * plan, RdsOsdGpu * gpu, const RdsOsdDrawOptions * opt, Frame * frames, Slot * imgs,
+    const RdsOsdGpuSurface * surfaces, guint n_slots, guint * passes)
+{
+  RdsOsdPass pass;
+  GError *err = NULL;
+  double t = 0;
+
+  rds_osd_plan_begin (plan);
+  for (guint k = 0; k < n_slots; k++)
+    rds_osd_plan_add_frame (plan, opt, k, &frames[k].fm, imgs[k].width, imgs[k].height);
+  *passes = 0;
+  while (rds_osd_plan_next_pass (plan, &pass)) {
+    gint64 t0 = g_get_monotonic_time ();
+
+    if (gpu != NULL) {
+      if (!rds_osd_gpu_draw_pass (gpu, plan, &pass, surfaces, n_slots, &err))
+        g_error ("draw_pass: %s", err->message);
+    } else {
+      for (guint32 i = 0; i < pass.n_frames; i++) {
+        Slot *s = &imgs[pass.frames[i].slot];
+
+        rds_osd_shade_commands (pass.cmds + pass.frames[i].first, pass.frames[i].n_cmds, rds_osd_plan_heap (plan),
+            s->cpu, s->width, s->height, s->pitch);
+      }
+    }
+    t += (g_get_monotonic_time () - t0) / 1000.0;
+    (*passes)++;
+  }
+  return t;
+}
+
+/* The median wall time of drawing @n_slots frames of @n_boxes labelled boxes each, or of lines, arrows and circles
+ * when 0, with a warm mask cache (the same batch again, as from frame to frame of a video): GPU runs back to back
+ * (an idle iGPU clocks down between runs), then the CPU path's. */
 static void
 time_batch (const gchar * what, gint w, gint h, guint n_slots, guint n_boxes, gboolean use_luts)
 {
@@ -591,9 +709,8 @@ time_batch (const gchar * what, gint w, gint h, guint n_slots, guint n_boxes, gb
   RdsOsdGpuSurface surfaces[4];
   Slot imgs[4];
   Frame frames[4];
-  double ms[RUNS], cpu[RUNS], first = 0;
-  guint passes = 0;
-  GError *err = NULL;
+  double ms[RUNS], cpu[RUNS], first;
+  guint passes;
 
   rds_osd_gpu_set_luts (gpu, use_luts);
   for (guint k = 0; k < n_slots; k++) {
@@ -604,38 +721,15 @@ time_batch (const gchar * what, gint w, gint h, guint n_slots, guint n_boxes, gb
     else
       shapes_frame (r, &frames[k], w, h);
   }
-  for (guint run = 0; run <= RUNS; run++) {
-    RdsOsdPass pass;
-    double t = 0, tc = 0;
-
-    rds_osd_plan_begin (plan);
-    for (guint k = 0; k < n_slots; k++)
-      rds_osd_plan_add_frame (plan, &opt, k, &frames[k].fm, w, h);
-    passes = 0;
-    while (rds_osd_plan_next_pass (plan, &pass)) {
-      gint64 t0 = g_get_monotonic_time ();
-
-      if (!rds_osd_gpu_draw_pass (gpu, plan, &pass, surfaces, n_slots, &err))
-        g_error ("draw_pass: %s", err->message);
-      t += (g_get_monotonic_time () - t0) / 1000.0;
-      t0 = g_get_monotonic_time ();
-      for (guint32 i = 0; i < pass.n_frames; i++)
-        rds_osd_shade_commands (pass.cmds + pass.frames[i].first, pass.frames[i].n_cmds, rds_osd_plan_heap (plan),
-            imgs[pass.frames[i].slot].cpu, w, h, imgs[pass.frames[i].slot].pitch);
-      tc += (g_get_monotonic_time () - t0) / 1000.0;
-      passes++;
-    }
-    if (run == 0) {
-      first = t;
-    } else {
-      ms[run - 1] = t;
-      cpu[run - 1] = tc;
-    }
-  }
+  first = draw_timed (plan, gpu, &opt, frames, imgs, surfaces, n_slots, &passes);
+  for (guint run = 0; run < RUNS; run++)
+    ms[run] = draw_timed (plan, gpu, &opt, frames, imgs, surfaces, n_slots, &passes);
+  for (guint run = 0; run < RUNS; run++)
+    cpu[run] = draw_timed (plan, NULL, &opt, frames, imgs, surfaces, n_slots, &passes);
   qsort (ms, RUNS, sizeof ms[0], cmp_double);
   qsort (cpu, RUNS, sizeof cpu[0], cmp_double);
   g_test_message ("%s, %s: median %.3f ms (min %.3f, max %.3f) over %u runs, %u pass(es); first run (masks "
-      "uploaded) %.3f ms; CPU path median %.3f ms", what, use_luts ? "tables" : "double blend", ms[RUNS / 2], ms[0],
+      "uploaded) %.3f ms; CPU path median %.3f ms", what, use_luts ? "tables" : "no tables", ms[RUNS / 2], ms[0],
       ms[RUNS - 1], RUNS, passes, first, cpu[RUNS / 2]);
   for (guint k = 0; k < n_slots; k++) {
     slot_clear (&imgs[k]);
@@ -663,6 +757,8 @@ main (int argc, char **argv)
   g_test_init (&argc, &argv, NULL);
   g_test_add_func ("/gpu/osd-gpu/random", test_random);
   g_test_add_func ("/gpu/osd-gpu/no-luts", test_no_luts);
+  g_test_add_func ("/gpu/osd-gpu/whole-text", test_whole_text);
+  g_test_add_func ("/gpu/osd-gpu/many-colors", test_many_colors);
   g_test_add_func ("/gpu/osd-gpu/mask-reuse", test_mask_reuse);
   g_test_add_func ("/gpu/osd-gpu/passes", test_passes);
   g_test_add_func ("/gpu/osd-gpu/failure", test_failure);

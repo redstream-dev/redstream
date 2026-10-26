@@ -608,13 +608,53 @@ test_blend (void)
       g_assert_cmpfloat (a, <=, 0);
       continue;
     }
-    rds_osd_blend (got, &c, cov);
+    rds_osd_blend (got, &c, cov, rds_osd_color_is_whole (&c));
     g_assert_cmpuint (got[0], ==, blend_ref (MIN (a, 1.0), CLAMP (r, 0.0, 1.0) * 255.0, dst[0], cov));
     g_assert_cmpuint (got[1], ==, blend_ref (MIN (a, 1.0), 0.5 * 255.0, dst[1], cov));
     g_assert_cmpuint (got[2], ==, blend_ref (MIN (a, 1.0), 255.0, dst[2], cov));
     g_assert_cmpuint (got[3], ==, blend_ref (MIN (a, 1.0), 255.0, dst[3], cov));
   }
   g_rand_free (rand);
+}
+
+/* The integer blend of whole opaque colours against the double formula: every source value s (all channels at once,
+ * so the alpha channel's source 255 is checked too), coverage and destination byte. */
+static void
+test_blend_whole (void)
+{
+  RdsOsdColor c;
+  RdsOsdCmd cmd;
+  gint64 t0 = g_get_monotonic_time ();
+
+  for (guint s = 0; s < 256; s++) {
+    c.value[0] = c.value[1] = c.value[2] = s;
+    c.alpha = 1.0;
+    g_assert_true (rds_osd_color_is_whole (&c));
+    for (guint cov = 1; cov < 256; cov++)
+      for (guint d = 0; d < 256; d++) {
+        guint8 got[4] = { d, d, d, d };
+        guint8 want = blend_ref (1.0, s, d, cov), want_alpha = blend_ref (1.0, 255.0, d, cov);
+
+        rds_osd_blend (got, &c, cov, 1);
+        if (got[0] != want || got[1] != want || got[2] != want || got[3] != want_alpha)
+          g_error ("s %u coverage %u d %u: %u %u %u %u, want %u (alpha %u)", s, cov, d, got[0], got[1], got[2],
+              got[3], want, want_alpha);
+      }
+  }
+  g_test_message ("%u cases in %.2f s", 256 * 255 * 256, (g_get_monotonic_time () - t0) / 1e6);
+
+  /* what is whole: opaque, every channel value an integer (colour params in 1/255 steps) */
+  g_assert_cmpuint (rds_osd_color_init (&c, 1.0, 0.0, 128 / 255.0, 1.0), ==, 1);
+  g_assert_true (rds_osd_color_is_whole (&c));
+  rds_osd_color_init (&c, 1.0, 0.0, 128 / 255.0, 0.999);
+  g_assert_false (rds_osd_color_is_whole (&c));
+  rds_osd_color_init (&c, 1.0, 0.5, 0.0, 1.0);
+  g_assert_false (rds_osd_color_is_whole (&c));
+  /* and the commands built with such a colour say so */
+  g_assert_cmpuint (rds_osd_shape_box (&cmd, 0, 0, 3, 3, &RED, 8, 8), ==, 1);
+  g_assert_true (cmd.flags & RDS_OSD_CMD_WHOLE_COLOR);
+  g_assert_cmpuint (rds_osd_shape_box (&cmd, 0, 0, 3, 3, &RED_HALF, 8, 8), ==, 1);
+  g_assert_false (cmd.flags & RDS_OSD_CMD_WHOLE_COLOR);
 }
 
 static void
@@ -792,6 +832,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/osd-shapes/circle-limits", test_circle_limits);
   g_test_add_func ("/cpu/osd-shapes/mask", test_mask);
   g_test_add_func ("/cpu/osd-shapes/blend", test_blend);
+  g_test_add_func ("/cpu/osd-shapes/blend-whole", test_blend_whole);
   g_test_add_func ("/cpu/osd-shapes/order", test_order);
   g_test_add_func ("/cpu/osd-shapes/bbox-equals-per-pixel", test_bbox_equals_per_pixel);
   g_test_add_func ("/cpu/osd-shapes/headroom", test_headroom);

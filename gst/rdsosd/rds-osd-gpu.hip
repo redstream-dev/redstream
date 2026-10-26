@@ -4,8 +4,8 @@
  * The draw: one block per work item, 32 × 4 threads over the 32 × 32 tile, each thread 8 pixels of a column (rows r,
  * r + 4, ..., r + 28, so a wave's loads and stores are whole tile rows; of 1, 2, 4 and 8 pixels a thread, 8 drew
  * fastest on an RDNA2 iGPU). A thread reads its pixels once, walks the tile's command list once for all of them (the
- * same steps as rds_osd_shade_pixel, with full coverage blended through the colour's table when it has one) and
- * writes back the pixels a command changed.
+ * same steps as rds_osd_shade_pixel, with full coverage of an opaque colour stored and of another blended through
+ * the colour's table when it has one) and writes back the pixels a command changed.
  *
  * The mask upload: one launch for all the pass's copies (usually one: new masks are placed back to back), blocks of
  * 16 bytes a thread.
@@ -60,6 +60,7 @@ rds_osd_draw_kernel (RdsOsdGpuJob job)
   for (uint32_t i = 0; i < w.count; i++) {
     uint32_t k = list[i];
     const RdsOsdCmd *c = &job.cmds[k];
+    const RdsOsdGpuBlend blend = job.blends[k];
 
     /* rds_osd_cmd_coverage, with its column test done once for the rows and boxes inline */
     if (x >= c->x0 && x <= c->x1) {
@@ -87,8 +88,10 @@ rds_osd_draw_kernel (RdsOsdGpuJob job)
     for (int r = 0; r < ROWS; r++) {
       if (coverage[r] == 0)
         continue;
-      if (coverage[r] == 255 && job.lut_of[k] != RDS_OSD_GPU_NO_LUT) {
-        const uint8_t *lut = job.luts + (size_t) job.lut_of[k] * 1024;
+      if (coverage[r] == 255 && (blend.flags & RDS_OSD_GPU_SOLID)) {
+        px[r] = blend.solid;
+      } else if (coverage[r] == 255 && blend.lut != RDS_OSD_GPU_NO_LUT) {
+        const uint8_t *lut = job.luts + (size_t) blend.lut * 1024;
         uint32_t p = px[r];
 
         px[r] = lut[(p & 0xff) * 4] | (uint32_t) lut[((p >> 8) & 0xff) * 4 + 1] << 8
@@ -97,7 +100,7 @@ rds_osd_draw_kernel (RdsOsdGpuJob job)
         uint8_t b[4];
 
         memcpy (b, &px[r], 4);
-        rds_osd_blend (b, &c->color, coverage[r]);
+        rds_osd_blend (b, &c->color, coverage[r], c->flags & RDS_OSD_CMD_WHOLE_COLOR);
         memcpy (&px[r], b, 4);
       }
       coverage[r] = 0;
@@ -114,6 +117,8 @@ rds_osd_draw_kernel (RdsOsdGpuJob job)
 extern "C" int
 rds_osd_gpu_launch (const RdsOsdGpuJob * job, void *stream)
 {
+  hipError_t e;
+
   (void) hipGetLastError ();    /* clear a stale error from an earlier call */
   if (job->n_copies > 0) {
     /* up to 64 blocks a copy, of 16 bytes a thread */
@@ -122,11 +127,12 @@ rds_osd_gpu_launch (const RdsOsdGpuJob * job, void *stream)
     blocks = blocks < 1 ? 1 : blocks > 64 ? 64 : blocks;
     hipLaunchKernelGGL (rds_osd_upload_kernel, dim3 (job->n_copies * blocks), dim3 (UPLOAD_BLOCK), 0,
         (hipStream_t) stream, job->copies, job->upload, job->heap, blocks);
-    if (hipGetLastError () != hipSuccess)
-      return -1;
+    e = hipGetLastError ();
+    if (e != hipSuccess)
+      return (int) e;
   }
   if (job->n_items > 0)
     hipLaunchKernelGGL (rds_osd_draw_kernel, dim3 (job->n_items), dim3 (TILE, TILE / ROWS), 0,
         (hipStream_t) stream, *job);
-  return hipGetLastError () == hipSuccess ? 0 : -1;
+  return (int) hipGetLastError ();
 }

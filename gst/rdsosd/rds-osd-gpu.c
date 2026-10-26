@@ -30,7 +30,7 @@ struct _RdsOsdGpu
   gsize capacity;               /* of both */
   gboolean use_luts;
   GHashTable *colors;           /* RdsOsdColor * (in the pass) -> table index + 1 */
-  GArray *lut_of;               /* guint16 per command */
+  GArray *blends;               /* RdsOsdGpuBlend per command */
   GByteArray *luts;
   GArray *copies;               /* RdsOsdGpuCopy */
 };
@@ -54,22 +54,34 @@ color_equal (gconstpointer a, gconstpointer b)
   return memcmp (a, b, sizeof (RdsOsdColor)) == 0;
 }
 
-/* The table of each command that ends a shape (blended in its colour), as the CPU path fills its own: the bytes
- * rds_osd_blend gives every value at full coverage. */
+/* The full-coverage blend of each command that ends a shape (blended in its colour). An opaque colour gives every
+ * pixel the same bytes; another gets the table the CPU path fills too: the bytes rds_osd_blend gives every value. */
 static void
 build_luts (RdsOsdGpu * gpu, const RdsOsdPass * pass)
 {
   g_hash_table_remove_all (gpu->colors);
-  g_array_set_size (gpu->lut_of, pass->n_cmds);
+  g_array_set_size (gpu->blends, pass->n_cmds);
   g_byte_array_set_size (gpu->luts, 0);
   for (guint32 i = 0; i < pass->n_cmds; i++) {
     const RdsOsdCmd *c = &pass->cmds[i];
-    guint16 *lut_of = &g_array_index (gpu->lut_of, guint16, i);
-    guint index = GPOINTER_TO_UINT (g_hash_table_lookup (gpu->colors, &c->color));
+    RdsOsdGpuBlend *b = &g_array_index (gpu->blends, RdsOsdGpuBlend, i);
+    guint index;
 
-    *lut_of = RDS_OSD_GPU_NO_LUT;
+    b->solid = 0;
+    b->lut = RDS_OSD_GPU_NO_LUT;
+    b->flags = 0;
     if (!gpu->use_luts || (c->flags & RDS_OSD_CMD_UNION_NEXT))
       continue;
+    if (c->color.alpha == 1.0) {
+      guint8 px[4] = { 0, 0, 0, 0 };
+
+      /* a = 1: v = value + 0 · px + epsilon, whatever px */
+      rds_osd_blend (px, &c->color, 255, c->flags & RDS_OSD_CMD_WHOLE_COLOR);
+      memcpy (&b->solid, px, 4);
+      b->flags = RDS_OSD_GPU_SOLID;
+      continue;
+    }
+    index = GPOINTER_TO_UINT (g_hash_table_lookup (gpu->colors, &c->color));
     if (index == 0) {
       guint8 *lut;
 
@@ -81,10 +93,10 @@ build_luts (RdsOsdGpu * gpu, const RdsOsdPass * pass)
       lut = gpu->luts->data + (index - 1) * LUT_SIZE;
       for (guint d = 0; d < 256; d++) {
         memset (lut + 4 * d, (int) d, 4);
-        rds_osd_blend (lut + 4 * d, &c->color, 255);
+        rds_osd_blend (lut + 4 * d, &c->color, 255, 0);
       }
     }
-    *lut_of = (guint16) (index - 1);
+    b->lut = (guint16) (index - 1);
   }
 }
 
@@ -160,9 +172,10 @@ draw_pass (RdsOsdGpu * gpu, RdsOsdPlan * plan, RdsOsdPass * pass, const RdsOsdGp
     guint n_surfaces, GError ** error)
 {
   const guint8 *host_heap = rds_osd_plan_heap (plan);
-  gsize at_surfaces, at_cmds, at_lists, at_items, at_lut_of, at_luts, at_copies, at_upload, size;
+  gsize at_surfaces, at_cmds, at_lists, at_items, at_blends, at_luts, at_copies, at_upload, size;
   guint32 max_copy = 0, upload_size = 0;
   RdsOsdGpuJob job;
+  int launched;
 
   if (!surfaces_ok (pass, surfaces, n_surfaces, error))
     return FALSE;
@@ -173,9 +186,13 @@ draw_pass (RdsOsdGpu * gpu, RdsOsdPlan * plan, RdsOsdPass * pass, const RdsOsdGp
     const RdsOsdMaskUpload *up = &pass->uploads[i];
     RdsOsdGpuCopy c = { upload_size, up->offset, up->size, 0 };
 
-    if ((guint64) up->offset + up->size > gpu->heap_size || i >= MAX_COPIES) {
+    if ((guint64) up->offset + up->size > gpu->heap_size) {
       g_set_error (error, RDS_OSD_GPU_ERROR, 0, "mask upload %u+%u outside the %" G_GSIZE_FORMAT "-byte heap",
           up->offset, up->size, gpu->heap_size);
+      return FALSE;
+    }
+    if (i >= MAX_COPIES) {
+      g_set_error (error, RDS_OSD_GPU_ERROR, 0, "more than %d mask uploads in a pass", MAX_COPIES);
       return FALSE;
     }
     g_array_append_val (gpu->copies, c);
@@ -189,8 +206,8 @@ draw_pass (RdsOsdGpu * gpu, RdsOsdPlan * plan, RdsOsdPass * pass, const RdsOsdGp
   at_cmds = align16 (at_surfaces + n_surfaces * sizeof (RdsOsdGpuSurface));
   at_lists = align16 (at_cmds + (gsize) pass->n_cmds * sizeof (RdsOsdCmd));
   at_items = align16 (at_lists + (gsize) pass->n_lists * sizeof (guint32));
-  at_lut_of = align16 (at_items + (gsize) pass->n_items * sizeof (RdsOsdGpuItem));
-  at_luts = align16 (at_lut_of + (gsize) pass->n_cmds * sizeof (guint16));
+  at_blends = align16 (at_items + (gsize) pass->n_items * sizeof (RdsOsdGpuItem));
+  at_luts = align16 (at_blends + (gsize) pass->n_cmds * sizeof (RdsOsdGpuBlend));
   at_copies = align16 (at_luts + gpu->luts->len);
   at_upload = align16 (at_copies + gpu->copies->len * sizeof (RdsOsdGpuCopy));
   size = at_upload + upload_size;
@@ -202,7 +219,7 @@ draw_pass (RdsOsdGpu * gpu, RdsOsdPlan * plan, RdsOsdPass * pass, const RdsOsdGp
   stage (gpu, at_cmds, pass->cmds, (gsize) pass->n_cmds * sizeof (RdsOsdCmd));
   stage (gpu, at_lists, pass->lists, (gsize) pass->n_lists * sizeof (guint32));
   stage (gpu, at_items, pass->items, (gsize) pass->n_items * sizeof (RdsOsdGpuItem));
-  stage (gpu, at_lut_of, gpu->lut_of->data, (gsize) pass->n_cmds * sizeof (guint16));
+  stage (gpu, at_blends, gpu->blends->data, (gsize) pass->n_cmds * sizeof (RdsOsdGpuBlend));
   stage (gpu, at_luts, gpu->luts->data, gpu->luts->len);
   stage (gpu, at_copies, gpu->copies->data, gpu->copies->len * sizeof (RdsOsdGpuCopy));
   for (guint32 i = 0; i < gpu->copies->len; i++) {
@@ -219,7 +236,7 @@ draw_pass (RdsOsdGpu * gpu, RdsOsdPlan * plan, RdsOsdPass * pass, const RdsOsdGp
     .lists = (const uint32_t *) (gpu->block + at_lists),
     .items = (const RdsOsdGpuItem *) (gpu->block + at_items),
     .surfaces = (const RdsOsdGpuSurface *) (gpu->block + at_surfaces),
-    .lut_of = (const uint16_t *) (gpu->block + at_lut_of),
+    .blends = (const RdsOsdGpuBlend *) (gpu->block + at_blends),
     .luts = gpu->block + at_luts,
     .n_items = pass->n_items,
     .copies = (const RdsOsdGpuCopy *) (gpu->block + at_copies),
@@ -228,9 +245,10 @@ draw_pass (RdsOsdGpu * gpu, RdsOsdPlan * plan, RdsOsdPass * pass, const RdsOsdGp
     .max_copy = max_copy,
     .heap = gpu->heap,
   };
-  if (rds_osd_gpu_launch (&job, gpu->stream) != 0) {
+  launched = rds_osd_gpu_launch (&job, gpu->stream);
+  if (launched != 0) {
     g_set_error (error, RDS_OSD_GPU_ERROR, 0, "drawing kernel launch failed: %s",
-        hipGetErrorString (hipGetLastError ()));
+        hipGetErrorString ((hipError_t) launched));
     return FALSE;
   }
   return TRUE;
@@ -276,7 +294,7 @@ rds_osd_gpu_new (gsize heap_size, GError ** error)
   gpu->heap_size = heap_size;
   gpu->use_luts = TRUE;
   gpu->colors = g_hash_table_new (color_hash, color_equal);
-  gpu->lut_of = g_array_new (FALSE, FALSE, sizeof (guint16));
+  gpu->blends = g_array_new (FALSE, FALSE, sizeof (RdsOsdGpuBlend));
   gpu->luts = g_byte_array_new ();
   gpu->copies = g_array_new (FALSE, FALSE, sizeof (RdsOsdGpuCopy));
   if (!hip_ok (hipStreamCreateWithFlags (&gpu->stream, hipStreamNonBlocking), "hipStreamCreateWithFlags", error)
@@ -303,7 +321,7 @@ rds_osd_gpu_free (RdsOsdGpu * gpu)
   if (gpu->stream != NULL)
     (void) hipStreamDestroy (gpu->stream);
   g_hash_table_unref (gpu->colors);
-  g_array_unref (gpu->lut_of);
+  g_array_unref (gpu->blends);
   g_byte_array_unref (gpu->luts);
   g_array_unref (gpu->copies);
   g_free (gpu);

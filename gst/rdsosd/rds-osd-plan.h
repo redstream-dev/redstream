@@ -46,7 +46,8 @@ typedef struct
 
 /* A non-empty tile of a slot: the pixels [tile_x · 32, tile_x · 32 + 31] × [tile_y · 32, tile_y · 32 + 31] within the
  * frame, shaded with the commands lists[list_offset .. list_offset + count − 1] (indices into the pass's cmds, in
- * draw order: every command whose bounding box touches the tile, a shape's commands all or none). */
+ * draw order: every shape that covers a pixel of the tile, perhaps a few more whose bounding box touches it but which
+ * cover none, a shape's commands all or none). */
 typedef struct
 {
   guint32 slot;

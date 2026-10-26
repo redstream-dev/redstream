@@ -16,7 +16,8 @@
  *
  * Blend (DeepStream 8.0 behaviour): out = a·src + (1 − a)·dst per channel, truncated, with a = alpha × coverage /
  * 255; the alpha byte blends the same way with src 255. In double precision with no fused multiply-add (contraction
- * is off here and in the build), so the CPU and the GPU round alike.
+ * is off here and in the build), so the CPU and the GPU round alike; an opaque colour with whole channel values
+ * blends in integers instead, which gives the same bytes (see rds_osd_blend).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_OSD_SHAPES_H
 #define RDS_OSD_SHAPES_H
@@ -66,6 +67,7 @@ typedef enum
 enum
 {
   RDS_OSD_CMD_UNION_NEXT = 1 << 0,
+  RDS_OSD_CMD_WHOLE_COLOR = 1 << 1,     /* the colour is opaque with whole channel values (rds_osd_color_is_whole) */
 };
 
 /* A colour ready to blend: the channel values (0..255) and an alpha in (0, 1]. */
@@ -190,13 +192,39 @@ rds_osd_cmd_coverage (const RdsOsdCmd * c, int32_t x, int32_t y, const uint8_t *
   }
 }
 
-/* Blends @color into the RGBA pixel @px at @coverage (1..255). */
+/* Whether @color is opaque with whole channel values (as colour params that are multiples of 1/255 give). */
+RDS_OSD_FN int
+rds_osd_color_is_whole (const RdsOsdColor * color)
+{
+  for (int i = 0; i < 3; i++)
+    if (color->value[i] != (double) (int) color->value[i])
+      return 0;
+  return color->alpha == 1.0;
+}
+
+/* Blends @color into the RGBA pixel @px at @coverage (1..255); @whole: rds_osd_color_is_whole (@color), else 0.
+ *
+ * A whole colour blends in integers: out = ⌊(c·s + (255 − c)·d) / 255⌋ for coverage c, source s and destination d,
+ * the same bytes as the double formula. With alpha 1, that formula computes k / 255 for the integer k = c·s +
+ * (255 − c)·d, within 1e-13 (a handful of roundings of values below 2^9). If k / 255 is a whole number, the
+ * epsilon (1e-6) lifts any rounding below it back over; otherwise its fraction is between 1/255 and 254/255, and
+ * neither the error nor the epsilon reaches a whole number. k / 255 <= 255, so the clamp never differs either. The
+ * osd_shapes blend test checks every s, c and d. */
 RDS_OSD_FN void
-rds_osd_blend (uint8_t * px, const RdsOsdColor * color, uint8_t coverage)
+rds_osd_blend (uint8_t * px, const RdsOsdColor * color, uint8_t coverage, int whole)
 {
   RDS_OSD_NO_CONTRACT;
-  double a = coverage == 255 ? color->alpha : color->alpha * coverage / 255.0;
+  double a;
 
+  if (whole) {
+    for (int i = 0; i < 4; i++) {
+      uint32_t src = i < 3 ? (uint32_t) color->value[i] : 255;
+
+      px[i] = (uint8_t) ((coverage * src + (255u - coverage) * px[i]) / 255u);
+    }
+    return;
+  }
+  a = coverage == 255 ? color->alpha : color->alpha * coverage / 255.0;
   for (int i = 0; i < 4; i++) {
     double v = a * (i < 3 ? color->value[i] : 255.0) + (1.0 - a) * px[i] + RDS_OSD_BLEND_EPSILON;
 
@@ -223,7 +251,7 @@ rds_osd_shade_pixel (const RdsOsdCmd * cmds, const uint32_t * list, uint32_t n, 
     if ((c->flags & RDS_OSD_CMD_UNION_NEXT) && i + 1 < n)
       continue;
     if (coverage != 0)
-      rds_osd_blend (rgba, &c->color, coverage);
+      rds_osd_blend (rgba, &c->color, coverage, c->flags & RDS_OSD_CMD_WHOLE_COLOR);
     coverage = 0;
   }
 }
