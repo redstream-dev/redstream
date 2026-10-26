@@ -28,6 +28,12 @@ G_BEGIN_DECLS
 #define RDS_OSD_MASK_HEAP_SIZE (8 * 1024 * 1024)
 /* masks start at multiples of this in the heap */
 #define RDS_OSD_MASK_ALIGN 16
+/* frames wider or taller than this, or of more than RDS_OSD_MAX_PLAN_TILES tiles, are not drawn (ours) */
+#define RDS_OSD_MAX_PLAN_FRAME RDS_OSD_MAX_COORD
+#define RDS_OSD_MAX_PLAN_TILES (1 << 20)
+/* the binning of a pass (its tile lists and its slots' tile counts) takes at most this many 32-bit words, beyond one
+ * shape alone: a batch that would need more is planned in more passes */
+#define RDS_OSD_PASS_BUDGET ((guint64) 1 << 26)
 
 /* One frame's commands in a pass: cmds[first .. first + n_cmds − 1] of the pass, drawn on batch slot @slot (a
  * @width × @height plane). A slot can have several frames (frame metas sharing a batch_id), drawn in order. */
@@ -43,10 +49,16 @@ typedef struct
  * draw order: every command whose bounding box touches the tile, a shape's commands all or none). */
 typedef struct
 {
-  guint32 slot, tile_x, tile_y, list_offset, count;
+  guint32 slot;
+  guint16 tile_x, tile_y;       /* a frame is at most 65536 tiles a side (RDS_OSD_MAX_PLAN_FRAME) */
+  guint32 list_offset, count;
 } RdsOsdWorkItem;
 
-/* Mask bytes new in a pass: heap[offset .. offset + size − 1], to copy to the GPU's heap before drawing it. */
+G_STATIC_ASSERT (sizeof (RdsOsdWorkItem) == 16);
+G_STATIC_ASSERT (RDS_OSD_MAX_PLAN_FRAME / RDS_OSD_TILE_SIZE <= 65536);
+
+/* Mask bytes new in a pass: heap[offset .. offset + size − 1], to copy to the GPU's heap before drawing it (masks
+ * placed back to back share one upload). */
 typedef struct
 {
   guint32 offset, size;
@@ -62,6 +74,7 @@ typedef struct
   guint32 n_frames;
   const RdsOsdMaskUpload *uploads;
   guint32 n_uploads;
+  guint32 n_new_masks;          /* masks rasterized for this pass */
   const RdsOsdWorkItem *items;
   guint32 n_items;
   const guint32 *lists;
@@ -91,6 +104,13 @@ RdsOsdDrawFlags rds_osd_plan_add_frame (RdsOsdPlan * plan, const RdsOsdDrawOptio
 /* The batch's next pass in @pass, its new masks rasterized into the heap; FALSE when every command has been
  * planned (a batch without commands has no pass). */
 gboolean rds_osd_plan_next_pass (RdsOsdPlan * plan, RdsOsdPass * pass);
+
+/* Empties the mask cache: the next passes rasterize and upload every mask they use again (after the GPU's heap was
+ * lost or reallocated). */
+void rds_osd_plan_drop_masks (RdsOsdPlan * plan);
+
+/* The binning budget of a pass in 32-bit words (RDS_OSD_PASS_BUDGET by default; smaller in tests). */
+void rds_osd_plan_set_pass_budget (RdsOsdPlan * plan, guint64 words);
 
 /* Fills @pass's work items and lists: for each slot in the order of its first frame, its non-empty tiles in row
  * order. */

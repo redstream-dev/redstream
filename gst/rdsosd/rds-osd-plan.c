@@ -6,7 +6,8 @@
  * one array. A text's MASK command then names a mask request (its index, in place of the heap offset), and the text's
  * layout is cached.
  * rds_osd_plan_next_pass walks the commands from where the last pass ended, finds or places each mask in the heap
- * (rasterizing the new ones) and ends the pass before the first mask that does not fit beside the ones the pass uses.
+ * (rasterizing the new ones) and ends the pass before the first mask that does not fit beside the ones the pass uses,
+ * or before the first shape that would take the pass's binning past its budget.
  * Shapes have hard edges (as DeepStream 8.0's GPU mode draws them); text is rasterized by Pango into A8 masks with
  * greyscale antialiasing, the only use of Cairo.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
@@ -20,8 +21,18 @@
 #define TEXT_DPI 96.0
 /* font sizes above this are drawn this size (ours: keeps Pango's fixed-point sizes in range) */
 #define MAX_FONT_SIZE 1024
-/* the layout cache is emptied when it holds this many texts */
+/* the layout cache is emptied when it holds this many texts; the font cache, at the start of a batch, when it holds
+ * more than this many fonts */
 #define MAX_LAYOUTS 4096
+#define MAX_FONTS 256
+
+/* A slot's tile grid in the pass: its tiles are tiles[base .. base + tiles_x · tiles_y − 1], in row order. */
+typedef struct
+{
+  guint32 slot, tiles_x, tiles_y, base;
+} Grid;
+
+#define TILES(n) (((guint32) (n) + RDS_OSD_TILE_SIZE - 1) / RDS_OSD_TILE_SIZE)
 
 /* A text's extents, by its text key: "<length of font>:<font><size>:<text>" (the font's length makes it
  * unambiguous whatever the font and text contain). */
@@ -40,11 +51,12 @@ typedef struct
   GList link;                   /* in the LRU queue, least recently used first */
 } Mask;
 
-/* A text mask the batch needs: @text in @desc with its layout origin at (dx, dy) of an mw × mh A8 mask. */
+/* A text mask the batch needs: its text in @desc with the layout origin at (dx, dy) of an mw × mh A8 mask. Its key
+ * and text are offsets into the batch's key arena (which moves while the batch is built). */
 typedef struct
 {
-  gchar *key;                   /* "<dx>,<dy>,<mw>,<mh>," and the text key */
-  gchar *text;                  /* valid UTF-8 */
+  gsize key;                    /* "<dx>,<dy>,<mw>,<mh>," and the text key */
+  gsize text;                   /* the text as given (the end of the key) */
   const PangoFontDescription *desc;
   gint dx, dy, mw, mh, stride;
 } MaskRequest;
@@ -56,6 +68,7 @@ struct _RdsOsdPlan
   PangoLayout *layout;
   GHashTable *fonts;            /* "<size>:<name>" -> PangoFontDescription */
   GHashTable *layouts;          /* text key -> Layout */
+  GString *font_key, *text_key; /* scratch */
 
   /* the mask heap */
   guint8 *heap;
@@ -70,7 +83,10 @@ struct _RdsOsdPlan
   guint32 n_cmds, cmds_size;
   GArray *frames;               /* RdsOsdPlanFrame, first indexing the batch's commands */
   GArray *requests;             /* MaskRequest */
+  GString *keys;                /* the requests' keys, each NUL-terminated */
   guint32 next_cmd;             /* where the next pass starts */
+  guint next_frame;             /* the frame next_cmd is in */
+  guint64 pass_budget;          /* words of tile lists and tile counts a pass may need */
   gboolean started;             /* a pass has been planned */
   /* the current frame while adding it */
   gint width, height;
@@ -81,6 +97,10 @@ struct _RdsOsdPlan
   GArray *items;                /* RdsOsdWorkItem */
   GArray *lists;                /* guint32 */
   GArray *tiles;                /* guint32 per tile: counts, then write positions */
+  GArray *pass_slots;           /* guint32: the slots of the pass, in the order of their first frame */
+  GArray *grids;                /* Grid per pass slot */
+  GArray *grid_of;              /* guint per pass frame: its grid */
+  guint32 n_new_masks;
 };
 
 /* Room for @n more commands at p->cmds + p->n_cmds; the builder's count is then added to p->n_cmds. */
@@ -201,18 +221,17 @@ build_circle (RdsOsdPlan * p, const RdsOSD_CircleParams * c)
 static const PangoFontDescription *
 font_for (RdsOsdPlan * p, const gchar * name, guint size)
 {
-  gchar *key = g_strdup_printf ("%u:%s", size, name != NULL ? name : "");
-  PangoFontDescription *desc = g_hash_table_lookup (p->fonts, key);
+  PangoFontDescription *desc;
 
-  if (desc != NULL) {
-    g_free (key);
+  g_string_printf (p->font_key, "%u:%s", size, name != NULL ? name : "");
+  desc = g_hash_table_lookup (p->fonts, p->font_key->str);
+  if (desc != NULL)
     return desc;
-  }
   desc = pango_font_description_from_string (name != NULL ? name : "");
   if (pango_font_description_get_family (desc) == NULL || *pango_font_description_get_family (desc) == '\0')
     pango_font_description_set_family (desc, RDS_OSD_DEFAULT_FONT);
   pango_font_description_set_size (desc, (gint) size * PANGO_SCALE);
-  g_hash_table_insert (p->fonts, key, desc);
+  g_hash_table_insert (p->fonts, g_strdup (p->font_key->str), desc);
   return desc;
 }
 
@@ -235,7 +254,7 @@ set_layout (RdsOsdPlan * p, const PangoFontDescription * desc, const gchar * tex
  * extents plus padding (about 10 px left and right and 5 px above and below at size 20: ours, size / 2 and size / 4);
  * with set_bg_clr it is filled with text_bg_clr, then the text is drawn in font_color. Not moved into the frame,
  * clipped at its edges. font_size 0, NULL or empty text draw nothing, not even the box. The glyphs are a mask request,
- * rasterized when a pass places it. */
+ * rasterized when a pass places it. A text whose layout is cached allocates nothing here. */
 static void
 build_text (RdsOsdPlan * p, const RdsOSD_TextParams * t)
 {
@@ -245,7 +264,7 @@ build_text (RdsOsdPlan * p, const RdsOSD_TextParams * t)
   const PangoFontDescription *desc;
   gdouble ox, oy, x0, y0, x1, y1;
   gint mw, mh, mstride;
-  gchar *key;
+  gsize text_at;
   Layout *lay;
   RdsOsdColor c;
   MaskRequest req;
@@ -253,8 +272,11 @@ build_text (RdsOsdPlan * p, const RdsOSD_TextParams * t)
   if (size == 0 || t->display_text == NULL || t->display_text[0] == '\0' || bx >= p->width || by >= p->height)
     return;
   desc = font_for (p, t->font_params.font_name, size);
-  key = g_strdup_printf ("%zu:%s%u:%s", strlen (font), font, size, t->display_text);
-  lay = g_hash_table_lookup (p->layouts, key);
+  /* the text key: "<length of font>:<font><size>:<text>" */
+  g_string_printf (p->text_key, "%zu:%s%u:", strlen (font), font, size);
+  text_at = p->text_key->len;
+  g_string_append (p->text_key, t->display_text);
+  lay = g_hash_table_lookup (p->layouts, p->text_key->str);
   if (lay == NULL) {
     gchar *valid = valid_text (t->display_text);
 
@@ -264,7 +286,7 @@ build_text (RdsOsdPlan * p, const RdsOSD_TextParams * t)
     pango_layout_get_pixel_extents (p->layout, &lay->ink, &lay->logical);
     if (g_hash_table_size (p->layouts) >= MAX_LAYOUTS)
       g_hash_table_remove_all (p->layouts);
-    g_hash_table_insert (p->layouts, g_strdup (key), lay);
+    g_hash_table_insert (p->layouts, g_strdup (p->text_key->str), lay);
   }
 
   if (t->set_bg_clr && color_init (&c, &t->text_bg_clr))
@@ -278,23 +300,20 @@ build_text (RdsOsdPlan * p, const RdsOSD_TextParams * t)
   y0 = floor (MAX (oy + lay->ink.y - 1, 0));
   x1 = ceil (MIN (ox + lay->ink.x + lay->ink.width + 1, p->width - 1));
   y1 = ceil (MIN (oy + lay->ink.y + lay->ink.height + 1, p->height - 1));
-  if (!color_init (&c, &t->font_params.font_color) || !(x0 <= x1 && y0 <= y1)) {
-    g_free (key);
+  if (!color_init (&c, &t->font_params.font_color) || !(x0 <= x1 && y0 <= y1))
     return;
-  }
   mw = (gint) x1 - (gint) x0 + 1;
   mh = (gint) y1 - (gint) y0 + 1;
   mstride = cairo_format_stride_for_width (CAIRO_FORMAT_A8, mw);
   /* ours: a text whose mask is larger than the heap is not drawn (its box is). Only absurd texts: a mask is clipped
    * to the frame and fonts to MAX_FONT_SIZE points. */
-  if (((gsize) mstride * mh + RDS_OSD_MASK_ALIGN - 1) / RDS_OSD_MASK_ALIGN * RDS_OSD_MASK_ALIGN > p->heap_size) {
-    g_free (key);
+  if (((gsize) mstride * mh + RDS_OSD_MASK_ALIGN - 1) / RDS_OSD_MASK_ALIGN * RDS_OSD_MASK_ALIGN > p->heap_size)
     return;
-  }
   /* cached by text, font and size, and by where the frame's edge clips it: (dx, dy, mw, mh) */
-  req.key = g_strdup_printf ("%d,%d,%d,%d,%s", (gint) (ox - x0), (gint) (oy - y0), mw, mh, key);
-  g_free (key);
-  req.text = valid_text (t->display_text);
+  req.key = p->keys->len;
+  g_string_append_printf (p->keys, "%d,%d,%d,%d,", (gint) (ox - x0), (gint) (oy - y0), mw, mh);
+  req.text = p->keys->len + text_at;
+  g_string_append_len (p->keys, p->text_key->str, (gssize) p->text_key->len + 1);
   req.desc = desc;
   req.dx = (gint) (ox - x0);
   req.dy = (gint) (oy - y0);
@@ -307,8 +326,7 @@ build_text (RdsOsdPlan * p, const RdsOSD_TextParams * t)
     g_array_append_val (p->requests, req);
     p->n_cmds += 1;
   } else {
-    g_free (req.key);
-    g_free (req.text);
+    g_string_truncate (p->keys, req.key);
   }
 }
 
@@ -320,11 +338,15 @@ rds_osd_plan_add_frame (RdsOsdPlan * p, const RdsOsdDrawOptions * opt, guint slo
 {
   RdsOsdDrawFlags flags = 0;
   GList *objs = frame != NULL ? frame->obj_meta_list : NULL, *dms = frame != NULL ? frame->display_meta_list : NULL;
-  RdsOsdPlanFrame bf = { slot, width, height, p->n_cmds, 0 };
+  RdsOsdPlanFrame bf;
 
   g_return_val_if_fail (p != NULL && opt != NULL, 0);
   g_return_val_if_fail (!p->started, 0);
   if (width <= 0 || height <= 0)
+    return 0;
+  /* ours: larger frames are not drawn (tile numbers are 16-bit, and a frame's tile counts stay bounded) */
+  if (width > RDS_OSD_MAX_PLAN_FRAME || height > RDS_OSD_MAX_PLAN_FRAME
+      || (guint64) TILES (width) * TILES (height) > RDS_OSD_MAX_PLAN_TILES)
     return 0;
   for (guint i = 0; i < p->frames->len; i++) {
     const RdsOsdPlanFrame *f = &g_array_index (p->frames, RdsOsdPlanFrame, i);
@@ -335,6 +357,8 @@ rds_osd_plan_add_frame (RdsOsdPlan * p, const RdsOsdDrawOptions * opt, guint slo
       return 0;
     }
   }
+  bf = (RdsOsdPlanFrame) {
+  slot, width, height, p->n_cmds, 0};
   p->width = width;
   p->height = height;
 
@@ -400,13 +424,6 @@ rds_osd_plan_add_frame (RdsOsdPlan * p, const RdsOsdDrawOptions * opt, guint slo
   return flags;
 }
 
-static void
-request_clear (MaskRequest * req)
-{
-  g_free (req->key);
-  g_free (req->text);
-}
-
 void
 rds_osd_plan_begin (RdsOsdPlan * p)
 {
@@ -414,11 +431,22 @@ rds_osd_plan_begin (RdsOsdPlan * p)
   p->n_cmds = 0;
   g_array_set_size (p->frames, 0);
   g_array_set_size (p->requests, 0);
+  g_string_truncate (p->keys, 0);
   p->next_cmd = 0;
+  p->next_frame = 0;
   p->started = FALSE;
+  /* the requests of the last batch held its font descriptions */
+  if (g_hash_table_size (p->fonts) > MAX_FONTS)
+    g_hash_table_remove_all (p->fonts);
 }
 
 /* ---- the mask heap ---- */
+
+static gsize
+mask_aligned (gsize size)
+{
+  return (size + RDS_OSD_MASK_ALIGN - 1) / RDS_OSD_MASK_ALIGN * RDS_OSD_MASK_ALIGN;
+}
 
 static void
 mask_free (Mask * m)
@@ -433,6 +461,15 @@ mask_evict (RdsOsdPlan * p, Mask * m)
   g_queue_unlink (&p->lru, &m->link);
   g_ptr_array_remove (p->by_offset, m);
   g_hash_table_remove (p->masks, m->key);
+}
+
+void
+rds_osd_plan_drop_masks (RdsOsdPlan * p)
+{
+  g_return_if_fail (p != NULL);
+  g_ptr_array_set_size (p->by_offset, 0);
+  g_queue_init (&p->lru);
+  g_hash_table_remove_all (p->masks);
 }
 
 /* The first gap of @size bytes in the heap: its offset, and where it goes in by_offset. */
@@ -459,11 +496,14 @@ first_fit (RdsOsdPlan * p, gsize size, guint32 * offset, guint * index)
 static void
 rasterize (RdsOsdPlan * p, const MaskRequest * req, guint32 offset)
 {
+  gchar *valid = valid_text (p->keys->str + req->text);
   cairo_surface_t *surface;
   cairo_t *cr;
 
-  memset (p->heap + offset, 0, (gsize) req->stride * req->mh);
-  set_layout (p, req->desc, req->text);
+  /* the alignment padding too: uploads of neighbouring masks are merged */
+  memset (p->heap + offset, 0, mask_aligned ((gsize) req->stride * req->mh));
+  set_layout (p, req->desc, valid);
+  g_free (valid);
   surface = cairo_image_surface_create_for_data (p->heap + offset, CAIRO_FORMAT_A8, req->mw, req->mh, req->stride);
   cr = cairo_create (surface);
   cairo_set_antialias (cr, CAIRO_ANTIALIAS_NONE);
@@ -474,13 +514,17 @@ rasterize (RdsOsdPlan * p, const MaskRequest * req, guint32 offset)
   cairo_surface_destroy (surface);
 }
 
-/* Finds or places @req's mask for this pass, evicting the least recently used masks this pass does not use; FALSE
- * when it does not fit beside them. */
+/* Finds or places @req's mask for this pass, evicting the least recently used masks this pass does not use (those
+ * the rest of the batch does not need first); FALSE when it does not fit beside them. Each eviction rescans the heap
+ * and the LRU queue: quadratic in the number of masks when a fragmented heap needs many evictions for one mask, which
+ * stays cheap for the few hundred masks a heap holds. */
 static gboolean
 mask_place (RdsOsdPlan * p, const MaskRequest * req, guint32 * offset)
 {
-  Mask *m = g_hash_table_lookup (p->masks, req->key);
-  gsize size = ((gsize) req->stride * req->mh + RDS_OSD_MASK_ALIGN - 1) / RDS_OSD_MASK_ALIGN * RDS_OSD_MASK_ALIGN;
+  const gchar *key = p->keys->str + req->key;
+  Mask *m = g_hash_table_lookup (p->masks, key);
+  gsize size = mask_aligned ((gsize) req->stride * req->mh);
+  RdsOsdMaskUpload *last;
   guint index;
 
   if (m != NULL) {
@@ -511,7 +555,7 @@ mask_place (RdsOsdPlan * p, const MaskRequest * req, guint32 * offset)
     mask_evict (p, victim);
   }
   m = g_new0 (Mask, 1);
-  m->key = g_strdup (req->key);
+  m->key = g_strdup (key);
   m->offset = *offset;
   m->size = (guint32) size;
   m->pass = p->pass_serial;
@@ -520,7 +564,12 @@ mask_place (RdsOsdPlan * p, const MaskRequest * req, guint32 * offset)
   g_ptr_array_insert (p->by_offset, (gint) index, m);
   g_hash_table_insert (p->masks, m->key, m);
   rasterize (p, req, *offset);
-  {
+  p->n_new_masks++;
+  /* one upload for masks placed back to back */
+  last = p->uploads->len > 0 ? &g_array_index (p->uploads, RdsOsdMaskUpload, p->uploads->len - 1) : NULL;
+  if (last != NULL && mask_aligned ((gsize) last->offset + last->size) == *offset) {
+    last->size = *offset - last->offset + (guint32) req->stride * (guint32) req->mh;
+  } else {
     RdsOsdMaskUpload up = { *offset, (guint32) req->stride * (guint32) req->mh };
 
     g_array_append_val (p->uploads, up);
@@ -529,74 +578,6 @@ mask_place (RdsOsdPlan * p, const MaskRequest * req, guint32 * offset)
 }
 
 /* ---- passes ---- */
-
-gboolean
-rds_osd_plan_next_pass (RdsOsdPlan * p, RdsOsdPass * pass)
-{
-  guint32 start, end;
-  RdsOsdCmd *cmds;
-
-  g_return_val_if_fail (p != NULL && pass != NULL, FALSE);
-  start = p->next_cmd;
-  cmds = p->cmds;
-  p->started = TRUE;
-  if (start >= p->n_cmds)
-    return FALSE;
-  p->pass_serial++;
-  g_array_set_size (p->pass_frames, 0);
-  g_array_set_size (p->uploads, 0);
-  g_array_set_size (p->items, 0);
-  g_array_set_size (p->lists, 0);
-  /* the cached masks the rest of the batch needs: evicted last */
-  for (guint32 i = start; i < p->n_cmds; i++)
-    if (cmds[i].type == RDS_OSD_CMD_MASK) {
-      Mask *m = g_hash_table_lookup (p->masks, g_array_index (p->requests, MaskRequest, cmds[i].mask.offset).key);
-
-      if (m != NULL)
-        m->wanted = p->pass_serial;
-    }
-
-  for (end = start; end < p->n_cmds; end++) {
-    RdsOsdCmd *c = &cmds[end];
-    guint32 offset;
-
-    if (c->type != RDS_OSD_CMD_MASK)
-      continue;
-    /* only at the first command of a pass can every other mask be evicted: then it fits (none exceeds the heap) */
-    if (!mask_place (p, &g_array_index (p->requests, MaskRequest, c->mask.offset), &offset)) {
-      g_assert (end > start && !(cmds[end - 1].flags & RDS_OSD_CMD_UNION_NEXT));
-      break;
-    }
-    c->mask.offset = offset;
-  }
-  p->next_cmd = end;
-
-  for (guint i = 0; i < p->frames->len; i++) {
-    const RdsOsdPlanFrame *bf = &g_array_index (p->frames, RdsOsdPlanFrame, i);
-    guint32 first = MAX (bf->first, start), last = MIN (bf->first + bf->n_cmds, end);
-
-    if (first < last) {
-      RdsOsdPlanFrame pf = { bf->slot, bf->width, bf->height, first - start, last - first };
-
-      g_array_append_val (p->pass_frames, pf);
-    }
-  }
-
-  memset (pass, 0, sizeof *pass);
-  pass->cmds = cmds + start;
-  pass->n_cmds = end - start;
-  pass->frames = (const RdsOsdPlanFrame *) p->pass_frames->data;
-  pass->n_frames = p->pass_frames->len;
-  pass->uploads = (const RdsOsdMaskUpload *) p->uploads->data;
-  pass->n_uploads = p->uploads->len;
-  return TRUE;
-}
-
-/* A slot's tile grid in the pass: its tiles are tiles[base .. base + tiles_x · tiles_y − 1], in row order. */
-typedef struct
-{
-  guint32 slot, tiles_x, tiles_y, base;
-} Grid;
 
 /* The shape of @f starting at cmds[i]: returns its last command, and in @t the tile range [t0, t1] × [t2, t3] its
  * commands' union box touches. */
@@ -620,40 +601,133 @@ shape_tiles (const RdsOsdCmd * cmds, const RdsOsdPlanFrame * f, guint32 i, guint
   return j;
 }
 
+gboolean
+rds_osd_plan_next_pass (RdsOsdPlan * p, RdsOsdPass * pass)
+{
+  guint32 start, end, j;
+  guint fi;
+  guint64 cost = 0;
+  RdsOsdCmd *cmds;
+
+  g_return_val_if_fail (p != NULL && pass != NULL, FALSE);
+  start = p->next_cmd;
+  cmds = p->cmds;
+  p->started = TRUE;
+  if (start >= p->n_cmds)
+    return FALSE;
+  p->pass_serial++;
+  p->n_new_masks = 0;
+  g_array_set_size (p->pass_frames, 0);
+  g_array_set_size (p->pass_slots, 0);
+  g_array_set_size (p->uploads, 0);
+  g_array_set_size (p->items, 0);
+  g_array_set_size (p->lists, 0);
+  /* the cached masks the rest of the batch needs: evicted last */
+  for (guint32 i = start; i < p->n_cmds; i++)
+    if (cmds[i].type == RDS_OSD_CMD_MASK) {
+      Mask *m = g_hash_table_lookup (p->masks,
+          p->keys->str + g_array_index (p->requests, MaskRequest, cmds[i].mask.offset).key);
+
+      if (m != NULL)
+        m->wanted = p->pass_serial;
+    }
+
+  /* shape by shape (every command is in a frame, every shape in one): the pass ends before the first shape whose
+   * binning would take it past the budget (tile lists and the tile counts of a slot's grid, 32-bit words each) or
+   * whose mask does not fit beside those the pass uses. It holds at least one shape. */
+  fi = p->next_frame;
+  for (end = start; end < p->n_cmds; end = j + 1) {
+    const RdsOsdPlanFrame *f;
+    guint32 t[4];
+    guint64 need;
+    gboolean new_slot = TRUE;
+
+    while (end >= g_array_index (p->frames, RdsOsdPlanFrame, fi).first
+        + g_array_index (p->frames, RdsOsdPlanFrame, fi).n_cmds)
+      fi++;
+    f = &g_array_index (p->frames, RdsOsdPlanFrame, fi);
+    j = shape_tiles (cmds, f, end, t);
+    need = (guint64) (j - end + 1) * (t[1] - t[0] + 1) * (t[3] - t[2] + 1);
+    for (guint k = 0; k < p->pass_slots->len && new_slot; k++)
+      new_slot = g_array_index (p->pass_slots, guint32, k) != f->slot;
+    if (new_slot)
+      need += (guint64) TILES (f->width) * TILES (f->height);
+    if (end > start && cost + need > p->pass_budget)
+      break;
+    /* a mask is never part of a larger shape */
+    if (cmds[end].type == RDS_OSD_CMD_MASK) {
+      guint32 offset;
+
+      /* only at the first command of a pass can every other mask be evicted: then it fits (none exceeds the heap) */
+      if (!mask_place (p, &g_array_index (p->requests, MaskRequest, cmds[end].mask.offset), &offset)) {
+        g_assert (end > start);
+        break;
+      }
+      cmds[end].mask.offset = offset;
+    }
+    cost += need;
+    if (new_slot)
+      g_array_append_val (p->pass_slots, f->slot);
+  }
+  p->next_cmd = end;
+  p->next_frame = fi;
+
+  for (guint i = 0; i < p->frames->len; i++) {
+    const RdsOsdPlanFrame *bf = &g_array_index (p->frames, RdsOsdPlanFrame, i);
+    guint32 first = MAX (bf->first, start), last = MIN (bf->first + bf->n_cmds, end);
+
+    if (first < last) {
+      RdsOsdPlanFrame pf = { bf->slot, bf->width, bf->height, first - start, last - first };
+
+      g_array_append_val (p->pass_frames, pf);
+    }
+  }
+
+  memset (pass, 0, sizeof *pass);
+  pass->cmds = cmds + start;
+  pass->n_cmds = end - start;
+  pass->frames = (const RdsOsdPlanFrame *) p->pass_frames->data;
+  pass->n_frames = p->pass_frames->len;
+  pass->uploads = (const RdsOsdMaskUpload *) p->uploads->data;
+  pass->n_uploads = p->uploads->len;
+  pass->n_new_masks = p->n_new_masks;
+  return TRUE;
+}
+
 void
 rds_osd_plan_bin (RdsOsdPlan * p, RdsOsdPass * pass)
 {
-  GArray *grids;
-  guint32 n_tiles = 0, total = 0, *tiles, *lists;
-  guint *grid_of;
+  guint64 n_tiles = 0, total = 0;
+  guint32 *tiles, *lists;
 
   g_return_if_fail (p != NULL && pass != NULL);
-  grids = g_array_new (FALSE, FALSE, sizeof (Grid));
-  grid_of = g_new (guint, MAX (pass->n_frames, 1));
+  g_array_set_size (p->grids, 0);
+  g_array_set_size (p->grid_of, pass->n_frames);
   /* a grid per slot, in the order of the slot's first frame */
   for (guint32 k = 0; k < pass->n_frames; k++) {
     const RdsOsdPlanFrame *f = &pass->frames[k];
     guint gi;
 
-    for (gi = 0; gi < grids->len && g_array_index (grids, Grid, gi).slot != f->slot; gi++);
-    if (gi == grids->len) {
-      Grid g = { f->slot, ((guint32) f->width + RDS_OSD_TILE_SIZE - 1) / RDS_OSD_TILE_SIZE,
-        ((guint32) f->height + RDS_OSD_TILE_SIZE - 1) / RDS_OSD_TILE_SIZE, n_tiles
-      };
+    for (gi = 0; gi < p->grids->len && g_array_index (p->grids, Grid, gi).slot != f->slot; gi++);
+    if (gi == p->grids->len) {
+      Grid g = { f->slot, TILES (f->width), TILES (f->height), (guint32) n_tiles };
 
-      g_array_append_val (grids, g);
-      n_tiles += g.tiles_x * g.tiles_y;
+      g_array_append_val (p->grids, g);
+      n_tiles += (guint64) g.tiles_x * g.tiles_y;
     }
-    grid_of[k] = gi;
+    g_array_index (p->grid_of, guint, k) = gi;
   }
-  g_array_set_size (p->tiles, n_tiles);
+  /* the pass budget bounds the tile counts and the lists (one shape alone may exceed a small budget, never 32 bits:
+   * a frame has at most RDS_OSD_MAX_PLAN_TILES tiles) */
+  g_assert (n_tiles <= G_MAXUINT32);
+  g_array_set_size (p->tiles, (guint) n_tiles);
   tiles = (guint32 *) p->tiles->data;
-  memset (tiles, 0, (gsize) n_tiles * sizeof (guint32));
+  memset (tiles, 0, n_tiles * sizeof (guint32));
 
   /* each tile's count; a shape's commands go to every tile its union box touches */
   for (guint32 k = 0; k < pass->n_frames; k++) {
     const RdsOsdPlanFrame *f = &pass->frames[k];
-    const Grid *g = &g_array_index (grids, Grid, grid_of[k]);
+    const Grid *g = &g_array_index (p->grids, Grid, g_array_index (p->grid_of, guint, k));
 
     for (guint32 i = f->first, j, t[4]; i < f->first + f->n_cmds; i = j + 1) {
       j = shape_tiles (pass->cmds, f, i, t);
@@ -664,27 +738,30 @@ rds_osd_plan_bin (RdsOsdPlan * p, RdsOsdPass * pass)
   }
   /* the work items of the non-empty tiles; each tile's count becomes its list's write position */
   g_array_set_size (p->items, 0);
-  for (guint gi = 0; gi < grids->len; gi++) {
-    const Grid *g = &g_array_index (grids, Grid, gi);
+  for (guint gi = 0; gi < p->grids->len; gi++) {
+    const Grid *g = &g_array_index (p->grids, Grid, gi);
 
     for (guint32 t = 0; t < g->tiles_x * g->tiles_y; t++) {
       guint32 count = tiles[g->base + t];
 
       if (count > 0) {
-        RdsOsdWorkItem w = { g->slot, t % g->tiles_x, t / g->tiles_x, total, count };
+        RdsOsdWorkItem w = { g->slot, (guint16) (t % g->tiles_x), (guint16) (t / g->tiles_x), (guint32) total,
+          count
+        };
 
         g_array_append_val (p->items, w);
       }
-      tiles[g->base + t] = total;
+      tiles[g->base + t] = (guint32) total;
       total += count;
+      g_assert (total <= G_MAXUINT32);
     }
   }
   /* the lists, in draw order */
-  g_array_set_size (p->lists, total);
+  g_array_set_size (p->lists, (guint) total);
   lists = (guint32 *) p->lists->data;
   for (guint32 k = 0; k < pass->n_frames; k++) {
     const RdsOsdPlanFrame *f = &pass->frames[k];
-    const Grid *g = &g_array_index (grids, Grid, grid_of[k]);
+    const Grid *g = &g_array_index (p->grids, Grid, g_array_index (p->grid_of, guint, k));
 
     for (guint32 i = f->first, j, t[4]; i < f->first + f->n_cmds; i = j + 1) {
       j = shape_tiles (pass->cmds, f, i, t);
@@ -702,8 +779,13 @@ rds_osd_plan_bin (RdsOsdPlan * p, RdsOsdPass * pass)
   pass->n_items = p->items->len;
   pass->lists = (const guint32 *) p->lists->data;
   pass->n_lists = p->lists->len;
-  g_free (grid_of);
-  g_array_unref (grids);
+}
+
+void
+rds_osd_plan_set_pass_budget (RdsOsdPlan * p, guint64 words)
+{
+  g_return_if_fail (p != NULL && words > 0);
+  p->pass_budget = words;
 }
 
 /* ---- the plan ---- */
@@ -774,12 +856,18 @@ rds_osd_plan_new (gsize heap_size)
 
   p->frames = g_array_new (FALSE, FALSE, sizeof (RdsOsdPlanFrame));
   p->requests = g_array_new (FALSE, FALSE, sizeof (MaskRequest));
-  g_array_set_clear_func (p->requests, (GDestroyNotify) request_clear);
+  p->keys = g_string_new (NULL);
+  p->font_key = g_string_new (NULL);
+  p->text_key = g_string_new (NULL);
+  p->pass_budget = RDS_OSD_PASS_BUDGET;
   p->pass_frames = g_array_new (FALSE, FALSE, sizeof (RdsOsdPlanFrame));
   p->uploads = g_array_new (FALSE, FALSE, sizeof (RdsOsdMaskUpload));
   p->items = g_array_new (FALSE, FALSE, sizeof (RdsOsdWorkItem));
   p->lists = g_array_new (FALSE, FALSE, sizeof (guint32));
   p->tiles = g_array_new (FALSE, FALSE, sizeof (guint32));
+  p->pass_slots = g_array_new (FALSE, FALSE, sizeof (guint32));
+  p->grids = g_array_new (FALSE, FALSE, sizeof (Grid));
+  p->grid_of = g_array_new (FALSE, FALSE, sizeof (guint));
   return p;
 }
 
@@ -796,6 +884,12 @@ rds_osd_plan_free (RdsOsdPlan * p)
   g_array_unref (p->items);
   g_array_unref (p->lists);
   g_array_unref (p->tiles);
+  g_array_unref (p->pass_slots);
+  g_array_unref (p->grids);
+  g_array_unref (p->grid_of);
+  g_string_free (p->keys, TRUE);
+  g_string_free (p->font_key, TRUE);
+  g_string_free (p->text_key, TRUE);
   g_ptr_array_unref (p->by_offset);
   g_hash_table_unref (p->masks);
   g_free (p->heap);
