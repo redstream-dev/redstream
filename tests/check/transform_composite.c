@@ -744,6 +744,51 @@ test_invalid (void)
   sources_clear (&s);
 }
 
+/* ---- timing ---- */
+
+/* Prints the time of one composite of a batch of 4 1280x720 frames into a 2x2 grid at 1280x720 (what
+ * rdsmultistreamtiler does per batch), for NV12 and RGBA batches into NV12 and RGBA, on an element-style
+ * non-blocking stream. Nothing is checked. */
+static void
+test_timing (void)
+{
+  static const RdsBufSurfaceColorFormat fmts[] = { RDS_BUF_COLOR_FORMAT_NV12, RDS_BUF_COLOR_FORMAT_RGBA };
+  const guint iterations = 200;
+  RdsBufSurfTransformConfigParams session = {.compute_mode = RdsBufSurfTransformCompute_GPU };
+  hipStream_t stream = NULL;
+
+  RDS_TEST_REQUIRE_GPU ();
+  g_assert_cmpint (hipStreamCreateWithFlags (&stream, hipStreamNonBlocking), ==, hipSuccess);
+  session.cuda_stream = stream;
+  g_assert_cmpint (rds_buf_surf_transform_set_session_params (&session), ==, RdsBufSurfTransformError_Success);
+  for (guint s = 0; s < G_N_ELEMENTS (fmts); s++) {
+    for (guint d = 0; d < G_N_ELEMENTS (fmts); d++) {
+      RdsBufSurface *batch = create_surf (fmts[s], W, H, N_SRC), *dst = create_surf (fmts[d], W, H, 1);
+      RdsBufSurfTransformRect sr[N_SRC], dr[N_SRC];
+      RdsBufSurfTransformCompositeParams cp = composite_params (sr, dr, RdsBufSurfTransformInter_Nearest);
+      gint64 t0;
+
+      grid_rects (sr, dr, W / 2, H / 2, 0);
+      for (guint i = 0; i < N_SRC; i++)
+        fill_random (batch, i, 21 + i);
+      /* warm-up: first launch of the kernel */
+      g_assert_cmpint (rds_buf_surf_transform_composite (batch, dst, &cp), ==, RdsBufSurfTransformError_Success);
+      t0 = g_get_monotonic_time ();
+      for (guint i = 0; i < iterations; i++)
+        g_assert_cmpint (rds_buf_surf_transform_composite (batch, dst, &cp), ==,
+            RdsBufSurfTransformError_Success);
+      g_test_message ("composite 4 x %ux%u %s -> %ux%u %s (2x2, nearest): %.3f ms per call", W, H,
+          fmts[s] == RDS_BUF_COLOR_FORMAT_NV12 ? "NV12" : "RGBA", W, H,
+          fmts[d] == RDS_BUF_COLOR_FORMAT_NV12 ? "NV12" : "RGBA",
+          (g_get_monotonic_time () - t0) / 1e3 / iterations);
+      g_assert_cmpint (rds_buf_surface_destroy (batch), ==, 0);
+      g_assert_cmpint (rds_buf_surface_destroy (dst), ==, 0);
+    }
+  }
+  g_assert_cmpint (rds_buf_surf_transform_set_default_session (), ==, RdsBufSurfTransformError_Success);
+  g_assert_cmpint (hipStreamDestroy (stream), ==, hipSuccess);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -757,5 +802,6 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/composite/clip-bilinear", test_clip_bilinear);
   g_test_add_func ("/gpu/composite/odd-origin", test_odd_origin);
   g_test_add_func ("/gpu/composite/invalid", test_invalid);
+  g_test_add_func ("/gpu/composite/timing", test_timing);
   return g_test_run ();
 }

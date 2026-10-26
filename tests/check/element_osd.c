@@ -632,6 +632,163 @@ test_switches (void)
   osd_clear (&o);
 }
 
+/* ---- timing ---- */
+
+#define TW 1920
+#define TH 1080
+#define T_OBJECTS 60
+
+/* A device batch of @n grey 1920x1080 RGBA slots, each with a frame meta holding T_OBJECTS objects styled as
+ * rdsinfer styles them (a 3 px red box, a white size-10 label on black above it). */
+static GstBuffer *
+make_timing_batch (guint n)
+{
+  RdsBufSurfaceCreateParams cp = {.width = TW,.height = TH,.layout = RDS_BUF_LAYOUT_PITCH,
+    .colorFormat = RDS_BUF_COLOR_FORMAT_RGBA
+  };
+  GstBuffer *buf = gst_buffer_new ();
+  RdsBatchMeta *bm = rds_create_batch_meta (n);
+  RdsBufSurface *s;
+
+  gst_buffer_append_memory (buf, rds_allocator_alloc_surface (dev_alloc, n, &cp));
+  s = rds_buffer_get_surface (buf);
+  for (guint i = 0; i < n; i++) {
+    RdsFrameMeta *fm = rds_acquire_frame_meta_from_pool (bm);
+
+    g_assert_cmpint (rds_buf_surface_memset (s, i, 0, GREY), ==, 0);
+    fm->batch_id = i;
+    fm->pad_index = i;
+    fm->source_id = i;
+    rds_add_frame_meta_to_batch (bm, fm);
+    for (guint k = 0; k < T_OBJECTS; k++) {
+      RdsObjectMeta *om = rds_acquire_obj_meta_from_pool (bm);
+      gfloat l = 30 + (k % 10) * 185, t = 60 + (k / 10) * 170;
+      RdsOSD_TextParams *tp = &om->text_params;
+
+      om->rect_params = box_at (l, t, 3);
+      om->rect_params.width = 140;
+      om->rect_params.height = 120;
+      om->object_id = k;
+      om->confidence = 0.8f;
+      tp->display_text = g_strdup_printf ("person %u", k);
+      tp->x_offset = (guint) l;
+      tp->y_offset = (guint) t - 20;
+      tp->font_params.font_name = (gchar *) "Serif";
+      tp->font_params.font_size = 10;
+      tp->font_params.font_color = (RdsOSD_ColorParams) {
+      1, 1, 1, 1};
+      tp->set_bg_clr = 1;
+      tp->text_bg_clr = (RdsOSD_ColorParams) {
+      0, 0, 0, 1};
+      rds_add_obj_meta_to_frame (fm, om, NULL);
+    }
+  }
+  s->numFilled = n;
+  g_assert_nonnull (rds_buffer_add_batch_meta (buf, bm));
+  GST_BUFFER_PTS (buf) = 0;
+  return buf;
+}
+
+/* A demuxed view of slot @slot of @batch, with that frame's meta (batch_id 0), as rdsstreamdemux pushes it. */
+static GstBuffer *
+timing_view (GstBuffer * batch, guint slot)
+{
+  GstBuffer *view = rds_buffer_new_surface_view (batch, slot);
+  RdsBatchMeta *vm = rds_create_batch_meta (1);
+
+  g_assert_nonnull (view);
+  g_assert_nonnull (rds_copy_frame_meta_to_batch (frame_of (batch, slot), vm));
+  ((RdsFrameMeta *) vm->frame_meta_list->data)->batch_id = 0;
+  g_assert_nonnull (rds_buffer_add_batch_meta (view, vm));
+  return view;
+}
+
+/* Prints rdsosd's cost per 1920x1080 frame with T_OBJECTS objects: in place on an owned buffer (sync to the CPU,
+ * draw, sync back), and on demuxed read-only views (plus the private copy of the slot, its staging allocation and
+ * the frees), with the copy's share on its own. Nothing is checked. */
+static void
+test_timing (void)
+{
+  const guint iterations = 40;
+  GstHarness *h;
+  GstBuffer *buf, *batch;
+  gint64 t0, view_us = 0, copy_us = 0;
+  gdouble owned_ms, view_ms, copy_ms = 0, copy_sync_ms = 0;
+  GstMemory *mem;
+
+  RDS_TEST_REQUIRE_GPU ();
+  h = gst_harness_new ("rdsosd");
+  gst_harness_set_src_caps_str (h, "video/x-raw(memory:RDS),format=RGBA,width=1920,height=1080,framerate=25/1");
+
+  /* owned: the same writable buffer through again and again (its staging mirror stays, as a pool buffer's does) */
+  buf = make_timing_batch (1);
+  g_assert_cmpint (gst_harness_push (h, buf), ==, GST_FLOW_OK);
+  buf = gst_harness_pull (h);
+  mem = gst_buffer_peek_memory (buf, 0);
+  t0 = g_get_monotonic_time ();
+  for (guint i = 0; i < iterations; i++) {
+    g_assert_cmpint (gst_harness_push (h, buf), ==, GST_FLOW_OK);
+    buf = gst_harness_pull (h);
+  }
+  /* drawn in place every time, never copied */
+  g_assert_true (gst_buffer_peek_memory (buf, 0) == mem);
+  owned_ms = (g_get_monotonic_time () - t0) / 1e3 / iterations;
+  gst_buffer_unref (buf);
+
+  /* views of slot 1 of a batch of 2: each one copied, drawn, freed */
+  batch = make_timing_batch (2);
+  for (guint i = 0; i <= iterations; i++) {
+    GstBuffer *view = timing_view (batch, 1);
+
+    t0 = g_get_monotonic_time ();
+    g_assert_cmpint (gst_harness_push (h, view), ==, GST_FLOW_OK);
+    gst_buffer_unref (gst_harness_pull (h));
+    if (i > 0)
+      view_us += g_get_monotonic_time () - t0;
+  }
+  view_ms = view_us / 1e3 / iterations;
+
+  /* the copy on its own (rds_memory_copy of the view's memory, freed), then with its first CPU sync (the staging
+   * allocation and one device-to-host copy) */
+  for (guint pass = 0; pass < 2; pass++) {
+    GstBuffer *view = timing_view (batch, 1);
+    GstMemory *vmem = gst_buffer_peek_memory (view, 0);
+
+    copy_us = 0;
+    for (guint i = 0; i < iterations; i++) {
+      GstMemory *copy;
+
+      t0 = g_get_monotonic_time ();
+      copy = gst_memory_copy (vmem, 0, -1);
+      g_assert_nonnull (copy);
+      if (pass == 1) {
+        GstMapInfo map;
+        RdsBufSurface *s;
+
+        g_assert_true (gst_memory_map (copy, &map, GST_MAP_READWRITE));
+        s = (RdsBufSurface *) map.data;
+        g_assert_cmpint (rds_buf_surface_map (s, 0, 0, RDS_BUF_MAP_READ_WRITE), ==, 0);
+        g_assert_cmpint (rds_buf_surface_sync_for_cpu (s, 0, 0), ==, 0);
+        g_assert_cmpint (rds_buf_surface_unmap (s, 0, 0), ==, 0);
+        gst_memory_unmap (copy, &map);
+      }
+      gst_memory_unref (copy);
+      copy_us += g_get_monotonic_time () - t0;
+    }
+    if (pass == 0)
+      copy_ms = copy_us / 1e3 / iterations;
+    else
+      copy_sync_ms = copy_us / 1e3 / iterations;
+    gst_buffer_unref (view);
+  }
+  gst_buffer_unref (batch);
+  gst_harness_teardown (h);
+
+  g_test_message ("rdsosd per 1920x1080 frame with %u objects: owned buffer %.3f ms, demuxed view %.3f ms "
+      "(+%.3f ms); the view's private copy alone %.3f ms, with its first CPU sync %.3f ms", T_OBJECTS, owned_ms,
+      view_ms, view_ms - owned_ms, copy_ms, copy_sync_ms);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -656,6 +813,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/osd-element/batch-id-outside", test_batch_id_outside);
   g_test_add_func ("/gpu/osd-element/border-clamped", test_border_clamped);
   g_test_add_func ("/gpu/osd-element/switches", test_switches);
+  g_test_add_func ("/gpu/osd-element/timing", test_timing);
   ret = g_test_run ();
 
   gst_object_unref (dev_alloc);

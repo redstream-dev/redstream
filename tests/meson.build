@@ -330,6 +330,28 @@ if rds_osd_enabled
     suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 endif
 
+if rds_osd_enabled and rds_tracker_enabled and rds_infer_enabled
+  # rdsmultistreamtiler and rdsosd end to end as rds-test3 runs them: four copies of the street clip, YOLO11n, NvSORT,
+  # the 2x2 tiler and rdsosd (pipeline_osd: merged meta, drawn boxes, frame rate), and the soak (pipeline_osd_soak,
+  # 4068 batches of 4, also in the soak suite). Both skip until tests/models/fetch-tracker-clip.sh and
+  # fetch-yolo11n.sh have run. The YOLO11n programs are shared with infer_engine, pipeline_infer and pipeline_tracker
+  # (a first batch-4 compile takes minutes). Never in parallel: one compile or soak at a time.
+  osd_pipeline_args = [
+    '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
+    '-DRDS_TEST_CACHE_MEDIA="@0@"'.format(meson.project_source_root() / '.cache' / 'media'),
+    '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
+    '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+  ]
+  test('pipeline_osd', executable('pipeline_osd', 'check' / 'pipeline_osd.c', dependencies : pipeline_deps,
+      c_args : osd_pipeline_args),
+    suite : ['gpu', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1200,
+    depends : rds_plugins)
+  test('pipeline_osd_soak', executable('pipeline_osd_soak', 'check' / 'pipeline_osd_soak.c',
+      dependencies : pipeline_deps, c_args : osd_pipeline_args),
+    suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,
+    depends : rds_plugins)
+endif
+
 # rdsmultistreamtiler: properties and pads (cpu); tiling device batches with scripted meta (gpu).
 element_tiler_exe = executable('element_tiler', 'check' / 'element_tiler.c', dependencies : test_deps)
 test('element_tiler_cpu', element_tiler_exe, args : ['-p', '/cpu/tiler'],

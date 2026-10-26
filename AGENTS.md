@@ -269,11 +269,12 @@ meson test -C build-rel --print-errorlogs
   registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
   `gst-plugin-scanner` can't load sanitized plugins. ASan runs with `use_sigaltstack=0` (Mesa's LLVM, loaded by the
   VA driver, installs its own alternate signal stack). The soak tests (`pipeline_soak`, `pipeline_mux_soak`,
-  `pipeline_infer_soak`, `pipeline_tracker_soak`) check host memory growth on VmRSS, or under ASan on ASan's live heap
-  (`__sanitizer_get_current_allocated_bytes`, which leaves out the quarantine, so ASan keeps its default options);
-  the normal build's VmRSS check covers memory that bypasses malloc (HIP pinned memory). They are also in the `soak`
-  suite; `pipeline_infer_soak` takes about 4 min with YOLO11n (3000 batches of 4 at ~50 fps on a small iGPU, also
-  under ASan) and `pipeline_tracker_soak` about 6 min with the street clip (4068 batches of 4), so
+  `pipeline_infer_soak`, `pipeline_tracker_soak`, `pipeline_osd_soak`) check host memory growth on VmRSS, or under
+  ASan on ASan's live heap (`__sanitizer_get_current_allocated_bytes`, which leaves out the quarantine, so ASan keeps
+  its default options); the normal build's VmRSS check covers memory that bypasses malloc (HIP pinned memory). They
+  are also in the `soak` suite; `pipeline_infer_soak` takes about 4 min with YOLO11n (3000 batches of 4 at ~50 fps on
+  a small iGPU, also under ASan), `pipeline_tracker_soak` about 6 min with the street clip (4068 batches of 4) and
+  `pipeline_osd_soak` (the same through the tiler and rdsosd) about 6.5 min, so
   `meson test --no-suite soak` leaves the soaks out. Their memory probes live in `tests/check/rds-test-soak.h`: host
   memory, and GPU memory from this process's DRM fdinfo (`drm-total-vram` + `drm-total-gtt` of its render-node fds,
   where HIP allocations are accounted), so other processes on the GPU don't skew it; `hipMemGetInfo` is device-wide.
