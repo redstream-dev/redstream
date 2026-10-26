@@ -705,7 +705,8 @@ timing_view (GstBuffer * batch, guint slot)
 
 /* Prints rdsosd's cost per 1920x1080 frame with T_OBJECTS objects: in place on an owned buffer (sync to the CPU,
  * draw, sync back), and on demuxed read-only views (plus the private copy of the slot, its staging allocation and
- * the frees), with the copy's share on its own. Nothing is checked. */
+ * the frees), with the copy's share on its own. The times are only printed; the one check is that the owned buffer is
+ * drawn in place (its memory is never replaced by a copy). */
 static void
 test_timing (void)
 {

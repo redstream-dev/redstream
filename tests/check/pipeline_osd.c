@@ -133,9 +133,22 @@ is_rgb (const HostImage * img, gint64 x, gint64 y, guint8 cr, guint8 cg, guint8 
   return p[0] == cr && p[1] == cg && p[2] == cb;
 }
 
-/* appsink: on every CHECK_EVERY-th frame, the pixel on each opaque red box's left edge, half way down (the left band
- * starts at the truncated left), must be the border colour. Text drawn later (another object's label) may cover
- * some of them. */
+/* TRUE if any pixel of the left border band of @rp (columns L - (bw-1)/2 .. L + bw/2, with L the truncated left) is
+ * opaque red over rows T+2 .. B-2. Text drawn later (another object's label) may cover part of a band, rarely all. */
+static gboolean
+left_band_drawn (const HostImage * img, const RdsOSD_RectParams * rp)
+{
+  gint64 bw = MIN (rp->border_width, 32), L = (gint64) rp->left, T = (gint64) rp->top, B = T + (gint64) rp->height;
+
+  for (gint64 x = MAX (L - (bw - 1) / 2, 0); x <= MIN (L + bw / 2, TILED_W - 1); x++)
+    for (gint64 y = T + 2; y <= B - 2; y++)
+      if (is_rgb (img, x, y, 255, 0, 0))
+        return TRUE;
+  return FALSE;
+}
+
+/* appsink: on every CHECK_EVERY-th frame, the left border band of each opaque red box inside the frame must be drawn
+ * (left_band_drawn). */
 static GstFlowReturn
 on_sample (GstAppSink * sink, gpointer user_data)
 {
@@ -158,17 +171,19 @@ on_sample (GstAppSink * sink, gpointer user_data)
   }
   snapshot (s, 0, &img);
   rds_acquire_meta_lock (bm);
+  g_assert_nonnull (bm->frame_meta_list);
   for (GList * o = ((RdsFrameMeta *) bm->frame_meta_list->data)->obj_meta_list; o; o = o->next) {
     const RdsOSD_RectParams *rp = &((RdsObjectMeta *) o->data)->rect_params;
     const RdsOSD_ColorParams *c = &rp->border_color;
     gint64 L = (gint64) rp->left, T = (gint64) rp->top, B = T + (gint64) rp->height;
+
 
     if (rp->border_width == 0 || c->red != 1.0 || c->green != 0.0 || c->blue != 0.0 || c->alpha != 1.0)
       continue;
     if (L < 0 || L >= TILED_W || T < 0 || B >= TILED_H || rp->height < 8)
       continue;
     r->edges++;
-    r->red_edges += is_rgb (&img, L, (T + B) / 2, 255, 0, 0);
+    r->red_edges += left_band_drawn (&img, rp);
   }
   rds_release_meta_lock (bm);
   host_image_clear (&img);
@@ -211,13 +226,15 @@ test_clip (void)
   gst_object_unref (pipe);
 
   secs = (t1 - t0) / 1e6;
-  g_test_message ("%u batches of %u (%u frames) in %.1f s: %.1f fps, %.1f tiled frames/s; %u objects (per source "
-      "%u %u %u %u)", r.batches, SOURCES, SOURCES * r.batches, secs, SOURCES * r.batches / secs, r.batches / secs,
-      r.objects, r.source_objects[0], r.source_objects[1], r.source_objects[2], r.source_objects[3]);
+  /* into an appsink, every CHECK_EVERY-th frame read back: not the end-to-end figure (rds-test3 into a fakesink) */
+  g_test_message ("%u batches of %u (%u frames) in %.1f s: %.1f fps, %.1f tiled frames/s (appsink and periodic "
+      "readback included); %u objects (per source %u %u %u %u)", r.batches, SOURCES, SOURCES * r.batches, secs,
+      SOURCES * r.batches / secs, r.batches / secs, r.objects, r.source_objects[0], r.source_objects[1],
+      r.source_objects[2], r.source_objects[3]);
   g_test_message ("rdsmultistreamtiler %.3f ms per batch, rdsosd %.3f ms per frame (%.1f objects per frame)",
       r.tiler_us / 1e3 / MAX (r.batches, 1), r.osd_us / 1e3 / MAX (r.frames, 1),
       (gdouble) r.objects / MAX (r.batches, 1));
-  g_test_message ("box edges: %u of %u sampled are the border colour", r.red_edges, r.edges);
+  g_test_message ("box edges: %u of %u sampled have their left border band drawn", r.red_edges, r.edges);
   g_assert_cmpuint (r.batches, ==, CLIP_FRAMES);
   g_assert_cmpuint (r.frames, ==, CLIP_FRAMES);
   g_assert_cmpuint (warnings, ==, 0);
@@ -227,7 +244,7 @@ test_clip (void)
     g_assert_cmpuint (r.source_objects[i], ==, r.source_objects[0]);
   }
   g_assert_cmpuint (r.edges, >, 1000);
-  g_assert_cmpuint (r.red_edges * 10, >=, r.edges * 9);
+  g_assert_cmpuint (r.red_edges * 100, >=, r.edges * 99);
   g_array_unref (r.expected);
   g_free (pgie);
 }
