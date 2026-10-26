@@ -131,6 +131,13 @@ Known gotchas:
 - `hipHostMalloc` (pinned) memory shows up in the process's VmRSS, not in `hipMemGetInfo`.
 - With `HSA_OVERRIDE_GFX_VERSION` set, HIP's `gcnArchName` reports the overridden target (gfx1030 on a gfx1036).
   The device's own architecture is the KFD topology's `gfx_target_version`; the engine's cache names use that one.
+- ROCm 10.1 shares `GPU_MAX_HW_QUEUES` (default 4) hardware queues between all HIP streams. With more streams than
+  queues (per-thread streams on many threads, as in a pipeline), an SDMA copy now and then faults: `Memory access
+  fault by GPU node-1 ... on address 0x401000`, then SIGABRT; the address is none of ours, and the faulting copy
+  (pageable host → device, `hipMemcpy2DAsync`) was valid. `HSA_ENABLE_SDMA=0` (copies by blit kernels) avoids it at
+  no measured cost on the gfx1036 iGPU, so `tests/meson.build` sets it for every test; `GPU_MAX_HW_QUEUES=16` avoids
+  it too but slowed `rds-test3` from ~45 to ~29 fps. Seen in `memory_hip`'s concurrent views test (~2 % of runs
+  under `meson test`, whose `MALLOC_PERTURB_` changes the timing); no standalone HIP reproducer yet.
 - MIOpen (MIGraphX's convolutions) keeps its databases under `$HOME/.config/miopen`. GLib tests with
   `G_TEST_OPTION_ISOLATE_DIRS` set `HOME=/dev/null`, so such tests point `MIOPEN_USER_DB_PATH` and
   `MIOPEN_CUSTOM_CACHE_DIR` somewhere writable, and `AMD_COMGR_CACHE_DIR` too, since the isolated

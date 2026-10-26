@@ -6,6 +6,11 @@ common_test_env = {
   # EINVAL).
   'ASAN_OPTIONS' : 'halt_on_error=1:abort_on_error=1:print_summary=1:allocator_may_return_null=1:use_sigaltstack=0',
   'UBSAN_OPTIONS' : 'halt_on_error=1:abort_on_error=1:print_stacktrace=1',
+  # ROCm 10.1: with more HIP streams than hardware queues (GPU_MAX_HW_QUEUES, default 4), an SDMA copy now and then
+  # faults on an address that is none of ours ("Memory access fault by GPU ... on address 0x401000"; seen in
+  # memory_hip's concurrent views test, ~2 % of runs). Copies done by blit kernels instead avoid it, at no measured
+  # cost on the gfx1036 iGPU; more queues avoid it too but slow pipelines down.
+  'HSA_ENABLE_SDMA' : '0',
 }
 # Sanitized plugins can't be loaded by gst-plugin-scanner (not linked with the ASan runtime): scan in-process.
 # b_sanitize was a string option ('none', 'address,undefined') before meson 1.8 and is an array option since;
