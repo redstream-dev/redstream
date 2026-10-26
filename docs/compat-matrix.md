@@ -820,9 +820,9 @@ Not aliased: `NVBUF_MEM_CUDA_ARRAY` (no Redstream counterpart), the other `NvBuf
 
 ## NvBufSurfTransform
 
-Batched crop, scale and colour conversion between surfaces, run by Redstream's own HIP kernels. Types are
-`typedef`s, functions and enumerators are object-like macros. All four functions have DeepStream's exact prototypes,
-so they can also be assigned to function pointers declared with them.
+Batched crop, scale and colour conversion between surfaces, and the many-to-one composite, run by Redstream's own
+HIP kernels. Types are `typedef`s, functions and enumerators are object-like macros. All five functions have
+DeepStream's exact prototypes, so they can also be assigned to function pointers declared with them.
 
 | DeepStream name | Redstream name | Status | Notes | Source |
 |---|---|---|---|---|
@@ -867,10 +867,15 @@ so they can also be assigned to function pointers declared with them.
 | `NvBufSurfTransformSetSessionParams` | `rds_buf_surf_transform_set_session_params` | supported | per thread | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvbufsurftransform_8h_source.html) |
 | `NvBufSurfTransformGetSessionParams` | `rds_buf_surf_transform_get_session_params` | supported |  | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvbufsurftransform_8h_source.html) |
 | `NvBufSurfTransformSetDefaultSession` | `rds_buf_surf_transform_set_default_session` | supported | GPU 0, default stream | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvbufsurftransform_8h_source.html) |
+| `NvBufSurfTransform_Composite_Flag` | `RdsBufSurfTransform_Composite_Flag` | supported | values as documented; `composite_flag` is ignored, as in DeepStream 8.0 | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
+| `NVBUFSURF_TRANSFORM_COMPOSITE` | `RDS_BUFSURF_TRANSFORM_COMPOSITE` | supported | ignored | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
+| `NVBUFSURF_TRANSFORM_BLEND` | `RDS_BUFSURF_TRANSFORM_BLEND` | supported | ignored (no blending) | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
+| `NVBUFSURF_TRANSFORM_COMPOSITE_FILTER` | `RDS_BUFSURF_TRANSFORM_COMPOSITE_FILTER` | supported | ignored: `composite_filter` is always read | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
+| `NvBufSurfTransformCompositeParams` | `RdsBufSurfTransformCompositeParams` | supported | `input_buf_count` is ignored (`src->numFilled` decides), as in DeepStream 8.0 | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
+| `NvBufSurfTransformComposite` | `rds_buf_surf_transform_composite` | supported | synchronous; see "Composite semantics" | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
 
-Not aliased: `NvBufSurfTransformAsync`, the composite and blend calls and their types (`NvBufSurfTransformComposite*`,
-`NvBufSurfTransformMultiInputBufCompositeBlend*`, `NvBufSurfTransform_Composite_Flag` and its
-`NVBUFSURF_TRANSFORM_COMPOSITE*`/`BLEND` flags), the sync objects (`NvBufSurfTransformSyncObj*`),
+Not aliased: `NvBufSurfTransformAsync`, `NvBufSurfTransformCompositeAsync`, the blend calls and their types
+(`NvBufSurfTransformCompositeBlend*`, `NvBufSurfTransformMultiInputBufCompositeBlend*`), the sync objects (`NvBufSurfTransformSyncObj*`),
 `NvBufSurfTransform_ColorParams` and `NVBUFSURF_MAX_SYNCOBJ` ([ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvbufsurftransform_8h_source.html)).
 
 ### Behaviour differences from DeepStream
@@ -983,6 +988,28 @@ tests compare the kernels with an independent CPU implementation of these rules.
 - On a surface with an odd width or height, the last column or row of 2x2 blocks is partial: only the in-bounds luma
   pixels are written, the chroma sample is still written, and for an RGB source its U and V are the mean over the
   in-bounds pixels only.
+
+### Composite semantics
+
+What `rds_buf_surf_transform_composite` (`NvBufSurfTransformComposite`) does. Where NVIDIA's reference is silent it
+matches observed DeepStream 8.0 behaviour; rows marked "ours" are Redstream's own choice.
+
+| Case | Behaviour | Origin |
+|---|---|---|
+| Entries | the first `src->numFilled` source surfaces; entry `i` scales `src_comp_rect[i]` of source surface `i` into `dst_comp_rect[i]` of destination surface 0. Other destination surfaces are not written. `input_buf_count` and `composite_flag` are ignored | DeepStream 8.0 behaviour |
+| Sampling and colour | as in "Transform semantics" (the composite runs the same kernels), with `composite_filter` as the filter; sources may differ in format and size, and each is stretched into its rect (no aspect preservation) | DeepStream 8.0 behaviour (stretch, NV12/RGBA conversion); rules ours |
+| Pixels outside every destination rect | not written | DeepStream 8.0 behaviour |
+| Overlapping destination rects | drawn in entry order, later entries on top | DeepStream 8.0 behaviour |
+| `src_comp_rect` or `dst_comp_rect` NULL | `Invalid_Params`, destination untouched | DeepStream 8.0 behaviour |
+| Destination rect partly outside the surface | success; the rect keeps its scaling and only its part inside the surface is drawn | clipping: DeepStream 8.0 behaviour; which part of the source shows: ours |
+| Source rect partly outside its surface | success; the rect is cut to the surface and that part is scaled into the destination rect | clipping: DeepStream 8.0 behaviour; cut: ours |
+| Rect empty, or wholly outside its surface | the entry draws nothing (success) | ours (8.0 draws a 2x2 block for a zero-size destination rect) |
+| Rect wider or taller than 16384 | `ROI_Error`, destination untouched | ours |
+| Odd destination rect on NV12 or I420 | left and top rounded up to even, an odd right or bottom edge rounded down unless it is the surface edge; the source is scaled onto that rect | DeepStream 8.0 behaviour |
+| Odd destination rect on an RGB-family or GRAY8 surface | used as given | ours (8.0 also rounds RGBA rects to even) |
+| `dst->numFilled` | not changed | ours |
+| Other arguments | the transform's rules for memory types, the session GPU, formats, layouts and plane geometry (the destination needs one surface); `numFilled` 0 or above `src->batchSize`, an out-of-range filter, a NULL `dataPtr` or a source sharing the destination's `dataPtr` is `Invalid_Params` | ours |
+| Execution | synchronous, on the session's stream and GPU, like `NvBufSurfTransform` | ours (no async variant) |
 
 ## OSD parameter structs
 

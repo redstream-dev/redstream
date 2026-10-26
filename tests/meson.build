@@ -73,6 +73,11 @@ foreach t : gpu_tests
     suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 endforeach
 
+# rds_buf_surf_transform_composite, checked against rds_buf_surf_transform (public API only).
+test('transform_composite', executable('transform_composite', 'check' / 'transform_composite.c',
+    dependencies : test_deps + [cc.find_library('m', required : false)]),
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+
 # GPU tests that call private library symbols link the static internal copy of libgstrds instead.
 # Such a test must never also link rds_dep, nor load one of our plugins in-process (the plugin pulls in the
 # shared libgstrds): two copies of the library register the same GTypes twice. internal_test_env makes sure.

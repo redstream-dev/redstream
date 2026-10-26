@@ -42,14 +42,17 @@ typedef struct
   int format;
 } RdsKernelSurface;
 
-/* One surface's transform: source rect (sl, st, sw, sh) into destination rect (dl, dt, dw, dh), both non-empty
- * and inside their surfaces. For a 4:2:0 destination the rect is already aligned: left and top even, right and
- * bottom even or on the surface edge. */
+/* One surface's transform: source rect (sl, st, sw, sh) into destination rect (dl, dt, dw, dh), of which only the
+ * window (cl, ct, cw, ch) is written. The source rect and the window are non-empty and inside their surfaces; the
+ * destination rect contains the window and may reach past the surface (a composite's clipped rect), with dw and dh
+ * at most RDS_BUF_SURFACE_MAX_DIM (the sampling arithmetic is 32-bit). For a 4:2:0 destination the rect and the
+ * window are already aligned: left and top even, right and bottom even or on the surface edge. */
 typedef struct
 {
   RdsKernelSurface src, dst;
   unsigned sl, st, sw, sh;
   unsigned dl, dt, dw, dh;
+  unsigned cl, ct, cw, ch;
   int bilinear;                 /* 0 nearest, 1 bilinear (after the filter mapping) */
 } RdsKernelJob;
 

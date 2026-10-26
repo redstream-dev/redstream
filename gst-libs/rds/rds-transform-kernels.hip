@@ -56,14 +56,14 @@ dst_at (const RdsKernelSurface * s, int plane, int bpp, unsigned x, unsigned y)
   return s->data + s->offset[plane] + (size_t) y * s->pitch[plane] + (size_t) x * bpp;
 }
 
-/* One 2x2 block (bx, by) of a 4:2:0 destination rect. */
+/* One 2x2 block (bx, by) of the window of a 4:2:0 destination rect. */
 __device__ static void
 transform_block_420 (const RdsKernelJob * job, unsigned bx, unsigned by)
 {
   const RdsKernelSurface *s = &job->src, *d = &job->dst;
   int sk = kind_of (s->format);
-  unsigned x0 = job->dl + 2 * bx, y0 = job->dt + 2 * by;
-  unsigned xend = job->dl + job->dw, yend = job->dt + job->dh;
+  unsigned x0 = job->cl + 2 * bx, y0 = job->ct + 2 * by;
+  unsigned xend = job->cl + job->cw, yend = job->ct + job->ch;
   unsigned cx = x0 / 2, cy = y0 / 2;
   float su = 0.0f, sv = 0.0f, u, v;
   int n = 0;
@@ -112,7 +112,7 @@ transform_block_420 (const RdsKernelJob * job, unsigned bx, unsigned by)
   }
 }
 
-/* One pixel (x, y) of an RGB-family or GRAY8 destination rect. */
+/* One pixel (x, y) of the window of an RGB-family or GRAY8 destination rect. */
 __device__ static void
 transform_pixel (const RdsKernelJob * job, unsigned x, unsigned y)
 {
@@ -166,17 +166,17 @@ rds_transform_kernel (RdsKernelJob job)
   unsigned gy = blockIdx.y * blockDim.y + threadIdx.y;
 
   if (kind_of (job.dst.format) == KIND_YUV420) {
-    if (gx < (job.dw + 1) / 2 && gy < (job.dh + 1) / 2)
+    if (gx < (job.cw + 1) / 2 && gy < (job.ch + 1) / 2)
       transform_block_420 (&job, gx, gy);
-  } else if (gx < job.dw && gy < job.dh) {
-    transform_pixel (&job, job.dl + gx, job.dt + gy);
+  } else if (gx < job.cw && gy < job.ch) {
+    transform_pixel (&job, job.cl + gx, job.ct + gy);
   }
 }
 
 extern "C" int
 rds_transform_launch (const RdsKernelJob * job, void *stream)
 {
-  unsigned w = job->dw, h = job->dh;
+  unsigned w = job->cw, h = job->ch;
   dim3 block (RDS_TRANSFORM_BLOCK, RDS_TRANSFORM_BLOCK);
 
   if (job->dst.format == RDS_KFMT_NV12 || job->dst.format == RDS_KFMT_YUV420) {

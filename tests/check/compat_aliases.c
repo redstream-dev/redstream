@@ -60,6 +60,8 @@ test_types (void)
   { RdsBufSurfTransformRect *r = NULL; NvBufSurfTransformRect *n = r; g_assert_null (n); }
   { RdsBufSurfTransformParams *r = NULL; NvBufSurfTransformParams *n = r; g_assert_null (n); }
   { RdsBufSurfTransformConfigParams *r = NULL; NvBufSurfTransformConfigParams *n = r; g_assert_null (n); }
+  { RdsBufSurfTransform_Composite_Flag *r = NULL; NvBufSurfTransform_Composite_Flag *n = r; g_assert_null (n); }
+  { RdsBufSurfTransformCompositeParams *r = NULL; NvBufSurfTransformCompositeParams *n = r; g_assert_null (n); }
   { RdsInferDims *r = NULL; NvDsInferDims *n = r; g_assert_null (n); }
   { RdsInferDimsCHW *r = NULL; NvDsInferDimsCHW *n = r; g_assert_null (n); }
   { RdsInferDataType *r = NULL; NvDsInferDataType *n = r; g_assert_null (n); }
@@ -107,6 +109,37 @@ test_transform_structs (void)
   g_assert_cmpuint (sizeof (config.cuda_stream), ==, sizeof (gpointer));
   g_assert_true (params.src_rect->left == 2 && params.dst_rect == NULL);
   g_assert_cmpint (config.compute_mode, ==, RdsBufSurfTransformCompute_GPU);
+}
+
+/* The composite params keep the documented field names, types and order. */
+static void
+test_composite_structs (void)
+{
+  NvBufSurfTransformRect src_rect = { .top = 0, .left = 0, .width = 8, .height = 8 };
+  NvBufSurfTransformRect dst_rect = { .top = 2, .left = 4, .width = 8, .height = 8 };
+  NvBufSurfTransformCompositeParams params = {
+    .composite_flag = NVBUFSURF_TRANSFORM_COMPOSITE | NVBUFSURF_TRANSFORM_COMPOSITE_FILTER,
+    .input_buf_count = 1,
+    .src_comp_rect = &src_rect,
+    .dst_comp_rect = &dst_rect,
+    .composite_filter = NvBufSurfTransformInter_Bilinear,
+    .reserved = { NULL },
+  };
+
+  g_assert_cmpuint (sizeof (NvBufSurfTransformCompositeParams), ==, sizeof (RdsBufSurfTransformCompositeParams));
+  g_assert_cmpuint (sizeof (params.composite_flag), ==, sizeof (guint32));
+  g_assert_cmpuint (sizeof (params.input_buf_count), ==, sizeof (guint32));
+  g_assert_cmpuint (G_STRUCT_OFFSET (NvBufSurfTransformCompositeParams, composite_flag), ==, 0);
+  g_assert_cmpuint (G_STRUCT_OFFSET (NvBufSurfTransformCompositeParams, input_buf_count), ==, 4);
+  g_assert_cmpuint (G_STRUCT_OFFSET (NvBufSurfTransformCompositeParams, src_comp_rect), <,
+      G_STRUCT_OFFSET (NvBufSurfTransformCompositeParams, dst_comp_rect));
+  g_assert_cmpuint (G_STRUCT_OFFSET (NvBufSurfTransformCompositeParams, dst_comp_rect), <,
+      G_STRUCT_OFFSET (NvBufSurfTransformCompositeParams, composite_filter));
+  g_assert_cmpuint (G_STRUCT_OFFSET (NvBufSurfTransformCompositeParams, composite_filter), <,
+      G_STRUCT_OFFSET (NvBufSurfTransformCompositeParams, reserved));
+  g_assert_cmpuint (G_N_ELEMENTS (params.reserved), ==, 4);
+  g_assert_true (params.dst_comp_rect->left == 4 && params.src_comp_rect->width == 8);
+  g_assert_cmpint (params.composite_filter, ==, RdsBufSurfTransformInter_Bilinear);
 }
 
 static void
@@ -165,6 +198,7 @@ test_functions (void)
     (gpointer) NvBufSurfTransformSetSessionParams,
     (gpointer) NvBufSurfTransformGetSessionParams,
     (gpointer) NvBufSurfTransformSetDefaultSession,
+    (gpointer) NvBufSurfTransformComposite,
   };
   gpointer rds[] = {
     (gpointer) rds_buf_surface_create,
@@ -219,6 +253,7 @@ test_functions (void)
     (gpointer) rds_buf_surf_transform_set_session_params,
     (gpointer) rds_buf_surf_transform_get_session_params,
     (gpointer) rds_buf_surf_transform_set_default_session,
+    (gpointer) rds_buf_surf_transform_composite,
   };
   /* The transform functions have DeepStream's exact prototypes: pointers declared with them accept our functions. */
   NvBufSurfTransform_Error (*transform) (NvBufSurface *, NvBufSurface *, NvBufSurfTransformParams *) =
@@ -226,11 +261,14 @@ test_functions (void)
   NvBufSurfTransform_Error (*set_session) (NvBufSurfTransformConfigParams *) = NvBufSurfTransformSetSessionParams;
   NvBufSurfTransform_Error (*get_session) (NvBufSurfTransformConfigParams *) = NvBufSurfTransformGetSessionParams;
   NvBufSurfTransform_Error (*set_default) (void) = NvBufSurfTransformSetDefaultSession;
+  NvBufSurfTransform_Error (*composite) (NvBufSurface *, NvBufSurface *, NvBufSurfTransformCompositeParams *) =
+      NvBufSurfTransformComposite;
 
   g_assert_true ((gpointer) transform == (gpointer) rds_buf_surf_transform);
   g_assert_true ((gpointer) set_session == (gpointer) rds_buf_surf_transform_set_session_params);
   g_assert_true ((gpointer) get_session == (gpointer) rds_buf_surf_transform_get_session_params);
   g_assert_true ((gpointer) set_default == (gpointer) rds_buf_surf_transform_set_default_session);
+  g_assert_true ((gpointer) composite == (gpointer) rds_buf_surf_transform_composite);
 
   g_assert_cmpuint (G_N_ELEMENTS (nv), ==, G_N_ELEMENTS (rds));
   for (gsize i = 0; i < G_N_ELEMENTS (nv); i++)
@@ -353,6 +391,9 @@ test_constants (void)
   g_assert_true ((gint64) NVBUFSURF_TRANSFORM_FLIP == (gint64) RDS_BUFSURF_TRANSFORM_FLIP);
   g_assert_true ((gint64) NVBUFSURF_TRANSFORM_NORMALIZE == (gint64) RDS_BUFSURF_TRANSFORM_NORMALIZE);
   g_assert_true ((gint64) NVBUFSURF_TRANSFORM_ALLOW_ODD_CROP == (gint64) RDS_BUFSURF_TRANSFORM_ALLOW_ODD_CROP);
+  g_assert_true ((gint64) NVBUFSURF_TRANSFORM_COMPOSITE == (gint64) RDS_BUFSURF_TRANSFORM_COMPOSITE);
+  g_assert_true ((gint64) NVBUFSURF_TRANSFORM_BLEND == (gint64) RDS_BUFSURF_TRANSFORM_BLEND);
+  g_assert_true ((gint64) NVBUFSURF_TRANSFORM_COMPOSITE_FILTER == (gint64) RDS_BUFSURF_TRANSFORM_COMPOSITE_FILTER);
 
   /* Values DeepStream's public reference documents and configs or apps rely on. */
   g_assert_cmpint (NVBUF_MEM_DEFAULT, ==, 0);
@@ -397,6 +438,9 @@ test_constants (void)
   g_assert_cmpint (NVBUFSURF_TRANSFORM_FLIP, ==, 8);
   g_assert_cmpint (NVBUFSURF_TRANSFORM_NORMALIZE, ==, 16);
   g_assert_cmpint (NVBUFSURF_TRANSFORM_ALLOW_ODD_CROP, ==, 32);
+  g_assert_cmpint (NVBUFSURF_TRANSFORM_COMPOSITE, ==, 1);
+  g_assert_cmpint (NVBUFSURF_TRANSFORM_BLEND, ==, 2);
+  g_assert_cmpint (NVBUFSURF_TRANSFORM_COMPOSITE_FILTER, ==, 4);
 }
 
 int
@@ -407,5 +451,6 @@ main (int argc, char **argv)
   g_test_add_func ("/compat-aliases/functions", test_functions);
   g_test_add_func ("/compat-aliases/constants", test_constants);
   g_test_add_func ("/compat-aliases/transform-structs", test_transform_structs);
+  g_test_add_func ("/compat-aliases/composite-structs", test_composite_structs);
   return g_test_run ();
 }

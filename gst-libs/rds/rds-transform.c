@@ -287,6 +287,38 @@ check_even_dst_rects (const RdsBufSurface * dst, const RdsBufSurfTransformRect *
   return TRUE;
 }
 
+/* Rules 4 to 5b for the first @n_src surfaces of @src and the first @n_dst of @dst. */
+static RdsBufSurfTransform_Error
+check_surfaces (const RdsBufSurface * src, guint n_src, const RdsBufSurface * dst, guint n_dst,
+    const RdsBufSurfTransformConfigParams * session)
+{
+  /* 4. memory types */
+  if (!is_device_accessible (src->memType) || !is_device_accessible (dst->memType)) {
+    GST_ERROR ("memory types src %d / dst %d: both must be device-accessible (default, device, pinned, unified)",
+        (gint) src->memType, (gint) dst->memType);
+    return RdsBufSurfTransformError_Unsupported;
+  }
+
+  /* 4b. device memory must be on the session's GPU (pinned and unified memory is reachable from any GPU) */
+  if (!check_gpu (src, session, "src") || !check_gpu (dst, session, "dst"))
+    return RdsBufSurfTransformError_Invalid_Params;
+
+  /* 5. formats and layouts */
+  if (!check_formats (src, n_src, "src") || !check_formats (dst, n_dst, "dst"))
+    return RdsBufSurfTransformError_Unsupported;
+
+  /* 5b. sizes and plane geometry */
+  if (!check_geometry (src, n_src, "src") || !check_geometry (dst, n_dst, "dst"))
+    return RdsBufSurfTransformError_Invalid_Params;
+  return RdsBufSurfTransformError_Success;
+}
+
+static gboolean
+is_valid_filter (RdsBufSurfTransform_Inter filter)
+{
+  return (gint) filter >= RdsBufSurfTransformInter_Nearest && (gint) filter <= RdsBufSurfTransformInter_Default;
+}
+
 RdsBufSurfTransform_Error
 rds_transform_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
     const RdsBufSurfTransformParams * transform_params)
@@ -325,24 +357,10 @@ rds_transform_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
     return RdsBufSurfTransformError_Unsupported;
   }
 
-  /* 4. memory types */
-  if (!is_device_accessible (src->memType) || !is_device_accessible (dst->memType)) {
-    GST_ERROR ("memory types src %d / dst %d: both must be device-accessible (default, device, pinned, unified)",
-        (gint) src->memType, (gint) dst->memType);
-    return RdsBufSurfTransformError_Unsupported;
-  }
-
-  /* 4b. device memory must be on the session's GPU (pinned and unified memory is reachable from any GPU) */
-  if (!check_gpu (src, session, "src") || !check_gpu (dst, session, "dst"))
-    return RdsBufSurfTransformError_Invalid_Params;
-
-  /* 5. formats and layouts */
-  if (!check_formats (src, n, "src") || !check_formats (dst, n, "dst"))
-    return RdsBufSurfTransformError_Unsupported;
-
-  /* 5b. sizes and plane geometry */
-  if (!check_geometry (src, n, "src") || !check_geometry (dst, n, "dst"))
-    return RdsBufSurfTransformError_Invalid_Params;
+  /* 4. - 5b. */
+  ret = check_surfaces (src, n, dst, n, session);
+  if (ret != RdsBufSurfTransformError_Success)
+    return ret;
 
   /* 6. rects */
   if (tp->transform_flag & RDS_BUFSURF_TRANSFORM_CROP_SRC) {
@@ -363,9 +381,7 @@ rds_transform_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
     return RdsBufSurfTransformError_Invalid_Params;
 
   /* 8. filter (only read when FILTER is set; otherwise Default) */
-  if ((tp->transform_flag & RDS_BUFSURF_TRANSFORM_FILTER)
-      && ((gint) tp->transform_filter < RdsBufSurfTransformInter_Nearest
-          || (gint) tp->transform_filter > RdsBufSurfTransformInter_Default)) {
+  if ((tp->transform_flag & RDS_BUFSURF_TRANSFORM_FILTER) && !is_valid_filter (tp->transform_filter)) {
     GST_ERROR ("invalid filter %d", (gint) tp->transform_filter);
     return RdsBufSurfTransformError_Invalid_Params;
   }
@@ -402,18 +418,16 @@ rds_transform_force_kernel (gboolean force)
   g_atomic_int_set (&force_kernel, force ? 1 : 0);
 }
 
-/* The filter mapping (rds_transform_filter_is_bilinear); no FILTER flag runs as nearest. */
+/* The filter mapping (rds_transform_filter_is_bilinear). */
 static gboolean
-use_bilinear (const RdsBufSurfTransformParams * tp)
+use_bilinear (RdsBufSurfTransform_Inter filter)
 {
   static gint warned = 0;
 
-  if (!(tp->transform_flag & RDS_BUFSURF_TRANSFORM_FILTER))
-    return FALSE;
-  if (tp->transform_filter >= RdsBufSurfTransformInter_Algo1 && tp->transform_filter <= RdsBufSurfTransformInter_Algo3
+  if (filter >= RdsBufSurfTransformInter_Algo1 && filter <= RdsBufSurfTransformInter_Algo3
       && g_atomic_int_compare_and_exchange (&warned, 0, 1))
     GST_WARNING ("filters Algo1-Algo3 run as bilinear on this implementation");
-  return rds_transform_filter_is_bilinear (tp->transform_filter);
+  return rds_transform_filter_is_bilinear (filter);
 }
 
 /* Builds the job for surface @i: rects default to the whole surface; a 4:2:0 destination rect is aligned outward
@@ -450,6 +464,7 @@ build_job (const RdsBufSurface * src, const RdsBufSurface * dst, const RdsBufSur
     job->dw = right - job->dl;
     job->dh = bottom - job->dt;
   }
+  job->cl = job->dl, job->ct = job->dt, job->cw = job->dw, job->ch = job->dh;
 }
 
 /* A same-format, same-size job whose result is a plain copy of the source rect: hipMemcpy2DAsync per plane gives
@@ -459,7 +474,8 @@ static gboolean
 is_plain_copy (const RdsKernelJob * job)
 {
   if (g_atomic_int_get (&force_kernel) || job->src.format != job->dst.format
-      || job->sw != job->dw || job->sh != job->dh)
+      || job->sw != job->dw || job->sh != job->dh
+      || job->cl != job->dl || job->ct != job->dt || job->cw != job->dw || job->ch != job->dh)
     return FALSE;
   switch (job->dst.format) {
     case RDS_BUF_COLOR_FORMAT_RGBx:
@@ -498,42 +514,24 @@ copy_rect (const RdsKernelJob * job, hipStream_t stream)
   return TRUE;
 }
 
-RdsBufSurfTransform_Error
-rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst, RdsBufSurfTransformParams * transform_params)
+/* Runs @n jobs in order on the session's stream and GPU and waits for them. */
+static RdsBufSurfTransform_Error
+run_jobs (const RdsKernelJob * jobs, guint n, const RdsBufSurfTransformConfigParams * session)
 {
-  const RdsBufSurfTransformConfigParams *session;
-  RdsBufSurfTransform_Error ret;
-  hipStream_t stream;
-  gboolean bilinear;
+  RdsBufSurfTransform_Error ret = RdsBufSurfTransformError_Success;
+  hipStream_t stream = (hipStream_t) session->cuda_stream;
   int prev_dev;
-
-  ret = rds_transform_validate (src, dst, transform_params);
-  if (ret != RdsBufSurfTransformError_Success)
-    return ret;
-  session = current_session ();
-
-  for (guint i = 0; i < src->numFilled; i++) {
-    if (src->surfaceList[i].dataPtr == NULL || dst->surfaceList[i].dataPtr == NULL) {
-      GST_ERROR ("surface %u has no pixel memory (dataPtr is NULL)", i);
-      return RdsBufSurfTransformError_Invalid_Params;
-    }
-  }
-  bilinear = use_bilinear (transform_params);
-  stream = (hipStream_t) session->cuda_stream;
 
   if (!rds_device_enter ((guint32) session->gpu_id, &prev_dev)) {
     GST_ERROR ("cannot select GPU %d", session->gpu_id);
     return RdsBufSurfTransformError_Execution_Error;
   }
-  for (guint i = 0; i < src->numFilled && ret == RdsBufSurfTransformError_Success; i++) {
-    RdsKernelJob job;
-
-    build_job (src, dst, transform_params, i, bilinear, &job);
-    if (is_plain_copy (&job)) {
-      if (!copy_rect (&job, stream))
+  for (guint i = 0; i < n && ret == RdsBufSurfTransformError_Success; i++) {
+    if (is_plain_copy (&jobs[i])) {
+      if (!copy_rect (&jobs[i], stream))
         ret = RdsBufSurfTransformError_Execution_Error;
-    } else if (rds_transform_launch (&job, stream) != 0) {
-      GST_ERROR ("kernel launch failed for surface %u (library built for another GPU architecture?)", i);
+    } else if (rds_transform_launch (&jobs[i], stream) != 0) {
+      GST_ERROR ("kernel launch failed for job %u (library built for another GPU architecture?)", i);
       ret = RdsBufSurfTransformError_Execution_Error;
     }
   }
@@ -541,8 +539,170 @@ rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst, RdsBufSurfTran
   if (!RDS_HIP_CHECK (hipStreamSynchronize (stream)))
     ret = RdsBufSurfTransformError_Execution_Error;
   rds_device_leave ((guint32) session->gpu_id, prev_dev);
+  return ret;
+}
+
+RdsBufSurfTransform_Error
+rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst, RdsBufSurfTransformParams * transform_params)
+{
+  RdsBufSurfTransform_Error ret;
+  RdsKernelJob *jobs;
+  gboolean bilinear;
+
+  ret = rds_transform_validate (src, dst, transform_params);
+  if (ret != RdsBufSurfTransformError_Success)
+    return ret;
+
+  for (guint i = 0; i < src->numFilled; i++) {
+    if (src->surfaceList[i].dataPtr == NULL || dst->surfaceList[i].dataPtr == NULL) {
+      GST_ERROR ("surface %u has no pixel memory (dataPtr is NULL)", i);
+      return RdsBufSurfTransformError_Invalid_Params;
+    }
+  }
+  /* no FILTER flag runs as nearest */
+  bilinear = (transform_params->transform_flag & RDS_BUFSURF_TRANSFORM_FILTER)
+      && use_bilinear (transform_params->transform_filter);
+
+  jobs = g_new (RdsKernelJob, src->numFilled);
+  for (guint i = 0; i < src->numFilled; i++)
+    build_job (src, dst, transform_params, i, bilinear, &jobs[i]);
+  ret = run_jobs (jobs, src->numFilled, current_session ());
+  g_free (jobs);
 
   if (ret == RdsBufSurfTransformError_Success)
     dst->numFilled = src->numFilled;
+  return ret;
+}
+
+/* Checks the arguments of rds_buf_surf_transform_composite (), like rds_transform_validate () does for the
+ * transform, plus the NULL pixel pointers. */
+static RdsBufSurfTransform_Error
+composite_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
+    const RdsBufSurfTransformCompositeParams * cp)
+{
+  const RdsBufSurfTransformConfigParams *session;
+  RdsBufSurfTransform_Error ret;
+  gpointer dp;
+  guint n;
+
+  g_return_val_if_fail (src != NULL, RdsBufSurfTransformError_Invalid_Params);
+  g_return_val_if_fail (dst != NULL, RdsBufSurfTransformError_Invalid_Params);
+  g_return_val_if_fail (cp != NULL, RdsBufSurfTransformError_Invalid_Params);
+  ensure_debug_category ();
+  session = current_session ();
+
+  /* both rect arrays are required (DeepStream 8.0 behaviour) */
+  if (cp->src_comp_rect == NULL || cp->dst_comp_rect == NULL) {
+    GST_ERROR ("composite rect arrays src %p / dst %p: both are required", cp->src_comp_rect, cp->dst_comp_rect);
+    return RdsBufSurfTransformError_Invalid_Params;
+  }
+
+  /* src->numFilled decides the entry count; input_buf_count is ignored (DeepStream 8.0 behaviour) */
+  n = src->numFilled;
+  if (n == 0 || n > src->batchSize || dst->batchSize == 0 || src->surfaceList == NULL || dst->surfaceList == NULL) {
+    GST_ERROR ("invalid batch: src numFilled %u, src batchSize %u, dst batchSize %u, surface lists %p/%p",
+        n, src->batchSize, dst->batchSize, src->surfaceList, dst->surfaceList);
+    return RdsBufSurfTransformError_Invalid_Params;
+  }
+  if (session->compute_mode == RdsBufSurfTransformCompute_VIC) {
+    GST_ERROR ("compute mode VIC is not available (NVIDIA Jetson only)");
+    return RdsBufSurfTransformError_Unsupported;
+  }
+  ret = check_surfaces (src, n, dst, 1, session);
+  if (ret != RdsBufSurfTransformError_Success)
+    return ret;
+
+  /* Rects are clipped, but their sizes must fit the kernel's arithmetic (ours). */
+  for (guint i = 0; i < n; i++) {
+    const RdsBufSurfTransformRect *s = &cp->src_comp_rect[i], *d = &cp->dst_comp_rect[i];
+
+    if (s->width > RDS_BUF_SURFACE_MAX_DIM || s->height > RDS_BUF_SURFACE_MAX_DIM
+        || d->width > RDS_BUF_SURFACE_MAX_DIM || d->height > RDS_BUF_SURFACE_MAX_DIM) {
+      GST_ERROR ("composite entry %u: src rect %ux%u or dst rect %ux%u larger than %u", i, s->width, s->height,
+          d->width, d->height, RDS_BUF_SURFACE_MAX_DIM);
+      return RdsBufSurfTransformError_ROI_Error;
+    }
+  }
+
+  if (!is_valid_filter (cp->composite_filter)) {
+    GST_ERROR ("invalid composite filter %d", (gint) cp->composite_filter);
+    return RdsBufSurfTransformError_Invalid_Params;
+  }
+
+  dp = dst->surfaceList[0].dataPtr;
+  if (dp == NULL) {
+    GST_ERROR ("dst surface 0 has no pixel memory (dataPtr is NULL)");
+    return RdsBufSurfTransformError_Invalid_Params;
+  }
+  for (guint i = 0; i < n; i++) {
+    gpointer sp = src->surfaceList[i].dataPtr;
+
+    if (sp == NULL || sp == dp) {
+      GST_ERROR ("src surface %u: pixel memory %p is NULL or the destination's", i, sp);
+      return RdsBufSurfTransformError_Invalid_Params;
+    }
+  }
+  return RdsBufSurfTransformError_Success;
+}
+
+/* Builds composite entry @i into surface 0 of @dst. Returns FALSE when the entry draws nothing: an empty source or
+ * destination rect after clipping. The source rect is cut to its surface (ours); the destination rect keeps its
+ * size, so the scaling is that of the whole rect, and only the window inside the surface is written. On 4:2:0 the
+ * rect is aligned inward: left and top rounded up to even, an odd right or bottom edge rounded down unless it is
+ * the surface edge (DeepStream 8.0 behaviour for the origin). */
+static gboolean
+build_composite_job (const RdsBufSurface * src, const RdsBufSurface * dst,
+    const RdsBufSurfTransformCompositeParams * cp, guint i, gboolean bilinear, RdsKernelJob * job)
+{
+  const RdsBufSurfaceParams *sp = &src->surfaceList[i], *dp = &dst->surfaceList[0];
+  const RdsBufSurfTransformRect *s = &cp->src_comp_rect[i], *d = &cp->dst_comp_rect[i];
+  guint64 sl = MIN (s->left, sp->width), sr = MIN ((guint64) s->left + s->width, sp->width);
+  guint64 st = MIN (s->top, sp->height), sb = MIN ((guint64) s->top + s->height, sp->height);
+  guint64 dl = d->left, dr = (guint64) d->left + d->width;
+  guint64 dt = d->top, db = (guint64) d->top + d->height;
+
+  if (is_yuv420 (dp->colorFormat)) {
+    dl = (dl + 1) & ~G_GUINT64_CONSTANT (1);
+    dt = (dt + 1) & ~G_GUINT64_CONSTANT (1);
+    if ((dr & 1) && dr != dp->width)
+      dr &= ~G_GUINT64_CONSTANT (1);
+    if ((db & 1) && db != dp->height)
+      db &= ~G_GUINT64_CONSTANT (1);
+  }
+  if (sr <= sl || sb <= st || dr <= dl || db <= dt || dl >= dp->width || dt >= dp->height)
+    return FALSE;
+
+  memset (job, 0, sizeof (*job));
+  rds_kernel_surface_init (&job->src, sp);
+  rds_kernel_surface_init (&job->dst, dp);
+  job->bilinear = bilinear;
+  job->sl = sl, job->st = st, job->sw = sr - sl, job->sh = sb - st;
+  job->dl = dl, job->dt = dt, job->dw = dr - dl, job->dh = db - dt;
+  job->cl = dl, job->ct = dt, job->cw = MIN (dr, dp->width) - dl, job->ch = MIN (db, dp->height) - dt;
+  return TRUE;
+}
+
+RdsBufSurfTransform_Error
+rds_buf_surf_transform_composite (RdsBufSurface * src, RdsBufSurface * dst,
+    RdsBufSurfTransformCompositeParams * composite_params)
+{
+  RdsBufSurfTransform_Error ret;
+  RdsKernelJob *jobs;
+  gboolean bilinear;
+  guint n = 0;
+
+  ret = composite_validate (src, dst, composite_params);
+  if (ret != RdsBufSurfTransformError_Success)
+    return ret;
+
+  /* composite_flag is ignored: the filter is always read (DeepStream 8.0 behaviour) */
+  bilinear = use_bilinear (composite_params->composite_filter);
+  jobs = g_new (RdsKernelJob, src->numFilled);
+  for (guint i = 0; i < src->numFilled; i++)
+    if (build_composite_job (src, dst, composite_params, i, bilinear, &jobs[n]))
+      n++;
+  if (n > 0)
+    ret = run_jobs (jobs, n, current_session ());
+  g_free (jobs);
   return ret;
 }
