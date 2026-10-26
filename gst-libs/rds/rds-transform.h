@@ -40,7 +40,7 @@ typedef enum
 
 typedef enum
 {
-  RdsBufSurfTransformError_ROI_Error = -4,     /* a rect is empty or not inside its surface (never clamped) */
+  RdsBufSurfTransformError_ROI_Error = -4,     /* rect empty or outside its surface (transform), too big (composite) */
   RdsBufSurfTransformError_Invalid_Params = -3,
   RdsBufSurfTransformError_Execution_Error = -2,
   RdsBufSurfTransformError_Unsupported = -1,
@@ -60,8 +60,9 @@ typedef enum
   RDS_BUFSURF_TRANSFORM_ALLOW_ODD_CROP = 1 << 5,
 } RdsBufSurfTransform_Transform_Flag;
 
-/* A rectangle in pixels of its surface: top-left corner (top, left) and size (width, height). It must be
- * non-empty and lie inside the surface, or the transform returns ROI_Error; it is never clamped. */
+/* A rectangle in pixels of its surface: top-left corner (top, left) and size (width, height). For
+ * rds_buf_surf_transform it must be non-empty and lie inside the surface, or the call returns ROI_Error; it is never
+ * clamped. rds_buf_surf_transform_composite clips its rects instead. */
 typedef struct
 {
   guint32 top;
@@ -78,6 +79,25 @@ typedef struct
   RdsBufSurfTransformRect *src_rect;            /* numFilled entries, read when CROP_SRC is set */
   RdsBufSurfTransformRect *dst_rect;            /* numFilled entries, read when CROP_DST is set */
 } RdsBufSurfTransformParams;
+
+/* composite_flag bits: accepted and ignored (DeepStream 8.0 behaviour: the composite always runs and always uses
+ * composite_filter). */
+typedef enum
+{
+  RDS_BUFSURF_TRANSFORM_COMPOSITE = 1,
+  RDS_BUFSURF_TRANSFORM_BLEND = 1 << 1,
+  RDS_BUFSURF_TRANSFORM_COMPOSITE_FILTER = 1 << 2,
+} RdsBufSurfTransform_Composite_Flag;
+
+typedef struct
+{
+  guint32 composite_flag;                       /* RdsBufSurfTransform_Composite_Flag bits, ignored */
+  guint32 input_buf_count;                      /* ignored: src->numFilled entries are composited */
+  RdsBufSurfTransformRect *src_comp_rect;       /* src->numFilled entries, required */
+  RdsBufSurfTransformRect *dst_comp_rect;       /* src->numFilled entries, required */
+  RdsBufSurfTransform_Inter composite_filter;   /* always read */
+  gpointer reserved[4];
+} RdsBufSurfTransformCompositeParams;
 
 typedef struct
 {
@@ -103,6 +123,18 @@ RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_set_default_session (vo
  * fails. The exact sampling and colour rules are documented in docs/compat-matrix.md. */
 RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform (RdsBufSurface * src, RdsBufSurface * dst,
     RdsBufSurfTransformParams * transform_params);
+
+/* Composites the first src->numFilled surfaces into surface 0 of dst: entry i scales src_comp_rect[i] of source
+ * surface i into dst_comp_rect[i], with the transform's sampling and colour rules (composite_filter as the filter).
+ * Entries are drawn in order, later ones on top; destination pixels outside every dst rect are not written. Rects
+ * reaching past their surface are clipped: a source rect is cut to its surface, a destination rect keeps its
+ * scaling and only its part inside the surface is drawn; an empty rect, or one wholly outside, draws nothing. On a
+ * 4:2:0 destination a rect's odd left or top edge is rounded up to even and an odd right or bottom edge (not on the
+ * surface edge) rounded down. Synchronous, on the session's stream, with the same surface requirements as
+ * rds_buf_surf_transform (dst only needs one surface); no source's pixel memory may overlap dst's. dst->numFilled is
+ * not changed. On error dst is not modified, apart from pixels if the GPU work itself fails. */
+RDS_API RdsBufSurfTransform_Error rds_buf_surf_transform_composite (RdsBufSurface * src, RdsBufSurface * dst,
+    RdsBufSurfTransformCompositeParams * composite_params);
 
 G_END_DECLS
 

@@ -5,8 +5,10 @@ online documentation (the Source column links the page); Redstream's implementat
 
 Status values: **supported** (same meaning), **accepted no-op** (compiles and is ignored), **unsupported**
 (compiles, then fails at run time), **different default** (supported, but the default value differs), **planned**
-(aliased, element not written yet). Names Redstream does not
-alias at all are listed under "Not aliased" in each section: code using them does not compile.
+(aliased, element not written yet). In element property tables also: **accepted** (the value is stored and read
+back, and does what the Notes say rather than what DeepStream does with it), **forwarded** (`rdsvideosink`: set on the
+stock sink inside it) and **ours** (a Redstream-only property). Names Redstream does not alias at all are listed under
+"Not aliased" in each section: code using them does not compile.
 
 Functions are aliased with object-like macros, so calls and `&function` work. Where a Redstream signature differs
 slightly (a `const` parameter, a `gboolean` instead of `void` result), calls compile unchanged but assigning the
@@ -29,12 +31,12 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvstreamdemux` | `rdsstreamdemux` | supported | zero-copy read-only views of the batch slots; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreamdemux) |
 | `nvinfer` | `rdsinfer` | supported | primary detector only (`process-mode=1`, `network-type` 0 or 100) on MIGraphX; nvinfer config files (key file or YAML); properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
 | `nvtracker` | `rdstracker` | supported | the IOU and NvSORT trackers of NvMultiObjectTracker, on the CPU, with its YAML config files; NvDCF and NvDeepSORT configs run as NvSORT. Matches observed DeepStream 8.0 behaviour where the docs are silent; properties, config keys and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker) |
-| `nvmultistreamtiler` | `rdsmultistreamtiler` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
-| `nvdsosd` | `rdsosd` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
+| `nvmultistreamtiler` | `rdsmultistreamtiler` | supported | NV12 and RGBA `memory:RDS` batches into one tiled frame of the same format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
+| `nvdsosd` | `rdsosd` | supported | RGBA `memory:RDS` frames (single or batched), drawn on the CPU with Cairo and Pango in the geometry of DeepStream 8.0's default GPU mode; masks and blur not yet; optional (`-Dosd`, needs cairo and pangocairo); properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
 | `nvdsanalytics` | `rdsanalytics` | planned | M2 | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsanalytics) |
-| `nvdslogger` | `rdslogger` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
-| `nveglglessink` | `rdsvideosink` | planned | display sink | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
-| `nv3dsink` | `rdsvideosink` | planned | display sink | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
+| `nvdslogger` | `rdslogger` | supported | passthrough, any caps; prints each stream's frame rate to stdout in DeepStream 8.0's `**PERF` line format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
+| `nveglglessink` | `rdsvideosink` | supported | display bin: `rdsvideoconvert` to system-memory BGRx, then a stock GStreamer sink (`video-sink`, default `autovideosink`); one frame per buffer; properties and behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
+| `nv3dsink` | `rdsvideosink` | supported | as `nveglglessink` (nv3dsink's properties are a subset of nveglglessink's) | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nvv4l2h264enc` | `rdsh264enc` | planned | VA (VCN) encode, M2 | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nvv4l2h265enc` | `rdsh265enc` | planned | VA (VCN) encode, M2 | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 
@@ -236,6 +238,214 @@ The demux returns the combination of its pads' results: NOT_LINKED only when eve
 FLUSHING or an error from one branch stops the streaming thread for all of them, so **block or unlink a branch
 before stopping it** (a sink set to NULL while still linked returns FLUSHING, which stops every branch). Give every branch a `queue`:
 otherwise the first sink to preroll blocks the others, which share the demux's streaming thread.
+
+### `rdsmultistreamtiler` (`nvmultistreamtiler`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler))
+
+Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0 (the 8.0 page omits
+`buffer-pool-size` and `interpolation-method`). Enum nicks are Redstream's.
+
+| Property | Type | Default | Status | Notes |
+|---|---|---|---|---|
+| `rows` | uint 1.. | `1` | supported | grown when the sources do not fit (see behaviour) |
+| `columns` | uint 1.. | `1` | supported | as `rows` |
+| `width` | uint 16.. | `1920` | supported | rounded up to a multiple of 4; a change renegotiates the output caps |
+| `height` | uint 16.. | `1080` | supported | as `width` |
+| `show-source` | int -1.. | `-1` | supported | a pad index: that source alone, scaled to the whole output; read on every batch |
+| `square-seq-grid` | boolean | `FALSE` | supported | a ⌈√n⌉ × ⌈√n⌉ grid; `rows` and `columns` are ignored. Cells are still by pad index |
+| `interpolation-method` | enum 0..6 | `6` (`default`) | supported | filters as in "Transform semantics" (`default` is nearest) |
+| `buffer-pool-size` | uint 4..10 | `5` | supported | buffers in the output pool; changeable only in NULL or READY |
+| `nvbuf-memory-type` | enum 0..3 | `2` (`nvbuf-mem-cuda-device`) | supported | memory of the output buffers; changeable only in NULL or READY |
+| `gpu-id` | uint | `0` | supported | changeable only in NULL or READY |
+| `compute-hw` | enum 0..2 | `0` | supported | `2` (VIC) fails at start; changeable only in NULL or READY |
+| `custom-tile-config` | pointer, write-only | NULL | accepted no-op | reserved in DeepStream too; a non-NULL value logs one warning |
+| `qos` | boolean | `FALSE` | supported | GstBaseTransform's |
+
+Pads: `sink` and `src`, `video/x-raw(memory:RDS)` NV12 or RGBA. The output has the input's format and framerate (no
+conversion) and `width` × `height`, rounded. The input batch must be in device-accessible memory (device, pinned or
+unified); a system-memory batch is an element error (ours).
+
+#### Tiling behaviour
+
+Each row is either **matches nvmultistreamtiler (DeepStream 8.0)**: observed DeepStream 8.0 behaviour where the docs
+are silent, or **ours**: where 8.0 settles nothing or is clearly broken.
+
+| Behaviour | Status | Notes |
+|---|---|---|
+| Cell of a frame | matches nvmultistreamtiler (DeepStream 8.0) | the frame meta's `pad_index`, row-major from the top left; `source_id` plays no part. The pixels come from the batch slot at the frame's `batch_id` |
+| Grid | matches nvmultistreamtiler (DeepStream 8.0) | n = highest pad index seen + 1, from `rds-pad-added` events. `rows` × `columns` while n fits; otherwise ⌊√n⌋ rows and ⌈n / rows⌉ columns (2: 1×2, 3: 1×3, 5: 2×3, 7: 2×4). Recomputed when a pad is added |
+| Grid grown from frame metas | ours | a frame meta's pad index beyond n grows the grid too (8.0 fails with a fatal composite error on a pad index only a frame meta has) |
+| Grid after a source leaves | ours | never shrunk (8.0 not observed) |
+| Cell geometry | matches nvmultistreamtiler (DeepStream 8.0) | output size rounded up to a multiple of 4 (1001×701 gives 1004×704); cells ⌊W / columns⌋ × ⌊H / rows⌋, each rounded down to even, at (column·cell width, row·cell height) |
+| Scaling | matches nvmultistreamtiler (DeepStream 8.0) | each frame stretched over its whole cell (no letterbox), with its own size |
+| Unused cells and the strip right and below the cells | matches nvmultistreamtiler (DeepStream 8.0) | black on every output frame: NV12 Y 16, U/V 128; RGBA all bytes 0 (ours for the alpha byte, as `rdsvideoconvert`'s fill) |
+| Output meta | matches nvmultistreamtiler (DeepStream 8.0) | a batch meta with one fresh frame meta (`num_frames_in_batch` and `max_frames_in_batch` 1) holding a copy of every object and display meta of the batch; its `pad_index`, `source_id`, `batch_id`, `frame_num`, `buf_pts`, `ntp_timestamp`, `source_frame_*`, `pipeline_*` and `surface_index` are 0. Frame user meta and batch user meta are not carried. Per-source counts belong before the tiler |
+| Order of the merged objects | ours | by pad index, each pad's objects (then display metas) in its list order |
+| Meta coordinates | matches nvmultistreamtiler (DeepStream 8.0) | `rect_params` of objects and display rects: x' = cell x + x·sx, y' = cell y + y·sy, w·sx, h·sy as floats (sx = cell width / frame width); text offsets, line and arrow end points and circle centres the same, truncated to integers; circle radius × min (sx, sy), truncated. Unchanged: `font_size`, all widths, `detector_bbox_info`, `tracker_bbox_info`, `mask_params`, ids, class, confidence, labels. Not clipped to the cell |
+| A source missing from a batch | matches nvmultistreamtiler (DeepStream 8.0) | its cell keeps its last pixels and its last objects and display metas are repeated, until its `rds-stream-eos` (or `rds-pad-deleted`); then the cell is black and its meta gone. Its pixels survive a grid change (moved into the new cell) |
+| Two frames of one pad in a batch | ours | both drawn, the later on top; the later one's meta is kept |
+| `show-source` | matches nvmultistreamtiler (DeepStream 8.0) | by pad index: that frame stretched to the output with only its meta, scaled to the output; a pad that never had a frame or has ended: black and an empty frame meta; a value of at least rows × columns: element error on the next batch. Changes apply from the next batch |
+| `show-source` on a live pad missing from the batch | ours | black and an empty frame meta, as for an ended pad (8.0 not observed); the grid would repeat such a pad's last frame instead. The grid keeps its cached cells meanwhile, so switching back to -1 shows them |
+| Live changes with empty cells | ours | `rows`, `columns`, `square-seq-grid`, `width` or `height` changed while playing to values whose cells would be empty: ignored with one element warning, the current grid kept |
+| Input on another GPU | ours | device memory on a GPU other than `gpu-id` is an element error naming both |
+| A pad the grid cannot hold | ours | a pad index whose grid would have empty cells (narrower or lower than 2 pixels) is skipped, with one element warning, whether it comes from a frame meta or an `rds-pad-added` event (also one before the caps) (8.0: fatal composite error) |
+| Empty batch | ours | no frames: a black frame with an empty frame meta, as the docs say the muxer sends one to clear the tiler's output (8.0 crashes on it, per the docs' troubleshooting page). The cached cells and meta stay: the next batch repeats absent sources again |
+| Events | ours | every event goes downstream unchanged; FLUSH_STOP forgets every cached cell and meta |
+| Ready on push | ours | the composite, copies and clears are synchronous on the element's own HIP stream; the output is complete when pushed |
+
+### `rdsosd` (`nvdsosd`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd))
+
+Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0. Enum nicks as in DeepStream.
+
+| Property | Type | Default | Status | Notes |
+|---|---|---|---|---|
+| `display-bbox` | boolean | `TRUE` | supported | object and display-meta rectangles (borders and fills) |
+| `display-text` | boolean | `TRUE` | supported | object text, display-meta labels and the clock |
+| `display-clock` | boolean | `FALSE` | supported | |
+| `clock-font` | string | NULL | supported | a fontconfig / Pango font name; NULL: `Serif` |
+| `clock-font-size` | uint 0..60 | `0` | supported | points; 0: 12. Changeable only in NULL or READY |
+| `x-clock-offset`, `y-clock-offset` | uint | `0` | supported | changeable only in NULL or READY |
+| `clock-color` | uint | `0` | supported | 0xRRGGBBAA; never set: opaque red; set to 0: invisible. Changeable only in NULL or READY |
+| `process-mode` | enum 0..1 (`MODE_CPU`, `MODE_GPU`) | `1` | accepted | both draw on the CPU with the GPU mode's geometry; logged at start. Changeable only in NULL or READY |
+| `gpu-id` | uint | `0` | accepted | frames are drawn where they are (synced to the CPU and back). Changeable only in NULL or READY |
+| `display-mask` | boolean | `FALSE` | accepted no-op | masks are not drawn yet; `TRUE` logs one warning |
+| `blur-bbox` | boolean | `FALSE` | accepted no-op | objects are not blurred yet; `TRUE` logs one warning. Changeable only in NULL or READY |
+| `blur-on-gie-class-ids` | string | NULL | accepted no-op | as `blur-bbox` |
+| `qos` | boolean | `FALSE` | supported | GstBaseTransform's |
+
+Pads: `sink` and `src`, `video/x-raw(memory:RDS)` RGBA only (ours: DeepStream 8.0's GPU mode also takes NV12), in
+place. A buffer whose memory is shared or a read-only surface view (`rdsstreamdemux` output) is drawn on a private
+copy; the batch it came from is never written. Frames with nothing to draw (under the current switches) are not
+synced, and a buffer with nothing to draw passes through unmapped, without a copy. A failed map or CPU/GPU sync is an
+element error.
+
+#### Drawing behaviour
+
+Each row is either **matches nvdsosd (DeepStream 8.0)**: observed DeepStream 8.0 behaviour in its default GPU mode
+where the docs are silent, or **ours**: where 8.0 settles nothing or is clearly broken.
+
+| Behaviour | Status | Notes |
+|---|---|---|
+| Rectangle borders | matches nvdsosd (DeepStream 8.0) | hard edges; each float field truncated; with L = left, R = L + width and bw = `border_width`, the left and top bands are [L − ⌊(bw−1)/2⌋, L + ⌈(bw−1)/2⌉], the right and bottom bands [R − ⌈(bw−1)/2⌉, R + ⌊(bw−1)/2⌋] (bw 3 at L 100: 99..101); `border_width` 0 draws no border |
+| Rectangles partly outside the frame | matches nvdsosd (DeepStream 8.0) | clipped, never moved into the frame (DeepStream's CPU mode clamps them) |
+| `border_width` above 32 (`MAX_BORDER_WIDTH`) | ours | drawn 32 wide with one element warning (8.0 stops the pipeline) |
+| Rectangle fills | matches nvdsosd (DeepStream 8.0) | `has_bg_color`: `bg_color` strictly inside the border bands (bw 0: L + 1 .. R − 1) |
+| Alpha | matches nvdsosd (DeepStream 8.0) | a·src + (1 − a)·dst per channel, truncated (red at 0.5 over 128 gives 191, 64, 64); applied to borders too (the docs say GPU mode ignores border alpha; 8.0 applies it); alpha byte blended with 255 |
+| A rect with a NaN field | ours | not drawn |
+| Text position | matches nvdsosd (DeepStream 8.0) | the background box's top left is (`x_offset` + 1, `y_offset` + 1); the text is inset by the padding; not moved into the frame, clipped at its edges |
+| Text box padding | ours | `font_size` / 2 pixels left and right, `font_size` / 4 above and below, around Pango's logical extents (8.0: ≈10 and ≈5 at size 20; size 20 boxes ≈40 px tall) |
+| Fonts | matches nvdsosd (DeepStream 8.0) | `font_name` honoured (a fontconfig / Pango name); unknown: fontconfig's fallback, a sans; `font_size` in points at 96 dpi; `font_size` 0, NULL or empty text: nothing drawn, not even the box; `\n` starts a new line; antialiased glyphs |
+| NULL or empty `font_name` | ours | `Sans` (8.0's GPU mode crashes on NULL) |
+| Text encoding | ours | `display_text` is UTF-8, shaped by Pango (any script the installed fonts cover); invalid UTF-8 is drawn with U+FFFD for the bad bytes (8.0 not observed) |
+| Font sizes above 1024 | ours | drawn at 1024 points |
+| Switches | matches nvdsosd (DeepStream 8.0) | `display-bbox=0` hides object and display-meta rects only; `display-text=0` hides object text, display-meta labels and the clock |
+| Draw order | matches nvdsosd (DeepStream 8.0) | all rects (objects, then display metas), all text (objects, then labels), lines, arrows, circles, the clock; within a kind in list order, later on top. The order of arrows against circles is ours |
+| Display meta limits | matches nvdsosd (DeepStream 8.0) | at most 16 entries of each kind read, a larger `num_*` ignored; every display meta of the frame drawn |
+| Lines and arrow shafts | matches nvdsosd (DeepStream 8.0) | hard edges, ⌊(w−1)/2⌋ pixels on each side of the segment (width 6 is drawn 5 wide), ends extended as far; clipped at the frame. Diagonals have hard edges (8.0 smooths them slightly); width 0 draws 1 pixel (ours) |
+| Arrow heads | matches nvdsosd (DeepStream 8.0) | an open V at (x1, y1) for `START_HEAD` and (x2, y2) for `END_HEAD`, its wings 22 px back and 7 px to each side (measured), drawn with the shaft's width |
+| `BOTH_HEAD` | ours | a head at both ends (8.0 draws one head, or nothing in CPU mode) |
+| Other `arrow_head` values, zero-length arrows | ours | the shaft only |
+| Circles | matches nvdsosd (DeepStream 8.0) | a ring straddling the radius: `circle_width` w covers the pixels at distances r − ⌊w/2⌋ .. r + ⌈w/2⌉ from the centre (w 3, r 60: 59..62); `has_bg_color` fills inside the ring with `bg_color`; clipped at the frame |
+| `circle_width` 0 | matches nvdsosd (DeepStream 8.0) | still outlined, 3 px centred on the radius (r 60: 59..61), so zeroed circles stay visible |
+| Huge coordinates and widths | ours | circles and arrow heads with a coordinate, radius or width beyond 2^21 (2097152) pixels are not drawn (a wider `circle_width` is taken as 2^21); `line_width` and `arrow_width` above twice the frame's larger side are clamped to it (the stroke covers the frame); lines are clipped to the frame first |
+| Clock | matches nvdsosd (DeepStream 8.0) | `YYYY-MM-DD HH:MM:SS`, the process's local time read once per buffer, drawn like text without a box at the clock offsets; default font a serif; one per frame |
+| A buffer without frame meta | ours | passes through untouched, except that it gets the clock on every frame when `display-clock` is on |
+| Masks | ours | not drawn yet (`display-mask` accepted, one warning); 8.0 draws them only with `display-mask=1` |
+| Blur | ours | not done yet (`blur-bbox`, `blur-on-gie-class-ids` accepted, one warning); 8.0 blurs in GPU mode only |
+| Batched input | ours | each frame meta drawn on its own surface, the slot at its `batch_id` (8.0 draws every frame's meta on surface 0); a `batch_id` outside the batch is skipped with one element warning |
+| Tracker-created objects | matches nvdsosd (DeepStream 8.0) | drawn like any other object (confidence −0.1 changes nothing); nothing is added (no id text) |
+| `has_color_info`, `color_id` | ours | ignored (Jetson colour table) |
+| `process-mode` | ours | both values draw on the CPU with the GPU mode's geometry |
+| Ready on push | ours | the CPU/GPU syncs are synchronous; the frame is complete when pushed |
+
+### `rdslogger` (`nvdslogger`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger.md))
+
+Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0 (the 8.0 guide has no page for
+the element; the 9.2 page lists `show-fps`, `show-latency` and an underscored interval name that 8.0 does not have).
+DeepStream 8.0's nvdslogger has identity's properties plus the interval.
+
+| Property | Type | Default | Status | Notes |
+|---|---|---|---|---|
+| `fps-measurement-interval-sec` | uint | `5` | supported | seconds of running time per printed rate; 0: nothing printed. Changeable while playing (restarts the measurement) |
+| `silent` | boolean | `TRUE` | supported | `FALSE` adds two lines per buffer (below) |
+| `signal-handoffs` | boolean | `TRUE` | supported | emits `handoff` (identity's signature) for every buffer |
+| `last-message` | string, read-only | NULL | accepted | always NULL |
+| `qos` | boolean | `FALSE` | supported | GstBaseTransform's |
+| `check-imperfect-offset`, `check-imperfect-timestamp`, `drop-allocation`, `dump`, `single-segment`, `sync` | boolean | `FALSE` | accepted no-op | a non-default value logs one warning per property |
+| `datarate` | int 0..2147483647 | `0` | accepted no-op | as above |
+| `drop-buffer-flags` | flags `GstBufferFlags` | `0` | accepted no-op | as above |
+| `drop-probability` | float 0..1 | `0` | accepted no-op | as above |
+| `error-after` | int | `-1` | accepted no-op | as above |
+| `latency`, `sleep-time` | uint | `0` | accepted no-op | as above |
+| `ts-offset` | int64 | `0` | accepted no-op | as above |
+
+Pads: `sink` and `src`, ANY caps; buffers pass through untouched.
+
+#### Logging behaviour
+
+Each row is either **matches nvdslogger (DeepStream 8.0)**: observed DeepStream 8.0 behaviour where the docs are
+silent, or **ours**: where 8.0 settles nothing or is clearly broken.
+
+| Behaviour | Status | Notes |
+|---|---|---|
+| Output | matches nvdslogger (DeepStream 8.0) | stdout (`g_print`), one line per interval: `**PERF : ` then `FPS_<source_id> (<rate>)` and a tab per stream, then a newline (`**PERF : FPS_0 (29.97)\tFPS_1 (30.00)\t`); printed whatever `silent` is |
+| Rate format | matches nvdslogger (DeepStream 8.0) | two decimals, always with `.` (ours: whatever the locale) |
+| Streams | matches nvdslogger (DeepStream 8.0) | one entry per `source_id` of the frame metas, by ascending id, listed from the stream's first frame on and kept after its `rds-stream-eos` (0.00 from then on); forgotten when the element goes back to READY |
+| Timing | matches nvdslogger (DeepStream 8.0) | a periodic id on the pipeline clock fires at every interval of running time from PLAYING; the first one only starts the count, so the first line comes two intervals in; paused, no time passes. A run shorter than two intervals prints nothing |
+| Rate value | ours | frames counted since the previous line / the interval (8.0's numbers drift above the true rate for a while after a stream joins or leaves) |
+| `fps-measurement-interval-sec=0` | ours | nothing printed (8.0 prints `FPS_0 (0.00)` in a busy loop) |
+| Interval changed while playing | ours | the measurement restarts: one interval to start the count, then a line every interval |
+| Flushes | ours | change nothing, also when they reset the running time (a seek, a looped clip): the boundaries are kept in clock time, and the frames counted before the flush count in the current interval |
+| A buffer without batch meta | ours | one frame of stream 0 |
+| No stream seen yet | ours | nothing printed |
+| `silent=false` | matches nvdslogger (DeepStream 8.0) | per buffer `<name> BUF_PTS : <pts> element time <running time now> elem-buf=<now − pts, ms> ms buf=<address> buffer_pts_to_running_time = <pts running time>rdslogger base time = <base time>buffer dur <duration>` (no separators before `rdslogger` and `buffer dur`, as in 8.0, whose label reads `nvdslogger base time`), then `BUFFER PTS is lesser than ELEMENT TIME, IT's LATE` or `BUFFER PTS is greater than ELEMENT TIME, IT's EARLY` (ours: only the LATE line was observed in 8.0, so the EARLY wording is inferred; equal counts as early); without a clock or PTS, the times print as `99:99:99.999999999` and the second line is left out (ours) |
+| Latency output | ours | none (8.0 printed none either without `NVDS_ENABLE_LATENCY_MEASUREMENT`) |
+
+### `rdsvideosink` (`nveglglessink`, `nv3dsink`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html))
+
+Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0's nveglglessink (nv3dsink has
+the same base-sink properties and the window geometry, with `window-x`/`window-y` defaulting to 0). Neither element
+has a page in the 8.0 guide. "Forwarded": set on the inner sink, and on the sinks inside it when it is a bin (as
+`autovideosink` is), whenever it has a writable property of that name and the value fits its range; the values are
+applied when the inner sink is created and on every change. A property the inner sink lacks is stored and does nothing,
+silently (ours: with `autovideosink` the real sink is known only at READY).
+
+| Property | Type | Default | Status | Notes |
+|---|---|---|---|---|
+| `video-sink` | string | `autovideosink` | ours | a factory name (string) of the GStreamer sink that shows the frames; an element instance is not accepted; NULL or empty: `autovideosink`; an unknown name, or an element that does not link or start, keeps the current sink with a warning. Changeable only in NULL or READY |
+| `sync` | boolean | `TRUE` | forwarded | |
+| `qos` | boolean | `TRUE` | forwarded | |
+| `max-lateness` | int64 −1.. | `5000000` | forwarded | nanoseconds |
+| `processing-deadline` | uint64 | `15000000` | forwarded | nanoseconds |
+| `async` | boolean | `TRUE` | forwarded | |
+| `window-x`, `window-y` | uint 0..2147483647 | `10` | forwarded | nveglglessink's defaults (nv3dsink's are 0); none of the stock sinks in the dev image has them |
+| `window-width`, `window-height` | uint 0..2147483647 | `0` | forwarded | 0: the video's size; writable only on sinks that have them writable (not `ximagesink`, where they are read-only) |
+| `force-aspect-ratio` | boolean | `TRUE` | forwarded | |
+| `create-window` | boolean | `TRUE` | forwarded | |
+| `gpu-id` | uint | `0` | forwarded | also `rdsvideoconvert`'s `gpu-id` (the GPU that copies the frames). Changeable only in NULL or READY |
+| `blocksize`, `enable-last-sample`, `max-bitrate`, `render-delay`, `show-preroll-frame`, `throttle-time`, `ts-offset` | as GstBaseSink | as GstBaseSink | forwarded | the base-sink properties both DeepStream sinks show |
+| `rows`, `columns` | uint 1..2147483647 | `1` | accepted no-op | a non-default value logs one warning per property (what 8.0 does with them was not determined) |
+| `profile` | uint | `0` | accepted no-op | as above |
+| `display` | pointer | NULL | accepted no-op | as above |
+| `do-transform` | boolean | `TRUE` | accepted no-op | as above |
+| `winsys` | string | `x11` | accepted no-op | Jetson's nveglglessink (`x11` or `wayland`); not in 8.0's dGPU gst-inspect, so its string type and `x11` default are ours; as above |
+
+Pads: `sink` (a ghost pad of `rdsvideoconvert`'s): `memory:RDS` or system memory, `NV12`, `I420`, `RGBA`, `BGRA`,
+`RGBx`, `BGRx`, `RGB`, `BGR`, `GRAY8`. Inside: `rdsvideoconvert ! video/x-raw,format=BGRx ! videoconvert !
+<video-sink>`. The stock sinks in the dev image are `ximagesink`, `kmssink`, `autovideosink` and `fpsdisplaysink`;
+from a container, X11 needs `DISPLAY`, the X socket and the Xauthority file.
+
+#### Display behaviour
+
+Each row is either **matches nveglglessink (DeepStream 8.0)**: observed DeepStream 8.0 behaviour where the docs are
+silent, or **ours**: where 8.0 settles nothing or is clearly broken. Every row is ours so far: the display path itself
+differs.
+
+| Behaviour | Status | Notes |
+|---|---|---|
+| Rendering path | ours | frames copied to system memory (BGRx) and shown by a stock GStreamer sink; no GL interop yet |
+| Batched input | ours | a buffer with more than one frame (`numFilled` above 1, or more than one frame meta) is an element error "rdsvideosink takes one frame per buffer: add a tiler or a demuxer" (buffer lists are checked buffer by buffer) (8.0 accepts the caps, then fails the first buffer without a message, and the pipeline hangs) |
+| No display | ours | the inner sink's own error reaches the bus (`ximagesink`: "Could not initialise X output"); a sink that fails to start without posting an error gets one from `rdsvideosink` naming it and the `video-sink` property (another element of the bin failing silently: "An element inside rdsvideosink failed <transition>") (8.0's nveglglessink fails the state change without a bus message; nv3dsink posts "state change failed and some element failed to post a proper error message") |
+| `autovideosink` without a display | ours | it may pick `kmssink`, which can start without showing anything; set `video-sink` for a definite sink |
 
 ### `rdsinfer` (`nvinfer`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvinfer.html))
 
@@ -820,9 +1030,9 @@ Not aliased: `NVBUF_MEM_CUDA_ARRAY` (no Redstream counterpart), the other `NvBuf
 
 ## NvBufSurfTransform
 
-Batched crop, scale and colour conversion between surfaces, run by Redstream's own HIP kernels. Types are
-`typedef`s, functions and enumerators are object-like macros. All four functions have DeepStream's exact prototypes,
-so they can also be assigned to function pointers declared with them.
+Batched crop, scale and colour conversion between surfaces, and the many-to-one composite, run by Redstream's own
+HIP kernels. Types are `typedef`s, functions and enumerators are object-like macros. All five functions have
+DeepStream's exact prototypes, so they can also be assigned to function pointers declared with them.
 
 | DeepStream name | Redstream name | Status | Notes | Source |
 |---|---|---|---|---|
@@ -867,10 +1077,15 @@ so they can also be assigned to function pointers declared with them.
 | `NvBufSurfTransformSetSessionParams` | `rds_buf_surf_transform_set_session_params` | supported | per thread | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvbufsurftransform_8h_source.html) |
 | `NvBufSurfTransformGetSessionParams` | `rds_buf_surf_transform_get_session_params` | supported |  | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvbufsurftransform_8h_source.html) |
 | `NvBufSurfTransformSetDefaultSession` | `rds_buf_surf_transform_set_default_session` | supported | GPU 0, default stream | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvbufsurftransform_8h_source.html) |
+| `NvBufSurfTransform_Composite_Flag` | `RdsBufSurfTransform_Composite_Flag` | supported | values as documented; `composite_flag` is ignored, as in DeepStream 8.0 | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
+| `NVBUFSURF_TRANSFORM_COMPOSITE` | `RDS_BUFSURF_TRANSFORM_COMPOSITE` | supported | ignored | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
+| `NVBUFSURF_TRANSFORM_BLEND` | `RDS_BUFSURF_TRANSFORM_BLEND` | supported | ignored (no blending) | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
+| `NVBUFSURF_TRANSFORM_COMPOSITE_FILTER` | `RDS_BUFSURF_TRANSFORM_COMPOSITE_FILTER` | supported | ignored: `composite_filter` is always read | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
+| `NvBufSurfTransformCompositeParams` | `RdsBufSurfTransformCompositeParams` | supported | `input_buf_count` is ignored (`src->numFilled` decides), as in DeepStream 8.0 | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
+| `NvBufSurfTransformComposite` | `rds_buf_surf_transform_composite` | supported | synchronous; see "Composite semantics" | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvbufsurftransform_8h.html) |
 
-Not aliased: `NvBufSurfTransformAsync`, the composite and blend calls and their types (`NvBufSurfTransformComposite*`,
-`NvBufSurfTransformMultiInputBufCompositeBlend*`, `NvBufSurfTransform_Composite_Flag` and its
-`NVBUFSURF_TRANSFORM_COMPOSITE*`/`BLEND` flags), the sync objects (`NvBufSurfTransformSyncObj*`),
+Not aliased: `NvBufSurfTransformAsync`, `NvBufSurfTransformCompositeAsync`, the blend calls and their types
+(`NvBufSurfTransformCompositeBlend*`, `NvBufSurfTransformMultiInputBufCompositeBlend*`), the sync objects (`NvBufSurfTransformSyncObj*`),
 `NvBufSurfTransform_ColorParams` and `NVBUFSURF_MAX_SYNCOBJ` ([ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvbufsurftransform_8h_source.html)).
 
 ### Behaviour differences from DeepStream
@@ -984,6 +1199,28 @@ tests compare the kernels with an independent CPU implementation of these rules.
   pixels are written, the chroma sample is still written, and for an RGB source its U and V are the mean over the
   in-bounds pixels only.
 
+### Composite semantics
+
+What `rds_buf_surf_transform_composite` (`NvBufSurfTransformComposite`) does. Where NVIDIA's reference is silent it
+matches observed DeepStream 8.0 behaviour; rows marked "ours" are Redstream's own choice.
+
+| Case | Behaviour | Origin |
+|---|---|---|
+| Entries | the first `src->numFilled` source surfaces; entry `i` scales `src_comp_rect[i]` of source surface `i` into `dst_comp_rect[i]` of destination surface 0. Other destination surfaces are not written. `input_buf_count` and `composite_flag` are ignored | DeepStream 8.0 behaviour |
+| Sampling and colour | as in "Transform semantics" (the composite runs the same kernels), with `composite_filter` as the filter; sources may differ in format and size, and each is stretched into its rect (no aspect preservation) | DeepStream 8.0 behaviour (stretch, NV12/RGBA conversion); rules ours |
+| Pixels outside every destination rect | not written | DeepStream 8.0 behaviour |
+| Overlapping destination rects | drawn in entry order, later entries on top | DeepStream 8.0 behaviour |
+| `src_comp_rect` or `dst_comp_rect` NULL | `Invalid_Params`, destination untouched | DeepStream 8.0 behaviour |
+| Destination rect partly outside the surface | success; the rect keeps its scaling and only its part inside the surface is drawn | clipping: DeepStream 8.0 behaviour; which part of the source shows: ours |
+| Source rect partly outside its surface | success; the rect is cut to the surface and that part is scaled into the destination rect | clipping: DeepStream 8.0 behaviour; cut: ours |
+| Rect empty, or wholly outside its surface | the entry draws nothing (success) | ours (8.0 draws a 2x2 block for a zero-size destination rect) |
+| Rect wider or taller than 16384 | `ROI_Error`, destination untouched | ours |
+| Odd destination rect on NV12 or I420 | left and top rounded up to even, an odd right or bottom edge rounded down unless it is the surface edge; the source is scaled onto that rect | origin: DeepStream 8.0 behaviour; odd right or bottom edge: ours |
+| Odd destination rect on an RGB-family or GRAY8 surface | used as given | ours (8.0 also rounds RGBA rects to even) |
+| `dst->numFilled` | not changed | ours |
+| Other arguments | the transform's rules for memory types, the session GPU, formats, layouts and plane geometry (the destination needs one surface); `numFilled` 0 or above `src->batchSize`, an out-of-range filter, a NULL `dataPtr` or a source whose pixel memory (`dataPtr`, `dataSize` bytes) overlaps the destination's is `Invalid_Params` | ours |
+| Execution | synchronous, on the session's stream and GPU, like `NvBufSurfTransform` | ours (no async variant) |
+
 ## OSD parameter structs
 
 | DeepStream name | Redstream name | Status | Notes | Source |
@@ -994,7 +1231,7 @@ tests compare the kernels with an independent CPU implementation of these rules.
 | `NvOSD_RectParams` | `RdsOSD_RectParams` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvll__osd__struct_8h.html) |
 | `NvOSD_LineParams` | `RdsOSD_LineParams` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvll__osd__struct_8h.html) |
 | `NvOSD_ArrowParams` | `RdsOSD_ArrowParams` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvll__osd__struct_8h.html) |
-| `NvOSD_CircleParams` | `RdsOSD_CircleParams` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvll__osd__struct_8h.html) |
+| `NvOSD_CircleParams` | `RdsOSD_CircleParams` | supported | with `circle_width` between `bg_color` and `reserved`, as documented | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvll__osd__struct_8h.html) |
 | `NvOSD_MaskParams` | `RdsOSD_MaskParams` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvll__osd__struct_8h.html) |
 | `NvOSD_Arrow_Head_Direction` | `RdsOSD_Arrow_Head_Direction` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvll__osd__struct_8h.html) |
 | `NvBbox_Coords` | `RdsBbox_Coords` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvll__osd__struct_8h.html) |
@@ -1073,6 +1310,8 @@ tests compare the kernels with an independent CPU implementation of these rules.
 | `nvds_remove_user_meta_from_frame` | `rds_remove_user_meta_from_frame` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `nvds_remove_user_meta_from_object` | `rds_remove_user_meta_from_object` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `nvds_get_user_meta_type` | `rds_get_user_meta_type` | supported | takes `const gchar *`, but assigning it to a pointer with DeepStream's exact prototype does not compile | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
+| `nvds_copy_obj_meta_list` | `rds_copy_obj_meta_list` | supported | appends deep copies to the frame. Ours: parents are remapped within the list (a parent outside it becomes NULL) | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
+| `nvds_copy_display_meta_list` | `rds_copy_display_meta_list` | supported | appends deep copies to the frame | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
 | `gst_buffer_get_nvds_batch_meta` | `gst_buffer_get_rds_batch_meta` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2gstnvdsmeta_8h.html) |
 | `NvDsInferTensorMeta` | `RdsInferTensorMeta` | supported | `rds/rds-infer-meta.h`; the documented fields in order; `priv_data` is rdsinfer's (it keeps the buffers alive). See the `rdsinfer` section | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferTensorMeta.html) |
 

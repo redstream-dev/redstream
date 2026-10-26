@@ -40,18 +40,19 @@ test_deps = [rds_dep, gst_check_dep, hip_dep]
 
 # GPU-free tests (hosted CI runs `meson test --suite cpu`): no device needed at run time, but building still
 # needs the ROCm headers and libamdhip64.
-cpu_tests = ['compat_remap', 'compat_header', 'compat_header_nomacros', 'buf_surface', 'memory', 'surface_view', 'buffer_pool',
-  'allocation', 'meta_batch', 'meta_children',
+cpu_tests = ['compat_remap', 'compat_header', 'compat_header_nomacros', 'buf_surface', 'memory', 'surface_view',
+  'buffer_pool', 'allocation', 'meta_batch', 'meta_children',
   'meta_copy', 'event', 'compat_meta', 'compat_aliases', 'transform_params']
 foreach t : cpu_tests
   test(t, executable(t, 'check' / (t + '.c'), dependencies : test_deps),
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 endforeach
 
-# plugin_load also checks that rdsinfer and rdstracker load when the build has them.
+# plugin_load also checks that rdsinfer, rdstracker and rdsosd load when the build has them.
 test('plugin_load', executable('plugin_load', 'check' / 'plugin_load.c', dependencies : test_deps,
     c_args : ['-DRDS_HAVE_INFER=@0@'.format(rds_infer_enabled ? 1 : 0),
-      '-DRDS_HAVE_TRACKER=@0@'.format(rds_tracker_enabled ? 1 : 0)]),
+      '-DRDS_HAVE_TRACKER=@0@'.format(rds_tracker_enabled ? 1 : 0),
+      '-DRDS_HAVE_OSD=@0@'.format(rds_osd_enabled ? 1 : 0)]),
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
 # GPU-free tests that call private library symbols: they link only the static internal copy of libgstrds
@@ -61,6 +62,10 @@ foreach t : internal_cpu_tests
   test(t, executable(t, 'check' / (t + '.c'), dependencies : [rds_internal_dep]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
 endforeach
+
+# rdsmultistreamtiler's layout core: grids, cells and meta scaling (no GStreamer, no GPU).
+test('tiler_layout', executable('tiler_layout', 'check' / 'tiler_layout.c', dependencies : [rdstiler_core_dep]),
+  suite : 'cpu', env : internal_test_env, protocol : 'tap')
 
 # DeepStream apps are often C++: check that the compat header builds and works there too.
 test('compat_cpp', executable('compat_cpp', 'check' / 'compat_cpp.cpp', dependencies : [rds_dep]),
@@ -72,6 +77,11 @@ foreach t : gpu_tests
   test(t, executable(t, 'check' / (t + '.c'), dependencies : test_deps),
     suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 endforeach
+
+# rds_buf_surf_transform_composite, checked against rds_buf_surf_transform (public API only).
+test('transform_composite', executable('transform_composite', 'check' / 'transform_composite.c',
+    dependencies : test_deps + [cc.find_library('m', required : false)]),
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 
 # GPU tests that call private library symbols link the static internal copy of libgstrds instead.
 # Such a test must never also link rds_dep, nor load one of our plugins in-process (the plugin pulls in the
@@ -308,6 +318,67 @@ if rds_tracker_enabled and rds_infer_enabled
     depends : rds_plugins)
 endif
 
+if rds_osd_enabled
+  # rdsosd's drawing core on host buffers (no GStreamer, no GPU); prints the draw time of a 720p frame.
+  test('osd_draw', executable('osd_draw', 'check' / 'osd_draw.c', dependencies : [rdsosd_core_dep]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
+  # rdsosd: properties (cpu); drawing on memory:RDS batches and demuxed views (gpu).
+  element_osd_exe = executable('element_osd', 'check' / 'element_osd.c', dependencies : test_deps)
+  test('element_osd_cpu', element_osd_exe, args : ['-p', '/cpu/osd-element'],
+    suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+  test('element_osd', element_osd_exe, args : ['-p', '/gpu/osd-element'],
+    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+endif
+
+if rds_osd_enabled and rds_tracker_enabled and rds_infer_enabled
+  # rdsmultistreamtiler and rdsosd end to end as rds-test3 runs them: four copies of the street clip, YOLO11n, NvSORT,
+  # the 2x2 tiler and rdsosd (pipeline_osd: merged meta, drawn boxes, frame rate), and the soak (pipeline_osd_soak,
+  # 4068 batches of 4, also in the soak suite). Both skip until tests/models/fetch-tracker-clip.sh and
+  # fetch-yolo11n.sh have run. The YOLO11n programs are shared with infer_engine, pipeline_infer and pipeline_tracker
+  # (a first batch-4 compile takes minutes). Never in parallel: one compile or soak at a time.
+  osd_pipeline_args = [
+    '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
+    '-DRDS_TEST_CACHE_MEDIA="@0@"'.format(meson.project_source_root() / '.cache' / 'media'),
+    '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
+    '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+  ]
+  test('pipeline_osd', executable('pipeline_osd', 'check' / 'pipeline_osd.c', dependencies : pipeline_deps,
+      c_args : osd_pipeline_args),
+    suite : ['gpu', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1200,
+    depends : rds_plugins)
+  test('pipeline_osd_soak', executable('pipeline_osd_soak', 'check' / 'pipeline_osd_soak.c',
+      dependencies : pipeline_deps, c_args : osd_pipeline_args),
+    suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,
+    depends : rds_plugins)
+endif
+
+# rdsmultistreamtiler: properties and pads (cpu); tiling device batches with scripted meta (gpu).
+element_tiler_exe = executable('element_tiler', 'check' / 'element_tiler.c', dependencies : test_deps)
+test('element_tiler_cpu', element_tiler_exe, args : ['-p', '/cpu/tiler'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_tiler', element_tiler_exe, args : ['-p', '/gpu/tiler'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180, depends : rds_plugins)
+
+# rdslogger: properties and the **PERF lines on scripted batches, driven by the harness's test clock (cpu).
+test('element_logger', executable('element_logger', 'check' / 'element_logger.c', dependencies : test_deps),
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+
+# docs/compat-matrix.md has a property-table row for every property of rdsmultistreamtiler, rdsosd (when built),
+# rdslogger and rdsvideosink, and none for a property they lack.
+test('element_compat_matrix', executable('element_compat_matrix', 'check' / 'element_compat_matrix.c',
+    dependencies : test_deps,
+    c_args : ['-DRDS_HAVE_OSD=@0@'.format(rds_osd_enabled ? 1 : 0),
+      '-DRDS_COMPAT_MATRIX="@0@"'.format(meson.project_source_root() / 'docs' / 'compat-matrix.md')]),
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+
+# rdsvideosink: properties, forwarding and start errors (cpu); RDS frames into the inner sink, batched input (gpu).
+element_videosink_exe = executable('element_videosink', 'check' / 'element_videosink.c',
+  dependencies : test_deps + [gst_video_dep])
+test('element_videosink_cpu', element_videosink_exe, args : ['-p', '/cpu/videosink'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_videosink', element_videosink_exe, args : ['-p', '/gpu/videosink'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)])
 test('element_streamdemux_cpu', element_streamdemux_exe, args : ['-p', '/cpu/demux'],
@@ -357,12 +428,21 @@ test('rds_compile', find_program('tools/rds_compile.sh'), args : rds_compile_arg
   depends : rds_compile_depends)
 
 # The dry run checks the compat mapping, the default PGIE config and --tracker-config; gst-inspect-1.0 (when found)
-# checks that the mapped decoder and converter (and rdsinfer and rdstracker, when built) resolve to real elements from
-# the build tree. Not in ASan builds: the uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process
+# checks that the mapped decoder, converter, tiler and display sink (and rdsinfer, rdstracker and rdsosd, when built)
+# resolve to real elements from the build tree. Not in ASan builds: the uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process
 # (plugin_load covers loading there).
 gst_inspect = find_program('gst-inspect-1.0', required : false)
 test('rds_test3_dry_run',
   find_program('samples/rds_test3_dry_run.sh'),
   args : [rds_test3_exe, gst_inspect.found() and not asan ? gst_inspect.full_path() : '',
-    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : ''],
+    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
   suite : 'cpu', env : test_env, depends : rds_plugins)
+
+# rds-test3 end to end on four copies of the street clip with YOLO11n and the NvSORT tracker, --no-display (gpu; skips
+# without a device, rdsinfer, rdstracker, rdsosd, YOLO11n or the clip). Never in parallel with the other YOLO11n tests; the
+# first run compiles the batch-4 program.
+test('rds_test3_run',
+  find_program('samples/rds_test3_run.sh'),
+  args : [rds_test3_exe, meson.project_source_root(), meson.current_build_dir(),
+    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
+  suite : ['gpu', 'yolo'], env : test_env, is_parallel : false, timeout : 900, depends : rds_plugins)

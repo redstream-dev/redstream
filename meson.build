@@ -117,6 +117,28 @@ if not tracker_opt.disabled()
   endif
 endif
 
+# rdsosd draws with Cairo and Pango. With -Dosd=auto, a missing one disables rdsosd and its tests.
+osd_opt = get_option('osd')
+rds_osd_enabled = false
+if not osd_opt.disabled()
+  osd_missing = []
+  cairo_dep = dependency('cairo', required : false)
+  if not cairo_dep.found()
+    osd_missing += 'cairo'
+  endif
+  pangocairo_dep = dependency('pangocairo', required : false)
+  if not pangocairo_dep.found()
+    osd_missing += 'pangocairo'
+  endif
+  if osd_missing.length() == 0
+    rds_osd_enabled = true
+  elif osd_opt.enabled()
+    error('rdsosd: missing ' + ', '.join(osd_missing))
+  else
+    message('rdsosd disabled: missing ' + ', '.join(osd_missing))
+  endif
+endif
+
 # Plugin metadata. RDS_ORIGIN is a placeholder until the public repository exists (TODO before release).
 rds_origin = 'https://example.invalid/redstream'
 rds_plugin_c_args = [

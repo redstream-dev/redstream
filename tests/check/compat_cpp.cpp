@@ -2,6 +2,12 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <rds/rds_compat.h>
 
+#include <cstddef>
+
+/* NvOSD_CircleParams field order as documented: circle_width between bg_color and reserved */
+static_assert (offsetof (NvOSD_CircleParams, bg_color) < offsetof (NvOSD_CircleParams, circle_width), "");
+static_assert (offsetof (NvOSD_CircleParams, circle_width) < offsetof (NvOSD_CircleParams, reserved), "");
+
 static void
 test_cpp_aliases (void)
 {
@@ -38,6 +44,10 @@ test_cpp_aliases (void)
   g_assert_cmpuint (source_id, ==, 7);
   gst_event_unref (ev);
 
+  NvOSD_CircleParams circle = {};
+  circle.circle_width = 3;
+  g_assert_cmpuint (circle.circle_width, ==, 3);
+
   NvOSD_Arrow_Head_Direction head = BOTH_HEAD;
   g_assert_cmpint (head, ==, RDS_OSD_ARROW_BOTH_HEAD);
 
@@ -46,8 +56,8 @@ test_cpp_aliases (void)
   g_assert_cmpint (state, ==, 1);
 }
 
-/* A DeepStream-style transform call compiled as C++. The source batch is empty (numFilled = 0), so the call fails
- * validation and never reaches the GPU: this test needs no device. */
+/* DeepStream-style transform and composite calls compiled as C++. The source batch is empty (numFilled = 0), so
+ * the calls fail validation and never reach the GPU: this test needs no device. */
 static void
 test_cpp_transform (void)
 {
@@ -83,6 +93,17 @@ test_cpp_transform (void)
   NvBufSurfTransform_Error err = NvBufSurfTransform (src, dst, &transform_params);
   g_assert_cmpint (err, ==, NvBufSurfTransformError_Invalid_Params);
   g_assert_cmpuint (dst->numFilled, ==, 0);
+
+  /* the composite, rejected the same way */
+  NvBufSurfTransformRect dst_rect = { 0, 0, 32, 16 };
+  NvBufSurfTransformCompositeParams composite_params = {};
+  composite_params.composite_flag = NVBUFSURF_TRANSFORM_COMPOSITE;
+  composite_params.input_buf_count = 1;
+  composite_params.src_comp_rect = &src_rect;
+  composite_params.dst_comp_rect = &dst_rect;
+  composite_params.composite_filter = NvBufSurfTransformInter_Bilinear;
+  err = NvBufSurfTransformComposite (src, dst, &composite_params);
+  g_assert_cmpint (err, ==, NvBufSurfTransformError_Invalid_Params);
 
   g_assert_cmpint (NvBufSurfaceDestroy (src), ==, 0);
   g_assert_cmpint (NvBufSurfaceDestroy (dst), ==, 0);

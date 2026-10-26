@@ -71,6 +71,7 @@ typedef struct
   RdsOSD_ColorParams circle_color;
   guint has_bg_color;
   RdsOSD_ColorParams bg_color;
+  guint circle_width;                               /* ring width in pixels */
   guint reserved;
 } RdsOSD_CircleParams;
 

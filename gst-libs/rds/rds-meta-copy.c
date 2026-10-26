@@ -149,13 +149,14 @@ copy_frame (RdsFrameMeta * src, RdsBatchMeta * dst, GHashTable * map)
   return f;
 }
 
-/* dst's lock held. Second pass, once every object the map covers exists: links each copy of src_objs to the copy
+/* dst's lock held. Second pass, once every object the map covers exists: links each copy of the first @n of src_objs
+ * to the copy
  * of its source parent, through the internal path so n_parented stays right. A parent the map does not cover
  * (a frame that was not copied, or an object in no list) becomes NULL. */
 static void
-remap_parents (RdsBatchMeta * dst, GList * src_objs, GHashTable * map)
+remap_parents (RdsBatchMeta * dst, GList * src_objs, guint n, GHashTable * map)
 {
-  for (GList * l = src_objs; l != NULL; l = l->next) {
+  for (GList * l = src_objs; l != NULL && n > 0; l = l->next, n--) {
     RdsObjectMeta *so = l->data;
     RdsObjectMeta *o = g_hash_table_lookup (map, so);
     RdsObjectMeta *parent = so->parent != NULL ? g_hash_table_lookup (map, so->parent) : NULL;
@@ -197,13 +198,86 @@ rds_copy_frame_meta_to_batch (RdsFrameMeta * src, RdsBatchMeta * dst)
   /* A local map: parents in other frames of src's batch become NULL. */
   map = g_hash_table_new (g_direct_hash, g_direct_equal);
   f = copy_frame (src, dst, map);
-  remap_parents (dst, src->obj_meta_list, map);
+  remap_parents (dst, src->obj_meta_list, G_MAXUINT, map);
   g_hash_table_unref (map);
   if (!add_copied_frame (dst, f))
     f = NULL;
   g_rec_mutex_unlock (&dst->meta_mutex);
   g_rec_mutex_unlock (&sb->meta_mutex);
   return f;
+}
+
+/* The batches of the first meta of @src_list and of @dst_frame_meta, or FALSE (with a warning) when either is
+ * missing. Every meta of @src_list must belong to that first meta's batch, as a frame's list does: only that batch is
+ * locked. */
+static gboolean
+list_batches (GList * src_list, RdsFrameMeta * dst_frame_meta, RdsBatchMeta ** sb, RdsBatchMeta ** db)
+{
+  *sb = ((RdsBaseMeta *) src_list->data)->batch_meta;
+  *db = dst_frame_meta->base_meta.batch_meta;
+  if (*sb == NULL || *db == NULL) {
+    GST_WARNING ("list %p or frame meta %p has no batch (released?); not copied", src_list, dst_frame_meta);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+void
+rds_copy_obj_meta_list (RdsObjectMetaList * src_list, RdsFrameMeta * dst_frame_meta)
+{
+  RdsBatchMeta *sb, *db;
+  GHashTable *map;
+  guint n, k;
+
+  g_return_if_fail (dst_frame_meta != NULL);
+  if (src_list == NULL || !list_batches (src_list, dst_frame_meta, &sb, &db))
+    return;
+
+  g_rec_mutex_lock (&sb->meta_mutex);
+  g_rec_mutex_lock (&db->meta_mutex);
+  /* parents outside the list become NULL */
+  map = g_hash_table_new (g_direct_hash, g_direct_equal);
+  /* the source may be the destination's own list: copy only the entries it has now */
+  n = g_list_length (src_list);
+  k = n;
+  for (GList * l = src_list; l != NULL && k > 0; l = l->next, k--) {
+    RdsObjectMeta *o = copy_obj (l->data, db);
+
+    if (rds_meta_attach (db, &dst_frame_meta->obj_meta_list, o, "object", dst_frame_meta)) {
+      dst_frame_meta->num_obj_meta++;
+      g_hash_table_insert (map, l->data, o);
+    } else {
+      rds_meta_release_obj (db, o);
+    }
+  }
+  remap_parents (db, src_list, n, map);
+  g_hash_table_unref (map);
+  g_rec_mutex_unlock (&db->meta_mutex);
+  g_rec_mutex_unlock (&sb->meta_mutex);
+}
+
+void
+rds_copy_display_meta_list (RdsDisplayMetaList * src_list, RdsFrameMeta * dst_frame_meta)
+{
+  RdsBatchMeta *sb, *db;
+  guint n;
+
+  g_return_if_fail (dst_frame_meta != NULL);
+  if (src_list == NULL || !list_batches (src_list, dst_frame_meta, &sb, &db))
+    return;
+
+  g_rec_mutex_lock (&sb->meta_mutex);
+  g_rec_mutex_lock (&db->meta_mutex);
+  /* the source may be the destination's own list: copy only the entries it has now */
+  n = g_list_length (src_list);
+  for (GList * l = src_list; l != NULL && n > 0; l = l->next, n--) {
+    RdsDisplayMeta *d = copy_display (l->data, db);
+
+    if (!rds_meta_attach (db, &dst_frame_meta->display_meta_list, d, "display", dst_frame_meta))
+      rds_meta_release_display (db, d);
+  }
+  g_rec_mutex_unlock (&db->meta_mutex);
+  g_rec_mutex_unlock (&sb->meta_mutex);
 }
 
 RdsBatchMeta *
@@ -228,7 +302,7 @@ rds_batch_meta_copy (RdsBatchMeta * src)
     ok = add_copied_frame (dst, copy_frame (l->data, dst, map));
   if (ok) {
     for (GList * l = src->frame_meta_list; l != NULL; l = l->next)
-      remap_parents (dst, ((RdsFrameMeta *) l->data)->obj_meta_list, map);
+      remap_parents (dst, ((RdsFrameMeta *) l->data)->obj_meta_list, G_MAXUINT, map);
     copy_user_list (src->batch_user_meta_list, dst, &dst->batch_user_meta_list, dst);
   }
   g_hash_table_unref (map);

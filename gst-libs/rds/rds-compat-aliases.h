@@ -64,6 +64,8 @@ typedef RdsBufSurfTransform_Transform_Flag NvBufSurfTransform_Transform_Flag;
 typedef RdsBufSurfTransformRect NvBufSurfTransformRect;
 typedef RdsBufSurfTransformParams NvBufSurfTransformParams;
 typedef RdsBufSurfTransformConfigParams NvBufSurfTransformConfigParams;
+typedef RdsBufSurfTransform_Composite_Flag NvBufSurfTransform_Composite_Flag;
+typedef RdsBufSurfTransformCompositeParams NvBufSurfTransformCompositeParams;
 
 #define NvBufSurfTransformCompute_Default RdsBufSurfTransformCompute_Default
 #define NvBufSurfTransformCompute_GPU RdsBufSurfTransformCompute_GPU
@@ -99,10 +101,15 @@ typedef RdsBufSurfTransformConfigParams NvBufSurfTransformConfigParams;
 #define NVBUFSURF_TRANSFORM_NORMALIZE RDS_BUFSURF_TRANSFORM_NORMALIZE
 #define NVBUFSURF_TRANSFORM_ALLOW_ODD_CROP RDS_BUFSURF_TRANSFORM_ALLOW_ODD_CROP
 
+#define NVBUFSURF_TRANSFORM_COMPOSITE RDS_BUFSURF_TRANSFORM_COMPOSITE
+#define NVBUFSURF_TRANSFORM_BLEND RDS_BUFSURF_TRANSFORM_BLEND
+#define NVBUFSURF_TRANSFORM_COMPOSITE_FILTER RDS_BUFSURF_TRANSFORM_COMPOSITE_FILTER
+
 #define NvBufSurfTransform rds_buf_surf_transform
 #define NvBufSurfTransformSetSessionParams rds_buf_surf_transform_set_session_params
 #define NvBufSurfTransformGetSessionParams rds_buf_surf_transform_get_session_params
 #define NvBufSurfTransformSetDefaultSession rds_buf_surf_transform_set_default_session
+#define NvBufSurfTransformComposite rds_buf_surf_transform_composite
 
 /* ---- OSD parameter structs ---- */
 typedef RdsOSD_ColorParams NvOSD_ColorParams;
@@ -230,6 +237,8 @@ typedef RdsTrackerState TRACKER_STATE;
 #define nvds_remove_user_meta_from_frame rds_remove_user_meta_from_frame
 #define nvds_remove_user_meta_from_object rds_remove_user_meta_from_object
 #define nvds_get_user_meta_type rds_get_user_meta_type
+#define nvds_copy_obj_meta_list rds_copy_obj_meta_list
+#define nvds_copy_display_meta_list rds_copy_display_meta_list
 #define gst_buffer_get_nvds_batch_meta gst_buffer_get_rds_batch_meta
 
 /* ---- Stream events (gst-nvevent) ---- */

@@ -3,3 +3,6 @@ leak:libamdhip64.so
 leak:libdrm_amdgpu.so
 # fontconfig's one-time FcInit cache (started by the pango plugin when ASan builds scan plugins in-process)
 leak:libfontconfig.so
+# subparse's typefinder (run by uridecodebin's typefinding, as in rds-test3) keeps a once-compiled GRegex whose PCRE2
+# JIT code LSan sees as leaked
+leak:gst_sub_parse_data_format_autodetect

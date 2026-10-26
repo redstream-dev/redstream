@@ -465,6 +465,102 @@ test_add_twice_refused (void)
   gst_buffer_unref (buf);
 }
 
+/* Object and display lists copied into a frame of another batch: appended after what the frame has, parents
+ * remapped within the list (a parent outside it becomes NULL), owned memory duplicated. */
+static void
+test_copy_lists (void)
+{
+  RdsBatchMeta *src, *dst;
+  RdsFrameMeta *f, *sf0;
+  RdsObjectMeta *existing, *ccar, *cplate, *cperson;
+  RdsDisplayMeta *cd;
+
+  reset_counters ();
+  src = build_batch ();
+  sf0 = frame_at (src, 0);
+  dst = rds_create_batch_meta (1);
+  f = rds_acquire_frame_meta_from_pool (dst);
+  rds_add_frame_meta_to_batch (dst, f);
+  existing = rds_acquire_obj_meta_from_pool (dst);
+  rds_add_obj_meta_to_frame (f, existing, NULL);
+
+  rds_copy_obj_meta_list (sf0->obj_meta_list, f);
+  rds_copy_obj_meta_list (frame_at (src, 1)->obj_meta_list, f);
+  rds_copy_display_meta_list (sf0->display_meta_list, f);
+  rds_copy_display_meta_list (sf0->display_meta_list, f);
+  /* empty lists are fine */
+  rds_copy_obj_meta_list (NULL, f);
+  rds_copy_display_meta_list (NULL, f);
+
+  g_assert_cmpuint (f->num_obj_meta, ==, 4);
+  g_assert_cmpuint (g_list_length (f->obj_meta_list), ==, 4);
+  g_assert_true (obj_at (f, 0) == existing);
+  ccar = obj_at (f, 1);
+  cplate = obj_at (f, 2);
+  cperson = obj_at (f, 3);
+  g_assert_true (ccar != obj_at (sf0, 0));
+  g_assert_true (ccar->base_meta.batch_meta == dst);
+  g_assert_cmpint (ccar->class_id, ==, 2);
+  g_assert_true (ccar->text_params.display_text != obj_at (sf0, 0)->text_params.display_text);
+  g_assert_cmpstr (ccar->text_params.display_text, ==, "car");
+  g_assert_true (ccar->mask_params.data != obj_at (sf0, 0)->mask_params.data);
+  g_assert_cmpuint (g_list_length (ccar->classifier_meta_list), ==, 1);
+  g_assert_cmpuint (((RdsClassifierMeta *) ccar->classifier_meta_list->data)->num_labels, ==, 2);
+  g_assert_cmpint (user_value (ccar->obj_user_meta_list), ==, 1);
+  g_assert_true (cplate->parent == ccar);
+  /* person's parent (car) was in another list: not remapped */
+  g_assert_cmpint (cperson->class_id, ==, 0);
+  g_assert_null (cperson->parent);
+
+  g_assert_cmpuint (g_list_length (f->display_meta_list), ==, 2);
+  cd = f->display_meta_list->data;
+  g_assert_true (cd != sf0->display_meta_list->data);
+  g_assert_true (cd->base_meta.batch_meta == dst);
+  g_assert_cmpstr (cd->text_params[0].display_text, ==, "HUD");
+  g_assert_true (cd->text_params[0].display_text !=
+      ((RdsDisplayMeta *) sf0->display_meta_list->data)->text_params[0].display_text);
+
+  /* a real parent link: removing the copied car clears the copied plate */
+  rds_remove_obj_meta_from_frame (f, ccar);
+  g_assert_null (cplate->parent);
+  g_assert_true (obj_at (sf0, 1)->parent == obj_at (sf0, 0));
+
+  rds_destroy_batch_meta (dst);
+  rds_destroy_batch_meta (src);
+  g_assert_cmpint (released, ==, created + copied);
+}
+
+/* Copying a list into a frame of its own batch. */
+static void
+test_copy_lists_same_batch (void)
+{
+  RdsBatchMeta *b;
+  RdsFrameMeta *f;
+
+  reset_counters ();
+  b = build_batch ();
+  f = rds_acquire_frame_meta_from_pool (b);
+  rds_add_frame_meta_to_batch (b, f);
+  rds_copy_obj_meta_list (frame_at (b, 0)->obj_meta_list, f);
+  rds_copy_display_meta_list (frame_at (b, 0)->display_meta_list, f);
+  g_assert_cmpuint (f->num_obj_meta, ==, 2);
+  g_assert_true (obj_at (f, 1)->parent == obj_at (f, 0));
+  g_assert_cmpuint (g_list_length (f->display_meta_list), ==, 1);
+
+  /* a frame's lists into themselves: each entry once more, the copies' parents among the copies */
+  rds_copy_obj_meta_list (f->obj_meta_list, f);
+  rds_copy_display_meta_list (f->display_meta_list, f);
+  g_assert_cmpuint (f->num_obj_meta, ==, 4);
+  g_assert_cmpuint (g_list_length (f->obj_meta_list), ==, 4);
+  g_assert_true (obj_at (f, 1)->parent == obj_at (f, 0));
+  g_assert_true (obj_at (f, 3)->parent == obj_at (f, 2));
+  g_assert_true (obj_at (f, 2) != obj_at (f, 0));
+  g_assert_cmpstr (obj_at (f, 2)->text_params.display_text, ==, "car");
+  g_assert_cmpuint (g_list_length (f->display_meta_list), ==, 2);
+  rds_destroy_batch_meta (b);
+  g_assert_cmpint (released, ==, created + copied);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -477,6 +573,8 @@ main (int argc, char **argv)
   g_test_add_func ("/meta-copy/parent-in-later-frame", test_copy_parent_in_later_frame);
   g_test_add_func ("/meta-copy/add-twice-refused", test_add_twice_refused);
   g_test_add_func ("/meta-copy/copy-into-existing", test_copy_into_existing);
+  g_test_add_func ("/meta-copy/lists", test_copy_lists);
+  g_test_add_func ("/meta-copy/lists-same-batch", test_copy_lists_same_batch);
   {
     /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at
      * process exit otherwise (seen under parallel ASan runs) */
