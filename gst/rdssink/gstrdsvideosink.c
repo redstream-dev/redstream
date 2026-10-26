@@ -406,7 +406,13 @@ gst_rds_video_sink_set_property (GObject * object, guint prop_id, const GValue *
   gchar *old;
 
   if (prop_id == PROP_VIDEO_SINK) {
-    /* the state lock keeps the state from changing between the check and the swap */
+    /* refuse at once while streaming (a streaming-thread caller must not wait behind a state change), then check
+     * again under the state lock, which keeps the state from changing until the swap is done */
+    GST_OBJECT_LOCK (self);
+    ok = check_mutable (self, pspec);
+    GST_OBJECT_UNLOCK (self);
+    if (!ok)
+      return;
     GST_STATE_LOCK (self);
     GST_OBJECT_LOCK (self);
     ok = check_mutable (self, pspec);

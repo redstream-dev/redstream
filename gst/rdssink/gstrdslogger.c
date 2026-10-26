@@ -11,8 +11,9 @@
  * after PLAYING starts, then every interval). The first boundary only starts the count, so the first line comes two
  * intervals in, as in DeepStream 8.0; each later line gives the frames counted since the previous boundary divided by
  * the interval (ours: DeepStream 8.0's numbers drift after streams join or leave). Paused, the clock id is
- * unscheduled and the time left to the next boundary is kept, so the boundaries resume in running time; a flush that
- * resets the running time starts the measurement again. Lines are written with g_print, from the clock's thread.
+ * unscheduled and the time left to the next boundary is kept, so the boundaries resume in running time. Flushes
+ * change nothing: the boundaries are kept in clock time, not running time, so a seek or a looped clip keeps the
+ * measurement going. Lines are written with g_print, from the clock's thread.
  * A new clock is only handed out on the way to PLAYING (PAUSED to PLAYING arms the id on the current clock), so
  * there is no set_clock override.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
@@ -301,24 +302,6 @@ gst_rds_logger_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   return GST_FLOW_OK;
 }
 
-static gboolean
-gst_rds_logger_sink_event (GstBaseTransform * trans, GstEvent * event)
-{
-  GstRdsLogger *self = GST_RDS_LOGGER (trans);
-  gboolean reset_time = FALSE;
-
-  if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP) {
-    gst_event_parse_flush_stop (event, &reset_time);
-    if (reset_time) {
-      /* the running time starts again: so does the measurement (streams stay listed) */
-      g_mutex_lock (&self->lock);
-      restart_locked (self);
-      g_mutex_unlock (&self->lock);
-    }
-  }
-  return GST_BASE_TRANSFORM_CLASS (gst_rds_logger_parent_class)->sink_event (trans, event);
-}
-
 static GstStateChangeReturn
 gst_rds_logger_change_state (GstElement * element, GstStateChange transition)
 {
@@ -528,6 +511,5 @@ gst_rds_logger_class_init (GstRdsLoggerClass * klass)
 
   element_class->change_state = GST_DEBUG_FUNCPTR (gst_rds_logger_change_state);
   trans_class->transform_ip = GST_DEBUG_FUNCPTR (gst_rds_logger_transform_ip);
-  trans_class->sink_event = GST_DEBUG_FUNCPTR (gst_rds_logger_sink_event);
   trans_class->transform_ip_on_passthrough = TRUE;
 }

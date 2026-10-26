@@ -392,7 +392,7 @@ silent, or **ours**: where 8.0 settles nothing or is clearly broken.
 | Rate value | ours | frames counted since the previous line / the interval (8.0's numbers drift above the true rate for a while after a stream joins or leaves) |
 | `fps-measurement-interval-sec=0` | ours | nothing printed (8.0 prints `FPS_0 (0.00)` in a busy loop) |
 | Interval changed while playing | ours | the measurement restarts: one interval to start the count, then a line every interval |
-| Flush that resets the running time | ours | the measurement restarts as above (the frames counted so far are dropped; streams stay listed); a flush that keeps the running time changes nothing |
+| Flushes | ours | change nothing, also when they reset the running time (a seek, a looped clip): the boundaries are kept in clock time, and the frames counted before the flush count in the current interval |
 | A buffer without batch meta | ours | one frame of stream 0 |
 | No stream seen yet | ours | nothing printed |
 | `silent=false` | matches nvdslogger (DeepStream 8.0) | per buffer `<name> BUF_PTS : <pts> element time <running time now> elem-buf=<now − pts, ms> ms buf=<address> buffer_pts_to_running_time = <pts running time>rdslogger base time = <base time>buffer dur <duration>` (no separators before `rdslogger` and `buffer dur`, as in 8.0, whose label reads `nvdslogger base time`), then `BUFFER PTS is lesser than ELEMENT TIME, IT's LATE` or `BUFFER PTS is greater than ELEMENT TIME, IT's EARLY` (ours: only the LATE line was observed in 8.0, so the EARLY wording is inferred; equal counts as early); without a clock or PTS, the times print as `99:99:99.999999999` and the second line is left out (ours) |

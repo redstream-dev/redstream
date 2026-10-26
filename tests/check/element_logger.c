@@ -431,22 +431,19 @@ test_flush_reset (void)
   crank (h);
   push_frames (h, 0, 5);
   gst_test_clock_set_time (clock, 1500 * GST_MSECOND);
-  /* a flush that resets the running time starts the measurement again: the frames counted so far are dropped, the
-   * next boundary is one interval away and only starts the count (without it, 2 s would print 5.00) */
+  /* flushes change nothing, even one that resets the running time (a seek, a looped clip): the boundary stays at
+   * 2 s and the frames counted before the flush count */
   g_assert_true (gst_harness_push_event (h, gst_event_new_flush_start ()));
   g_assert_true (gst_harness_push_event (h, gst_event_new_flush_stop (TRUE)));
   gst_segment_init (&seg, GST_FORMAT_TIME);
   g_assert_true (gst_harness_push_event (h, gst_event_new_segment (&seg)));
   g_assert_true (gst_test_clock_peek_next_pending_id (clock, &id));
-  g_assert_cmpuint (gst_clock_id_get_time (id), ==, 2500 * GST_MSECOND);
+  g_assert_cmpuint (gst_clock_id_get_time (id), ==, 2 * GST_SECOND);
   gst_clock_id_unref (id);
-  crank (h);
-  assert_output ("");
   push_frames (h, 0, 3);
   crank (h);
-  assert_output ("**PERF : FPS_0 (3.00)\t\n");
+  assert_output ("**PERF : FPS_0 (8.00)\t\n");
 
-  /* a flush that keeps the running time changes nothing */
   push_frames (h, 0, 2);
   g_assert_true (gst_harness_push_event (h, gst_event_new_flush_start ()));
   g_assert_true (gst_harness_push_event (h, gst_event_new_flush_stop (FALSE)));
