@@ -84,6 +84,11 @@ typedef struct
  * device. Returns 0 (hipSuccess), or the hipError_t of the launch that failed. */
 __attribute__ ((visibility ("hidden"))) int rds_osd_gpu_launch (const RdsOsdGpuJob * job, void *stream);
 
+/* Loads the kernels' code object on the current device, so that the first launch does not have to: with HIP's
+ * deferred loading (the default), the first launch of a kernel of a dlopen'ed library, as the plugin is, on a
+ * non-blocking stream completed without drawing anything (ROCm 10.1). Returns 0 (hipSuccess) or the hipError_t. */
+__attribute__ ((visibility ("hidden"))) int rds_osd_gpu_load (void);
+
 #ifdef __cplusplus
 }
 #endif

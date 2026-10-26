@@ -192,7 +192,8 @@ rds_osd_cmd_coverage (const RdsOsdCmd * c, int32_t x, int32_t y, const uint8_t *
   }
 }
 
-/* Whether @color is opaque with whole channel values (as colour params that are multiples of 1/255 give). */
+/* Whether @color is opaque with whole channel values (as colour params that are multiples of 1/255 give). Colours
+ * come only from rds_osd_color_init, whose clamping to 0..255 keeps the (int) cast in range. */
 RDS_OSD_FN int
 rds_osd_color_is_whole (const RdsOsdColor * color)
 {

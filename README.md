@@ -65,8 +65,9 @@ Jetson-specific hardware blocks.
   merges the sources' metadata into it, scaled into the tiles, as DeepStream 8.0 does; `show-source` shows one
   source alone.
 - **`rdsosd`** (`nvdsosd`): draws object boxes and labels, and display meta (rectangles, text, lines, arrows,
-  circles) and the clock, in the geometry of DeepStream 8.0's GPU mode. It draws on the CPU (Pango for text) for
-  now; a GPU path comes before the first release. Masks and blur are not drawn yet.
+  circles) and the clock, in the geometry of DeepStream 8.0's GPU mode. It draws on the GPU by default, so frames
+  never leave it, or on the CPU with `process-mode=0`, the same pixels either way (Pango renders the text). Masks
+  and blur are not drawn yet.
 - **`rdslogger`** (`nvdslogger`): prints each stream's frame rate in DeepStream's `**PERF` line format.
 - **`rdsvideosink`** (`nveglglessink`, `nv3dsink`): shows frames in a window through a stock GStreamer sink
   (`autovideosink` by default), with the DeepStream sinks' property names.
@@ -142,7 +143,7 @@ GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/cross
 On that clip (56 s of a busy crosswalk, YOLO11n detections) the NvSORT sample config keeps 98.8 % of the confident
 detections tracked, with 4 ID switches over 283 tracks; the tracker itself takes about 0.01 ms per batch on the CPU.
 Four copies of the clip through the whole `rds-test3` chain run at about 44–46 fps on the iGPU below (`--no-display`):
-the detector sets the pace, and the tiler and OSD add about 3.4 ms per batch.
+the detector sets the pace, and the tiler and OSD add about 2.5 ms per batch.
 
 ## How it maps to DeepStream
 
@@ -167,7 +168,7 @@ the detector sets the pace, and the tiler and OSD add about 3.4 ms per batch.
 **M1: multi-stream detector**
 - File/RTSP sources → rocDecode decode (`rdsvideodec`) → `rdsstreammux` → `rdsinfer` (YOLO + custom bbox parser) → `rdstracker` → `rdsosd`.
 - Done: the pipeline runs end to end from files, with tiling, on-screen display and a display sink. Left: RTSP
-  sources (`rdsurisrcbin`), the OSD's GPU path, and the ported `deepstream-test3`.
+  sources (`rdsurisrcbin`) and the ported `deepstream-test3`.
 - Acceptance test: NVIDIA's `deepstream-test3` sample, ported with `#ifdef`s only, produces equivalent detections.
 
 **M2: production-style multi-model pipeline**
@@ -188,7 +189,8 @@ Early numbers on a 2-CU Ryzen 9 7900X iGPU:
 - `rdsinfer` with YOLO11n FP32, four 720p sources at batch 4 (decode, batching, inference and post-processing):
   about 50 fps; about 48 fps with `rdstracker` (NvSORT) after it; about 44–46 fps through the whole `rds-test3`
   chain (tracker, tiler and OSD, to a fakesink).
-- `rdsosd` at 1280×720 with about 60 objects: about 1.3 ms per frame, CPU drawing and the GPU↔CPU syncs included.
+- `rdsosd` at 1280×720 with about 60 objects: about 0.3 ms per frame on the GPU (about 1.2 ms with
+  `process-mode=0`, the CPU drawing and the GPU↔CPU syncs included).
 
 **Known issue (ROCm 10.1):** with more HIP streams than hardware queues, which a multi-stream pipeline easily has,
 an SDMA copy can occasionally fault and abort the process with `Memory access fault by GPU ... on address 0x401000`.

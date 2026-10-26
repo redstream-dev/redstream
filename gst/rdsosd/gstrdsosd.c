@@ -1,18 +1,27 @@
-/* Redstream: rdsosd, draws each frame's object meta, display meta and the clock onto its RGBA surface, on the CPU
- * (rds-osd-draw: hard-edged shapes, Pango text). Property names, ranges and defaults follow DeepStream's nvdsosd as
- * gst-inspect shows it for 8.0; drawing behaviour the docs leave open matches DeepStream 8.0's default GPU mode
- * ("DeepStream 8.0 behaviour") except where marked "ours". Every such choice has a row in docs/compat-matrix.md.
+/* Redstream: rdsosd, draws each frame's object meta, display meta and the clock onto its RGBA surface, on the GPU
+ * (process-mode 1, the default, and 2: rds-osd-gpu) or on the CPU (process-mode 0: rds-osd-draw), the same bytes in
+ * both: hard-edged shapes, Pango text. Property names, ranges and defaults follow DeepStream's nvdsosd as gst-inspect
+ * shows it for 8.0; drawing behaviour the docs leave open matches DeepStream 8.0's default GPU mode ("DeepStream 8.0
+ * behaviour") except where marked "ours". Every such choice has a row in docs/compat-matrix.md.
  *
  * In place: the base class hands transform_ip a writable buffer, and the WRITE map gives this element memory it owns
- * (a shared surface or a read-only surface view, as rdsstreamdemux pushes, is replaced by a private copy first; the
- * batch it came from is never written). Each frame meta's slot (batch_id) is synced to the CPU, drawn and synced
- * back, under the batch's meta lock. The syncs are synchronous: the frame is ready when pushed. Frames with nothing
- * to draw are not synced, and a buffer with nothing to draw is not mapped at all (no copy of view memory).
+ * (a shared surface or a read-only surface view, as rdsstreamdemux pushes, is replaced by a private copy first, a
+ * synchronous device copy; the batch it came from is never written). Each frame meta is drawn on its slot (batch_id).
+ * GPU modes: the batch is planned under its meta lock (one plan: commands, text masks), then drawn pass by pass on
+ * the element's own non-blocking stream, which each pass waits for; the frames never leave the GPU. CPU mode: each
+ * slot is synced to the CPU, drawn and synced back, under the meta lock (synchronous syncs). Either way the frame is
+ * ready when pushed. Frames with nothing to draw are not touched, and a buffer with nothing to draw is not mapped at
+ * all (no copy of view memory). A GPU failure is an element error: the element never falls back to the CPU.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsosd.h"
 #include "rds-osd-draw.h"
+#include "rds-osd-gpu.h"
+#include "rds-osd-plan.h"
 
 #include <rds/rds.h>
+
+/* GLib first: HIP's headers define __noinline__, which breaks GLib if HIP comes first. */
+#include <hip/hip_runtime_api.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_rds_osd_debug);
 #define GST_CAT_DEFAULT gst_rds_osd_debug
@@ -39,6 +48,7 @@ enum
 {
   MODE_CPU = 0,
   MODE_GPU = 1,
+  MODE_VIC = 2,                 /* ours: not in DeepStream 8.0's dGPU enum (Jetson's VIC); drawn on the GPU */
 };
 
 enum
@@ -78,15 +88,24 @@ struct _GstRdsOsd
   guint gpu_id;
   gboolean blur_bbox;
   gchar *blur_on_gie_class_ids;
-  /* accepted no-ops warn once each */
+  /* accepted no-ops warn once each; process-mode=2 logs once */
   gboolean display_mask_warned;
   gboolean blur_bbox_warned;
   gboolean blur_ids_warned;
+  gboolean vic_logged;
 
   /* streaming state (streaming thread, or stopped) */
-  RdsOsdDraw *draw;
+  gint mode;                    /* process-mode at start */
+  RdsOsdDraw *draw;             /* MODE_CPU */
+  RdsOsdPlan *plan;             /* the GPU modes: its mask cache mirrors gpu's device heap, so it is gpu's alone */
+  RdsOsdGpu *gpu;
+  guint stream_gpu;             /* the GPU gpu is on */
+  GArray *surfaces;             /* RdsOsdGpuSurface per slot of the batch being drawn */
   gboolean border_warned;
   gboolean slot_warned;
+  /* test hooks: counts since start (streaming thread; read while idle), and a failure to inject */
+  guint64 cpu_frames, gpu_passes;
+  gint fail_next_pass;          /* atomic */
 };
 
 #define RDS_OSD_CAPS \
@@ -107,7 +126,8 @@ gst_rds_osd_mode_get_type (void)
   static GType type = 0;
   static const GEnumValue values[] = {
     {MODE_CPU, "CPU", "MODE_CPU"},
-    {MODE_GPU, "GPU in DeepStream; drawn on the CPU here, with the GPU mode's geometry", "MODE_GPU"},
+    {MODE_GPU, "GPU", "MODE_GPU"},
+    {MODE_VIC, "VIC on Jetson; drawn on the GPU here", "MODE_VIC"},
     {0, NULL, NULL},
   };
 
@@ -127,28 +147,93 @@ static gboolean
 gst_rds_osd_start (GstBaseTransform * trans)
 {
   GstRdsOsd *self = GST_RDS_OSD (trans);
-  gint mode;
+  GError *error = NULL;
+  gboolean log_vic;
+  int prev = 0;
 
   GST_OBJECT_LOCK (self);
-  mode = self->process_mode;
+  self->mode = self->process_mode;
+  self->stream_gpu = self->gpu_id;
+  log_vic = self->mode == MODE_VIC && !self->vic_logged;
+  self->vic_logged |= log_vic;
   GST_OBJECT_UNLOCK (self);
 
-  GST_INFO_OBJECT (self, "process-mode %d: drawing on the CPU, with the GPU mode's geometry", mode);
-  self->draw = rds_osd_draw_new ();
-  rds_osd_draw_warm_up (self->draw);
   self->border_warned = FALSE;
   self->slot_warned = FALSE;
+  self->cpu_frames = 0;
+  self->gpu_passes = 0;
+  if (self->mode == MODE_CPU) {
+    GST_INFO_OBJECT (self, "process-mode 0: drawing on the CPU");
+    self->draw = rds_osd_draw_new ();
+    rds_osd_draw_warm_up (self->draw);
+    return TRUE;
+  }
+
+  /* ours: there is no VIC, so process-mode 2 draws on the GPU as 1 does (logged once per element) */
+  if (log_vic)
+    GST_WARNING_OBJECT (self, "process-mode=2 (VIC) is a Jetson unit: drawing on the GPU instead");
+  if (hipGetDevice (&prev) != hipSuccess || hipSetDevice ((int) self->stream_gpu) != hipSuccess) {
+    GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND, ("GPU %u is not available", self->stream_gpu),
+        ("process-mode %d draws on the GPU (process-mode=0 draws on the CPU)", self->mode));
+    return FALSE;
+  }
+  self->gpu = rds_osd_gpu_new (RDS_OSD_MASK_HEAP_SIZE, &error);
+  (void) hipSetDevice (prev);
+  if (self->gpu == NULL) {
+    GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Cannot set up drawing on GPU %u", self->stream_gpu),
+        ("%s", error->message));
+    g_error_free (error);
+    return FALSE;
+  }
+  /* a new plan: its mask cache starts empty, as the new device heap does */
+  self->plan = rds_osd_plan_new (RDS_OSD_MASK_HEAP_SIZE);
+  rds_osd_plan_warm_up (self->plan);
+  self->surfaces = g_array_new (FALSE, TRUE, sizeof (RdsOsdGpuSurface));
+  GST_INFO_OBJECT (self, "process-mode %d: drawing on GPU %u", self->mode, self->stream_gpu);
   return TRUE;
+}
+
+static void
+free_streaming (GstRdsOsd * self)
+{
+  rds_osd_draw_free (self->draw);
+  self->draw = NULL;
+  /* waits for the stream */
+  rds_osd_gpu_free (self->gpu);
+  self->gpu = NULL;
+  if (self->plan != NULL)
+    rds_osd_plan_free (self->plan);
+  self->plan = NULL;
+  if (self->surfaces != NULL)
+    g_array_unref (self->surfaces);
+  self->surfaces = NULL;
 }
 
 static gboolean
 gst_rds_osd_stop (GstBaseTransform * trans)
 {
-  GstRdsOsd *self = GST_RDS_OSD (trans);
-
-  rds_osd_draw_free (self->draw);
-  self->draw = NULL;
+  free_streaming (GST_RDS_OSD (trans));
   return TRUE;
+}
+
+static gboolean
+check_rgba (GstRdsOsd * self, const RdsBufSurface * surf, guint slot)
+{
+  if (surf->surfaceList[slot].colorFormat == RDS_BUF_COLOR_FORMAT_RGBA)
+    return TRUE;
+  GST_ELEMENT_ERROR (self, STREAM, FORMAT, ("rdsosd draws on RGBA surfaces only"),
+      ("slot %u has colour format %d", slot, surf->surfaceList[slot].colorFormat));
+  return FALSE;
+}
+
+static void
+warn_border (GstRdsOsd * self, RdsOsdDrawFlags flags)
+{
+  if ((flags & RDS_OSD_DRAW_BORDER_CLAMPED) && !self->border_warned) {
+    self->border_warned = TRUE;
+    GST_ELEMENT_WARNING (self, STREAM, FAILED, ("A border_width above %d was drawn %d pixels wide",
+            RDS_OSD_MAX_BORDER_WIDTH, RDS_OSD_MAX_BORDER_WIDTH), ("logged once"));
+  }
 }
 
 /* Draws @fm (NULL: the clock only) onto slot @slot of @surf: map, sync to the CPU, draw, sync back. */
@@ -157,14 +242,11 @@ draw_slot (GstRdsOsd * self, RdsBufSurface * surf, guint slot, const RdsFrameMet
     const RdsOsdDrawOptions * opt)
 {
   RdsBufSurfaceParams *p = &surf->surfaceList[slot];
-  RdsOsdDrawFlags flags;
   gboolean ok;
 
-  if (p->colorFormat != RDS_BUF_COLOR_FORMAT_RGBA) {
-    GST_ELEMENT_ERROR (self, STREAM, FORMAT, ("rdsosd draws on RGBA surfaces only"),
-        ("slot %u has colour format %d", slot, p->colorFormat));
+  if (!check_rgba (self, surf, slot))
     return FALSE;
-  }
+  self->cpu_frames++;
   if (rds_buf_surface_map (surf, (int) slot, 0, RDS_BUF_MAP_READ_WRITE) != 0) {
     GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot map frame %u for drawing", slot),
         ("rds_buf_surface_map failed"));
@@ -173,13 +255,8 @@ draw_slot (GstRdsOsd * self, RdsBufSurface * surf, guint slot, const RdsFrameMet
   }
   ok = rds_buf_surface_sync_for_cpu (surf, (int) slot, 0) == 0;
   if (ok) {
-    flags = rds_osd_draw_frame (self->draw, opt, fm, p->mappedAddr.addr[0], (gint) p->width, (gint) p->height,
-        (gint) p->planeParams.pitch[0]);
-    if ((flags & RDS_OSD_DRAW_BORDER_CLAMPED) && !self->border_warned) {
-      self->border_warned = TRUE;
-      GST_ELEMENT_WARNING (self, STREAM, FAILED, ("A border_width above %d was drawn %d pixels wide",
-              RDS_OSD_MAX_BORDER_WIDTH, RDS_OSD_MAX_BORDER_WIDTH), ("logged once"));
-    }
+    warn_border (self, rds_osd_draw_frame (self->draw, opt, fm, p->mappedAddr.addr[0], (gint) p->width,
+            (gint) p->height, (gint) p->planeParams.pitch[0]));
     ok = rds_buf_surface_sync_for_device (surf, (int) slot, 0) == 0;
   }
   if (!ok)
@@ -198,6 +275,76 @@ typedef struct
   guint slot;
   RdsFrameMeta *fm;
 } Work;
+
+/* Plans the frames of @work on @surf's slots for the GPU (under the meta lock: the plan reads the metas, and keeps
+ * nothing of them). FALSE (an element error) when a slot cannot be drawn on the GPU. */
+static gboolean
+plan_gpu (GstRdsOsd * self, RdsBufSurface * surf, guint n_slots, GArray * work, const RdsOsdDrawOptions * opt)
+{
+  RdsOsdDrawFlags flags = 0;
+
+  if (surf->memType == RDS_BUF_MEM_SYSTEM) {
+    GST_ELEMENT_ERROR (self, STREAM, FAILED, ("process-mode %d draws on frames the GPU can reach", self->mode),
+        ("the frames are in system memory"));
+    return FALSE;
+  }
+  if ((surf->memType == RDS_BUF_MEM_DEFAULT || surf->memType == RDS_BUF_MEM_HIP_DEVICE)
+      && surf->gpuId != self->stream_gpu) {
+    GST_ELEMENT_ERROR (self, STREAM, FAILED, ("The frames are on GPU %u, gpu-id is %u", surf->gpuId,
+            self->stream_gpu), (NULL));
+    return FALSE;
+  }
+  g_array_set_size (self->surfaces, 0);
+  g_array_set_size (self->surfaces, n_slots);
+  rds_osd_plan_begin (self->plan);
+  for (guint i = 0; i < work->len; i++) {
+    Work *w = &g_array_index (work, Work, i);
+    const RdsBufSurfaceParams *p = &surf->surfaceList[w->slot];
+
+    if (!check_rgba (self, surf, w->slot))
+      return FALSE;
+    g_array_index (self->surfaces, RdsOsdGpuSurface, w->slot) = (RdsOsdGpuSurface) {
+    .data = (guint8 *) p->dataPtr + p->planeParams.offset[0],.pitch = p->planeParams.pitch[0],.width =
+          (gint32) p->width,.height = (gint32) p->height};
+    flags |= rds_osd_plan_add_frame (self->plan, opt, w->slot, w->fm, (gint) p->width, (gint) p->height);
+  }
+  warn_border (self, flags);
+  return TRUE;
+}
+
+/* Draws the planned batch on the GPU, pass by pass; each pass is complete when rds_osd_gpu_draw_pass returns. FALSE
+ * (an element error) on a HIP failure. */
+static gboolean
+draw_gpu (GstRdsOsd * self)
+{
+  RdsOsdPass pass;
+  GError *error = NULL;
+  gboolean ok = TRUE;
+  int prev = 0;
+
+  if (hipGetDevice (&prev) != hipSuccess || hipSetDevice ((int) self->stream_gpu) != hipSuccess) {
+    GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Cannot draw on the GPU"), ("GPU %u cannot be selected",
+            self->stream_gpu));
+    return FALSE;
+  }
+  while (ok && rds_osd_plan_next_pass (self->plan, &pass)) {
+    guint n_surfaces = self->surfaces->len;
+
+    /* (tests) no plane for any slot: the pass fails as on a HIP error, its masks dropped */
+    if (g_atomic_int_compare_and_exchange (&self->fail_next_pass, TRUE, FALSE))
+      n_surfaces = 0;
+    ok = rds_osd_gpu_draw_pass (self->gpu, self->plan, &pass, (const RdsOsdGpuSurface *) self->surfaces->data,
+        n_surfaces, &error);
+    if (ok)
+      self->gpu_passes++;
+  }
+  (void) hipSetDevice (prev);
+  if (!ok) {
+    GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Cannot draw on the GPU"), ("%s", error->message));
+    g_error_free (error);
+  }
+  return ok;
+}
 
 static GstFlowReturn
 gst_rds_osd_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
@@ -269,7 +416,8 @@ gst_rds_osd_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   }
 
   if (work->len > 0) {
-    /* writable buffer + WRITE map: memory this element may write (a copy of shared or view memory) */
+    /* writable buffer + WRITE map: memory this element may write (a copy of shared or view memory, made by a
+     * synchronous copy: complete before any drawing reads it) */
     if (!gst_buffer_map (buf, &map, GST_MAP_WRITE)) {
       GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot map the buffer for drawing"),
           ("the input must be one writable memory:RDS memory"));
@@ -277,10 +425,21 @@ gst_rds_osd_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     } else {
       RdsBufSurface *surf = (RdsBufSurface *) map.data;
 
-      for (guint i = 0; i < work->len && ret == GST_FLOW_OK; i++) {
-        Work *w = &g_array_index (work, Work, i);
+      if (self->mode == MODE_CPU) {
+        for (guint i = 0; i < work->len && ret == GST_FLOW_OK; i++) {
+          Work *w = &g_array_index (work, Work, i);
 
-        if (!draw_slot (self, surf, w->slot, w->fm, &opt))
+          if (!draw_slot (self, surf, w->slot, w->fm, &opt))
+            ret = GST_FLOW_ERROR;
+        }
+      } else {
+        if (!plan_gpu (self, surf, n_slots, work, &opt))
+          ret = GST_FLOW_ERROR;
+        /* the passes read the plan only, not the metas */
+        if (bm != NULL)
+          rds_release_meta_lock (bm);
+        bm = NULL;
+        if (ret == GST_FLOW_OK && !draw_gpu (self))
           ret = GST_FLOW_ERROR;
       }
       gst_buffer_unmap (buf, &map);
@@ -454,7 +613,7 @@ gst_rds_osd_finalize (GObject * object)
 
   g_free (self->clock_font);
   g_free (self->blur_on_gie_class_ids);
-  rds_osd_draw_free (self->draw);
+  free_streaming (self);
   G_OBJECT_CLASS (gst_rds_osd_parent_class)->finalize (object);
 }
 
@@ -521,10 +680,11 @@ gst_rds_osd_class_init (GstRdsOsdClass * klass)
           DEFAULT_CLOCK_COLOR, flags | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_PROCESS_MODE,
       g_param_spec_enum ("process-mode", "Process mode",
-          "Accepted for compatibility: both modes draw on the CPU, with the GPU mode's geometry",
+          "Where to draw: on the CPU, or on the GPU (the same pixels; 2, Jetson's VIC, draws on the GPU here)",
           GST_TYPE_RDS_OSD_MODE, DEFAULT_PROCESS_MODE, flags | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_GPU_ID,
-      g_param_spec_uint ("gpu-id", "GPU id", "Accepted for compatibility (the frames are drawn where they are)", 0,
+      g_param_spec_uint ("gpu-id", "GPU id",
+          "GPU to draw on in the GPU modes (frames in device memory must be on it; the CPU mode ignores it)", 0,
           G_MAXUINT, DEFAULT_GPU_ID, flags | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_BLUR_BBOX,
       g_param_spec_boolean ("blur-bbox", "Blur boxes", "Blur inside the object boxes (accepted; not blurred yet)",
@@ -547,4 +707,21 @@ gst_rds_osd_class_init (GstRdsOsdClass * klass)
   trans_class->transform_ip_on_passthrough = FALSE;
 
   gst_type_mark_as_plugin_api (GST_TYPE_RDS_OSD_MODE, 0);
+}
+
+/* ---- test hooks ---- */
+
+void
+rds_osd_test_get_counts (GstElement * element, guint64 * cpu_frames, guint64 * gpu_passes)
+{
+  GstRdsOsd *self = GST_RDS_OSD (element);
+
+  *cpu_frames = self->cpu_frames;
+  *gpu_passes = self->gpu_passes;
+}
+
+void
+rds_osd_test_fail_next_pass (GstElement * element)
+{
+  g_atomic_int_set (&GST_RDS_OSD (element)->fail_next_pass, TRUE);
 }

@@ -18,8 +18,8 @@ far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, s
 views of the batch), `rdsinfer` (MIGraphX primary detector: nvinfer configs, custom bbox parsers, object and
 tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs),
 `rdsmultistreamtiler` (batches into one tiled frame), `rdsosd` (boxes, text, lines, arrows, circles and the clock,
-drawn on the CPU, Pango for text), `rdslogger` (per-stream FPS lines) and `rdsvideosink` (display through a stock
-GStreamer sink). Nothing here is stable.
+drawn on the GPU by default or on the CPU, the same pixels, Pango for text), `rdslogger` (per-stream FPS lines) and
+`rdsvideosink` (display through a stock GStreamer sink). Nothing here is stable.
 
 ## Architecture principles
 
@@ -138,6 +138,11 @@ Known gotchas:
   no measured cost on the gfx1036 iGPU, so `tests/meson.build` sets it for every test; `GPU_MAX_HW_QUEUES=16` avoids
   it too but slowed `rds-test3` from ~45 to ~29 fps. Seen in `memory_hip`'s concurrent views test (~2 % of runs
   under `meson test`, whose `MALLOC_PERTURB_` changes the timing); no standalone HIP reproducer yet.
+- HIP loads a library's kernels lazily, at their first launch (`HIP_ENABLE_DEFERRED_LOADING`, on by default). In
+  ROCm 10.1 the first launch of `rdsosd`'s drawing kernel from the plugin, a `dlopen`ed library, on its non-blocking
+  stream completed without drawing anything (no error; the same kernel linked into a test executable was fine).
+  `rds_osd_gpu_new` loads the kernels up front with `hipFuncGetAttributes`; do the same for new kernels in plugins
+  whose first launch matters.
 - MIOpen (MIGraphX's convolutions) keeps its databases under `$HOME/.config/miopen`. GLib tests with
   `G_TEST_OPTION_ISOLATE_DIRS` set `HOME=/dev/null`, so such tests point `MIOPEN_USER_DB_PATH` and
   `MIOPEN_CUSTOM_CACHE_DIR` somewhere writable, and `AMD_COMGR_CACHE_DIR` too, since the isolated
@@ -194,7 +199,9 @@ gst/rdstiler/      libgstrdstiler plugin: rdsmultistreamtiler (gstrdsmultistream
                    layout core (grid, cells, meta scaling; GLib only), the static rdstiler-core the tests link. Always
                    built
 gst/rdsosd/        libgstrdsosd plugin: rdsosd (gstrdsosd.c: in place on RGBA memory:RDS, each frame meta drawn on its
-                   batch_id slot, synced to the CPU and back; views and shared memory are drawn on a private copy).
+                   batch_id slot; process-mode 1 (default) and 2 plan the batch under the meta lock and draw it with
+                   rds-osd-gpu, no CPU staging; 0 syncs each slot to the CPU, draws it there and syncs it back; views
+                   and shared memory are drawn on a private copy; test hooks exported for element_osd).
                    rds-osd-plan is the draw planner (a batch's metas -> draw commands in draw order, text rasterized by
                    Pango into A8 masks cached in an 8 MiB heap, split into passes when a batch's masks overflow it,
                    commands binned into 32x32 tiles for the GPU; GLib, Cairo and Pango only); rds-osd-draw draws a
@@ -202,8 +209,8 @@ gst/rdsosd/        libgstrdsosd plugin: rdsosd (gstrdsosd.c: in place on RGBA me
                    (plain C that also compiles as HIP device code: exact integer coverage, no FMA in the blend);
                    together the static rdsosd-core the tests link. rds-osd-gpu draws a pass on the GPU, byte for byte
                    as the CPU path (one upload a pass, a block per tile; kernel in rds-osd-gpu.hip, built with
-                   -ffp-contract=off), the static rdsosd-gpu; the element does not use it yet. Optional (-Dosd,
-                   default auto): needs cairo and pangocairo
+                   -ffp-contract=off), the static rdsosd-gpu. Optional (-Dosd, default auto): needs cairo and
+                   pangocairo
 gst/rdssink/       libgstrdssink plugin: rdslogger (gstrdslogger.c: passthrough, counts frames per source_id and prints
                    the **PERF line on a periodic pipeline-clock id) and rdsvideosink (gstrdsvideosink.c: a bin of
                    rdsvideoconvert, BGRx videoconvert and the video-sink factory; forwards the DeepStream sink

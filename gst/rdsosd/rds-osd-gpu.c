@@ -298,7 +298,8 @@ rds_osd_gpu_new (gsize heap_size, GError ** error)
   gpu->luts = g_byte_array_new ();
   gpu->copies = g_array_new (FALSE, FALSE, sizeof (RdsOsdGpuCopy));
   if (!hip_ok (hipStreamCreateWithFlags (&gpu->stream, hipStreamNonBlocking), "hipStreamCreateWithFlags", error)
-      || !hip_ok (hipMalloc ((void **) &gpu->heap, heap_size), "hipMalloc", error)) {
+      || !hip_ok (hipMalloc ((void **) &gpu->heap, heap_size), "hipMalloc", error)
+      || !hip_ok ((hipError_t) rds_osd_gpu_load (), "hipFuncGetAttributes", error)) {
     rds_osd_gpu_free (gpu);
     return NULL;
   }

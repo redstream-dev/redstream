@@ -336,12 +336,14 @@ if rds_osd_enabled
   # rdsosd's GPU drawing against the CPU path, byte for byte; prints the draw time of a 720p frame and a 1080p batch.
   test('osd_gpu', executable('osd_gpu', 'check' / 'osd_gpu.c', dependencies : [rdsosd_gpu_dep, gst_dep]),
     suite : 'gpu', env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 300)
-  # rdsosd: properties (cpu); drawing on memory:RDS batches and demuxed views (gpu).
-  element_osd_exe = executable('element_osd', 'check' / 'element_osd.c', dependencies : test_deps)
+  # rdsosd: properties, no GPU (cpu); drawing on memory:RDS batches and demuxed views in both process modes, the same
+  # bytes in each, GPU errors (gpu; the test hooks are looked up in the plugin with GModule).
+  element_osd_exe = executable('element_osd', 'check' / 'element_osd.c',
+    dependencies : test_deps + [dependency('gmodule-2.0')])
   test('element_osd_cpu', element_osd_exe, args : ['-p', '/cpu/osd-element'],
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
   test('element_osd', element_osd_exe, args : ['-p', '/gpu/osd-element'],
-    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 240, depends : rds_plugins)
 endif
 
 if rds_osd_enabled and rds_tracker_enabled and rds_infer_enabled

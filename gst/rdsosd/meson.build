@@ -15,15 +15,6 @@ rdsosd_core_dep = declare_dependency(link_with : rdsosd_core,
   dependencies : [dependency('glib-2.0'), rds_dep.partial_dependency(includes : true), cairo_dep, pangocairo_dep,
     cc.find_library('m', required : false)])
 
-gstrdsosd = library('gstrdsosd',
-  files('plugin.c', 'gstrdsosd.c'),
-  c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdsosd"'],
-  dependencies : [rds_dep, gst_dep, gst_base_dep, gst_video_dep, rdsosd_core_dep],
-  gnu_symbol_visibility : 'hidden',
-  install_rpath : rds_install_rpath,
-  install : true,
-  install_dir : get_option('libdir') / 'gstreamer-1.0')
-rds_plugins += gstrdsosd
 
 # The GPU drawing kernels, built like rdsinfer's (gst/rdsinfer/meson.build), with contraction off: the kernel blends
 # with the same code as the CPU path and must round alike (amdclang's default is fast-honor-pragmas). The context
@@ -49,3 +40,13 @@ rdsosd_gpu = static_library('rdsosd-gpu',
   pic : true)
 rdsosd_gpu_dep = declare_dependency(link_with : rdsosd_gpu,
   dependencies : [rdsosd_core_dep, hip_dep])
+
+gstrdsosd = library('gstrdsosd',
+  files('plugin.c', 'gstrdsosd.c'),
+  c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdsosd"'],
+  dependencies : [rds_dep, gst_dep, gst_base_dep, gst_video_dep, rdsosd_gpu_dep],
+  gnu_symbol_visibility : 'hidden',
+  install_rpath : rds_install_rpath,
+  install : true,
+  install_dir : get_option('libdir') / 'gstreamer-1.0')
+rds_plugins += gstrdsosd

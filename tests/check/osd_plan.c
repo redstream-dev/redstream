@@ -456,7 +456,8 @@ rnd (GRand * r, gint lo, gint hi)
   return g_rand_int_range (r, lo, hi + 1);
 }
 
-/* Random object rects (some text), display rects, lines, arrows with heads (union chains) and circles. */
+/* Random object rects (some text), display rects, lines (some wide), arrows with heads (union chains) and circles
+ * (some huge, centred off the frame), so that tile culling sees shapes whose boxes cover far more than they draw. */
 static void
 random_frame (GRand * r, Frame * f, gint w, gint h)
 {
@@ -481,7 +482,7 @@ random_frame (GRand * r, Frame * f, gint w, gint h)
   dm->num_lines = rnd (r, 0, 4);
   for (guint i = 0; i < dm->num_lines; i++)
     dm->line_params[i] = line (rnd (r, 0, w + 30), rnd (r, 0, h + 30), rnd (r, 0, w + 30), rnd (r, 0, h + 30),
-        rnd (r, 1, 9), random_color (r));
+        rnd (r, 0, 3) == 0 ? rnd (r, 10, 40) : rnd (r, 1, 9), random_color (r));
   dm->num_arrows = rnd (r, 0, 4);
   for (guint i = 0; i < dm->num_arrows; i++)
     dm->arrow_params[i] = (RdsOSD_ArrowParams) {.x1 = rnd (r, 0, w + 30),.y1 = rnd (r, 0, h + 30),.x2 =
@@ -489,11 +490,15 @@ random_frame (GRand * r, Frame * f, gint w, gint h)
           RDS_OSD_ARROW_BOTH_HEAD,.arrow_color = random_color (r)
     };
   dm->num_circles = rnd (r, 0, 3);
-  for (guint i = 0; i < dm->num_circles; i++)
-    dm->circle_params[i] = (RdsOSD_CircleParams) {.xc = rnd (r, 0, w + 20),.yc = rnd (r, 0, h + 20),.radius =
-          rnd (r, 0, 80),.circle_width = rnd (r, 0, 6),.circle_color = random_color (r),.has_bg_color =
-          g_rand_boolean (r),.bg_color = random_color (r)
+  for (guint i = 0; i < dm->num_circles; i++) {
+    gboolean huge = rnd (r, 0, 4) == 0;
+
+    dm->circle_params[i] = (RdsOSD_CircleParams) {.xc = huge ? rnd (r, 0, 4 * w) : rnd (r, 0, w + 20),.yc =
+          huge ? rnd (r, 0, 4 * h) : rnd (r, 0, h + 20),.radius = huge ? rnd (r, w, 6 * w + 6 * h) : rnd (r, 0, 80),
+      .circle_width = rnd (r, 0, 6),.circle_color = random_color (r),.has_bg_color = g_rand_boolean (r),.bg_color =
+          random_color (r)
     };
+  }
 }
 
 /* The bounding box of the shape cmds[i] belongs to, and its first and last command. */

@@ -136,3 +136,12 @@ rds_osd_gpu_launch (const RdsOsdGpuJob * job, void *stream)
         (hipStream_t) stream, *job);
   return (int) hipGetLastError ();
 }
+
+extern "C" int
+rds_osd_gpu_load (void)
+{
+  hipFuncAttributes attr;
+  hipError_t e = hipFuncGetAttributes (&attr, (const void *) rds_osd_upload_kernel);
+
+  return (int) (e != hipSuccess ? e : hipFuncGetAttributes (&attr, (const void *) rds_osd_draw_kernel));
+}
