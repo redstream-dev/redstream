@@ -5,8 +5,10 @@ online documentation (the Source column links the page); Redstream's implementat
 
 Status values: **supported** (same meaning), **accepted no-op** (compiles and is ignored), **unsupported**
 (compiles, then fails at run time), **different default** (supported, but the default value differs), **planned**
-(aliased, element not written yet). Names Redstream does not
-alias at all are listed under "Not aliased" in each section: code using them does not compile.
+(aliased, element not written yet). In element property tables also: **accepted** (the value is stored and read
+back, and does what the Notes say rather than what DeepStream does with it), **forwarded** (`rdsvideosink`: set on the
+stock sink inside it) and **ours** (a Redstream-only property). Names Redstream does not alias at all are listed under
+"Not aliased" in each section: code using them does not compile.
 
 Functions are aliased with object-like macros, so calls and `&function` work. Where a Redstream signature differs
 slightly (a `const` parameter, a `gboolean` instead of `void` result), calls compile unchanged but assigning the
@@ -398,7 +400,7 @@ silent, or **ours**: where 8.0 settles nothing or is clearly broken.
 | `silent=false` | matches nvdslogger (DeepStream 8.0) | per buffer `<name> BUF_PTS : <pts> element time <running time now> elem-buf=<now − pts, ms> ms buf=<address> buffer_pts_to_running_time = <pts running time>rdslogger base time = <base time>buffer dur <duration>` (no separators before `rdslogger` and `buffer dur`, as in 8.0, whose label reads `nvdslogger base time`), then `BUFFER PTS is lesser than ELEMENT TIME, IT's LATE` or `BUFFER PTS is greater than ELEMENT TIME, IT's EARLY` (ours: only the LATE line was observed in 8.0, so the EARLY wording is inferred; equal counts as early); without a clock or PTS, the times print as `99:99:99.999999999` and the second line is left out (ours) |
 | Latency output | ours | none (8.0 printed none either without `NVDS_ENABLE_LATENCY_MEASUREMENT`) |
 
-### `rdsvideosink` (`nveglglessink`, `nv3dsink`) properties
+### `rdsvideosink` (`nveglglessink`, `nv3dsink`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html))
 
 Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0's nveglglessink (nv3dsink has
 the same base-sink properties and the window geometry, with `window-x`/`window-y` defaulting to 0). Neither element
@@ -433,6 +435,10 @@ Pads: `sink` (a ghost pad of `rdsvideoconvert`'s): `memory:RDS` or system memory
 from a container, X11 needs `DISPLAY`, the X socket and the Xauthority file.
 
 #### Display behaviour
+
+Each row is either **matches nveglglessink (DeepStream 8.0)**: observed DeepStream 8.0 behaviour where the docs are
+silent, or **ours**: where 8.0 settles nothing or is clearly broken. Every row is ours so far: the display path itself
+differs.
 
 | Behaviour | Status | Notes |
 |---|---|---|

@@ -363,6 +363,14 @@ test('element_tiler', element_tiler_exe, args : ['-p', '/gpu/tiler'],
 test('element_logger', executable('element_logger', 'check' / 'element_logger.c', dependencies : test_deps),
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
+# docs/compat-matrix.md has a property-table row for every property of rdsmultistreamtiler, rdsosd (when built),
+# rdslogger and rdsvideosink, and none for a property they lack.
+test('element_compat_matrix', executable('element_compat_matrix', 'check' / 'element_compat_matrix.c',
+    dependencies : test_deps,
+    c_args : ['-DRDS_HAVE_OSD=@0@'.format(rds_osd_enabled ? 1 : 0),
+      '-DRDS_COMPAT_MATRIX="@0@"'.format(meson.project_source_root() / 'docs' / 'compat-matrix.md')]),
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+
 # rdsvideosink: properties, forwarding and start errors (cpu); RDS frames into the inner sink, batched input (gpu).
 element_videosink_exe = executable('element_videosink', 'check' / 'element_videosink.c',
   dependencies : test_deps + [gst_video_dep])

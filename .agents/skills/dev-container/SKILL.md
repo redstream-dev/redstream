@@ -36,7 +36,7 @@ tests/models/fetch-yolo11n.sh               # on the HOST, not in $RUN (it start
 tests/models/fetch-tracker-clip.sh          # on the HOST too (Docker, network and the GPU): the CC0 street clip,
                                             # VP8 decoded in a python container, vah264enc in redstream:dev, into
                                             # .cache/media/crosswalk-720p.h264 (never commit it)
-# the YOLO11n soak takes ~4 min, the tracker soak ~6 min; leave the soaks out of repeat runs
+# the YOLO11n soak takes ~4 min, the tracker soak ~6 min, the OSD soak ~6.5 min; leave the soaks out of repeat runs
 $RUN meson test -C build --no-suite soak --print-errorlogs
 
 # ASan + UBSan (tests/lsan.supp, applied by meson test, hides HIP runtime leaks)
@@ -88,6 +88,13 @@ $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 --
   file:///src/.cache/media/crosswalk-720p.h264 file:///src/.cache/media/crosswalk-720p.h264 | tail'
 # the same in a window (autovideosink -> ximagesink): add the X11 flags to docker run, drop --no-display
 #   -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -e XAUTHORITY=/tmp/.xauth -v $XAUTHORITY:/tmp/.xauth:ro
+# one source, decode to display with gst-launch (X11 flags as above; sync=false: raw .h264 has no timestamps)
+$RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/crosswalk-720p.h264 \
+  ! h264parse ! rdsvideodec ! m.sink_0 rdsstreammux name=m batch-size=1 width=1280 height=720 \
+  ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=1 \
+  ! rdstracker ll-config-file=samples/tracker/config_tracker_NvSORT.yml \
+  ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA" ! rdsosd ! rdsvideosink sync=false'
+# per-stream frame rates: put rdslogger after the mux (**PERF lines every fps-measurement-interval-sec, default 5)
 # pre-build a program (exit 2: already up to date)
 $RUN build/tools/rds-compile -c samples/rds-test3/rds_test3_pgie_config.yml -b 4
 # autoplugging: -v shows GstRdsVideoDec inside the decodebin
@@ -114,7 +121,12 @@ $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 -v uridecodebin uri=f
 | YOLO11n tests `SKIP` ("run tests/models/fetch-yolo11n.sh") | run the fetch script on the host; outputs go to `.cache/models` |
 | `pipeline_tracker` `SKIP`s; `tracker_replay` skips its clip case | run `tests/models/fetch-tracker-clip.sh` on the host; the replay needs a `pipeline_tracker` run after the last change to the tracker core's sources (its saved detections are stamped with their hash) |
 | `vp8dec`/VP8 not found in `redstream:dev` | expected: the image can't decode VP8; `fetch-tracker-clip.sh` decodes it in a python container |
-| a compat-matrix lint fails (`/cpu/*-config/compat-matrix`) | a config key changed: copy the expected row from the test's message into `docs/compat-matrix.md` |
+| a compat-matrix lint fails (`/cpu/*-config/compat-matrix`, `/cpu/elements/compat-matrix`) | a config key or element property changed: copy the expected row from the test's message into `docs/compat-matrix.md` (and fill in its status and notes) |
+| `rdsosd`: `no element` while the other elements load | the build found no cairo/pangocairo (`-Dosd` is auto): the meson setup log says so |
+| `rdsvideosink` runs but no window appears (headless or no X11 flags) | `autovideosink` picked `kmssink`, which can start without showing anything: pass the X11 flags (`DISPLAY`, the X socket, `XAUTHORITY`), or set `video-sink=ximagesink` to get a clear error instead |
+| `Could not initialise X output` / `cannot open display` | the X11 flags are missing from `docker run`, or `$XAUTHORITY` is unset on the host |
+| `ximagesink`: "A lot of buffers are being dropped" | raw `.h264` from `filesrc` has no timestamps: use `rdsvideosink sync=false` |
+| `MIT-SHM` / XShm unavailable warnings from `ximagesink` | harmless in the container (no shared memory with the host X server); it falls back to plain X11 puts |
 | MIOpen errors about `/dev/null/.config/miopen` in a GLib test | `G_TEST_OPTION_ISOLATE_DIRS` sets `HOME=/dev/null`: set `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR` and `AMD_COMGR_CACHE_DIR` to writable dirs |
 | ASan: MIGraphX can't load `libmigraphx_gpu.so` | ASan's `dlopen` ignores MIGraphX's `$ORIGIN` RUNPATH; `meson test` sets `LD_LIBRARY_PATH` (do the same when running a binary by hand) |
 | MIGraphX error says only "Failed to call function" | the real reason is printed on stderr just before it |

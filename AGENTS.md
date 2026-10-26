@@ -10,9 +10,10 @@ DeepStream on AMD GPUs (ROCm)**. Porting an existing DeepStream application shou
 mechanical changes: element factory names behind an `#ifdef`, the same config files, and the same
 metadata-traversal code via a compatibility header.
 
-Status: **pre-alpha.** Phase 0 spikes and the walking skeleton are done; the libgstrds core is in place (surfaces,
-`memory:RDS`, pools, metadata, events, read-only surface views, the `rds_buf_surf_transform` GPU transform). The
-elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
+Status: **pre-alpha.** M1's pipeline runs end to end from files (decode → mux → infer → tracker → tiler → OSD →
+display, `samples/rds-test3`). The libgstrds core is in place (surfaces, `memory:RDS`, pools, metadata, events,
+read-only surface views, the `rds_buf_surf_transform` GPU transform and its many-to-one composite). The elements so
+far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
 `rdsstreammux` (the default scaling mux: batches of fixed-size slots), `rdsstreamdemux` (zero-copy per-source
 views of the batch), `rdsinfer` (MIGraphX primary detector: nvinfer configs, custom bbox parsers, object and
 tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs),
@@ -206,7 +207,8 @@ gst/rdstracker/    libgstrdstracker plugin: rdstracker (gstrdstracker.c: write-b
                    default auto): needs only libyaml, not MIGraphX
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its rdsinfer
                    and rdstracker config-key tables must match the key tables: the infer_config and tracker_config
-                   tests check every row)
+                   tests check every row; element_compat_matrix checks the tiler, OSD, logger and sink property
+                   tables against the elements' properties)
 samples/rds-test3/ clean-room test3-style multi-stream sample (end to end: per-frame counts, tiler, OSD, display;
                    --dry-run, --no-display, --pgie-config, --tracker-config)
 samples/tracker/   our IOU and NvSORT low-level tracker configs for rdstracker (tuned on the street clip)
@@ -249,6 +251,17 @@ GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 rdsstreammux name=m batch-size=2 wi
   filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
   filesrc location=.cache/media/smpte-1366x768.h264 ! h264parse ! rdsvideodec ! m.sink_1 \
   d.src_0 ! queue ! fakesink sync=false  d.src_1 ! queue ! fakesink sync=false
+# the whole M1 chain on the street clip (needs YOLO11n and the clip): counts per frame, tiled frames in a window;
+# --no-display runs to fakesink sync=false. A window from the container needs the X11 flags on docker run:
+#   -e DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -e XAUTHORITY=/tmp/.xauth -v $XAUTHORITY:/tmp/.xauth:ro
+GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 --tracker-config samples/tracker/config_tracker_NvSORT.yml \
+  file://$PWD/.cache/media/crosswalk-720p.h264 file://$PWD/.cache/media/crosswalk-720p.h264
+# one source, decode to display (sync=false: raw .h264 has no timestamps)
+GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse \
+  ! rdsvideodec ! m.sink_0 rdsstreammux name=m batch-size=1 width=1280 height=720 \
+  ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=1 \
+  ! rdstracker ll-config-file=samples/tracker/config_tracker_NvSORT.yml \
+  ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA" ! rdsosd ! rdsvideosink sync=false
 
 # ASan + UBSan build; tests/lsan.supp hides HIP runtime leaks
 meson setup build-asan -Db_sanitize=address,undefined -Db_lundef=false
@@ -299,7 +312,10 @@ meson test -C build-rel --print-errorlogs
 - The compat-matrix lints (`/cpu/infer-config/compat-matrix`, `/cpu/tracker-config/compat-matrix`) run only in
   builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
   check the rdsinfer key tables in `docs/compat-matrix.md`. A new or changed config key needs its row there; the
-  test's message prints the expected row.
+  test's message prints the expected row. `/cpu/elements/compat-matrix` does the same for the property tables of
+  `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger` and `rdsvideosink`: every property except those of
+  GstObject, GstElement and GstBin needs a row (GstBaseTransform's `qos` included), and a row naming no property
+  fails too.
 - **Tracker, tiler, OSD, logger and sink behaviour.** Where NVIDIA's docs are silent, `rdstracker`,
   `rdsmultistreamtiler`, `rdsosd`, `rdslogger` and `rdsvideosink` match observed DeepStream 8.0 behaviour, except where
   8.0 is clearly broken; there they do the sane thing. Code comments say "DeepStream 8.0 behaviour" or "ours", and

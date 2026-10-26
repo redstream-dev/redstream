@@ -2,9 +2,11 @@
 
 **GStreamer video and audio analytics on AMD GPUs: an open-source, ROCm-based functional equivalent of NVIDIA DeepStream.**
 
-> Status: **pre-alpha.** The core library `libgstrds` and the first six elements, `rdsvideodec`,
-> `rdsvideoconvert`, `rdsstreammux`, `rdsstreamdemux`, `rdsinfer` and `rdstracker`, are in place, with the
-> `rds-compile` tool (see "What works" below). APIs and element names will change.
+> Status: **pre-alpha.** The first milestone's pipeline runs end to end on an AMD GPU: decode → batch → detect →
+> track → tile → on-screen display → window, with the core library `libgstrds`, ten elements (`rdsvideodec`,
+> `rdsvideoconvert`, `rdsstreammux`, `rdsstreamdemux`, `rdsinfer`, `rdstracker`, `rdsmultistreamtiler`, `rdsosd`,
+> `rdslogger`, `rdsvideosink`) and the `rds-compile` tool (see "What works" below). APIs and element names will
+> change.
 
 ## Why
 
@@ -36,7 +38,8 @@ Jetson-specific hardware blocks.
 - **`libgstrds`:** batched GPU surfaces (`RdsBufSurface`, the `memory:RDS` caps feature), buffer pools,
   DeepStream-shaped metadata (batch, frame, object, user and display meta) and stream events.
 - **`rds_buf_surf_transform`:** batched crop, scale (nearest, bilinear) and colour conversion between NV12, I420,
-  RGBA, BGRA, RGBx, BGRx, RGB, BGR and GRAY8 on the GPU, shaped like `NvBufSurfTransform`.
+  RGBA, BGRA, RGBx, BGRx, RGB, BGR and GRAY8 on the GPU, shaped like `NvBufSurfTransform`; and
+  `rds_buf_surf_transform_composite`, many surfaces into one (`NvBufSurfTransformComposite`).
 - **`rdsvideodec`** (`nvv4l2decoder`): H.264 and H.265 (8-bit 4:2:0) decoding with rocDecode into `memory:RDS` NV12,
   bit-exact with the stock VA decoders. It ranks above them, so `uridecodebin` picks it; it falls back to system
   memory for ordinary sinks.
@@ -58,10 +61,19 @@ Jetson-specific hardware blocks.
   NvMultiObjectTracker, on the CPU, reading the same YAML low-level config files (NvDCF and NvDeepSORT configs run
   as NvSORT). Where NVIDIA's docs leave behaviour open, it follows observed DeepStream 8.0 behaviour, and the compat
   matrix lists every point where it differs. Our own tuned configs are in `samples/tracker/`.
+- **`rdsmultistreamtiler`** (`nvmultistreamtiler`): composes a batch into one rows × columns frame on the GPU and
+  merges the sources' metadata into it, scaled into the tiles, as DeepStream 8.0 does; `show-source` shows one
+  source alone.
+- **`rdsosd`** (`nvdsosd`): draws object boxes and labels, and display meta (rectangles, text, lines, arrows,
+  circles) and the clock, in the geometry of DeepStream 8.0's GPU mode. It draws on the CPU with Cairo and Pango for
+  now; a GPU path comes before the first release. Masks and blur are not drawn yet.
+- **`rdslogger`** (`nvdslogger`): prints each stream's frame rate in DeepStream's `**PERF` line format.
+- **`rdsvideosink`** (`nveglglessink`, `nv3dsink`): shows frames in a window through a stock GStreamer sink
+  (`autovideosink` by default), with the DeepStream sinks' property names.
 - **`rds-compile`** (`trtexec`): compiles and caches `rdsinfer`'s MIGraphX program ahead of time.
 - **Compat header** `rds/rds_compat.h`: DeepStream names for the above, plus runtime remapping of element names
   (`nvv4l2decoder` → `rdsvideodec`, `nvstreammux` → `rdsstreammux`, `nvinfer` → `rdsinfer`, `nvtracker` →
-  `rdstracker`, …).
+  `rdstracker`, `nvdsosd` → `rdsosd`, …).
 
 [`docs/compat-matrix.md`](docs/compat-matrix.md) lists every mapped name and property with its status. Built from
 this repository (see "Getting started"; `tests/media/make-test-media.sh` generates the clips), a decode and convert
@@ -96,9 +108,12 @@ GST_PLUGIN_PATH_1_0=build/gst GST_DEBUG=rdsinfer:5 gst-launch-1.0 rdsstreammux n
 The generated test clips (a bouncing ball, SMPTE bars) contain nothing YOLO11n detects, so expect 0 objects per
 frame: this checks that the pipeline runs, not what it finds.
 
-To see tracking, fetch the street clip (see "Getting started") and run the sample with the NvSORT config. It prints
-each source's object counts per frame and shows the sources tiled, with boxes and track IDs, in a window
-(`--no-display` runs to a fakesink as fast as it can; `GST_DEBUG=rdstracker:5` adds the tracker's per-frame log):
+### See it
+
+Fetch YOLO11n and the street clip (see "Getting started"). The `rds-test3` sample is shaped like DeepStream's
+`deepstream-test3`: N sources → `rdsstreammux` → `rdsinfer` → `rdstracker` → `rdsmultistreamtiler` →
+`rdsvideoconvert` → `rdsosd` → `rdsvideosink`. It prints each source's object counts per frame and shows the sources
+tiled, with boxes and track IDs, in a window:
 
 ```bash
 GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 \
@@ -106,9 +121,28 @@ GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 \
   file://$PWD/.cache/media/crosswalk-720p.h264 file://$PWD/.cache/media/crosswalk-720p.h264
 ```
 
+`--no-display` runs to a fakesink as fast as it can; `GST_DEBUG=rdstracker:5` adds the tracker's per-frame log.
+From the dev container, a window needs the X11 socket and credentials; add these to `docker run`:
+
+```bash
+-e DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -e XAUTHORITY=/tmp/.xauth -v $XAUTHORITY:/tmp/.xauth:ro
+```
+
+One source through the whole chain with `gst-launch-1.0` (`sync=false`: a raw `.h264` file has no timestamps, so a
+synchronizing sink would drop most frames):
+
+```bash
+GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse \
+  ! rdsvideodec ! m.sink_0 rdsstreammux name=m batch-size=1 width=1280 height=720 \
+  ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=1 \
+  ! rdstracker ll-config-file=samples/tracker/config_tracker_NvSORT.yml \
+  ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA" ! rdsosd ! rdsvideosink sync=false
+```
+
 On that clip (56 s of a busy crosswalk, YOLO11n detections) the NvSORT sample config keeps 98.8 % of the confident
-detections tracked, with 4 ID switches over 283 tracks; the tracker itself takes about 0.01 ms per batch on the CPU,
-so the pipeline runs at the detector's speed (about 48 fps for four 720p sources at batch 4 on the iGPU below).
+detections tracked, with 4 ID switches over 283 tracks; the tracker itself takes about 0.01 ms per batch on the CPU.
+Four copies of the clip through the whole `rds-test3` chain run at about 44–46 fps on the iGPU below (`--no-display`):
+the detector sets the pace, and the tiler and OSD add about 3.4 ms per batch.
 
 ## How it maps to DeepStream
 
@@ -132,6 +166,8 @@ so the pipeline runs at the detector's speed (about 48 fps for four 720p sources
 
 **M1: multi-stream detector**
 - File/RTSP sources → rocDecode decode (`rdsvideodec`) → `rdsstreammux` → `rdsinfer` (YOLO + custom bbox parser) → `rdstracker` → `rdsosd`.
+- Done: the pipeline runs end to end from files, with tiling, on-screen display and a display sink. Left: RTSP
+  sources (`rdsurisrcbin`), the OSD's GPU path, and the ported `deepstream-test3`.
 - Acceptance test: NVIDIA's `deepstream-test3` sample, ported with `#ifdef`s only, produces equivalent detections.
 
 **M2: production-style multi-model pipeline**
@@ -150,7 +186,9 @@ Early numbers on a 2-CU Ryzen 9 7900X iGPU:
 - VA-API H.264 1080p decode: about 600 fps.
 - YOLO11n 640×640 FP16 via MIGraphX: about 60 inferences/s.
 - `rdsinfer` with YOLO11n FP32, four 720p sources at batch 4 (decode, batching, inference and post-processing):
-  about 50 fps; about 48 fps with `rdstracker` (NvSORT) after it.
+  about 50 fps; about 48 fps with `rdstracker` (NvSORT) after it; about 44–46 fps through the whole `rds-test3`
+  chain (tracker, tiler and OSD, to a fakesink).
+- `rdsosd` at 1280×720 with about 60 objects: about 1.3 ms per frame, CPU drawing and the GPU↔CPU syncs included.
 
 ## Getting started (development)
 
