@@ -10,3 +10,6 @@ endif
 if rds_tracker_enabled
   subdir('rdstracker')
 endif
+if rds_osd_enabled
+  subdir('rdsosd')
+endif

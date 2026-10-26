@@ -15,8 +15,9 @@ Status: **pre-alpha.** Phase 0 spikes and the walking skeleton are done; the lib
 elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
 `rdsstreammux` (the default scaling mux: batches of fixed-size slots), `rdsstreamdemux` (zero-copy per-source
 views of the batch), `rdsinfer` (MIGraphX primary detector: nvinfer configs, custom bbox parsers, object and
-tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs) and
-`rdsmultistreamtiler` (batches into one tiled frame). Nothing here is stable.
+tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs),
+`rdsmultistreamtiler` (batches into one tiled frame) and `rdsosd` (boxes, text, lines, arrows, circles and the clock,
+drawn on the CPU with Cairo and Pango). Nothing here is stable.
 
 ## Architecture principles
 
@@ -183,6 +184,11 @@ gst/rdstiler/      libgstrdstiler plugin: rdsmultistreamtiler (gstrdsmultistream
                    grid, per-pad cached meta, composite with rds_buf_surf_transform_composite). rds-tiler-layout is the
                    layout core (grid, cells, meta scaling; GLib only), the static rdstiler-core the tests link. Always
                    built
+gst/rdsosd/        libgstrdsosd plugin: rdsosd (gstrdsosd.c: in place on RGBA memory:RDS, each frame meta drawn on its
+                   batch_id slot, synced to the CPU and back; views and shared memory are drawn on a private copy).
+                   rds-osd-draw is the drawing core (rects by pixel loops; shapes and text through Cairo/Pango A8
+                   coverage masks blended into the RGBA plane; GLib, Cairo and Pango only), the static rdsosd-core the
+                   tests link. Optional (-Dosd, default auto): needs cairo and pangocairo
 gst/common/        static rds-plugin-common, shared by the plugins: rds-keyfile-yaml (YAML config -> GKeyFile, with the
                    OpenCV-style "%YAML:1.0" line), rds-config-parse (number and bool parsing for the key tables),
                    rds-object-style.h (the drawing defaults of the object metas rdsinfer and rdstracker create).
@@ -287,9 +293,10 @@ meson test -C build-rel --print-errorlogs
   builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
   check the rdsinfer key tables in `docs/compat-matrix.md`. A new or changed config key needs its row there; the
   test's message prints the expected row.
-- **Tracker behaviour.** Where NVIDIA's docs are silent, `rdstracker` matches observed DeepStream 8.0 behaviour,
-  except where 8.0 is clearly broken; there it does the sane thing. Code comments say "DeepStream 8.0 behaviour" or
-  "ours", and every such choice has a row in the compat matrix's "Tracking behaviour" table: keep them in step.
+- **Tracker, tiler and OSD behaviour.** Where NVIDIA's docs are silent, `rdstracker`, `rdsmultistreamtiler` and
+  `rdsosd` match observed DeepStream 8.0 behaviour, except where 8.0 is clearly broken; there they do the sane thing.
+  Code comments say "DeepStream 8.0 behaviour" or "ours", and every such choice has a row in the compat matrix's
+  behaviour tables ("Tracking behaviour", "Tiling behaviour", "Drawing behaviour"): keep them in step.
 - **The street clip** (`tests/models/fetch-tracker-clip.sh`, CC0 from Wikimedia Commons) is VP8, which nothing in
   `redstream:dev` decodes: the script decodes it with a pinned PyAV in a throwaway Python container and encodes it
   with `vah264enc` in the dev image. The encoding depends on the GPU and driver (another hash is only a warning), and

@@ -2,6 +2,12 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <rds/rds_compat.h>
 
+#include <cstddef>
+
+/* NvOSD_CircleParams field order as documented: circle_width between bg_color and reserved */
+static_assert (offsetof (NvOSD_CircleParams, bg_color) < offsetof (NvOSD_CircleParams, circle_width), "");
+static_assert (offsetof (NvOSD_CircleParams, circle_width) < offsetof (NvOSD_CircleParams, reserved), "");
+
 static void
 test_cpp_aliases (void)
 {
@@ -37,6 +43,10 @@ test_cpp_aliases (void)
   }
   g_assert_cmpuint (source_id, ==, 7);
   gst_event_unref (ev);
+
+  NvOSD_CircleParams circle = {};
+  circle.circle_width = 3;
+  g_assert_cmpuint (circle.circle_width, ==, 3);
 
   NvOSD_Arrow_Head_Direction head = BOTH_HEAD;
   g_assert_cmpint (head, ==, RDS_OSD_ARROW_BOTH_HEAD);

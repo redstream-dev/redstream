@@ -51,6 +51,22 @@ test_tracker_plugin (void)
 }
 #endif
 
+/* RDS_HAVE_OSD comes from the build: rdsosd is optional (cairo, pangocairo). */
+#if RDS_HAVE_OSD
+static void
+test_osd_plugin (void)
+{
+  GstPlugin *plugin = gst_registry_find_plugin (gst_registry_get (), "rdsosd");
+  GstElementFactory *f = gst_element_factory_find ("rdsosd");
+
+  g_assert_nonnull (plugin);
+  g_assert_cmpstr (gst_plugin_get_license (plugin), ==, "LGPL");
+  g_assert_nonnull (f);
+  gst_object_unref (f);
+  gst_object_unref (plugin);
+}
+#endif
+
 int
 main (int argc, char **argv)
 {
@@ -63,6 +79,9 @@ main (int argc, char **argv)
 #endif
 #if RDS_HAVE_TRACKER
   g_test_add_func ("/plugin/tracker", test_tracker_plugin);
+#endif
+#if RDS_HAVE_OSD
+  g_test_add_func ("/plugin/osd", test_osd_plugin);
 #endif
   return g_test_run ();
 }

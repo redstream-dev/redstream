@@ -48,10 +48,11 @@ foreach t : cpu_tests
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 endforeach
 
-# plugin_load also checks that rdsinfer and rdstracker load when the build has them.
+# plugin_load also checks that rdsinfer, rdstracker and rdsosd load when the build has them.
 test('plugin_load', executable('plugin_load', 'check' / 'plugin_load.c', dependencies : test_deps,
     c_args : ['-DRDS_HAVE_INFER=@0@'.format(rds_infer_enabled ? 1 : 0),
-      '-DRDS_HAVE_TRACKER=@0@'.format(rds_tracker_enabled ? 1 : 0)]),
+      '-DRDS_HAVE_TRACKER=@0@'.format(rds_tracker_enabled ? 1 : 0),
+      '-DRDS_HAVE_OSD=@0@'.format(rds_osd_enabled ? 1 : 0)]),
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
 # GPU-free tests that call private library symbols: they link only the static internal copy of libgstrds
@@ -315,6 +316,18 @@ if rds_tracker_enabled and rds_infer_enabled
   test('pipeline_tracker_soak', pipeline_tracker_exe, args : ['-p', '/gpu/tracker-soak'],
     suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,
     depends : rds_plugins)
+endif
+
+if rds_osd_enabled
+  # rdsosd's drawing core on host buffers (no GStreamer, no GPU); prints the draw time of a 720p frame.
+  test('osd_draw', executable('osd_draw', 'check' / 'osd_draw.c', dependencies : [rdsosd_core_dep]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
+  # rdsosd: properties (cpu); drawing on memory:RDS batches and demuxed views (gpu).
+  element_osd_exe = executable('element_osd', 'check' / 'element_osd.c', dependencies : test_deps)
+  test('element_osd_cpu', element_osd_exe, args : ['-p', '/cpu/osd-element'],
+    suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+  test('element_osd', element_osd_exe, args : ['-p', '/gpu/osd-element'],
+    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 endif
 
 # rdsmultistreamtiler: properties and pads (cpu); tiling device batches with scripted meta (gpu).

@@ -8,3 +8,5 @@ option('migraphx_path', type : 'string', value : '',
   description : 'MIGraphX prefix with include/migraphx and lib/libmigraphx_c.so (default: <rocm_path>/extras-10)')
 option('tracker', type : 'feature', value : 'auto',
   description : 'rdstracker (needs libyaml)')
+option('osd', type : 'feature', value : 'auto',
+  description : 'rdsosd (needs cairo and pangocairo)')
