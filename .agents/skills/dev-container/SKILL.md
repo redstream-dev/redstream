@@ -33,7 +33,10 @@ $RUN bash -c 'meson setup build --reconfigure 2>/dev/null || meson setup build; 
 $RUN tests/media/make-test-media.sh          # .cache/media/{ball-720p,smpte-1366x768,ball-1080p}.h264
 tests/models/fetch-yolo11n.sh               # on the HOST, not in $RUN (it starts its own python container; needs
                                             # network): YOLO11n + reference data into .cache/models (AGPL: never commit)
-# the YOLO11n soak takes ~4 min; leave the soaks out of repeat runs
+tests/models/fetch-tracker-clip.sh          # on the HOST too (Docker, network and the GPU): the CC0 street clip,
+                                            # VP8 decoded in a python container, vah264enc in redstream:dev, into
+                                            # .cache/media/crosswalk-720p.h264 (never commit it)
+# the YOLO11n soak takes ~4 min, the tracker soak ~6 min; leave the soaks out of repeat runs
 $RUN meson test -C build --no-suite soak --print-errorlogs
 
 # ASan + UBSan (tests/lsan.supp, applied by meson test, hides HIP runtime leaks)
@@ -78,6 +81,13 @@ $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst GST_DEBUG=rdsinfer:5 gst-launch-1.0 
   width=1280 height=720 ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=2 \
   ! fakesink sync=false filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
   filesrc location=.cache/media/smpte-1366x768.h264 ! h264parse ! rdsvideodec ! m.sink_1'
+# ... -> rdstracker (our NvSORT config) on the street clip (needs fetch-tracker-clip.sh); rdstracker:5 logs the
+# tracks reported, objects removed and targets kept per frame
+$RUN bash -c 'GST_DEBUG=rdstracker:5 GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 rdsstreammux name=m batch-size=2 \
+  width=1280 height=720 ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=2 \
+  ! rdstracker ll-config-file=samples/tracker/config_tracker_NvSORT.yml ! fakesink sync=false \
+  filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
+  filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse ! rdsvideodec ! m.sink_1'
 # pre-build a program (exit 2: already up to date)
 $RUN build/tools/rds-compile -c samples/rds-test3/rds_test3_pgie_config.yml -b 4
 # autoplugging: -v shows GstRdsVideoDec inside the decodebin
@@ -102,6 +112,9 @@ $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 -v uridecodebin uri=f
 | mux/demux pipeline hangs (in preroll or after a few frames), no error | a demux branch without a `queue`, or more branches pinning batches than `rdsstreammux`'s `buffer-pool-size` (leave it unset) |
 | test process crashes at exit in libamdhip64 TLS destructors | the test `main()` must end with `gst_deinit ()` |
 | YOLO11n tests `SKIP` ("run tests/models/fetch-yolo11n.sh") | run the fetch script on the host; outputs go to `.cache/models` |
+| `pipeline_tracker` `SKIP`s; `tracker_replay` skips its clip case | run `tests/models/fetch-tracker-clip.sh` on the host; the replay needs a `pipeline_tracker` run after the last rebuild (its saved detections are stamped with the core library's hash) |
+| `vp8dec`/VP8 not found in `redstream:dev` | expected: the image can't decode VP8; `fetch-tracker-clip.sh` decodes it in a python container |
+| a compat-matrix lint fails (`/cpu/*-config/compat-matrix`) | a config key changed: copy the expected row from the test's message into `docs/compat-matrix.md` |
 | MIOpen errors about `/dev/null/.config/miopen` in a GLib test | `G_TEST_OPTION_ISOLATE_DIRS` sets `HOME=/dev/null`: set `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR` and `AMD_COMGR_CACHE_DIR` to writable dirs |
 | ASan: MIGraphX can't load `libmigraphx_gpu.so` | ASan's `dlopen` ignores MIGraphX's `$ORIGIN` RUNPATH; `meson test` sets `LD_LIBRARY_PATH` (do the same when running a binary by hand) |
 | MIGraphX error says only "Failed to call function" | the real reason is printed on stderr just before it |

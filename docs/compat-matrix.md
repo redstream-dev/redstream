@@ -28,7 +28,7 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvstreammux` | `rdsstreammux` | supported | the default (scaling) mux only; the new mux is not implemented yet. GstAggregator-based; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreammux) |
 | `nvstreamdemux` | `rdsstreamdemux` | supported | zero-copy read-only views of the batch slots; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreamdemux) |
 | `nvinfer` | `rdsinfer` | supported | primary detector only (`process-mode=1`, `network-type` 0 or 100) on MIGraphX; nvinfer config files (key file or YAML); properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
-| `nvtracker` | `rdstracker` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker) |
+| `nvtracker` | `rdstracker` | supported | the IOU and NvSORT trackers of NvMultiObjectTracker, on the CPU, with its YAML config files; NvDCF and NvDeepSORT configs run as NvSORT. Matches observed DeepStream 8.0 behaviour where the docs are silent; properties, config keys and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker) |
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
 | `nvdsosd` | `rdsosd` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
 | `nvdsanalytics` | `rdsanalytics` | planned | M2 | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsanalytics) |
@@ -477,6 +477,294 @@ rds-compile -c CONFIG [-b BATCH] [--fp16|--fp32] [-g GPU] [-o OUT.mxr] [--force]
 - Prints the program's path on stdout; the build reason, warnings and errors (with the element's messages) on
   stderr.
 - Exit status: 0 built, 1 error, 2 already up to date (the element would load it; `--force` rebuilds).
+
+### `rdstracker` (`nvtracker`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker))
+
+Names, types and defaults as nvtracker reports them in DeepStream 8.0 (7.1 is the same). The properties marked
+"NULL/READY" can be changed only in NULL or READY; the config file is read, and every property checked, when the
+element starts (READY to PAUSED), and an error there fails the state change with a message naming the file or the
+property. An accepted no-op property set to other than its default posts one warning at start.
+
+| Property | Type | Range | Default | Status | Notes |
+|---|---|---|---|---|---|
+| `ll-lib-file` | string |  | NULL | supported | NULL/READY. Only the built-in tracker exists: unset, `libnvds_nvmultiobjecttracker.so` or `librdstracker-builtin.so` (bare or as a path; an INFO log says the built-in one is used). Any other library fails at start |
+| `ll-config-file` | string |  | NULL | supported | NULL/READY. An NvMultiObjectTracker YAML config (see "Tracker config files"); unset: every key's default, which is an IOU tracker |
+| `tracker-width` | uint | 0..`G_MAXUINT` | `960` | accepted no-op | NULL/READY. Boxes are tracked in the frame's (the mux's) pixels, so the tracker size has no effect, as observed with DeepStream 8.0's IOU and NvSORT. 0 is accepted and ignored (ours: 8.0 gives NaN boxes) |
+| `tracker-height` | uint | 0..`G_MAXUINT` | `544` | accepted no-op | as `tracker-width` |
+| `gpu-id` | uint | 0..`G_MAXUINT` | `0` | accepted no-op | NULL/READY. The tracker runs on the CPU, on the metadata only |
+| `display-tracking-id` | boolean |  | `TRUE` | supported | the ID is appended to each tracked object's `display_text` (see "Behaviour"); read per batch |
+| `tracking-id-reset-mode` | uint | 0..3 | `1` | supported | NULL/READY. 0: stream events change nothing; 1: a stream reset ends the stream's targets; 2: per-stream IDs, and a stream EOS ends the stream's targets and restarts its IDs at 0; 3: 1 and 2 together (see "Behaviour") |
+| `tracking-surface-type` | uint | 0..`G_MAXUINT` | `0` | accepted no-op | NULL/READY. Every surface of the batch is tracked; a warning when set |
+| `compute-hw` | enum | 0 default, 1 gpu, 2 vic | `0` | accepted no-op | no frames are scaled; a warning when set |
+| `input-tensor-meta` | boolean |  | `FALSE` | accepted no-op | tensor meta input is not supported; a warning when set |
+| `tensor-meta-gie-id` | uint | 0..`G_MAXUINT` | `0` | accepted no-op | NULL/READY. A warning when set |
+| `sub-batches` | string |  | `""` | accepted no-op | one tracker instance serves every stream; a warning when set |
+| `sub-batch-err-recovery-trial-cnt` | int | -1..`G_MAXINT` | `0` | accepted no-op | a warning when set |
+| `user-meta-pool-size` | uint | 1..`G_MAXUINT` | `32` | accepted no-op | NULL/READY. No tracker user meta is emitted yet; a warning when set |
+| `operate-on-class-ids` | string |  | NULL | supported | NULL/READY. From the DeepStream 9.x docs (8.0 and 7.1 have no such property): track only these classes, `;`-separated (`0;2`); unset or empty: every class. Objects of other classes pass untouched with `UNTRACKED_OBJECT_ID`. A token that isn't an integer fails at start |
+
+Pads: `sink` and `src`, `video/x-raw(memory:RDS)` batches with an `RdsBatchMeta` (from `rdsstreammux`), as for
+`rdsinfer`. Buffers pass through unchanged and pixels are never read: only the object meta is changed, in place,
+under the batch's metadata lock. A buffer without batch meta is an error.
+
+Trackers: the config selects **IOU** (`stateEstimatorType: 0` and `associationMatcherType: 0`) or **NvSORT**
+(anything else: a Kalman filter per target and the cascaded association). NvDeepSORT and NvDCF configs run as
+NvSORT without their visual tracker and Re-ID, with a warning naming the ignored sections. The tracking itself is
+on the CPU: about 0.01 ms per batch on a 720p street clip (about 22 detections a frame), 0.025 ms (IOU) and
+0.047 ms (NvSORT) for 4 streams × 50 objects (release build, Ryzen 9 7900X).
+
+Not implemented: the NvDCF and NvDeepSORT trackers, Re-ID, re-association, pose estimation, 3D projection; the
+tracker misc meta (past-frame data, shadow and terminated track lists, visibility); custom low-level libraries
+(the NvMOT API); sub-batches; changing the config at run time.
+
+#### Tracker config files
+
+- The `ll-config-file` is YAML with top-level sections (`BaseConfig:`, `TargetManagement:`, ...), each a mapping
+  of scalar keys; a sequence is a list value. The OpenCV-style `%YAML:1.0` first line is accepted.
+- Keys are in the tables below with the parser's types, ranges and defaults. Defaults are the documented ones
+  unless marked "(ours)". **supported**: used; **accepted no-op**: read and ignored, with one warning when set to
+  other than its default; **ignored**: used only by a module rdstracker doesn't have, type-checked and ignored
+  without a warning; **deprecated**: an old name, ignored with a warning whenever set. Values of the wrong type or
+  out of range are errors in every status.
+- A `VisualTracker`, `ReID`, `ObjectModelProjection` or `PoseEstimator` section gives one warning naming the
+  ignored sections and the tracker the config runs as.
+- An unknown key or section is a warning, not an error. Errors name the file, the section and the key:
+  `FILE:SECTION.KEY: VALUE: reason`.
+- `checkClassMatch` is read under `DataAssociator` (where observed DeepStream 8.0 behaviour reads it) and under
+  `BaseConfig` (where the current docs put it); the same key in both with different values is an error.
+- In those ignored sections, a value nested deeper than the reader accepts (the documented map form of
+  `cameraModelFilepath`, keyed by sensor name) is skipped with a warning; the list form is type-checked.
+- `samples/tracker/config_tracker_IOU.yml` and `config_tracker_NvSORT.yml` are our own configs, tuned on a 720p
+  street clip with YOLO11n detections. On that clip (1356 frames) the NvSORT config gives 283 tracks of 75.6 frames
+  on average with 4 ID switches and 98.8 % of the confident detections tracked; the IOU config 426 tracks of 62.9
+  frames, 12 switches, 99.4 %.
+
+#### Tracker config keys: `BaseConfig`
+
+| Key | Type | Default | Range | Trackers | Status | Notes |
+|---|---|---|---|---|---|---|
+| `minDetectorConfidence` | float | `0.0` | any | IOU, NvSORT, NvDeepSORT, NvDCF | supported | lower detections are removed before association |
+| `checkClassMatch` | bool | `1` |  | IOU, NvSORT, NvDeepSORT, NvDCF | supported | also read under DataAssociator; different values in the two sections are an error |
+| `useBatchNumForFrameId` | bool | `0` |  | IOU, NvSORT, NvDeepSORT, NvDCF | accepted no-op | frame numbers always come from the frame meta |
+
+#### Tracker config keys: `TargetManagement`
+
+| Key | Type | Default | Range | Trackers | Status | Notes |
+|---|---|---|---|---|---|---|
+| `preserveStreamUpdateOrder` | bool | `0` |  | IOU, NvSORT, NvDeepSORT, NvDCF | accepted no-op | IDs are always assigned in input order (streams in batch order) |
+| `maxTargetsPerStream` | uint | `30` | 0..65535 | IOU, NvSORT, NvDeepSORT, NvDCF | supported | Inactive targets count; detections over the cap are removed |
+| `minIouDiff4NewTarget` | float | `0.5` | 0..1 | IOU, NvSORT, NvDeepSORT, NvDCF | supported | see "Duplicate check" under "Tracking behaviour" |
+| `enableBboxUnClipping` | bool | `0` |  | IOU, NvSORT, NvDeepSORT, NvDCF | accepted no-op | boxes are reported as detected (observed DeepStream 8.0 behaviour for IOU and NvSORT) |
+| `probationAge` | uint | `5` | >= 0 | IOU, NvSORT, NvDeepSORT, NvDCF | supported | see "Activation" under "Tracking behaviour" |
+| `maxShadowTrackingAge` | uint | `38` | >= 0 | IOU, NvSORT, NvDeepSORT, NvDCF | supported | see "Termination" under "Tracking behaviour" |
+| `earlyTerminationAge` | uint | `2` | >= 0 | IOU, NvSORT, NvDeepSORT, NvDCF | supported | Tentative targets only; see "Termination" |
+| `outputTerminatedTracks` | bool | `0` |  | IOU, NvSORT, NvDeepSORT, NvDCF | accepted no-op | tracker misc data (past-frame, shadow, terminated tracks) is not output yet |
+| `outputShadowTracks` | bool | `0` |  | IOU, NvSORT, NvDeepSORT, NvDCF | accepted no-op | tracker misc data (past-frame, shadow, terminated tracks) is not output yet |
+| `outputVisibility` | bool | `0` |  | IOU, NvSORT, NvDeepSORT, NvDCF | accepted no-op | object visibility is not output yet |
+| `terminatedTrackFilename` | string | none |  | IOU, NvSORT, NvDeepSORT, NvDCF | accepted no-op | tracker misc data (past-frame, shadow, terminated tracks) is not output yet |
+| `minTrackerConfidence` | float | `0.6` | 0..1 | NvDCF | ignored | no effect for IOU and NvSORT, whose tracker confidence is constant |
+| `searchRegionPaddingScale` | int | `1` | 1..3 | NvDCF | ignored | used only by NvDCF (visual tracker), which is not supported |
+
+#### Tracker config keys: `TrajectoryManagement`
+
+| Key | Type | Default | Range | Trackers | Status | Notes |
+|---|---|---|---|---|---|---|
+| `useUniqueID` | bool | `0` |  | IOU, NvSORT, NvDeepSORT, NvDCF | supported | the upper 32 bits of every ID: one random value per element start |
+| `enableReAssoc` | bool | `0` |  | NvDCF | accepted no-op | target re-association is not supported; its other keys are ignored |
+| `minMatchingScore4Overall` | float | `0.4` | 0..1 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `minTrackletMatchingScore` | float | `0.4` | 0..1 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `minMatchingScore4ReidSimilarity` | float | `0.8` | 0..1 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `matchingScoreWeight4TrackletSimilarity` | float | `1.0` | 0..1 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `matchingScoreWeight4ReidSimilarity` | float | `0.0` | 0..1 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `minTrajectoryLength4Projection` | int | `20` | >= 0 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `prepLength4TrajectoryProjection` | int | `10` | >= 0 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `trajectoryProjectionLength` | int | `90` | >= 0 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `maxAngle4TrackletMatching` | int | `40` | 0..180 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `minSpeedSimilarity4TrackletMatching` | float | `0.3` | 0..1 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `minBboxSizeSimilarity4TrackletMatching` | float | `0.6` | 0..1 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `maxTrackletMatchingTimeSearchRange` | int | `20` | >= 0 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `trajectoryProjectionProcessNoiseScale` | float | `1.0` | >= 0 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `trajectoryProjectionMeasurementNoiseScale` | float | `1.0` | >= 0 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `trackletSpacialSearchRegionScale` | float | `0.0` | >= 0 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `reidExtractionInterval` | int | `0` | >= -1 | NvDCF | ignored | a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `enableVanishingTrackletReconstruction` | int | none | any | NvDCF | ignored | undocumented; a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `minInclusionRatio4DuplicateTrackletRemoval` | float | none | any | NvDCF | ignored | undocumented; a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `minIou4DuplicateTrackletRemoval` | float | none | any | NvDCF | ignored | undocumented; a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `minMatchRatio4ValidTrackletDetermination` | float | none | any | NvDCF | ignored | undocumented; a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `minVisibility4VanishingTrackletReconstruction` | float | none | any | NvDCF | ignored | undocumented; a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `visibilityThreshold4VanishingTrackletDetection` | float | none | any | NvDCF | ignored | undocumented; a re-association setting; re-association is not supported (enableReAssoc warns) |
+| `checkClassMatchForReAssoc` | bool | none |  | NvDCF | deprecated | deprecated: use checkClassMatch |
+
+#### Tracker config keys: `DataAssociator`
+
+| Key | Type | Default | Range | Trackers | Status | Notes |
+|---|---|---|---|---|---|---|
+| `dataAssociatorType` | int | `0` | 0..0 | IOU, NvSORT, NvDeepSORT, NvDCF | accepted no-op | 0 (the default data associator) is the only type |
+| `associationMatcherType` | int | `0` | 0..1 | IOU, NvSORT, NvDeepSORT, NvDCF | supported | 0 greedy, 1 cascaded (NvSORT's three stages) |
+| `checkClassMatch` | bool | `1` |  | IOU, NvSORT, NvDeepSORT, NvDCF | supported | where observed DeepStream 8.0 behaviour reads it; also read under BaseConfig |
+| `minMatchingScore4Overall` | float | `0.0` | 0..1 | IOU, NvSORT, NvDeepSORT, NvDCF | supported |  |
+| `minMatchingScore4SizeSimilarity` | float | `0.0` | 0..1 | IOU, NvSORT, NvDeepSORT, NvDCF | supported |  |
+| `minMatchingScore4Iou` | float | `0.0` | 0..1 | IOU, NvSORT, NvDeepSORT, NvDCF | supported |  |
+| `matchingScoreWeight4SizeSimilarity` | float | `0.0` | 0..1 | IOU, NvSORT, NvDeepSORT, NvDCF | supported |  |
+| `matchingScoreWeight4Iou` | float | `1.0` | 0..1 | IOU, NvSORT, NvDeepSORT, NvDCF | supported |  |
+| `tentativeDetectorConfidence` | float | `0.5` | 0..1 | NvSORT, NvDeepSORT, NvDCF | supported | NvSORT: lower detections never create targets |
+| `minMatchingScore4TentativeIou` | float | `0.0` | 0..1 | NvSORT, NvDeepSORT, NvDCF | supported | NvSORT's second and third stages |
+| `minMatchingScore4VisualSimilarity` | float | `0.0` | 0..1 | NvDCF | ignored | used only by NvDCF (visual tracker), which is not supported |
+| `matchingScoreWeight4VisualSimilarity` | float | `0.0` | 0..1 | NvDCF | ignored | used only by NvDCF (visual tracker), which is not supported |
+| `thresholdMahalanobis` | float | `-1.0` | any | NvDeepSORT | ignored | used only by NvDeepSORT (Re-ID), which is not supported |
+| `minMatchingScore4ReidSimilarity` | float | `0.0` | 0..1 | NvDeepSORT | ignored | used only by NvDeepSORT (Re-ID), which is not supported |
+| `matchingScoreWeight4ReidSimilarity` | float | `0.0` | 0..1 | NvDeepSORT | ignored | used only by NvDeepSORT (Re-ID), which is not supported |
+| `matchingScoreWeight4ReIDSimilarity` | float | `0.0` | 0..1 | NvDeepSORT | ignored | used only by NvDeepSORT (Re-ID), which is not supported |
+| `usePrediction4Assoc` | bool | see notes (ours) |  | NvSORT, NvDeepSORT, NvDCF | supported | undocumented; associate against the predicted box; default (ours) 1 for NvSORT, 0 for IOU |
+
+#### Tracker config keys: `StateEstimator`
+
+| Key | Type | Default | Range | Trackers | Status | Notes |
+|---|---|---|---|---|---|---|
+| `stateEstimatorType` | int | `0` | 0..3 | IOU, NvSORT, NvDeepSORT, NvDCF | supported | 3 (SIMPLE_LOC) runs as 2 (REGULAR), with a warning |
+| `processNoiseVar4Loc` | float | `2.0` | >= 0 | NvSORT, NvDeepSORT, NvDCF | supported |  |
+| `processNoiseVar4Size` | float | `1.0` | >= 0 | NvSORT, NvDeepSORT, NvDCF | supported |  |
+| `processNoiseVar4Vel` | float | `0.1` | >= 0 | NvSORT, NvDeepSORT, NvDCF | supported |  |
+| `measurementNoiseVar4Detector` | float | `4.0` | >= 0 | NvSORT, NvDeepSORT, NvDCF | supported |  |
+| `measurementNoiseVar4Tracker` | float | `16.0` | >= 0 | NvDCF | supported | the noise of the visual tracker's own estimates (NvDCF): no effect for NvSORT |
+| `noiseWeightVar4Loc` | float | `-0.1` | any | NvSORT, NvDeepSORT, NvDCF | supported | with `noiseWeightVar4Vel`, both above 0: noise proportional to the box height |
+| `noiseWeightVar4Vel` | float | `-0.1` | any | NvSORT, NvDeepSORT, NvDCF | supported | see `noiseWeightVar4Loc` |
+| `useAspectRatio` | bool | `0` |  | NvSORT, NvDeepSORT, NvDCF | supported | the filter tracks w/h instead of w |
+
+#### Tracker config keys: `VisualTracker`
+
+| Key | Type | Default | Range | Trackers | Status | Notes |
+|---|---|---|---|---|---|---|
+| `visualTrackerType` | int | `0` | 0..2 | NvDCF | ignored | the visual tracker (NvDCF) is not supported |
+| `useColorNames` | bool | `1` |  | NvDCF | ignored | the visual tracker (NvDCF) is not supported |
+| `useHog` | bool | `0` |  | NvDCF | ignored | the visual tracker (NvDCF) is not supported |
+| `featureImgSizeLevel` | int | `2` | 1..5 | NvDCF | ignored | the visual tracker (NvDCF) is not supported |
+| `featureFocusOffsetFactor_y` | float | `0.0` | -0.5..0.5 | NvDCF | ignored | the visual tracker (NvDCF) is not supported |
+| `useHighPrecisionFeature` | bool | `0` |  | NvDCF | ignored | the visual tracker (NvDCF) is not supported |
+| `filterLr` | float | `0.075` | 0..1 | NvDCF | ignored | the visual tracker (NvDCF) is not supported |
+| `filterChannelWeightsLr` | float | `0.1` | 0..1 | NvDCF | ignored | the visual tracker (NvDCF) is not supported |
+| `gaussianSigma` | float | `0.75` | >= 0 | NvDCF | ignored | the visual tracker (NvDCF) is not supported |
+| `vpiBackend4DcfTracker` | int | `1` | 1..2 | NvDCF | ignored | the visual tracker (NvDCF) is not supported |
+
+#### Tracker config keys: `ReID`
+
+| Key | Type | Default | Range | Trackers | Status | Notes |
+|---|---|---|---|---|---|---|
+| `reidType` | int | `0` | 0..3 | NvDeepSORT, NvDCF | ignored | Re-ID is not supported |
+| `reidFeatureSize` | int | `128` | >= 1 | NvDeepSORT, NvDCF | ignored | Re-ID is not supported |
+| `reidHistorySize` | int | `100` | >= 1 | NvDeepSORT, NvDCF | ignored | Re-ID is not supported |
+| `addFeatureNormalization` | bool | `0` |  | NvDeepSORT, NvDCF | ignored | Re-ID is not supported |
+| `keepAspc` | bool | `1` |  | NvDeepSORT, NvDCF | ignored | Re-ID is not supported |
+| `outputReidTensor` | bool | `0` |  | NvDeepSORT, NvDCF | ignored | Re-ID is not supported |
+
+#### Tracker config keys: `ReID`, `PoseEstimator` (model inference)
+
+| Key | Type | Default | Range | Trackers | Status | Notes |
+|---|---|---|---|---|---|---|
+| `batchSize` | int | `1` | >= 1 | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `workspaceSize` | int | `20` | >= 0 | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `inferDims` | int list | `[128, 64, 3]` | >= 1 | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `inputOrder` | int | `1` | 0..1 | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `colorFormat` | int | `0` | >= 0 | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `networkMode` | int | `0` | 0..2 | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `offsets` | float list | `[0.0, 0.0, 0.0]` | any | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `netScaleFactor` | float | `1.0` | >= 0 | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `tltEncodedModel` | string | none |  | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `tltModelKey` | string | none |  | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `onnxFile` | string | none |  | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `modelEngineFile` | string | none |  | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `calibrationTableFile` | string | none |  | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+| `useVPICropScaler` | bool | `0` |  | NvDeepSORT, NvDCF | ignored | the Re-ID and pose models are not supported |
+
+#### Tracker config keys: `ObjectModelProjection`
+
+| Key | Type | Default | Range | Trackers | Status | Notes |
+|---|---|---|---|---|---|---|
+| `cameraModelFilepath` | string list | none |  | any (add-on module) | ignored | 3D object model projection is not supported |
+| `waistHeightRatio` | float | `0.5` | 0..1 | any (add-on module) | ignored | 3D object model projection is not supported |
+| `outputFootLocation` | bool | `0` |  | any (add-on module) | ignored | 3D object model projection is not supported |
+| `outputConvexHull` | bool | `1` |  | any (add-on module) | ignored | 3D object model projection is not supported |
+| `maxConvexHullSize` | int | `15` | >= 0 | any (add-on module) | ignored | 3D object model projection is not supported |
+| `minPoseConfidence` | float | `0.5` | 0..1 | any (add-on module) | ignored | 3D object model projection is not supported |
+
+#### Tracker config keys: `PoseEstimator`
+
+| Key | Type | Default | Range | Trackers | Status | Notes |
+|---|---|---|---|---|---|---|
+| `poseEstimatorType` | int | `0` | 0..1 | any (add-on module) | ignored | pose estimation is not supported |
+| `poseInferenceInterval` | int | `-1` | >= -1 | any (add-on module) | ignored | pose estimation is not supported |
+| `operateOnClassIds` | int list | `[]` | >= 0 | any (add-on module) | ignored | pose estimation is not supported |
+
+#### Tracking behaviour
+
+The public docs describe the target life cycle and the matching, but leave many details open or contradict
+themselves between versions. Each row is either **matches nvtracker (DeepStream 8.0)**: observed DeepStream 8.0
+behaviour with the IOU and NvSORT trackers, or **ours**: where the docs and 8.0 settle nothing, or where 8.0 is
+clearly broken. Terms: a target is **Tentative** until it is activated, then **Active** while matched and
+**Inactive** (tracked but not reported) while unmatched; its **age** counts frames since it was created and its
+**shadow tracking age** the consecutive frames with inference without a match.
+
+| Behaviour | Status | Notes |
+|---|---|---|
+| Detections without a reported target are removed from the frame | matches nvtracker (DeepStream 8.0) | the detections of Tentative targets, those below `minDetectorConfidence`, duplicates (`minIouDiff4NewTarget`) and those over `maxTargetsPerStream` (Inactive targets count). Only objects of classes left out by `operate-on-class-ids` leave the tracker with `UNTRACKED_OBJECT_ID` |
+| Which detections create targets | matches nvtracker (DeepStream 8.0) | IOU: any detection at or above `minDetectorConfidence`. NvSORT: only detections at or above `tentativeDetectorConfidence`; lower ones can only extend an Active target |
+| Matched objects: boxes and fields | matches nvtracker (DeepStream 8.0) | `object_id` set; `tracker_bbox_info` is the detector's box (IOU and NvSORT, unclipped); `rect_params` is that box clipped to the frame; `confidence`, `detector_bbox_info`, `obj_label` and `unique_component_id` stay the detector's. `class_id` is the target's (with `checkClassMatch: 0` it follows the detection). NvSORT still updates its Kalman filter with the detection |
+| `enableBboxUnClipping` | matches nvtracker (DeepStream 8.0) | no effect: boxes are reported as detected |
+| `tracker_confidence` | matches nvtracker (DeepStream 8.0) | 0.5 on every tracked object, IOU and NvSORT (the docs, and DeepStream 7.1, give 1.0) |
+| Frames without inference (`bInferDone` FALSE) | matches nvtracker (DeepStream 8.0) | every Active target is reported as a new object meta: its ID and class, `confidence` -0.1, `detector_bbox_info` all zero, `tracker_bbox_info` its last matched box (IOU) or its Kalman prediction (NvSORT), `rect_params` that box clipped. Tentative and Inactive targets are not reported. Objects already on such a frame are removed, never tracked |
+| Labels of created objects | ours | `obj_label`, `display_text` and `unique_component_id` come from that target's own last matched detection (8.0 copies them from one detection per class), with rdsinfer's drawing defaults |
+| Ages on frames without inference | matches nvtracker (DeepStream 8.0) | the age (and so probation) grows; the shadow tracking age doesn't |
+| When IDs are assigned | matches nvtracker (DeepStream 8.0) | at activation, from 0; a Tentative target that dies takes no ID. Targets activated on the same frame are numbered in input order: streams in batch order, objects in `obj_meta_list` order |
+| Activation | matches nvtracker (DeepStream 8.0) | age is 1 on the creation frame and grows by 1 every frame; a Tentative target activates on the first frame where its age exceeds `probationAge` and it is matched. `probationAge: 0` activates at once |
+| Termination | matches nvtracker (DeepStream 8.0) | Active and Inactive targets end when the shadow tracking age exceeds `maxShadowTrackingAge`; Tentative ones when it reaches `earlyTerminationAge` or exceeds `maxShadowTrackingAge`. One match makes an Inactive target Active again. An object that returns after its target ended gets a new target and ID |
+| `display-tracking-id` | matches nvtracker (DeepStream 8.0) | `display_text` becomes `"<display_text> <id>"`, the full 64-bit ID in decimal (rdsinfer's text is the label, so `"person 3"`); an empty text gives `" <id>"`. The string is replaced by a fresh one |
+| `display-tracking-id` with a NULL `display_text` | ours | `"<id>"` (8.0 writes `"(null) <id>"`) |
+| `tracking-id-reset-mode` | matches nvtracker (DeepStream 8.0) | one 32-bit counter per element, shared by every stream. 1: a stream reset ends the stream's targets; later detections go through probation again and get new IDs. 2: the lower 32 bits count per stream, from the counter's value at the stream's first target, so every stream starts at 0; a stream EOS ends the stream's targets and its count restarts at 0. 3: both |
+| The ID counter is never restarted | ours | resets, EOS and flushes never restart the shared counter, so live IDs never repeat (8.0 restarts it, giving duplicate live IDs and `0xFFFFFFFF` after an underflow; 7.1 continues it, as here) |
+| Size similarity | matches nvtracker (DeepStream 8.0) | the smaller area over the larger; the match score is `matchingScoreWeight4Iou`·IOU + `matchingScoreWeight4SizeSimilarity`·size similarity, and a pair must pass `minMatchingScore4Iou`, `minMatchingScore4SizeSimilarity` and `minMatchingScore4Overall` |
+| Matching when all three minimums are 0 | ours | a pair also needs an IOU above 0, so a target never jumps to a disjoint box of a similar size. With any minimum set, the configured filters alone decide |
+| Order of equal match scores | ours | greedy matching takes the best score first, then the lower target ID, then the earlier detection |
+| NvSORT association | ours | the documented three stages: confirmed detections with Active and Inactive targets (joint score); tentative detections with the remaining Active targets (`minMatchingScore4TentativeIou`); the remaining confirmed detections with Tentative targets. Against the Kalman prediction when `usePrediction4Assoc` is 1 (default for NvSORT, ours) |
+| `useUniqueID` | matches nvtracker (DeepStream 8.0) | the upper 32 bits are one random value, shared by every stream; 0 without it. Drawn again each time the element starts (ours) |
+| `tracker-width` / `tracker-height` | matches nvtracker (DeepStream 8.0) | no effect on the boxes: tracking is in the frame's pixels |
+| `tracker-width` / `tracker-height` 0 | ours | accepted and ignored (8.0 gives NaN boxes) |
+| `checkClassMatch` | matches nvtracker (DeepStream 8.0) | 1: a target matches only detections of its class. Read under `DataAssociator` (as 8.0 does) and `BaseConfig` (as the current docs say) |
+| Duplicate check (`minIouDiff4NewTarget`) | matches nvtracker (DeepStream 8.0) | a detection is a duplicate when its best IOU with any target of its stream, of any class and state, reaches the threshold |
+| Duplicate check: which targets and boxes | ours | it includes targets created earlier on the same frame, and uses each target's box on this frame (for NvSORT the matched detection or the predicted box) |
+| `minIouDiff4NewTarget: 0` | ours | only an overlapping detection (IOU above 0) can be a duplicate, so 0 doesn't block every new target |
+| Invalid detection boxes | ours | a detection with a non-finite coordinate or a width or height of 0 or less is removed before matching |
+| Which box a detection has | ours | the detector's unclipped `detector_bbox_info`; an object without one (added by an application) is tracked on its `rect_params` |
+| Kalman prediction under 1 px | ours | a prediction that isn't a finite box at least 1 px wide and high is replaced by the target's last matched box |
+| A box entirely outside the frame | ours | kept, with a `rect_params` of width or height 0 |
+| Two frames of one source in a batch | ours | an element error. `rdsstreammux` never makes such batches; DeepStream's new streammux can (`max-same-source-frames`), which is a known limitation |
+| Created objects in the frame's list | matches nvtracker (DeepStream 8.0) | matched objects keep their order; objects created for targets are put first, highest ID first |
+| Kalman filter | ours | the docs describe the state and noise options, not the matrices. Constant velocity, one step per frame (also without inference), updated only on a match. Noise is fixed (`processNoiseVar4*`, `measurementNoiseVar4Detector`) or DeepSORT-style proportional to the box height; aspect-ratio terms use small constants, as in DeepSORT. Initial standard deviations 10·`noiseWeightVar4Loc`·h for position and size and 13·`noiseWeightVar4Vel`·h for velocities, fitted to observed 8.0 output: a constant-velocity object's predictions stay within 1.4 px of 8.0's (8.0's filter differs in structure, so no exact match) |
+| Height-proportional noise | ours | used only when both `noiseWeightVar4Loc` and `noiseWeightVar4Vel` are above 0; otherwise the fixed noise |
+| `stateEstimatorType: 3` | ours | SIMPLE_LOC runs as 2 (REGULAR), with a warning |
+| Streams and events | ours | a stream is the frame meta's `source_id`, the ID `rdsstreammux`'s stream events carry. `rds-pad-deleted` frees the stream's state; FLUSH_STOP clears every stream (the counter continues). Every event goes downstream unchanged |
+| Tracker misc meta | unsupported | past-frame data, shadow and terminated track lists and visibility are not emitted (8.0 emits past-frame data even without the keys that ask for it) |
+
+#### Tracker metadata types
+
+The tracker meta types are defined, at their documented positions, so ported code compiles; `rdstracker` doesn't
+attach any of them yet (see "Tracker misc meta" above).
+
+| DeepStream name | Redstream name | Status | Notes | Source |
+|---|---|---|---|---|
+| `NVDS_TRACKER_PAST_FRAME_META` | `RDS_TRACKER_PAST_FRAME_META` | supported | 15; not emitted yet | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
+| `NVDS_TRACKER_BATCH_REID_META` | `RDS_TRACKER_BATCH_REID_META` | supported | 16; not emitted yet | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
+| `NVDS_TRACKER_OBJ_REID_META` | `RDS_TRACKER_OBJ_REID_META` | supported | 17; not emitted yet | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
+| `NVDS_TRACKER_TERMINATED_LIST_META` | `RDS_TRACKER_TERMINATED_LIST_META` | supported | 18; not emitted yet | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
+| `NVDS_TRACKER_SHADOW_LIST_META` | `RDS_TRACKER_SHADOW_LIST_META` | supported | 19; not emitted yet | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
+| `NVDS_OBJ_VISIBILITY` | `RDS_OBJ_VISIBILITY` | supported | 20; not emitted yet | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
+| `NVDS_OBJ_IMAGE_FOOT_LOCATION` | `RDS_OBJ_IMAGE_FOOT_LOCATION` | supported | 21; not emitted yet | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
+| `NVDS_OBJ_WORLD_FOOT_LOCATION` | `RDS_OBJ_WORLD_FOOT_LOCATION` | supported | 22; not emitted yet | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
+| `NVDS_OBJ_IMAGE_CONVEX_HULL` | `RDS_OBJ_IMAGE_CONVEX_HULL` | supported | 23; not emitted yet | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
+| `TRACKER_STATE` | `RdsTrackerState` | supported | the type name only. The values are `RDS_TRACKER_STATE_EMPTY` (0), `_ACTIVE` (1), `_INACTIVE` (2), `_TENTATIVE` (3), `_PROJECTED` (4) and `_QUASIACTIVE` (5, as in DeepStream 8.0); DeepStream's bare `EMPTY`, `ACTIVE`, ... are not aliased, since such macros would rewrite any identifier of that name | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvds__tracker__meta_8h.html) |
+
+The object meta fields the tracker writes (`object_id`, `tracker_bbox_info`, `tracker_confidence`, `rect_params`,
+`text_params.display_text`) are those of `RdsObjectMeta` under "Metadata"; `RDS_UNTRACKED_OBJECT_ID` is
+`G_MAXUINT64`.
 
 ## NvBufSurface
 

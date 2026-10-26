@@ -236,11 +236,14 @@ endif
 
 if rds_tracker_enabled
   # The config parser on its own, against the corpus in check/tracker-configs; it also tests the shared YAML reader's
-  # handling of the OpenCV-style "%YAML:1.0" line. It uses no GStreamer, so it gets the environment without plugin
-  # paths.
+  # handling of the OpenCV-style "%YAML:1.0" line, and checks that docs/compat-matrix.md lists every config key as
+  # the key table does. It uses no GStreamer, so it gets the environment without plugin paths.
   test('tracker_config', executable('tracker_config', 'check' / 'tracker_config.c',
       dependencies : [rdstracker_core_dep],
-      c_args : ['-DRDS_TRACKER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'tracker-configs')]),
+      c_args : [
+        '-DRDS_TRACKER_CONFIGS="@0@"'.format(meson.current_source_dir() / 'check' / 'tracker-configs'),
+        '-DRDS_COMPAT_MATRIX="@0@"'.format(meson.project_source_root() / 'docs' / 'compat-matrix.md'),
+      ]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
   # The tracking core on scripted sequences (life cycle, IDs, IOU and NvSORT association, reset modes); prints a
   # 4 x 50 x 1000 timing for both.
