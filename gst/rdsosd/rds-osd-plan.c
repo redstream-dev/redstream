@@ -20,12 +20,11 @@
 #define TEXT_DPI 96.0
 /* font sizes above this are drawn this size (ours: keeps Pango's fixed-point sizes in range) */
 #define MAX_FONT_SIZE 1024
-/* masks start at multiples of this in the heap */
-#define MASK_ALIGN 16
 /* the layout cache is emptied when it holds this many texts */
 #define MAX_LAYOUTS 4096
 
-/* A text's extents, by "font\x1fsize\x1ftext". */
+/* A text's extents, by its text key: "<length of font>:<font><size>:<text>" (the font's length makes it
+ * unambiguous whatever the font and text contain). */
 typedef struct
 {
   PangoRectangle ink, logical;
@@ -37,13 +36,14 @@ typedef struct
   gchar *key;
   guint32 offset, size;
   guint64 pass;                 /* the last pass that used it */
+  guint64 wanted;               /* the last pass whose batch still needed it when the pass started */
   GList link;                   /* in the LRU queue, least recently used first */
 } Mask;
 
 /* A text mask the batch needs: @text in @desc with its layout origin at (dx, dy) of an mw × mh A8 mask. */
 typedef struct
 {
-  gchar *key;                   /* "font\x1fsize\x1ftext\x1fdx\x1fdy\x1fmw\x1fmh" */
+  gchar *key;                   /* "<dx>,<dy>,<mw>,<mh>," and the text key */
   gchar *text;                  /* valid UTF-8 */
   const PangoFontDescription *desc;
   gint dx, dy, mw, mh, stride;
@@ -54,8 +54,8 @@ struct _RdsOsdPlan
   PangoFontMap *font_map;
   PangoContext *context;
   PangoLayout *layout;
-  GHashTable *fonts;            /* "name\x1fsize" -> PangoFontDescription */
-  GHashTable *layouts;          /* "font\x1fsize\x1ftext" -> Layout */
+  GHashTable *fonts;            /* "<size>:<name>" -> PangoFontDescription */
+  GHashTable *layouts;          /* text key -> Layout */
 
   /* the mask heap */
   guint8 *heap;
@@ -201,7 +201,7 @@ build_circle (RdsOsdPlan * p, const RdsOSD_CircleParams * c)
 static const PangoFontDescription *
 font_for (RdsOsdPlan * p, const gchar * name, guint size)
 {
-  gchar *key = g_strdup_printf ("%s\x1f%u", name != NULL ? name : "", size);
+  gchar *key = g_strdup_printf ("%u:%s", size, name != NULL ? name : "");
   PangoFontDescription *desc = g_hash_table_lookup (p->fonts, key);
 
   if (desc != NULL) {
@@ -253,7 +253,7 @@ build_text (RdsOsdPlan * p, const RdsOSD_TextParams * t)
   if (size == 0 || t->display_text == NULL || t->display_text[0] == '\0' || bx >= p->width || by >= p->height)
     return;
   desc = font_for (p, t->font_params.font_name, size);
-  key = g_strdup_printf ("%s\x1f%u\x1f%s", font, size, t->display_text);
+  key = g_strdup_printf ("%zu:%s%u:%s", strlen (font), font, size, t->display_text);
   lay = g_hash_table_lookup (p->layouts, key);
   if (lay == NULL) {
     gchar *valid = valid_text (t->display_text);
@@ -287,12 +287,12 @@ build_text (RdsOsdPlan * p, const RdsOSD_TextParams * t)
   mstride = cairo_format_stride_for_width (CAIRO_FORMAT_A8, mw);
   /* ours: a text whose mask is larger than the heap is not drawn (its box is). Only absurd texts: a mask is clipped
    * to the frame and fonts to MAX_FONT_SIZE points. */
-  if ((gsize) mstride * mh > p->heap_size) {
+  if (((gsize) mstride * mh + RDS_OSD_MASK_ALIGN - 1) / RDS_OSD_MASK_ALIGN * RDS_OSD_MASK_ALIGN > p->heap_size) {
     g_free (key);
     return;
   }
   /* cached by text, font and size, and by where the frame's edge clips it: (dx, dy, mw, mh) */
-  req.key = g_strdup_printf ("%s\x1f%d\x1f%d\x1f%d\x1f%d", key, (gint) (ox - x0), (gint) (oy - y0), mw, mh);
+  req.key = g_strdup_printf ("%d,%d,%d,%d,%s", (gint) (ox - x0), (gint) (oy - y0), mw, mh, key);
   g_free (key);
   req.text = valid_text (t->display_text);
   req.desc = desc;
@@ -326,6 +326,15 @@ rds_osd_plan_add_frame (RdsOsdPlan * p, const RdsOsdDrawOptions * opt, guint slo
   g_return_val_if_fail (!p->started, 0);
   if (width <= 0 || height <= 0)
     return 0;
+  for (guint i = 0; i < p->frames->len; i++) {
+    const RdsOsdPlanFrame *f = &g_array_index (p->frames, RdsOsdPlanFrame, i);
+
+    if (f->slot == slot && (f->width != width || f->height != height)) {
+      g_critical ("rdsosd: frame of %dx%d on slot %u, which has a %dx%d frame in this batch: not drawn", width,
+          height, slot, f->width, f->height);
+      return 0;
+    }
+  }
   p->width = width;
   p->height = height;
 
@@ -471,7 +480,7 @@ static gboolean
 mask_place (RdsOsdPlan * p, const MaskRequest * req, guint32 * offset)
 {
   Mask *m = g_hash_table_lookup (p->masks, req->key);
-  gsize size = ((gsize) req->stride * req->mh + MASK_ALIGN - 1) / MASK_ALIGN * MASK_ALIGN;
+  gsize size = ((gsize) req->stride * req->mh + RDS_OSD_MASK_ALIGN - 1) / RDS_OSD_MASK_ALIGN * RDS_OSD_MASK_ALIGN;
   guint index;
 
   if (m != NULL) {
@@ -483,12 +492,23 @@ mask_place (RdsOsdPlan * p, const MaskRequest * req, guint32 * offset)
     return TRUE;
   }
   while (!first_fit (p, size, offset, &index)) {
-    GList *head = g_queue_peek_head_link (&p->lru);
+    Mask *victim = NULL;
 
-    /* the masks this pass uses are at the tail: none left to evict */
-    if (head == NULL || ((Mask *) head->data)->pass == p->pass_serial)
+    /* the least recently used mask the rest of the batch does not need, else the least recently used one this pass
+     * does not use (those it uses are at the tail) */
+    for (GList * l = g_queue_peek_head_link (&p->lru); l != NULL; l = l->next) {
+      Mask *c = l->data;
+
+      if (c->pass == p->pass_serial)
+        break;
+      if (victim == NULL || (victim->wanted == p->pass_serial && c->wanted != p->pass_serial))
+        victim = c;
+      if (victim->wanted != p->pass_serial)
+        break;
+    }
+    if (victim == NULL)
       return FALSE;
-    mask_evict (p, head->data);
+    mask_evict (p, victim);
   }
   m = g_new0 (Mask, 1);
   m->key = g_strdup (req->key);
@@ -527,6 +547,14 @@ rds_osd_plan_next_pass (RdsOsdPlan * p, RdsOsdPass * pass)
   g_array_set_size (p->uploads, 0);
   g_array_set_size (p->items, 0);
   g_array_set_size (p->lists, 0);
+  /* the cached masks the rest of the batch needs: evicted last */
+  for (guint32 i = start; i < p->n_cmds; i++)
+    if (cmds[i].type == RDS_OSD_CMD_MASK) {
+      Mask *m = g_hash_table_lookup (p->masks, g_array_index (p->requests, MaskRequest, cmds[i].mask.offset).key);
+
+      if (m != NULL)
+        m->wanted = p->pass_serial;
+    }
 
   for (end = start; end < p->n_cmds; end++) {
     RdsOsdCmd *c = &cmds[end];
@@ -720,7 +748,8 @@ rds_osd_plan_new (gsize heap_size)
   RdsOsdPlan *p;
   cairo_font_options_t *fo;
 
-  g_return_val_if_fail (heap_size > 0 && heap_size <= G_MAXUINT32, NULL);
+  g_return_val_if_fail (heap_size > 0 && heap_size <= G_MAXUINT32 - RDS_OSD_MASK_ALIGN + 1, NULL);
+  g_return_val_if_fail (heap_size % RDS_OSD_MASK_ALIGN == 0, NULL);
   p = g_new0 (RdsOsdPlan, 1);
   fo = cairo_font_options_create ();
   p->font_map = pango_cairo_font_map_new ();

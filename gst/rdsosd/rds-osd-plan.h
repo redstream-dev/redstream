@@ -5,8 +5,9 @@
  *
  * Text is rasterized by Pango into A8 coverage masks in one mask heap (host memory here; the GPU keeps a copy). Masks
  * are cached by text, font and size (and where the frame's edge clips them), placed first fit and evicted least
- * recently used. A batch whose new masks do not fit the heap, even with every mask it does not use evicted, is planned
- * in several passes: each pass is a run of the batch's commands, in order, whose masks are all in the heap at once.
+ * recently used, those the rest of the batch needs last. A batch whose new masks do not fit the heap, even with
+ * every mask it does not use evicted, is planned in several passes: each pass is a run of the batch's commands, in
+ * order, whose masks are all in the heap at once.
  * Drawing the passes in order gives the same pixels as one pass with a heap large enough.
  *
  * Use: rds_osd_plan_begin, rds_osd_plan_add_frame for each frame of the batch, then rds_osd_plan_next_pass until it
@@ -25,6 +26,8 @@ G_BEGIN_DECLS
 #define RDS_OSD_TILE_SIZE 32
 /* the mask heap of rdsosd (ours): a text whose mask is larger is not drawn */
 #define RDS_OSD_MASK_HEAP_SIZE (8 * 1024 * 1024)
+/* masks start at multiples of this in the heap */
+#define RDS_OSD_MASK_ALIGN 16
 
 /* One frame's commands in a pass: cmds[first .. first + n_cmds − 1] of the pass, drawn on batch slot @slot (a
  * @width × @height plane). A slot can have several frames (frame metas sharing a batch_id), drawn in order. */
@@ -67,7 +70,8 @@ typedef struct
 
 typedef struct _RdsOsdPlan RdsOsdPlan;
 
-/* A plan with a mask heap of @heap_size bytes (RDS_OSD_MASK_HEAP_SIZE in rdsosd; at most 4 GiB − 1). */
+/* A plan with a mask heap of @heap_size bytes (RDS_OSD_MASK_HEAP_SIZE in rdsosd): a multiple of RDS_OSD_MASK_ALIGN,
+ * below 4 GiB. */
 RdsOsdPlan *rds_osd_plan_new (gsize heap_size);
 void rds_osd_plan_free (RdsOsdPlan * plan);
 
@@ -78,7 +82,9 @@ const guint8 *rds_osd_plan_heap (RdsOsdPlan * plan);
 void rds_osd_plan_begin (RdsOsdPlan * plan);
 
 /* Adds the commands of @frame (NULL: the clock only) on slot @slot, a @width × @height plane, in the order of
- * rds_osd_draw_frame. Before the first rds_osd_plan_next_pass of the batch. Returns what had to be adjusted. */
+ * rds_osd_draw_frame. Before the first rds_osd_plan_next_pass of the batch. Returns what had to be adjusted. Every
+ * frame of a slot has the slot's size: a frame of another size on a slot that already has commands is not drawn (a
+ * critical warning). */
 RdsOsdDrawFlags rds_osd_plan_add_frame (RdsOsdPlan * plan, const RdsOsdDrawOptions * options, guint slot,
     const RdsFrameMeta * frame, gint width, gint height);
 

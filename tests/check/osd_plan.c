@@ -9,7 +9,6 @@
 #include <string.h>
 
 #define GREY 128
-#define MASK_ALIGN 16
 
 static const RdsOSD_ColorParams WHITE = { 1, 1, 1, 1 }, BLUE = { 0, 0, 1, 1 };
 
@@ -135,9 +134,9 @@ same_pixels (const Img * a, const Img * b)
   return a->stride == b->stride && a->height == b->height && memcmp (a->data, b->data, a->stride * a->height) == 0;
 }
 
-/* The CPU path: each frame of the pass shaded over its commands' bounding boxes. */
+/* The CPU path: each frame of the pass shaded over its commands' bounding boxes, reading @masks. */
 static void
-draw_pass (RdsOsdPlan * plan, const RdsOsdPass * pass, Img * imgs)
+draw_pass (const guint8 * masks, const RdsOsdPass * pass, Img * imgs)
 {
   for (guint32 i = 0; i < pass->n_frames; i++) {
     const RdsOsdPlanFrame *f = &pass->frames[i];
@@ -145,14 +144,13 @@ draw_pass (RdsOsdPlan * plan, const RdsOsdPass * pass, Img * imgs)
 
     g_assert_cmpint (f->width, ==, im->width);
     g_assert_cmpint (f->height, ==, im->height);
-    rds_osd_shade_commands (pass->cmds + f->first, f->n_cmds, rds_osd_plan_heap (plan), im->data, im->width,
-        im->height, im->stride);
+    rds_osd_shade_commands (pass->cmds + f->first, f->n_cmds, masks, im->data, im->width, im->height, im->stride);
   }
 }
 
-/* The GPU path, per pixel: every pixel of each work item's tile shaded with its list. */
+/* The GPU path, per pixel: every pixel of each work item's tile shaded with its list, reading @masks. */
 static void
-draw_pass_tiles (RdsOsdPlan * plan, const RdsOsdPass * pass, Img * imgs)
+draw_pass_tiles (const guint8 * masks, const RdsOsdPass * pass, Img * imgs)
 {
   for (guint32 i = 0; i < pass->n_items; i++) {
     const RdsOsdWorkItem *w = &pass->items[i];
@@ -163,7 +161,7 @@ draw_pass_tiles (RdsOsdPlan * plan, const RdsOsdPass * pass, Img * imgs)
       for (gint x = (gint) w->tile_x * RDS_OSD_TILE_SIZE;
           x < MIN ((gint) (w->tile_x + 1) * RDS_OSD_TILE_SIZE, im->width); x++)
         rds_osd_shade_pixel (pass->cmds, pass->lists + w->list_offset, w->count, x, y,
-            im->data + (gsize) y * im->stride + 4 * (gsize) x, rds_osd_plan_heap (plan));
+            im->data + (gsize) y * im->stride + 4 * (gsize) x, masks);
   }
 }
 
@@ -612,8 +610,8 @@ test_binning (void)
       check_binning (&pass, a, 3);
       for (guint32 i = 0; i < pass.n_cmds; i++)
         chains += (pass.cmds[i].flags & RDS_OSD_CMD_UNION_NEXT) != 0;
-      draw_pass (plan, &pass, a);
-      draw_pass_tiles (plan, &pass, b);
+      draw_pass (rds_osd_plan_heap (plan), &pass, a);
+      draw_pass_tiles (rds_osd_plan_heap (plan), &pass, b);
     }
     for (guint s = 0; s < 3; s++) {
       if (!same_pixels (&a[s], &b[s]))
@@ -682,19 +680,22 @@ test_empty_tiles (void)
 static guint32
 aligned (guint32 v)
 {
-  return (v + MASK_ALIGN - 1) / MASK_ALIGN * MASK_ALIGN;
+  return (v + RDS_OSD_MASK_ALIGN - 1) / RDS_OSD_MASK_ALIGN * RDS_OSD_MASK_ALIGN;
 }
 
-/* Plans @s alone on a 400 × 300 frame; returns the pass's new masks (and the first's offset). */
+/* Plans @s in @font at @size alone at (x, y) of a 400 × 300 frame; returns the pass's new masks (and the first's
+ * offset and size). */
 static guint
-plan_text (RdsOsdPlan * plan, const gchar * s, guint32 * offset, guint32 * size)
+plan_text_full (RdsOsdPlan * plan, const gchar * font, guint size, const gchar * s, guint x, guint y,
+    guint32 * offset, guint32 * mask_size)
 {
   RdsOsdDrawOptions opt = options ();
   RdsOsdPass pass;
   Frame f;
 
   frame_init (&f);
-  frame_add_object (&f)->text_params = text (s, 10, 10, 20, WHITE, FALSE, BLUE);
+  frame_add_object (&f)->text_params = text (s, x, y, size, WHITE, FALSE, BLUE);
+  f.obj[0].text_params.font_params.font_name = (gchar *) font;
   g_assert_true (plan_one (plan, &opt, &f, 400, 300, &pass, NULL));
   frame_clear (&f);
   g_assert_cmpuint (pass.n_cmds, ==, 1);
@@ -702,10 +703,22 @@ plan_text (RdsOsdPlan * plan, const gchar * s, guint32 * offset, guint32 * size)
     g_assert_cmpuint (pass.uploads[0].offset, ==, pass.cmds[0].mask.offset);
     if (offset != NULL)
       *offset = pass.uploads[0].offset;
-    if (size != NULL)
-      *size = pass.uploads[0].size;
+    if (mask_size != NULL)
+      *mask_size = pass.uploads[0].size;
   }
   return pass.n_uploads;
+}
+
+static guint
+plan_text_at (RdsOsdPlan * plan, const gchar * s, guint x, guint y)
+{
+  return plan_text_full (plan, "Sans", 20, s, x, y, NULL, NULL);
+}
+
+static guint
+plan_text (RdsOsdPlan * plan, const gchar * s, guint32 * offset, guint32 * mask_size)
+{
+  return plan_text_full (plan, "Sans", 20, s, 10, 10, offset, mask_size);
 }
 
 static void
@@ -714,9 +727,14 @@ test_text_cache (void)
   RdsOsdPlan *plan = rds_osd_plan_new (RDS_OSD_MASK_HEAP_SIZE);
   guint32 sa, sb, sc, off;
 
-  /* a miss rasterizes and uploads; the same text, font and size again is a hit, wherever it is drawn */
+  /* a miss rasterizes and uploads; the same text, font and size again is a hit, wherever it is drawn whole */
   g_assert_cmpuint (plan_text (plan, "Alpha", NULL, &sa), ==, 1);
   g_assert_cmpuint (plan_text (plan, "Alpha", NULL, NULL), ==, 0);
+  g_assert_cmpuint (plan_text_at (plan, "Alpha", 200, 150), ==, 0);
+  /* clipped by the frame's edge: another mask, a hit again at the same clip */
+  g_assert_cmpuint (plan_text_at (plan, "Alpha", 370, 150), ==, 1);
+  g_assert_cmpuint (plan_text_at (plan, "Alpha", 370, 100), ==, 0);
+  g_assert_cmpuint (plan_text_at (plan, "Alpha", 380, 150), ==, 1);
   g_assert_cmpuint (plan_text (plan, "Bravo", NULL, &sb), ==, 1);
   g_assert_cmpuint (plan_text (plan, "i", NULL, &sc), ==, 1);
   rds_osd_plan_free (plan);
@@ -740,50 +758,195 @@ test_text_cache (void)
   g_assert_cmpuint (plan_text (plan, "Alpha", NULL, NULL), ==, 0);
   g_assert_cmpuint (plan_text (plan, "i", NULL, NULL), ==, 1);
   rds_osd_plan_free (plan);
+
+  /* a mask the rest of the batch needs is evicted after those it does not: Alpha, the least recently used, stays
+   * for the batch [i, Alpha], Bravo makes room for i; one upload, one pass */
+  plan = rds_osd_plan_new (aligned (sa) + aligned (sb));
+  g_assert_cmpuint (plan_text (plan, "Alpha", NULL, NULL), ==, 1);
+  g_assert_cmpuint (plan_text (plan, "Bravo", NULL, NULL), ==, 1);
+  {
+    RdsOsdDrawOptions opt = options ();
+    RdsOsdPass pass;
+    Frame f;
+
+    frame_init (&f);
+    frame_add_object (&f)->text_params = text ("i", 10, 10, 20, WHITE, FALSE, BLUE);
+    frame_add_object (&f)->text_params = text ("Alpha", 10, 10, 20, WHITE, FALSE, BLUE);
+    g_assert_true (plan_one (plan, &opt, &f, 400, 300, &pass, NULL));
+    g_assert_cmpuint (pass.n_cmds, ==, 2);
+    g_assert_cmpuint (pass.n_uploads, ==, 1);
+    g_assert_cmpuint (pass.uploads[0].offset, ==, aligned (sa));
+    g_assert_cmpuint (pass.cmds[1].mask.offset, ==, 0);
+    frame_clear (&f);
+  }
+  rds_osd_plan_free (plan);
+
+  /* a mask exactly the heap's size fits; a heap one alignment step smaller draws nothing */
+  plan = rds_osd_plan_new (aligned (sc));
+  g_assert_cmpuint (plan_text (plan, "i", &off, NULL), ==, 1);
+  rds_osd_plan_free (plan);
+  if (aligned (sc) > RDS_OSD_MASK_ALIGN) {
+    RdsOsdDrawOptions opt = options ();
+    RdsOsdPass pass;
+    Frame f;
+
+    plan = rds_osd_plan_new (aligned (sc) - RDS_OSD_MASK_ALIGN);
+    frame_init (&f);
+    frame_add_object (&f)->text_params = text ("i", 10, 10, 20, WHITE, FALSE, BLUE);
+    g_assert_false (plan_one (plan, &opt, &f, 400, 300, &pass, NULL));
+    frame_clear (&f);
+    rds_osd_plan_free (plan);
+  }
+  /* the heap is a whole number of alignment steps */
+  g_test_expect_message ("rdsosd", G_LOG_LEVEL_CRITICAL, "*heap_size % RDS_OSD_MASK_ALIGN*");
+  g_assert_null (rds_osd_plan_new (aligned (sc) + 1));
+  g_test_assert_expected_messages ();
 }
 
-/* Random labelled objects on two slots, drawn with @heap_size; returns the number of passes. */
-static guint
-draw_labels (gsize heap_size, guint seed, Img * imgs, guint32 * max_mask)
+static void
+test_text_keys (void)
 {
-  RdsOsdPlan *plan = rds_osd_plan_new (heap_size);
+  RdsOsdPlan *plan = rds_osd_plan_new (RDS_OSD_MASK_HEAP_SIZE), *alone = rds_osd_plan_new (RDS_OSD_MASK_HEAP_SIZE);
   RdsOsdDrawOptions opt = options ();
-  GRand *r = g_rand_new_with_seed (seed);
-  gchar labels[2][24][16];
   RdsOsdPass pass;
-  Frame f[2];
-  guint passes = 0;
+  RdsOsdCmd want[2];
+  guint8 *want_mask;
+  Frame f;
 
+  /* font "Sans\x1f20" at 10 with "x" and font "Sans" at 20 with "10\x1fx" join to the same string with a 0x1f
+   * separator: they must not share extents or masks */
+  frame_init (&f);
+  frame_add_object (&f)->text_params = text ("10\x1fx", 10, 10, 20, WHITE, TRUE, BLUE);
+  g_assert_true (plan_one (alone, &opt, &f, 400, 300, &pass, NULL));
+  g_assert_cmpuint (pass.n_cmds, ==, 2);
+  memcpy (want, pass.cmds, sizeof want);
+  want_mask = g_memdup2 (rds_osd_plan_heap (alone) + pass.cmds[1].mask.offset, pass.uploads[0].size);
+
+  g_assert_cmpuint (plan_text_full (plan, "Sans\x1f" "20", 10, "x", 10, 10, NULL, NULL), ==, 1);
+  g_assert_true (plan_one (plan, &opt, &f, 400, 300, &pass, NULL));
+  g_assert_cmpuint (pass.n_cmds, ==, 2);
+  g_assert_cmpuint (pass.n_uploads, ==, 1);
+  g_assert_cmpuint (memcmp (&pass.cmds[0], &want[0], sizeof want[0]), ==, 0);
+  g_assert_cmpint (pass.cmds[1].x1, ==, want[1].x1);
+  g_assert_cmpint (pass.cmds[1].y1, ==, want[1].y1);
+  g_assert_cmpuint (pass.cmds[1].mask.stride, ==, want[1].mask.stride);
+  g_assert_cmpuint (memcmp (rds_osd_plan_heap (plan) + pass.cmds[1].mask.offset, want_mask, pass.uploads[0].size),
+      ==, 0);
+  g_free (want_mask);
+  frame_clear (&f);
+  rds_osd_plan_free (plan);
+  rds_osd_plan_free (alone);
+}
+
+static void
+test_slot_size (void)
+{
+  RdsOsdPlan *plan = rds_osd_plan_new (RDS_OSD_MASK_HEAP_SIZE);
+  RdsOsdDrawOptions opt = options ();
+  RdsOsdPass pass;
+  Frame f;
+
+  /* a second frame on a slot with another size is not drawn (its tiles would not be the slot's) */
+  frame_init (&f);
+  frame_add_object (&f)->rect_params = fill (0, 0, 90, 90, BLUE);
   rds_osd_plan_begin (plan);
+  rds_osd_plan_add_frame (plan, &opt, 0, &f.fm, 100, 100);
+  g_test_expect_message ("rdsosd", G_LOG_LEVEL_CRITICAL, "*slot 0*");
+  rds_osd_plan_add_frame (plan, &opt, 0, &f.fm, 200, 200);
+  g_test_assert_expected_messages ();
+  rds_osd_plan_add_frame (plan, &opt, 0, &f.fm, 100, 100);
+  g_assert_true (rds_osd_plan_next_pass (plan, &pass));
+  g_assert_cmpuint (pass.n_frames, ==, 2);
+  g_assert_cmpint (pass.frames[0].width, ==, 100);
+  g_assert_cmpint (pass.frames[1].width, ==, 100);
+  rds_osd_plan_bin (plan, &pass);
+  g_assert_cmpuint (pass.n_items, ==, 9);
+  frame_clear (&f);
+  rds_osd_plan_free (plan);
+}
+
+#define N_BATCHES 4
+
+/* A batch of random labelled objects, arrows (union chains) and the clock on two slots; @r continues across
+ * batches, and labels repeat, so masks are hits within and across batches. */
+static void
+labels_batch (GRand * r, Frame f[2], gchar labels[2][24][16])
+{
   for (guint k = 0; k < 2; k++) {
+    RdsDisplayMeta *dm;
+
     frame_init (&f[k]);
     for (guint i = 0; i < 24; i++) {
       RdsObjectMeta *om = frame_add_object (&f[k]);
 
-      /* a few repeats, so some masks are hits within the batch */
       g_snprintf (labels[k][i], sizeof labels[k][i], "obj %u", rnd (r, 0, 30));
       om->rect_params = rect (rnd (r, 0, 300), rnd (r, 0, 200), rnd (r, 10, 80), rnd (r, 10, 60), 2,
           random_color (r));
       om->text_params = text (labels[k][i], rnd (r, 0, 330), rnd (r, 0, 230), rnd (r, 8, 18), random_color (r),
           g_rand_boolean (r), random_color (r));
     }
-    rds_osd_plan_add_frame (plan, &opt, k, &f[k].fm, imgs[k].width, imgs[k].height);
+    dm = frame_add_display (&f[k]);
+    dm->num_arrows = 4;
+    for (guint i = 0; i < dm->num_arrows; i++)
+      dm->arrow_params[i] = (RdsOSD_ArrowParams) {.x1 = rnd (r, 0, 360),.y1 = rnd (r, 0, 260),.x2 =
+            rnd (r, 0, 360),.y2 = rnd (r, 0, 260),.arrow_width = rnd (r, 1, 5),.arrow_head =
+            RDS_OSD_ARROW_BOTH_HEAD,.arrow_color = random_color (r)
+      };
   }
+}
+
+/* Draws N_BATCHES batches of labels_batch (from @seed) with one plan of @heap_size into imgs[batch][slot], twice: on
+ * the CPU path and per tile, both reading a mirror of the heap that only the passes' uploads fill (as the GPU's).
+ * Returns the number of passes; @max_mask: the largest mask. */
+static guint
+draw_labels (gsize heap_size, guint seed, Img imgs[N_BATCHES][2], guint32 * max_mask)
+{
+  RdsOsdPlan *plan = rds_osd_plan_new (heap_size);
+  RdsOsdDrawOptions opt = options ();
+  GRand *r = g_rand_new_with_seed (seed);
+  guint8 *mirror = g_malloc (heap_size);
+  gchar labels[2][24][16];
+  RdsOsdPass pass;
+  guint passes = 0;
+
+  /* the clock after each frame's arrows: a pass can end right after a union chain */
+  opt.display_clock = TRUE;
+  opt.clock_text = "2026-10-26 12:00:00";
+  opt.y_clock_offset = 200;
+  memset (mirror, 0xA5, heap_size);
   if (max_mask != NULL)
     *max_mask = 0;
-  while (rds_osd_plan_next_pass (plan, &pass)) {
-    passes++;
-    for (guint32 i = 0; i < pass.n_uploads; i++) {
-      g_assert_cmpuint ((gsize) pass.uploads[i].offset + pass.uploads[i].size, <=, heap_size);
-      if (max_mask != NULL)
-        *max_mask = MAX (*max_mask, pass.uploads[i].size);
+  for (guint b = 0; b < N_BATCHES; b++) {
+    Frame f[2];
+    Img tiles[2];
+
+    labels_batch (r, f, labels);
+    rds_osd_plan_begin (plan);
+    for (guint k = 0; k < 2; k++) {
+      img_init (&tiles[k], imgs[b][k].width, imgs[b][k].height);
+      rds_osd_plan_add_frame (plan, &opt, k, &f[k].fm, imgs[b][k].width, imgs[b][k].height);
     }
-    rds_osd_plan_bin (plan, &pass);
-    check_binning (&pass, imgs, 2);
-    draw_pass (plan, &pass, imgs);
+    while (rds_osd_plan_next_pass (plan, &pass)) {
+      passes++;
+      for (guint32 i = 0; i < pass.n_uploads; i++) {
+        g_assert_cmpuint ((gsize) pass.uploads[i].offset + pass.uploads[i].size, <=, heap_size);
+        memcpy (mirror + pass.uploads[i].offset, rds_osd_plan_heap (plan) + pass.uploads[i].offset,
+            pass.uploads[i].size);
+        if (max_mask != NULL)
+          *max_mask = MAX (*max_mask, pass.uploads[i].size);
+      }
+      rds_osd_plan_bin (plan, &pass);
+      check_binning (&pass, imgs[b], 2);
+      draw_pass (mirror, &pass, imgs[b]);
+      draw_pass_tiles (mirror, &pass, tiles);
+    }
+    for (guint k = 0; k < 2; k++) {
+      g_assert_true (same_pixels (&imgs[b][k], &tiles[k]));
+      img_clear (&tiles[k]);
+      frame_clear (&f[k]);
+    }
   }
-  for (guint k = 0; k < 2; k++)
-    frame_clear (&f[k]);
+  g_free (mirror);
   g_rand_free (r);
   rds_osd_plan_free (plan);
   return passes;
@@ -793,24 +956,29 @@ static void
 test_passes (void)
 {
   for (guint seed = 1; seed <= 5; seed++) {
-    Img one[2], many[2];
+    Img one[N_BATCHES][2], many[N_BATCHES][2];
     guint32 max_mask;
     guint passes;
 
-    for (guint k = 0; k < 2; k++) {
-      img_init (&one[k], 360, 260);
-      img_init (&many[k], 360, 260);
-    }
-    g_assert_cmpuint (draw_labels (RDS_OSD_MASK_HEAP_SIZE, seed, one, &max_mask), ==, 1);
-    /* room for a few masks only: the batch is split, the pixels are the same */
+    for (guint b = 0; b < N_BATCHES; b++)
+      for (guint k = 0; k < 2; k++) {
+        img_init (&one[b][k], 360, 260);
+        img_init (&many[b][k], 360, 260);
+      }
+    /* one pass a batch with the full heap */
+    g_assert_cmpuint (draw_labels (RDS_OSD_MASK_HEAP_SIZE, seed, one, &max_mask), ==, N_BATCHES);
+    /* room for a few masks only: the batches are split, the pixels are the same */
     passes = draw_labels (aligned (max_mask) * 3, seed, many, NULL);
-    g_test_message ("seed %u: %u passes with a %u-byte heap", seed, passes, aligned (max_mask) * 3);
-    g_assert_cmpuint (passes, >, 2);
-    for (guint k = 0; k < 2; k++) {
-      g_assert_true (same_pixels (&one[k], &many[k]));
-      img_clear (&one[k]);
-      img_clear (&many[k]);
-    }
+    g_test_message ("seed %u: %u passes for %u batches with a %u-byte heap", seed, passes, N_BATCHES,
+        aligned (max_mask) * 3);
+    g_assert_cmpuint (passes, >, 2 * N_BATCHES);
+    for (guint b = 0; b < N_BATCHES; b++)
+      for (guint k = 0; k < 2; k++) {
+        if (!same_pixels (&one[b][k], &many[b][k]))
+          g_error ("seed %u batch %u slot %u: split passes draw other pixels", seed, b, k);
+        img_clear (&one[b][k]);
+        img_clear (&many[b][k]);
+      }
   }
 }
 
@@ -824,6 +992,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/osd-plan/binning", test_binning);
   g_test_add_func ("/cpu/osd-plan/empty-tiles", test_empty_tiles);
   g_test_add_func ("/cpu/osd-plan/text-cache", test_text_cache);
+  g_test_add_func ("/cpu/osd-plan/text-keys", test_text_keys);
+  g_test_add_func ("/cpu/osd-plan/slot-size", test_slot_size);
   g_test_add_func ("/cpu/osd-plan/passes", test_passes);
   return g_test_run ();
 }
