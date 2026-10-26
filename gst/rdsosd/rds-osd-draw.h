@@ -51,6 +51,17 @@ void rds_osd_draw_free (RdsOsdDraw * draw);
 RdsOsdDrawFlags rds_osd_draw_frame (RdsOsdDraw * draw, const RdsOsdDrawOptions * options,
     const RdsFrameMeta * frame, guint8 * data, gint width, gint height, gint stride);
 
+/* FALSE when rds_osd_draw_frame would draw nothing for @frame (may be NULL) under @options: no visible object rect
+ * or text, no display-meta element the switches show, no clock. The caller can then skip mapping the frame. */
+gboolean rds_osd_draw_frame_has_work (const RdsOsdDrawOptions * options, const RdsFrameMeta * frame);
+
+/* Loads the default fonts, so the first frame does not pay for fontconfig's start-up. */
+void rds_osd_draw_warm_up (RdsOsdDraw * draw);
+
+/* The family fontconfig resolves @name (as a text's font_name) to, e.g. "DejaVu Serif"; NULL if none. Free with
+ * g_free. */
+gchar *rds_osd_draw_resolve_font (RdsOsdDraw * draw, const gchar * name);
+
 /* The clock text for @t: "YYYY-MM-DD HH:MM:SS" (DeepStream 8.0 behaviour). Free with g_free. */
 gchar *rds_osd_clock_text (GDateTime * t);
 

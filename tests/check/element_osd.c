@@ -410,6 +410,37 @@ test_view_copied (void)
 }
 
 static void
+test_nothing_to_draw (void)
+{
+  Osd o;
+  GstBuffer *batch, *view, *out;
+  GstMemory *mem;
+  RdsBatchMeta *view_meta;
+
+  /* a view with nothing visible to draw (its one box hidden by display-bbox=false) is not mapped for writing: it
+   * comes out with the same read-only memory, not a copy */
+  RDS_TEST_REQUIRE_GPU ();
+  osd_init (&o, "display-bbox=false");
+  batch = make_batch (2);
+  view = rds_buffer_new_surface_view (batch, 1);
+  view_meta = rds_create_batch_meta (1);
+  g_assert_nonnull (rds_copy_frame_meta_to_batch (frame_of (batch, 1), view_meta));
+  ((RdsFrameMeta *) view_meta->frame_meta_list->data)->batch_id = 0;
+  g_assert_nonnull (rds_buffer_add_batch_meta (view, view_meta));
+  mem = gst_buffer_peek_memory (view, 0);
+  g_assert_true (GST_MEMORY_IS_READONLY (mem));
+
+  out = osd_run (&o, view);
+  g_assert_cmpuint (gst_buffer_n_memory (out), ==, 1);
+  g_assert_true (gst_buffer_peek_memory (out, 0) == mem);
+  g_assert_true (GST_MEMORY_IS_READONLY (gst_buffer_peek_memory (out, 0)));
+  gst_buffer_unref (out);
+  gst_buffer_unref (batch);
+  g_assert_cmpuint (count_messages (o.bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING), ==, 0);
+  osd_clear (&o);
+}
+
+static void
 test_shared_copied (void)
 {
   Osd o;
@@ -618,6 +649,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/osd-element/batch", test_batch);
   g_test_add_func ("/gpu/osd-element/view-copied", test_view_copied);
   g_test_add_func ("/gpu/osd-element/shared-copied", test_shared_copied);
+  g_test_add_func ("/gpu/osd-element/nothing-to-draw", test_nothing_to_draw);
   g_test_add_func ("/gpu/osd-element/tracker-object", test_tracker_object);
   g_test_add_func ("/gpu/osd-element/clock", test_clock);
   g_test_add_func ("/gpu/osd-element/no-frame-meta", test_no_frame_meta);

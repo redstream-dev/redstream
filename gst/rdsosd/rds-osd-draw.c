@@ -26,9 +26,10 @@
 #define ARROW_HEAD_HALF_WIDTH 7.0
 /* the ring of a circle whose circle_width is 0, in pixels (DeepStream 8.0 still outlines it, 3 px in GPU mode) */
 #define ZERO_CIRCLE_WIDTH 3
-/* shapes further than this outside the frame are not drawn; coordinates beyond it would overflow Cairo's fixed
- * point (ours: such shapes cannot touch the frame, or are degenerate) */
-#define MAX_COORD 4194304.0
+/* circles and arrow heads with a coordinate, radius or width beyond this are not drawn (ours). Cairo works in 24.8
+ * fixed point (about ±8.4 million): with centres and radii below 2^21, and widths and radii clamped to the frame
+ * (below), every coordinate Cairo sees stays in range. Lines are clipped to the frame before Cairo sees them. */
+#define MAX_COORD 2097152.0
 /* added before truncating a blend, so that a sum that is exact in decimal (127.5 + 127.5) is not lost to binary
  * rounding (254.9999...) */
 #define BLEND_EPSILON 1e-6
@@ -114,6 +115,8 @@ span (const Plane * pl, gint64 y, gint64 x0, gint64 x1, const Paint * p)
     return;
   x0 = MAX (x0, 0);
   x1 = MIN (x1, (gint64) pl->width - 1);
+  if (x0 > x1)
+    return;
   px = pl->data + (gsize) y * pl->stride + 4 * x0;
   for (gint64 x = x0; x <= x1; x++, px += 4)
     blend_full (px, p);
@@ -193,7 +196,9 @@ typedef struct
 } Mask;
 
 /* Starts a mask over the frame pixels x0..x1 × y0..y1 (inclusive, clipped to the frame), with the Cairo context in
- * frame coordinates. FALSE when nothing of it is in the frame. */
+ * frame coordinates. FALSE when nothing of it is in the frame. The mask is the shape's whole bounding box: cleared
+ * here and scanned in mask_end, so its cost grows with the box's area, not the shape's. Boxes, labels and short lines
+ * are small; a line across the whole frame diagonally costs a frame-sized A8 clear and scan (~1 MB at 1280×720). */
 static gboolean
 mask_begin (RdsOsdDraw * d, const Plane * pl, gdouble x0, gdouble y0, gdouble x1, gdouble y1, Mask * m)
 {
@@ -244,8 +249,12 @@ mask_end (RdsOsdDraw * d, const Plane * pl, Mask * m, const Paint * p)
 /* Lines and arrow shafts: DeepStream 8.0 GPU mode draws (w − 1) / 2 pixels on each side of the segment (width 6 is
  * 5 pixels wide) and extends the ends as far. */
 static gdouble
-stroke_width (guint w)
+stroke_width (guint w, const Plane * pl)
 {
+  /* ours: a stroke wider than twice the frame covers it anyway; the clamp keeps Cairo in range */
+  guint max = 2 * (guint) MAX (pl->width, pl->height) + 1;
+
+  w = MIN (w, max);
   return 2.0 * (w > 0 ? (w - 1) / 2 : 0) + 1.0;
 }
 
@@ -284,7 +293,7 @@ static void
 draw_segment (RdsOsdDraw * d, const Plane * pl, gdouble x1, gdouble y1, gdouble x2, gdouble y2, guint width,
     const RdsOSD_ColorParams * color)
 {
-  gdouble w = stroke_width (width), margin = w + 2;
+  gdouble w = stroke_width (width, pl), margin = w + 2;
   Paint p;
   Mask m;
 
@@ -313,7 +322,7 @@ static void
 draw_arrow_head (RdsOsdDraw * d, const Plane * pl, gdouble tx, gdouble ty, gdouble fx, gdouble fy, guint width,
     const Paint * p)
 {
-  gdouble len = hypot (tx - fx, ty - fy), ux, uy, w = stroke_width (width), margin = w + 2;
+  gdouble len = hypot (tx - fx, ty - fy), ux, uy, w = stroke_width (width, pl), margin = w + 2;
   gdouble ax, ay, bx, by;
   Mask m;
 
@@ -364,7 +373,7 @@ draw_arrow (RdsOsdDraw * d, const Plane * pl, const RdsOSD_ArrowParams * a)
 static void
 draw_circle (RdsOsdDraw * d, const Plane * pl, const RdsOSD_CircleParams * c)
 {
-  gdouble w = MIN (c->circle_width, MAX_COORD), r = c->radius, lo, hi;
+  gdouble w = MIN (c->circle_width, MAX_COORD), r = c->radius, lo, hi, dx, dy, near, far;
   gdouble xc = c->xc + 0.5, yc = c->yc + 0.5, inner, outer;
   Paint p;
   Mask m;
@@ -379,17 +388,39 @@ draw_circle (RdsOsdDraw * d, const Plane * pl, const RdsOSD_CircleParams * c)
   }
   inner = r - lo - 0.5;
   outer = r + hi + 0.5;
-  if (c->has_bg_color && inner > 0 && paint_init (&p, &c->bg_color)
-      && mask_begin (d, pl, xc - inner, yc - inner, xc + inner, yc + inner, &m)) {
-    cairo_arc (m.cr, xc, yc, inner, 0, 2 * G_PI);
-    cairo_fill (m.cr);
-    mask_end (d, pl, &m, &p);
+  /* Only the band between the nearest and the farthest frame pixel can show: a ring outside it is not drawn, and
+   * the band is clamped to it (same pixels, and Cairo stays in range). */
+  dx = MAX (MAX (0.0 - xc, xc - pl->width), 0);
+  dy = MAX (MAX (0.0 - yc, yc - pl->height), 0);
+  near = hypot (dx, dy);
+  far = hypot (MAX (xc, pl->width - xc), MAX (yc, pl->height - yc));
+  if (outer < near - 1 || (inner > far + 1 && !c->has_bg_color))
+    return;
+  outer = MIN (outer, far + 2);
+  inner = MIN (inner, far + 1);
+  if (c->has_bg_color && inner > 0 && paint_init (&p, &c->bg_color)) {
+    if (far < inner) {
+      box (pl, 0, 0, pl->width - 1, pl->height - 1, &p);
+    } else if (mask_begin (d, pl, xc - inner, yc - inner, xc + inner, yc + inner, &m)) {
+      cairo_arc (m.cr, xc, yc, inner, 0, 2 * G_PI);
+      cairo_fill (m.cr);
+      mask_end (d, pl, &m, &p);
+    }
   }
-  if (paint_init (&p, &c->circle_color)
-      && mask_begin (d, pl, xc - outer - 1, yc - outer - 1, xc + outer + 1, yc + outer + 1, &m)) {
-    cairo_set_line_width (m.cr, outer - MAX (inner, 0));
-    cairo_arc (m.cr, xc, yc, (outer + MAX (inner, 0)) / 2, 0, 2 * G_PI);
-    cairo_stroke (m.cr);
+  if (inner >= outer || !paint_init (&p, &c->circle_color))
+    return;
+  if (near > inner && far < outer) {
+    /* the band covers the frame */
+    box (pl, 0, 0, pl->width - 1, pl->height - 1, &p);
+  } else if (mask_begin (d, pl, xc - outer - 1, yc - outer - 1, xc + outer + 1, yc + outer + 1, &m)) {
+    /* the band as an annulus (filled, even-odd): robust for any width, unlike a stroke */
+    cairo_set_fill_rule (m.cr, CAIRO_FILL_RULE_EVEN_ODD);
+    cairo_arc (m.cr, xc, yc, outer, 0, 2 * G_PI);
+    if (inner > 0) {
+      cairo_new_sub_path (m.cr);
+      cairo_arc (m.cr, xc, yc, inner, 0, 2 * G_PI);
+    }
+    cairo_fill (m.cr);
     mask_end (d, pl, &m, &p);
   }
 }
@@ -529,6 +560,71 @@ rds_osd_draw_frame (RdsOsdDraw * d, const RdsOsdDrawOptions * opt, const RdsFram
     draw_text (d, &pl, &clock);
   }
   return flags;
+}
+
+static gboolean
+text_visible (const RdsOSD_TextParams * t)
+{
+  return t->font_params.font_size > 0 && t->display_text != NULL && t->display_text[0] != '\0';
+}
+
+static gboolean
+rect_visible (const RdsOSD_RectParams * r)
+{
+  return r->border_width > 0 || r->has_bg_color;
+}
+
+gboolean
+rds_osd_draw_frame_has_work (const RdsOsdDrawOptions * opt, const RdsFrameMeta * frame)
+{
+  if (opt->display_clock && opt->display_text && opt->clock_text != NULL)
+    return TRUE;
+  if (frame == NULL)
+    return FALSE;
+  for (GList * l = frame->obj_meta_list; l != NULL; l = l->next) {
+    RdsObjectMeta *om = l->data;
+
+    if ((opt->display_bbox && rect_visible (&om->rect_params)) || (opt->display_text && text_visible
+            (&om->text_params)))
+      return TRUE;
+  }
+  for (GList * l = frame->display_meta_list; l != NULL; l = l->next) {
+    RdsDisplayMeta *dm = l->data;
+
+    if (dm->num_lines > 0 || dm->num_arrows > 0 || dm->num_circles > 0 || (opt->display_bbox && dm->num_rects > 0)
+        || (opt->display_text && dm->num_labels > 0))
+      return TRUE;
+  }
+  return FALSE;
+}
+
+void
+rds_osd_draw_warm_up (RdsOsdDraw * d)
+{
+  PangoRectangle ink, logical;
+
+  /* fontconfig's first lookup reads its caches (tens of ms): do it before the first frame */
+  pango_layout_set_text (d->layout, "0", -1);
+  pango_layout_set_font_description (d->layout, font_for (d, RDS_OSD_DEFAULT_FONT, RDS_OSD_CLOCK_FONT_SIZE));
+  pango_layout_get_pixel_extents (d->layout, &ink, &logical);
+  pango_layout_set_font_description (d->layout, font_for (d, RDS_OSD_CLOCK_FONT, RDS_OSD_CLOCK_FONT_SIZE));
+  pango_layout_get_pixel_extents (d->layout, &ink, &logical);
+}
+
+gchar *
+rds_osd_draw_resolve_font (RdsOsdDraw * d, const gchar * name)
+{
+  PangoFont *font = pango_font_map_load_font (d->font_map, d->context, font_for (d, name, 12));
+  PangoFontDescription *desc;
+  gchar *family;
+
+  if (font == NULL)
+    return NULL;
+  desc = pango_font_describe (font);
+  family = g_strdup (pango_font_description_get_family (desc));
+  pango_font_description_free (desc);
+  g_object_unref (font);
+  return family;
 }
 
 gchar *

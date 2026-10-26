@@ -312,7 +312,9 @@ Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream
 
 Pads: `sink` and `src`, `video/x-raw(memory:RDS)` RGBA only (ours: DeepStream 8.0's GPU mode also takes NV12), in
 place. A buffer whose memory is shared or a read-only surface view (`rdsstreamdemux` output) is drawn on a private
-copy; the batch it came from is never written. A failed map or CPU/GPU sync is an element error.
+copy; the batch it came from is never written. Frames with nothing to draw (under the current switches) are not
+synced, and a buffer with nothing to draw passes through unmapped, without a copy. A failed map or CPU/GPU sync is an
+element error.
 
 #### Drawing behaviour
 
@@ -342,7 +344,7 @@ where the docs are silent, or **ours**: where 8.0 settles nothing or is clearly 
 | Other `arrow_head` values, zero-length arrows | ours | the shaft only |
 | Circles | matches nvdsosd (DeepStream 8.0) | a ring straddling the radius: `circle_width` w covers the pixels at distances r − ⌊w/2⌋ .. r + ⌈w/2⌉ from the centre (w 3, r 60: 59..62); `has_bg_color` fills inside the ring with `bg_color`; clipped at the frame |
 | `circle_width` 0 | matches nvdsosd (DeepStream 8.0) | still outlined, 3 px centred on the radius (r 60: 59..61), so zeroed circles stay visible |
-| Shapes beyond 4194304 pixels | ours | circles and arrow heads with such coordinates are not drawn (lines are clipped first) |
+| Huge coordinates and widths | ours | circles and arrow heads with a coordinate, radius or width beyond 2^21 (2097152) pixels are not drawn (a wider `circle_width` is taken as 2^21); `line_width` and `arrow_width` above twice the frame's larger side are clamped to it (the stroke covers the frame); lines are clipped to the frame first |
 | Clock | matches nvdsosd (DeepStream 8.0) | `YYYY-MM-DD HH:MM:SS`, the process's local time read once per buffer, drawn like text without a box at the clock offsets; default font a serif; one per frame |
 | A buffer without frame meta | ours | passes through untouched, except that it gets the clock on every frame when `display-clock` is on |
 | Masks | ours | not drawn yet (`display-mask` accepted, one warning); 8.0 draws them only with `display-mask=1` |

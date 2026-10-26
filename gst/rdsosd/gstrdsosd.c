@@ -6,7 +6,8 @@
  * In place: the base class hands transform_ip a writable buffer, and the WRITE map gives this element memory it owns
  * (a shared surface or a read-only surface view, as rdsstreamdemux pushes, is replaced by a private copy first; the
  * batch it came from is never written). Each frame meta's slot (batch_id) is synced to the CPU, drawn and synced
- * back, under the batch's meta lock. The syncs are synchronous: the frame is ready when pushed.
+ * back, under the batch's meta lock. The syncs are synchronous: the frame is ready when pushed. Frames with nothing
+ * to draw are not synced, and a buffer with nothing to draw is not mapped at all (no copy of view memory).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsosd.h"
 #include "rds-osd-draw.h"
@@ -135,6 +136,7 @@ gst_rds_osd_start (GstBaseTransform * trans)
   GST_INFO_OBJECT (self, "process-mode %d: drawing on the CPU with Cairo and Pango, with the GPU mode's geometry",
       mode);
   self->draw = rds_osd_draw_new ();
+  rds_osd_draw_warm_up (self->draw);
   self->border_warned = FALSE;
   self->slot_warned = FALSE;
   return TRUE;
@@ -191,6 +193,13 @@ draw_slot (GstRdsOsd * self, RdsBufSurface * surf, guint slot, const RdsFrameMet
   return ok;
 }
 
+/* A frame to draw: its slot and frame meta (NULL: the clock only). */
+typedef struct
+{
+  guint slot;
+  RdsFrameMeta *fm;
+} Work;
+
 static GstFlowReturn
 gst_rds_osd_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 {
@@ -199,7 +208,8 @@ gst_rds_osd_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   RdsOsdDrawOptions opt = { 0 };
   gchar *clock_font, *clock_text = NULL;
   GstMapInfo map;
-  RdsBufSurface *surf;
+  RdsBufSurface *in;
+  GArray *work = g_array_new (FALSE, FALSE, sizeof (Work));
   GstFlowReturn ret = GST_FLOW_OK;
   guint n_slots;
 
@@ -223,44 +233,65 @@ gst_rds_osd_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     opt.clock_text = clock_text;
   }
 
-  /* writable buffer + WRITE map: memory this element may write (a copy of shared or view memory) */
-  if (rds_buffer_get_surface (buf) == NULL || !gst_buffer_map (buf, &map, GST_MAP_WRITE)) {
-    GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot map the buffer for drawing"),
-        ("the input must be one writable memory:RDS memory"));
+  in = rds_buffer_get_surface (buf);
+  if (in == NULL) {
+    GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot draw on the buffer"), ("the input must be memory:RDS"));
     ret = GST_FLOW_ERROR;
     goto done;
   }
-  surf = (RdsBufSurface *) map.data;
-  n_slots = MIN (surf->numFilled, surf->batchSize);
+  n_slots = MIN (in->numFilled, in->batchSize);
 
   if (bm != NULL)
     rds_acquire_meta_lock (bm);
+  /* The frames with something to draw. Frames with nothing are not mapped, and a buffer with nothing at all is not
+   * mapped for writing either: shared or view memory then passes through without a copy. */
   if (bm == NULL || bm->frame_meta_list == NULL) {
     /* no frame meta: only the clock, on every frame (ours) */
-    for (guint slot = 0; slot < n_slots && opt.clock_text != NULL && ret == GST_FLOW_OK; slot++)
-      if (!draw_slot (self, surf, slot, NULL, &opt))
-        ret = GST_FLOW_ERROR;
+    for (guint slot = 0; slot < n_slots && rds_osd_draw_frame_has_work (&opt, NULL); slot++) {
+      Work w = { slot, NULL };
+
+      g_array_append_val (work, w);
+    }
   }
-  for (GList * l = bm != NULL ? bm->frame_meta_list : NULL; l != NULL && ret == GST_FLOW_OK; l = l->next) {
-    RdsFrameMeta *fm = l->data;
+  for (GList * l = bm != NULL ? bm->frame_meta_list : NULL; l != NULL; l = l->next) {
+    Work w = { ((RdsFrameMeta *) l->data)->batch_id, l->data };
 
     /* each frame on its own surface (ours: DeepStream 8.0 draws every frame's meta on surface 0) */
-    if (fm->batch_id >= n_slots) {
+    if (w.slot >= n_slots) {
       if (!self->slot_warned) {
         self->slot_warned = TRUE;
         GST_ELEMENT_WARNING (self, STREAM, FAILED, ("A frame meta's batch_id is outside the batch: not drawn"),
-            ("batch_id %u, %u frames in the buffer (logged once)", fm->batch_id, n_slots));
+            ("batch_id %u, %u frames in the buffer (logged once)", w.slot, n_slots));
       }
       continue;
     }
-    if (!draw_slot (self, surf, fm->batch_id, fm, &opt))
+    if (rds_osd_draw_frame_has_work (&opt, w.fm))
+      g_array_append_val (work, w);
+  }
+
+  if (work->len > 0) {
+    /* writable buffer + WRITE map: memory this element may write (a copy of shared or view memory) */
+    if (!gst_buffer_map (buf, &map, GST_MAP_WRITE)) {
+      GST_ELEMENT_ERROR (self, STREAM, FAILED, ("Cannot map the buffer for drawing"),
+          ("the input must be one writable memory:RDS memory"));
       ret = GST_FLOW_ERROR;
+    } else {
+      RdsBufSurface *surf = (RdsBufSurface *) map.data;
+
+      for (guint i = 0; i < work->len && ret == GST_FLOW_OK; i++) {
+        Work *w = &g_array_index (work, Work, i);
+
+        if (!draw_slot (self, surf, w->slot, w->fm, &opt))
+          ret = GST_FLOW_ERROR;
+      }
+      gst_buffer_unmap (buf, &map);
+    }
   }
   if (bm != NULL)
     rds_release_meta_lock (bm);
-  gst_buffer_unmap (buf, &map);
 
 done:
+  g_array_unref (work);
   g_free (clock_text);
   g_free (clock_font);
   return ret;

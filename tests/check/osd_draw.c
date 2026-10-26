@@ -522,15 +522,27 @@ test_text_fonts (void)
       unknown = render_font ("NoSuchFontXYZ", 20), serif = render_font ("Serif", 20),
       mono = render_font ("DejaVu Sans Mono", 20), zero = render_font ("Sans", 0);
 
+  gchar *sans_family = rds_osd_draw_resolve_font (draw_ctx, "Sans");
+  gchar *serif_family = rds_osd_draw_resolve_font (draw_ctx, "Serif");
+  gchar *mono_family = rds_osd_draw_resolve_font (draw_ctx, "DejaVu Sans Mono");
+
   /* unknown -> Sans (DeepStream 8.0 behaviour, through fontconfig); NULL and "" -> Sans (ours: 8.0's GPU mode
    * crashes on NULL) */
   g_assert_false (untouched (&sans));
   g_assert_true (same_pixels (&sans, &null_font));
   g_assert_true (same_pixels (&sans, &empty));
   g_assert_true (same_pixels (&sans, &unknown));
-  /* font_name is honoured */
-  g_assert_false (same_pixels (&sans, &serif));
-  g_assert_false (same_pixels (&sans, &mono));
+  /* font_name is honoured: different families render differently (when the system has them) */
+  g_test_message ("Sans: %s, Serif: %s, mono: %s", sans_family, serif_family, mono_family);
+  if (g_strcmp0 (sans_family, serif_family) == 0 || g_strcmp0 (sans_family, mono_family) == 0) {
+    g_test_skip ("Sans, Serif and DejaVu Sans Mono do not resolve to three fonts here (fonts-dejavu-core)");
+  } else {
+    g_assert_false (same_pixels (&sans, &serif));
+    g_assert_false (same_pixels (&sans, &mono));
+  }
+  g_free (sans_family);
+  g_free (serif_family);
+  g_free (mono_family);
   /* font_size 0 draws nothing, not even the box (DeepStream 8.0 behaviour) */
   g_assert_true (untouched (&zero));
 
@@ -778,6 +790,118 @@ test_circles (void)
   img_clear (&im);
 }
 
+static void
+test_huge_widths (void)
+{
+  Img im;
+  Frame f;
+  RdsDisplayMeta *dm;
+  gint x0, y0, x1, y1;
+
+  /* ours: widths far beyond the frame are clamped (the stroke covers the frame); huge radii are not drawn or
+   * clamped to the frame: no crash, and Cairo stays in range */
+  img_init (&im, 100, 80);
+  frame_init (&f);
+  dm = frame_add_display (&f);
+  dm->num_lines = 1;
+  dm->line_params[0] = line (10, 40, 90, 40, G_MAXUINT, RED);
+  draw (&im, &f, NULL);
+  g_assert_cmpint (count_rgb (&im, 0, 0, 99, 79, 255, 0, 0), ==, 100 * 80);
+  frame_clear (&f);
+  img_clear (&im);
+
+  img_init (&im, 100, 80);
+  frame_init (&f);
+  dm = frame_add_display (&f);
+  dm->num_arrows = 1;
+  dm->arrow_params[0] = (RdsOSD_ArrowParams) {.x1 = 10,.y1 = 40,.x2 = 90,.y2 = 40,.arrow_width = G_MAXUINT,
+    .arrow_head = RDS_OSD_ARROW_BOTH_HEAD,.arrow_color = GREEN };
+  draw (&im, &f, NULL);
+  g_assert_cmpint (count_rgb (&im, 0, 0, 99, 79, 0, 255, 0), ==, 100 * 80);
+  frame_clear (&f);
+  img_clear (&im);
+
+  /* a ring far outside the frame: nothing; a ring as wide as MAX: the whole frame */
+  img_init (&im, 100, 80);
+  frame_init (&f);
+  dm = frame_add_display (&f);
+  dm->num_circles = 3;
+  dm->circle_params[0] = (RdsOSD_CircleParams) {.xc = 50,.yc = 40,.radius = 2097152,.circle_color = RED,
+    .circle_width = 3 };
+  dm->circle_params[1] = (RdsOSD_CircleParams) {.xc = 2097152,.yc = 2097152,.radius = 2097152,
+    .circle_color = RED,.circle_width = 2097152 };
+  dm->circle_params[2] = (RdsOSD_CircleParams) {.xc = G_MAXUINT,.yc = 40,.radius = G_MAXUINT,.circle_color = RED,
+    .circle_width = G_MAXUINT };
+  draw (&im, &f, NULL);
+  /* [1]: its band reaches from about 1048576 to 3145728 px from a centre about 2965000 px away: it covers the frame */
+  g_assert_cmpint (count_rgb (&im, 0, 0, 99, 79, 255, 0, 0), ==, 100 * 80);
+  frame_clear (&f);
+  img_clear (&im);
+
+  img_init (&im, 100, 80);
+  frame_init (&f);
+  dm = frame_add_display (&f);
+  dm->num_circles = 2;
+  dm->circle_params[0] = (RdsOSD_CircleParams) {.xc = 50,.yc = 40,.radius = 2097152,.circle_color = RED,
+    .circle_width = 3,.has_bg_color = 1,.bg_color = BLUE };
+  dm->circle_params[1] = (RdsOSD_CircleParams) {.xc = 50,.yc = 40,.radius = 30,.circle_color = GREEN,
+    .circle_width = G_MAXUINT };
+  draw (&im, &f, NULL);
+  /* [0]'s fill covers the frame, then [1]'s ring (r 30, width clamped to MAX_COORD) covers it all again */
+  g_assert_true (drawn_bbox (&im, &x0, &y0, &x1, &y1));
+  g_assert_cmpint (count_rgb (&im, 0, 0, 99, 79, 0, 255, 0), ==, 100 * 80);
+  frame_clear (&f);
+  img_clear (&im);
+
+  img_init (&im, 100, 80);
+  frame_init (&f);
+  dm = frame_add_display (&f);
+  dm->num_circles = 1;
+  dm->circle_params[0] = (RdsOSD_CircleParams) {.xc = 50,.yc = 40,.radius = 2097152,.circle_color = RED,
+    .circle_width = 3,.has_bg_color = 1,.bg_color = BLUE };
+  draw (&im, &f, NULL);
+  g_assert_cmpint (count_rgb (&im, 0, 0, 99, 79, 0, 0, 255), ==, 100 * 80);
+  frame_clear (&f);
+  img_clear (&im);
+}
+
+static void
+test_has_work (void)
+{
+  Frame f;
+  RdsOsdDrawOptions opt = options ();
+  RdsObjectMeta *om;
+  RdsDisplayMeta *dm;
+
+  frame_init (&f);
+  g_assert_false (rds_osd_draw_frame_has_work (&opt, NULL));
+  g_assert_false (rds_osd_draw_frame_has_work (&opt, &f.fm));
+  om = frame_add_object (&f);
+  /* a zeroed object (no border, no fill, no text) draws nothing */
+  g_assert_false (rds_osd_draw_frame_has_work (&opt, &f.fm));
+  om->rect_params = rect (10, 10, 20, 20, 3, RED);
+  g_assert_true (rds_osd_draw_frame_has_work (&opt, &f.fm));
+  opt.display_bbox = FALSE;
+  g_assert_false (rds_osd_draw_frame_has_work (&opt, &f.fm));
+  om->text_params = text ("t", 0, 0, "Sans", 10, FALSE);
+  g_assert_true (rds_osd_draw_frame_has_work (&opt, &f.fm));
+  opt.display_text = FALSE;
+  g_assert_false (rds_osd_draw_frame_has_work (&opt, &f.fm));
+  dm = frame_add_display (&f);
+  dm->num_rects = 1;
+  g_assert_false (rds_osd_draw_frame_has_work (&opt, &f.fm));
+  dm->num_lines = 1;
+  g_assert_true (rds_osd_draw_frame_has_work (&opt, &f.fm));
+  dm->num_lines = 0;
+  /* the clock is hidden by display-text too */
+  opt.display_clock = TRUE;
+  opt.clock_text = "2026-10-26 00:00:00";
+  g_assert_false (rds_osd_draw_frame_has_work (&opt, NULL));
+  opt.display_text = TRUE;
+  g_assert_true (rds_osd_draw_frame_has_work (&opt, NULL));
+  frame_clear (&f);
+}
+
 /* ---- switches, order, limits ---- */
 
 /* One of everything: an object (rect + text), a display meta (rect, label, line, arrow, circle) and the clock. */
@@ -911,7 +1035,7 @@ test_draw_order (void)
   g_assert_true (is_color (&im, 170, 169, &MAGENTA));      /* arrows over lines (the line covers rows 168..172) */
   g_assert_true (is_color (&im, 175, 170, &CYAN));
   g_assert_true (is_color (&im, 170, 180, &BLUE));         /* circles over arrows */
-  g_assert_true (is_color (&im, 170, 174, &BLUE));         /* the ring over the line's last row and the arrow */
+  g_assert_true (is_color (&im, 170, 174, &BLUE));         /* the ring over the arrow */
   frame_clear (&f);
   img_clear (&im);
 }
@@ -1119,6 +1243,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/osd/arrows", test_arrows);
   g_test_add_func ("/cpu/osd/arrow-degenerate", test_arrow_degenerate);
   g_test_add_func ("/cpu/osd/circles", test_circles);
+  g_test_add_func ("/cpu/osd/huge-widths", test_huge_widths);
+  g_test_add_func ("/cpu/osd/has-work", test_has_work);
   g_test_add_func ("/cpu/osd/switches", test_switches);
   g_test_add_func ("/cpu/osd/draw-order", test_draw_order);
   g_test_add_func ("/cpu/osd/display-limits", test_display_limits);
