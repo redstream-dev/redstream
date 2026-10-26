@@ -190,6 +190,12 @@ Early numbers on a 2-CU Ryzen 9 7900X iGPU:
   chain (tracker, tiler and OSD, to a fakesink).
 - `rdsosd` at 1280×720 with about 60 objects: about 1.3 ms per frame, CPU drawing and the GPU↔CPU syncs included.
 
+**Known issue (ROCm 10.1):** with more HIP streams than hardware queues, which a multi-stream pipeline easily has,
+an SDMA copy can occasionally fault and abort the process with `Memory access fault by GPU ... on address 0x401000`.
+Set `HSA_ENABLE_SDMA=0` to have copies done by blit kernels instead; on the gfx1036 iGPU this costs nothing
+measurable (about 44 fps for `rds-test3` either way). Raising `GPU_MAX_HW_QUEUES` also avoids it but costs
+throughput (about 29 fps with 16 queues). The test suite sets `HSA_ENABLE_SDMA=0`.
+
 ## Getting started (development)
 
 Requirements: Linux with the `amdgpu` kernel driver (`/dev/kfd` and `/dev/dri/renderD*` present), Docker.

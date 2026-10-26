@@ -119,6 +119,7 @@ $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 -v uridecodebin uri=f
 | first frame of each rocDecode surface all zeros (small clips) | surfaces ≤ 1 MiB must be mapped before the first decode; `rdsvideodec` does it, a bare rocDecode program must too |
 | mux/demux pipeline hangs (in preroll or after a few frames), no error | a demux branch without a `queue`, or more branches pinning batches than `rdsstreammux`'s `buffer-pool-size` (leave it unset) |
 | test process crashes at exit in libamdhip64 TLS destructors | the test `main()` must end with `gst_deinit ()` |
+| `Memory access fault by GPU node-1 ... on address 0x401000`, then SIGABRT (rare, multi-threaded) | ROCm 10.1 SDMA fault with more streams than HW queues: run with `HSA_ENABLE_SDMA=0` (`meson test` sets it; free on the iGPU). `GPU_MAX_HW_QUEUES=16` also works but is ~35 % slower. The host core is in `coredumpctl` on the host |
 | YOLO11n tests `SKIP` ("run tests/models/fetch-yolo11n.sh") | run the fetch script on the host; outputs go to `.cache/models` |
 | `pipeline_tracker` `SKIP`s; `tracker_replay` skips its clip case | run `tests/models/fetch-tracker-clip.sh` on the host; the replay needs a `pipeline_tracker` run after the last change to the tracker core's sources (its saved detections are stamped with their hash) |
 | `vp8dec`/VP8 not found in `redstream:dev` | expected: the image can't decode VP8; `fetch-tracker-clip.sh` decodes it in a python container |
