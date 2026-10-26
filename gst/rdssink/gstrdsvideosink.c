@@ -487,7 +487,8 @@ gst_rds_video_sink_class_init (GstRdsVideoSinkClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_VIDEO_SINK,
       g_param_spec_string ("video-sink", "Video sink",
-          "Factory name of the GStreamer sink that shows the frames (NULL or empty: autovideosink)",
+          "Factory name of the GStreamer sink that shows the frames (NULL or empty: autovideosink; ours: a factory "
+          "name, not an element instance)",
           DEFAULT_VIDEO_SINK, flags | GST_PARAM_MUTABLE_READY));
 
   /* names, ranges and defaults as gst-inspect shows them for DeepStream 8.0's nveglglessink */
@@ -540,6 +541,7 @@ gst_rds_video_sink_class_init (GstRdsVideoSinkClass * klass)
   noop_specs[NOOP_PROFILE] = g_param_spec_uint ("profile", "Profile", NOOP_DESC, 0, G_MAXUINT, 0, flags);
   noop_specs[NOOP_DISPLAY] = g_param_spec_pointer ("display", "Display", NOOP_DESC, flags);
   noop_specs[NOOP_DO_TRANSFORM] = g_param_spec_boolean ("do-transform", "Do transform", NOOP_DESC, TRUE, flags);
+  /* not in DeepStream 8.0's dGPU gst-inspect (Jetson's nveglglessink has it): the string type and default are ours */
   noop_specs[NOOP_WINSYS] = g_param_spec_string ("winsys", "Window system", NOOP_DESC " (x11 or wayland)", "x11",
       flags);
 #undef NOOP_DESC

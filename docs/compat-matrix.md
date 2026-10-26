@@ -394,7 +394,7 @@ silent, or **ours**: where 8.0 settles nothing or is clearly broken.
 | Interval changed while playing | ours | the measurement restarts: one interval to start the count, then a line every interval |
 | A buffer without batch meta | ours | one frame of stream 0 |
 | No stream seen yet | ours | nothing printed |
-| `silent=false` | matches nvdslogger (DeepStream 8.0) | per buffer `<name> BUF_PTS : <pts> element time <running time now> elem-buf=<now − pts, ms> ms buf=<address> buffer_pts_to_running_time = <pts running time>rdslogger base time = <base time>buffer dur <duration>` (no separators before `rdslogger` and `buffer dur`, as in 8.0, whose label reads `nvdslogger base time`), then `BUFFER PTS is lesser than ELEMENT TIME, IT's LATE` or `BUFFER PTS is greater than ELEMENT TIME, IT's EARLY` (equal counts as early: ours); without a clock or PTS, the times print as `99:99:99.999999999` and the second line is left out (ours) |
+| `silent=false` | matches nvdslogger (DeepStream 8.0) | per buffer `<name> BUF_PTS : <pts> element time <running time now> elem-buf=<now − pts, ms> ms buf=<address> buffer_pts_to_running_time = <pts running time>rdslogger base time = <base time>buffer dur <duration>` (no separators before `rdslogger` and `buffer dur`, as in 8.0, whose label reads `nvdslogger base time`), then `BUFFER PTS is lesser than ELEMENT TIME, IT's LATE` or `BUFFER PTS is greater than ELEMENT TIME, IT's EARLY` (ours: only the LATE line was observed in 8.0, so the EARLY wording is inferred; equal counts as early); without a clock or PTS, the times print as `99:99:99.999999999` and the second line is left out (ours) |
 | Latency output | ours | none (8.0 printed none either without `NVDS_ENABLE_LATENCY_MEASUREMENT`) |
 
 ### `rdsvideosink` (`nveglglessink`, `nv3dsink`) properties
@@ -408,7 +408,7 @@ silently (ours: with `autovideosink` the real sink is known only at READY).
 
 | Property | Type | Default | Status | Notes |
 |---|---|---|---|---|
-| `video-sink` | string | `autovideosink` | ours | factory name of the GStreamer sink that shows the frames; NULL or empty: `autovideosink`; an unknown name keeps the current sink with a warning. Changeable only in NULL or READY |
+| `video-sink` | string | `autovideosink` | ours | a factory name (string) of the GStreamer sink that shows the frames; an element instance is not accepted; NULL or empty: `autovideosink`; an unknown name keeps the current sink with a warning. Changeable only in NULL or READY |
 | `sync` | boolean | `TRUE` | forwarded | |
 | `qos` | boolean | `TRUE` | forwarded | |
 | `max-lateness` | int64 −1.. | `5000000` | forwarded | nanoseconds |
@@ -424,7 +424,7 @@ silently (ours: with `autovideosink` the real sink is known only at READY).
 | `profile` | uint | `0` | accepted no-op | as above |
 | `display` | pointer | NULL | accepted no-op | as above |
 | `do-transform` | boolean | `TRUE` | accepted no-op | as above |
-| `winsys` | string | `x11` | accepted no-op | Jetson's nveglglessink (`x11` or `wayland`); as above |
+| `winsys` | string | `x11` | accepted no-op | Jetson's nveglglessink (`x11` or `wayland`); not in 8.0's dGPU gst-inspect, so its string type and `x11` default are ours; as above |
 
 Pads: `sink` (a ghost pad of `rdsvideoconvert`'s): `memory:RDS` or system memory, `NV12`, `I420`, `RGBA`, `BGRA`,
 `RGBx`, `BGRx`, `RGB`, `BGR`, `GRAY8`. Inside: `rdsvideoconvert ! video/x-raw,format=BGRx ! videoconvert !
