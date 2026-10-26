@@ -24,8 +24,8 @@
  * 8.0's GPU mode output at arrow widths 2 and 4) */
 #define ARROW_HEAD_LENGTH 22.0
 #define ARROW_HEAD_HALF_WIDTH 7.0
-/* the ring of a circle whose circle_width is 0 (DeepStream 8.0 still outlines it, ~3 px in GPU mode) */
-#define ZERO_CIRCLE_WIDTH 2
+/* the ring of a circle whose circle_width is 0, in pixels (DeepStream 8.0 still outlines it, 3 px in GPU mode) */
+#define ZERO_CIRCLE_WIDTH 3
 /* shapes further than this outside the frame are not drawn; coordinates beyond it would overflow Cairo's fixed
  * point (ours: such shapes cannot touch the frame, or are degenerate) */
 #define MAX_COORD 4194304.0
@@ -357,27 +357,38 @@ draw_arrow (RdsOsdDraw * d, const Plane * pl, const RdsOSD_ArrowParams * a)
     draw_arrow_head (d, pl, x2, y2, x1, y1, a->arrow_width, &p);
 }
 
-/* A ring of circle_width straddling the radius (DeepStream 8.0 behaviour; width 0 still draws a thin ring), filled
- * inside the ring with bg_color when has_bg_color. */
+/* A ring straddling the radius (DeepStream 8.0 behaviour, GPU mode): circle_width w covers the pixels whose
+ * distance from the centre pixel is in [r - floor(w/2), r + ceil(w/2)] (w 3, r 60: 59..62); w 0 still draws a
+ * ZERO_CIRCLE_WIDTH ring centred on r (59..61). has_bg_color fills inside the ring with bg_color. The band edges
+ * lie half a pixel outside those distances, so no pixel centre sits on an edge. */
 static void
 draw_circle (RdsOsdDraw * d, const Plane * pl, const RdsOSD_CircleParams * c)
 {
-  gdouble w = c->circle_width > 0 ? MIN (c->circle_width, MAX_COORD) : ZERO_CIRCLE_WIDTH;
-  gdouble xc = c->xc + 0.5, yc = c->yc + 0.5, r = c->radius + 0.5, reach = r + w / 2 + 1, inner = r - w / 2;
+  gdouble w = MIN (c->circle_width, MAX_COORD), r = c->radius, lo, hi;
+  gdouble xc = c->xc + 0.5, yc = c->yc + 0.5, inner, outer;
   Paint p;
   Mask m;
 
   if (c->xc > MAX_COORD || c->yc > MAX_COORD || c->radius > MAX_COORD)
     return;
+  if (c->circle_width > 0) {
+    lo = floor (w / 2);
+    hi = ceil (w / 2);
+  } else {
+    lo = hi = (ZERO_CIRCLE_WIDTH - 1) / 2;
+  }
+  inner = r - lo - 0.5;
+  outer = r + hi + 0.5;
   if (c->has_bg_color && inner > 0 && paint_init (&p, &c->bg_color)
       && mask_begin (d, pl, xc - inner, yc - inner, xc + inner, yc + inner, &m)) {
     cairo_arc (m.cr, xc, yc, inner, 0, 2 * G_PI);
     cairo_fill (m.cr);
     mask_end (d, pl, &m, &p);
   }
-  if (paint_init (&p, &c->circle_color) && mask_begin (d, pl, xc - reach, yc - reach, xc + reach, yc + reach, &m)) {
-    cairo_set_line_width (m.cr, w);
-    cairo_arc (m.cr, xc, yc, r, 0, 2 * G_PI);
+  if (paint_init (&p, &c->circle_color)
+      && mask_begin (d, pl, xc - outer - 1, yc - outer - 1, xc + outer + 1, yc + outer + 1, &m)) {
+    cairo_set_line_width (m.cr, outer - MAX (inner, 0));
+    cairo_arc (m.cr, xc, yc, (outer + MAX (inner, 0)) / 2, 0, 2 * G_PI);
     cairo_stroke (m.cr);
     mask_end (d, pl, &m, &p);
   }
@@ -423,7 +434,15 @@ draw_text (RdsOsdDraw * d, const Plane * pl, const RdsOSD_TextParams * t)
   if (size == 0 || t->display_text == NULL || t->display_text[0] == '\0' || bx >= pl->width || by >= pl->height)
     return;
   pango_layout_set_font_description (d->layout, font_for (d, t->font_params.font_name, size));
-  pango_layout_set_text (d->layout, t->display_text, -1);
+  if (g_utf8_validate (t->display_text, -1, NULL)) {
+    pango_layout_set_text (d->layout, t->display_text, -1);
+  } else {
+    /* ours: invalid UTF-8 is drawn with U+FFFD for the bad bytes (Pango refuses such text) */
+    gchar *valid = g_utf8_make_valid (t->display_text, -1);
+
+    pango_layout_set_text (d->layout, valid, -1);
+    g_free (valid);
+  }
   pango_layout_get_pixel_extents (d->layout, &ink, &logical);
 
   if (t->set_bg_clr && paint_init (&p, &t->text_bg_clr))

@@ -331,6 +331,7 @@ where the docs are silent, or **ours**: where 8.0 settles nothing or is clearly 
 | Text box padding | ours | `font_size` / 2 pixels left and right, `font_size` / 4 above and below, around Pango's logical extents (8.0: ≈10 and ≈5 at size 20; size 20 boxes ≈40 px tall) |
 | Fonts | matches nvdsosd (DeepStream 8.0) | `font_name` honoured (a fontconfig / Pango name); unknown: fontconfig's fallback, a sans; `font_size` in points at 96 dpi; `font_size` 0, NULL or empty text: nothing drawn, not even the box; `\n` starts a new line; antialiased glyphs |
 | NULL or empty `font_name` | ours | `Sans` (8.0's GPU mode crashes on NULL) |
+| Text encoding | ours | `display_text` is UTF-8, shaped by Pango (any script the installed fonts cover); invalid UTF-8 is drawn with U+FFFD for the bad bytes (8.0 not observed) |
 | Font sizes above 1024 | ours | drawn at 1024 points |
 | Switches | matches nvdsosd (DeepStream 8.0) | `display-bbox=0` hides object and display-meta rects only; `display-text=0` hides object text, display-meta labels and the clock |
 | Draw order | matches nvdsosd (DeepStream 8.0) | all rects (objects, then display metas), all text (objects, then labels), lines, arrows, circles, the clock; within a kind in list order, later on top. The order of arrows against circles is ours |
@@ -339,11 +340,11 @@ where the docs are silent, or **ours**: where 8.0 settles nothing or is clearly 
 | Arrow heads | matches nvdsosd (DeepStream 8.0) | an open V at (x1, y1) for `START_HEAD` and (x2, y2) for `END_HEAD`, its wings 22 px back and 7 px to each side (measured), drawn with the shaft's width |
 | `BOTH_HEAD` | ours | a head at both ends (8.0 draws one head, or nothing in CPU mode) |
 | Other `arrow_head` values, zero-length arrows | ours | the shaft only |
-| Circles | matches nvdsosd (DeepStream 8.0) | a ring of `circle_width` straddling the radius; `has_bg_color` fills inside the ring with `bg_color`; clipped at the frame |
-| `circle_width` 0 | matches nvdsosd (DeepStream 8.0) | still outlined (drawn 2 px wide here, ≈3 px in 8.0's GPU mode), so zeroed circles stay visible |
+| Circles | matches nvdsosd (DeepStream 8.0) | a ring straddling the radius: `circle_width` w covers the pixels at distances r − ⌊w/2⌋ .. r + ⌈w/2⌉ from the centre (w 3, r 60: 59..62); `has_bg_color` fills inside the ring with `bg_color`; clipped at the frame |
+| `circle_width` 0 | matches nvdsosd (DeepStream 8.0) | still outlined, 3 px centred on the radius (r 60: 59..61), so zeroed circles stay visible |
 | Shapes beyond 4194304 pixels | ours | circles and arrow heads with such coordinates are not drawn (lines are clipped first) |
 | Clock | matches nvdsosd (DeepStream 8.0) | `YYYY-MM-DD HH:MM:SS`, the process's local time read once per buffer, drawn like text without a box at the clock offsets; default font a serif; one per frame |
-| Clock without frame meta | ours | a buffer with no frame meta gets the clock on every frame |
+| A buffer without frame meta | ours | passes through untouched, except that it gets the clock on every frame when `display-clock` is on |
 | Masks | ours | not drawn yet (`display-mask` accepted, one warning); 8.0 draws them only with `display-mask=1` |
 | Blur | ours | not done yet (`blur-bbox`, `blur-on-gie-class-ids` accepted, one warning); 8.0 blurs in GPU mode only |
 | Batched input | ours | each frame meta drawn on its own surface, the slot at its `batch_id` (8.0 draws every frame's meta on surface 0); a `batch_id` outside the batch is skipped with one element warning |

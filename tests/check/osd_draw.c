@@ -561,6 +561,26 @@ test_text_empty (void)
 }
 
 static void
+test_text_utf8 (void)
+{
+  Img im;
+  Frame f;
+  gint x0, y0, x1, y1;
+
+  /* ours: text is UTF-8, shaped by Pango; invalid bytes are drawn as U+FFFD instead of being refused */
+  img_init (&im, 640, 120);
+  frame_init (&f);
+  frame_add_object (&f)->text_params = text ("Gr\xc3\xb6\xc3\x9f" "e \xe2\x82\xac", 10, 10, "Sans", 20, FALSE);
+  frame_add_object (&f)->text_params = text ("bad \xff\xfe bytes", 300, 10, "Sans", 20, FALSE);
+  draw (&im, &f, NULL);
+  g_assert_true (drawn_bbox (&im, &x0, &y0, &x1, &y1));
+  g_assert_cmpint (count_rgb (&im, 0, 0, 290, 119, 255, 255, 255), >, 30);
+  g_assert_cmpint (count_rgb (&im, 300, 0, 639, 119, 255, 255, 255), >, 30);
+  frame_clear (&f);
+  img_clear (&im);
+}
+
+static void
 test_text_alpha (void)
 {
   Img im;
@@ -729,22 +749,30 @@ test_circles (void)
   dm->circle_params[3] = (RdsOSD_CircleParams) {.xc = 630,.yc = 350,.radius = 40,.circle_color = CYAN,
     .circle_width = 3 };
   draw (&im, &f, NULL);
-  /* the ring straddles the radius */
-  g_assert_true (drawn_at_distance (&im, 100, 100, 60));
-  g_assert_true (drawn_at_distance (&im, 100, 100, 61));
+  /* DeepStream 8.0 GPU mode: w 3, r 60 covers distances 59..62 on every side */
+  g_assert_true (grey_at_distance (&im, 100, 100, 58));
+  for (gint dist = 59; dist <= 62; dist++)
+    g_assert_true (drawn_at_distance (&im, 100, 100, dist));
+  g_assert_true (grey_at_distance (&im, 100, 100, 63));
   g_assert_true (is_color (&im, 40, 100, &RED));
-  g_assert_true (grey_at_distance (&im, 100, 100, 56));
-  g_assert_true (grey_at_distance (&im, 100, 100, 65));
+  g_assert_true (is_color (&im, 162, 100, &RED));
   g_assert_true (is_grey (&im, 100, 100));
-  /* filled inside the ring */
+  /* filled inside the ring (to distance 58), the ring on top */
   g_assert_true (is_color (&im, 300, 100, &BLUE));
-  g_assert_true (is_color (&im, 300 - 55, 100, &BLUE));
-  g_assert_true (is_color (&im, 300 - 60, 100, &GREEN));
-  g_assert_true (grey_at_distance (&im, 300, 100, 65));
-  /* width 0 */
-  g_assert_true (drawn_at_distance (&im, 500, 100, 60));
-  g_assert_true (grey_at_distance (&im, 500, 100, 57));
-  g_assert_true (grey_at_distance (&im, 500, 100, 64));
+  g_assert_true (is_color (&im, 300 - 58, 100, &BLUE));
+  g_assert_true (is_color (&im, 300 + 58, 100, &BLUE));
+  for (gint dist = 59; dist <= 62; dist++) {
+    g_assert_true (is_color (&im, 300 - dist, 100, &GREEN));
+    g_assert_true (is_color (&im, 300 + dist, 100, &GREEN));
+    g_assert_true (is_color (&im, 300, 100 - dist, &GREEN));
+    g_assert_true (is_color (&im, 300, 100 + dist, &GREEN));
+  }
+  g_assert_true (grey_at_distance (&im, 300, 100, 63));
+  /* width 0: a 3 px ring, 59..61 (DeepStream 8.0 behaviour) */
+  g_assert_true (grey_at_distance (&im, 500, 100, 58));
+  for (gint dist = 59; dist <= 61; dist++)
+    g_assert_true (drawn_at_distance (&im, 500, 100, dist));
+  g_assert_true (grey_at_distance (&im, 500, 100, 62));
   g_assert_true (is_color (&im, 630 - 40, 350, &CYAN));
   frame_clear (&f);
   img_clear (&im);
@@ -866,7 +894,7 @@ test_draw_order (void)
   dm->arrow_params[0] = (RdsOSD_ArrowParams) {.x1 = 170,.y1 = 100,.x2 = 170,.y2 = 290,.arrow_width = 3,
     .arrow_head = RDS_OSD_ARROW_END_HEAD,.arrow_color = MAGENTA };
   dm->num_circles = 1;
-  dm->circle_params[0] = (RdsOSD_CircleParams) {.xc = 170,.yc = 175,.radius = 6,.circle_color = BLUE,
+  dm->circle_params[0] = (RdsOSD_CircleParams) {.xc = 170,.yc = 180,.radius = 6,.circle_color = BLUE,
     .has_bg_color = 1,.bg_color = BLUE,.circle_width = 1 };
   /* a later display meta's rect still goes under every text */
   dm = frame_add_display (&f);
@@ -880,7 +908,10 @@ test_draw_order (void)
   g_assert_true (is_color (&im, 300, 222, &WHITE));        /* labels over display rects of later metas too */
   g_assert_true (is_color (&im, 290, 170, &CYAN));         /* lines over text */
   g_assert_true (is_color (&im, 170, 150, &MAGENTA));      /* arrows over lines and rects */
-  g_assert_true (is_color (&im, 170, 170, &BLUE));         /* circles over arrows and lines */
+  g_assert_true (is_color (&im, 170, 169, &MAGENTA));      /* arrows over lines (the line covers rows 168..172) */
+  g_assert_true (is_color (&im, 175, 170, &CYAN));
+  g_assert_true (is_color (&im, 170, 180, &BLUE));         /* circles over arrows */
+  g_assert_true (is_color (&im, 170, 174, &BLUE));         /* the ring over the line's last row and the arrow */
   frame_clear (&f);
   img_clear (&im);
 }
@@ -1083,6 +1114,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/osd/text-fonts", test_text_fonts);
   g_test_add_func ("/cpu/osd/text-empty", test_text_empty);
   g_test_add_func ("/cpu/osd/text-alpha", test_text_alpha);
+  g_test_add_func ("/cpu/osd/text-utf8", test_text_utf8);
   g_test_add_func ("/cpu/osd/lines", test_lines);
   g_test_add_func ("/cpu/osd/arrows", test_arrows);
   g_test_add_func ("/cpu/osd/arrow-degenerate", test_arrow_degenerate);

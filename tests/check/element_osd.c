@@ -148,9 +148,9 @@ box_at (gfloat left, gfloat top, guint bw)
 }
 
 /* A device batch of @n grey RGBA slots, slot i with a frame meta (batch_id i) holding one object: a red 3 px box at
- * (20 + 80 i, 30). */
+ * (20 + 80 i, 30). Without @with_meta, no batch meta at all. */
 static GstBuffer *
-make_batch (guint n)
+make_batch_full (guint n, gboolean with_meta)
 {
   RdsBufSurfaceCreateParams cp = {.width = W,.height = H,.layout = RDS_BUF_LAYOUT_PITCH,
     .colorFormat = RDS_BUF_COLOR_FORMAT_RGBA
@@ -177,9 +177,18 @@ make_batch (guint n)
     rds_add_obj_meta_to_frame (fm, om, NULL);
   }
   s->numFilled = n;
-  g_assert_nonnull (rds_buffer_add_batch_meta (buf, bm));
+  if (with_meta)
+    g_assert_nonnull (rds_buffer_add_batch_meta (buf, bm));
+  else
+    rds_destroy_batch_meta (bm);
   GST_BUFFER_PTS (buf) = 0;
   return buf;
+}
+
+static GstBuffer *
+make_batch (guint n)
+{
+  return make_batch_full (n, TRUE);
 }
 
 static RdsFrameMeta *
@@ -220,6 +229,35 @@ osd_clear (Osd * o)
   gst_bus_set_flushing (o->bus, TRUE);
   gst_harness_teardown (o->h);
   gst_object_unref (o->bus);
+}
+
+static void
+test_mutable_ready (void)
+{
+  Osd o;
+  guint size, x, color;
+  gint mode;
+  gboolean text;
+
+  /* the properties gst-inspect marks "changeable only in NULL or READY" keep their value while PLAYING, with a
+   * warning; the others change */
+  osd_init (&o, NULL);
+  g_assert_cmpint (GST_STATE (o.h->element), ==, GST_STATE_PLAYING);
+  g_test_expect_message ("rdsosd", G_LOG_LEVEL_WARNING, "*clock-font-size*NULL or READY*");
+  g_test_expect_message ("rdsosd", G_LOG_LEVEL_WARNING, "*x-clock-offset*NULL or READY*");
+  g_test_expect_message ("rdsosd", G_LOG_LEVEL_WARNING, "*clock-color*NULL or READY*");
+  g_test_expect_message ("rdsosd", G_LOG_LEVEL_WARNING, "*process-mode*NULL or READY*");
+  g_object_set (o.h->element, "clock-font-size", 20u, "x-clock-offset", 5u, "clock-color", 0x00ff00ffu,
+      "process-mode", 0, "display-text", FALSE, NULL);
+  g_test_assert_expected_messages ();
+  g_object_get (o.h->element, "clock-font-size", &size, "x-clock-offset", &x, "clock-color", &color,
+      "process-mode", &mode, "display-text", &text, NULL);
+  g_assert_cmpuint (size, ==, 0);
+  g_assert_cmpuint (x, ==, 0);
+  g_assert_cmpuint (color, ==, 0);
+  g_assert_cmpint (mode, ==, 1);
+  g_assert_false (text);
+  osd_clear (&o);
 }
 
 static guint
@@ -418,35 +456,105 @@ test_tracker_object (void)
   osd_clear (&o);
 }
 
-/* Pixels drawn in the clock's region (offsets 100, 150; the frame's object box lies above it). */
+/* Pixels drawn in the clock's region (offsets 100, 150; the frame's object box lies above it) of each of the @n
+ * slots of the output, and how many of them are opaque red (@red, may be NULL). */
 static guint
-clock_pixels (const gchar * props)
+clock_pixels_full (const gchar * props, guint n, gboolean with_meta, guint slot, guint * red)
 {
   Osd o;
   GstBuffer *out;
   HostImage img;
-  guint n;
+  guint drawn;
 
   osd_init (&o, props);
-  out = osd_run (&o, make_batch (1));
-  snapshot (rds_buffer_get_surface (out), 0, &img);
-  n = (W - 100) * (H - 150) - count_rgb (&img, 100, 150, W - 1, H - 1, GREY, GREY, GREY);
+  out = osd_run (&o, make_batch_full (n, with_meta));
+  snapshot (rds_buffer_get_surface (out), slot, &img);
+  drawn = (W - 100) * (H - 150) - count_rgb (&img, 100, 150, W - 1, H - 1, GREY, GREY, GREY);
+  if (red != NULL)
+    *red = count_rgb (&img, 100, 150, W - 1, H - 1, 255, 0, 0);
   host_image_clear (&img);
   gst_buffer_unref (out);
+  g_assert_cmpuint (count_messages (o.bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING), ==, 0);
   osd_clear (&o);
-  return n;
+  return drawn;
+}
+
+static guint
+clock_pixels (const gchar * props)
+{
+  return clock_pixels_full (props, 1, TRUE, 0, NULL);
 }
 
 static void
 test_clock (void)
 {
+  guint red = 0, drawn;
+
   RDS_TEST_REQUIRE_GPU ();
-  /* clock-color never set: red; 0: invisible; display-text=0 hides it (DeepStream 8.0 behaviour) */
-  g_assert_cmpuint (clock_pixels ("display-clock=true x-clock-offset=100 y-clock-offset=150"), >, 30);
+  /* clock-color never set: opaque red; 0: invisible; display-text=0 hides it (DeepStream 8.0 behaviour) */
+  drawn = clock_pixels_full ("display-clock=true x-clock-offset=100 y-clock-offset=150", 1, TRUE, 0, &red);
+  g_assert_cmpuint (drawn, >, 30);
+  g_assert_cmpuint (red, >, 20);
+  /* the antialiased edges are red over grey: no other hue */
+  drawn = clock_pixels_full ("display-clock=true x-clock-offset=100 y-clock-offset=150 clock-color=0x00ff00ff", 1,
+      TRUE, 0, &red);
+  g_assert_cmpuint (drawn, >, 30);
+  g_assert_cmpuint (red, ==, 0);
   g_assert_cmpuint (clock_pixels ("display-clock=true x-clock-offset=100 y-clock-offset=150 clock-color=0"), ==, 0);
   g_assert_cmpuint (clock_pixels ("display-clock=true x-clock-offset=100 y-clock-offset=150 display-text=false"),
       ==, 0);
   g_assert_cmpuint (clock_pixels ("display-clock=false x-clock-offset=100 y-clock-offset=150"), ==, 0);
+}
+
+static void
+test_no_frame_meta (void)
+{
+  Osd o;
+  GstBuffer *out;
+  HostImage img;
+  guint red = 0;
+
+  /* ours: a batch without frame meta passes through, and gets the clock on every frame */
+  RDS_TEST_REQUIRE_GPU ();
+  for (guint slot = 0; slot < 3; slot++) {
+    g_assert_cmpuint (clock_pixels_full ("display-clock=true x-clock-offset=100 y-clock-offset=150", 3, FALSE, slot,
+            &red), >, 30);
+    g_assert_cmpuint (red, >, 20);
+  }
+  osd_init (&o, NULL);
+  out = osd_run (&o, make_batch_full (3, FALSE));
+  for (guint slot = 0; slot < 3; slot++) {
+    snapshot (rds_buffer_get_surface (out), slot, &img);
+    g_assert_cmpuint (count_rgb (&img, 0, 0, W - 1, H - 1, GREY, GREY, GREY), ==, W * H);
+    host_image_clear (&img);
+  }
+  gst_buffer_unref (out);
+  g_assert_cmpuint (count_messages (o.bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING), ==, 0);
+  osd_clear (&o);
+}
+
+static void
+test_batch_id_outside (void)
+{
+  Osd o;
+  GstBuffer *in, *out;
+  HostImage img;
+
+  /* ours: a frame meta whose batch_id is outside the batch is skipped, with one element warning */
+  RDS_TEST_REQUIRE_GPU ();
+  osd_init (&o, NULL);
+  for (guint k = 0; k < 3; k++) {
+    in = make_batch (1);
+    frame_of (in, 0)->batch_id = 5;
+    out = osd_run (&o, in);
+    snapshot (rds_buffer_get_surface (out), 0, &img);
+    g_assert_cmpuint (count_rgb (&img, 0, 0, W - 1, H - 1, GREY, GREY, GREY), ==, W * H);
+    host_image_clear (&img);
+    gst_buffer_unref (out);
+  }
+  g_assert_cmpuint (count_messages (o.bus, GST_MESSAGE_WARNING), ==, 1);
+  g_assert_cmpuint (count_messages (o.bus, GST_MESSAGE_ERROR), ==, 0);
+  osd_clear (&o);
 }
 
 static void
@@ -505,12 +613,15 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/osd-element/properties", test_properties);
   g_test_add_func ("/cpu/osd-element/noops-warn-once", test_noops_warn_once);
   g_test_add_func ("/cpu/osd-element/caps", test_caps);
+  g_test_add_func ("/cpu/osd-element/mutable-ready", test_mutable_ready);
   g_test_add_func ("/gpu/osd-element/single", test_single);
   g_test_add_func ("/gpu/osd-element/batch", test_batch);
   g_test_add_func ("/gpu/osd-element/view-copied", test_view_copied);
   g_test_add_func ("/gpu/osd-element/shared-copied", test_shared_copied);
   g_test_add_func ("/gpu/osd-element/tracker-object", test_tracker_object);
   g_test_add_func ("/gpu/osd-element/clock", test_clock);
+  g_test_add_func ("/gpu/osd-element/no-frame-meta", test_no_frame_meta);
+  g_test_add_func ("/gpu/osd-element/batch-id-outside", test_batch_id_outside);
   g_test_add_func ("/gpu/osd-element/border-clamped", test_border_clamped);
   g_test_add_func ("/gpu/osd-element/switches", test_switches);
   ret = g_test_run ();
