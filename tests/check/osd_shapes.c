@@ -433,8 +433,9 @@ test_arrow_heads (void)
   g_assert_true (is_rgba (&im, 27, 47, 255, 0, 0, 255));
   img_clear (&im);
 
-  /* the same head without the join: its pixels past the tip go */
+  /* the same head without the join (the wings alone, a complete shape): its pixels past the tip go */
   img_init (&im, 96, 80);
+  c[1].flags &= ~RDS_OSD_CMD_UNION_NEXT;
   draw (&im, c, 2, NULL);
   g_assert_true (is_grey (&im, 51, 40));
   img_clear (&im);
@@ -644,6 +645,60 @@ test_order (void)
   img_clear (&im);
 }
 
+/* ---- 64-bit headroom ---- */
+
+static void
+test_headroom (void)
+{
+  /* the widest frame shapes are drawn on, a few rows: the largest coordinates and widths the builders accept, as
+   * shade_commands draws them and as shade_pixel does */
+  const gint w = RDS_OSD_MAX_SHAPE_FRAME, h = 3;
+  RdsOsdColor c[4];
+  RdsOsdCmd cmds[16];
+  guint n = 0;
+  Img a, b;
+
+  rds_osd_color_init (&c[0], 1, 0, 0, 0.5);
+  rds_osd_color_init (&c[1], 0, 1, 0, 0.5);
+  rds_osd_color_init (&c[2], 0, 0, 1, 0.5);
+  rds_osd_color_init (&c[3], 1, 1, 0, 0.5);
+  /* lines as long as coordinates go, at the widest stroke (clamped to 2·2^20 + 1) and thin */
+  n += rds_osd_shape_line (&cmds[n], 0, 1, G_MAXUINT, 2, G_MAXUINT, &c[0], w, h);
+  n += rds_osd_shape_line (&cmds[n], G_MAXUINT, 0, 0, G_MAXUINT, 3, &c[1], w, h);
+  n += rds_osd_shape_line (&cmds[n], 0, 1, G_MAXUINT, 1, 5, &c[2], w, h);
+  /* arrow heads at RDS_OSD_MAX_COORD, widest and thin */
+  n += rds_osd_shape_arrow_head (&cmds[n], RDS_OSD_MAX_COORD, 1, 0, 1, G_MAXUINT, &c[3], w, h);
+  n += rds_osd_shape_arrow_head (&cmds[n], w - 3, 1, RDS_OSD_MAX_COORD, RDS_OSD_MAX_COORD, G_MAXUINT, &c[1], w, h);
+  n += rds_osd_shape_arrow_head (&cmds[n], w - 10, 1, 0, 1, 9, &c[2], w, h);
+  /* rings as large as allowed */
+  n += rds_osd_shape_circle (&cmds[n], RDS_OSD_MAX_COORD, RDS_OSD_MAX_COORD, RDS_OSD_MAX_COORD, G_MAXUINT, &c[0],
+      &c[1], w, h);
+  n += rds_osd_shape_circle (&cmds[n], w / 2, 1, RDS_OSD_MAX_COORD, 3, &c[2], &c[3], w, h);
+  g_assert_cmpuint (n, >=, 8);
+
+  img_init (&a, w, h);
+  img_init (&b, w, h);
+  rds_osd_shade_commands (cmds, n, NULL, a.data, w, h, a.stride);
+  for (gint y = 0; y < h; y++)
+    for (gint x = 0; x < w; x++)
+      rds_osd_shade_pixel (cmds, NULL, n, x, y, b.data + y * b.stride + 4 * x, NULL);
+  for (gint y = 0; y < h; y++)
+    if (memcmp (a.data + y * a.stride, b.data + y * b.stride, 4 * (gsize) w) != 0)
+      g_error ("row %d differs", y);
+  /* the widest line covers the whole frame */
+  for (gint y = 0; y < h; y++)
+    for (gint x = 0; x < w; x += 4099)
+      g_assert_false (is_grey (&a, x, y));
+  img_clear (&a);
+  img_clear (&b);
+
+  /* one pixel wider: lines, arrow heads and circles are not drawn (ours) */
+  g_assert_cmpuint (rds_osd_shape_line (cmds, 0, 1, 10, 1, 3, &c[0], w + 1, h), ==, 0);
+  g_assert_cmpuint (rds_osd_shape_arrow_head (cmds, 10, 1, 0, 1, 3, &c[0], w + 1, h), ==, 0);
+  g_assert_cmpuint (rds_osd_shape_circle (cmds, 10, 1, 5, 3, &c[0], NULL, w + 1, h), ==, 0);
+  g_assert_cmpuint (rds_osd_shape_line (cmds, 0, 1, 10, 1, G_MAXUINT, &c[0], 4, G_MAXINT), ==, 0);
+}
+
 /* ---- per bounding box == per pixel ---- */
 
 static void
@@ -739,5 +794,6 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/osd-shapes/blend", test_blend);
   g_test_add_func ("/cpu/osd-shapes/order", test_order);
   g_test_add_func ("/cpu/osd-shapes/bbox-equals-per-pixel", test_bbox_equals_per_pixel);
+  g_test_add_func ("/cpu/osd-shapes/headroom", test_headroom);
   return g_test_run ();
 }

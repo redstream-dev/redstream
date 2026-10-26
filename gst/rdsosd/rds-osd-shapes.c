@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-osd-shapes.h"
 
+#include <assert.h>
 #include <math.h>
 #include <string.h>
 
@@ -197,12 +198,16 @@ unsigned
 rds_osd_shape_line (RdsOsdCmd * out, double x1, double y1, double x2, double y2, unsigned line_width,
     const RdsOsdColor * c, int32_t width, int32_t height)
 {
-  int64_t s = stroke_width (line_width, width, height);
-  double margin = (double) s + 2;
+  int64_t s;
+  double margin;
 
+  /* first: stroke_width's clamp would wrap on larger frames */
+  if (!shape_frame_ok (width, height))
+    return 0;
+  s = stroke_width (line_width, width, height);
+  margin = (double) s + 2;
   /* clipped to a margin around the frame first, which keeps every coordinate in fixed-point range */
-  if (!shape_frame_ok (width, height)
-      || !clip_segment (&x1, &y1, &x2, &y2, -margin, -margin, width + margin, height + margin))
+  if (!clip_segment (&x1, &y1, &x2, &y2, -margin, -margin, width + margin, height + margin))
     return 0;
   return segment (out, to_fixed (x1 + 0.5), to_fixed (y1 + 0.5), to_fixed (x2 + 0.5), to_fixed (y2 + 0.5),
       s * RDS_OSD_FIXED_ONE / 2, 1, c, width, height);
@@ -231,7 +236,7 @@ rds_osd_shape_arrow_head (RdsOsdCmd out[3], double tx, double ty, double fx, dou
     const RdsOsdColor * c, int32_t width, int32_t height)
 {
   double len = hypot (tx - fx, ty - fy), ux, uy;
-  int64_t hf = stroke_width (line_width, width, height) * RDS_OSD_FIXED_ONE / 2;
+  int64_t hf;
   int32_t tipx, tipy, wx[2], wy[2];
   RdsOsdTriangle tri;
   unsigned n = 0;
@@ -239,6 +244,7 @@ rds_osd_shape_arrow_head (RdsOsdCmd out[3], double tx, double ty, double fx, dou
   if (!shape_frame_ok (width, height) || len == 0 || fabs (tx) > RDS_OSD_MAX_COORD || fabs (ty) > RDS_OSD_MAX_COORD
       || fabs (fx) > RDS_OSD_MAX_COORD || fabs (fy) > RDS_OSD_MAX_COORD)
     return 0;
+  hf = stroke_width (line_width, width, height) * RDS_OSD_FIXED_ONE / 2;
   ux = (tx - fx) / len;
   uy = (ty - fy) / len;
   tipx = to_fixed (tx + 0.5);
@@ -470,12 +476,14 @@ row_spans (const RdsOsdCmd * c, int32_t y, int64_t out[2][2])
 }
 
 void
-rds_osd_shade_commands (const RdsOsdCmd * cmds, size_t n, const uint8_t * masks, uint8_t * data, int32_t width,
+rds_osd_shade_commands (const RdsOsdCmd * cmds, uint32_t n, const uint8_t * masks, uint8_t * data, int32_t width,
     int32_t height, size_t stride)
 {
   LutCache cache = {.n = 0 };
 
-  for (size_t i = 0, j; i < n; i = j + 1) {
+  /* the list never ends inside a shape (rds_osd_shade_pixel); if it does, its last command ends the shape there too */
+  assert (n == 0 || !(cmds[n - 1].flags & RDS_OSD_CMD_UNION_NEXT));
+  for (uint32_t i = 0, j; i < n; i = j + 1) {
     int32_t x0, y0, x1, y1;
     const uint8_t (*lut)[4] = NULL;
 
@@ -485,7 +493,7 @@ rds_osd_shade_commands (const RdsOsdCmd * cmds, size_t n, const uint8_t * masks,
     y0 = cmds[i].y0;
     x1 = cmds[i].x1;
     y1 = cmds[i].y1;
-    for (size_t k = i + 1; k <= j; k++) {
+    for (uint32_t k = i + 1; k <= j; k++) {
       x0 = MIN2 (x0, cmds[k].x0);
       y0 = MIN2 (y0, cmds[k].y0);
       x1 = MAX2 (x1, cmds[k].x1);
@@ -508,7 +516,7 @@ rds_osd_shade_commands (const RdsOsdCmd * cmds, size_t n, const uint8_t * masks,
           lut_blend (px, lut);
         continue;
       }
-      if (lut != NULL) {
+      if (i == j && cmds[i].type == RDS_OSD_CMD_MASK) {
         /* a mask: its row of coverage */
         const RdsOsdMask *m = &cmds[i].mask;
         const uint8_t *cov = masks + m->offset + (size_t) (y - m->y) * m->stride + (size_t) (x0 - m->x);
@@ -536,7 +544,7 @@ rds_osd_shade_commands (const RdsOsdCmd * cmds, size_t n, const uint8_t * masks,
       for (int32_t x = x0; x <= x1; x++, px += 4) {
         uint8_t coverage = 0;
 
-        for (size_t k = i; k <= j; k++) {
+        for (uint32_t k = i; k <= j; k++) {
           uint8_t v = rds_osd_cmd_coverage (&cmds[k], x, y, masks);
 
           coverage = MAX2 (coverage, v);

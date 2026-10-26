@@ -33,7 +33,8 @@
 #ifdef __clang__
 #define RDS_OSD_NO_CONTRACT _Pragma ("clang fp contract(off)")
 #else
-#define RDS_OSD_NO_CONTRACT     /* GCC: -ffp-contract=off in the build */
+#define RDS_OSD_NO_CONTRACT     /* GCC ignores the pragma: whoever includes this header builds with -ffp-contract=off
+                                 * (rdsosd_core_dep passes it on) */
 #endif
 
 #ifdef __cplusplus
@@ -42,6 +43,11 @@
 #define RDS_OSD_STATIC_ASSERT(e, msg) _Static_assert (e, msg)
 #endif
 
+/* Circles and arrow heads with a coordinate, radius or width beyond this are not drawn (ours); widths are taken as
+ * this at most. Lines, arrows and circles are drawn on frames up to RDS_OSD_MAX_SHAPE_FRAME pixels a side (ours):
+ * with both limits every fixed-point product fits in 64 bits. */
+#define RDS_OSD_MAX_COORD 2097152
+#define RDS_OSD_MAX_SHAPE_FRAME 1048576
 /* segment and triangle coordinates: 24.8 fixed point, the pixel centre of x is x * 256 + 128 */
 #define RDS_OSD_FIXED_ONE 256
 /* added before truncating a blend, so that a sum that is exact in decimal (127.5 + 127.5) is not lost to binary
@@ -139,6 +145,8 @@ rds_osd_cmd_coverage (const RdsOsdCmd * c, int32_t x, int32_t y, const uint8_t *
       return 255;
     case RDS_OSD_CMD_SEGMENT:{
       const RdsOsdSegment *s = &c->segment;
+      /* Within RDS_OSD_MAX_SHAPE_FRAME and the builders' clipping, |px|, |py| < 2^30 (~1.07e9) and |dx|, |dy| < 1.4e9:
+       * each product stays below 1.5e18 and their sum and difference below 3e18, inside int64. */
       int64_t px = (int64_t) x * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2 - s->ax;
       int64_t py = (int64_t) y * RDS_OSD_FIXED_ONE + RDS_OSD_FIXED_ONE / 2 - s->ay;
       int64_t cross = (int64_t) s->dx * py - (int64_t) s->dy * px;
@@ -192,7 +200,9 @@ rds_osd_blend (uint8_t * px, const RdsOsdColor * color, uint8_t coverage)
 }
 
 /* Shades the RGBA pixel @rgba at (x, y) with the commands @list[0 .. n−1] (indices into @cmds; NULL: @cmds[0 .. n−1]),
- * in order. A shape's commands (RDS_OSD_CMD_UNION_NEXT) must be consecutive in the list. */
+ * in order. A shape's commands (RDS_OSD_CMD_UNION_NEXT) must be consecutive and complete in the list: a list that
+ * holds any command of a shape holds all of them, and never ends on a command flagged RDS_OSD_CMD_UNION_NEXT. (The
+ * last command of a list ends its shape whatever its flag, here and in rds_osd_shade_commands.) */
 RDS_OSD_FN void
 rds_osd_shade_pixel (const RdsOsdCmd * cmds, const uint32_t * list, uint32_t n, int32_t x, int32_t y, uint8_t * rgba,
     const uint8_t * masks)
@@ -205,7 +215,7 @@ rds_osd_shade_pixel (const RdsOsdCmd * cmds, const uint32_t * list, uint32_t n, 
 
     if (v > coverage)
       coverage = v;
-    if (c->flags & RDS_OSD_CMD_UNION_NEXT)
+    if ((c->flags & RDS_OSD_CMD_UNION_NEXT) && i + 1 < n)
       continue;
     if (coverage != 0)
       rds_osd_blend (rgba, &c->color, coverage);
@@ -219,12 +229,6 @@ rds_osd_shade_pixel (const RdsOsdCmd * cmds, const uint32_t * list, uint32_t n, 
 extern "C"
 {
 #endif
-
-/* Circles and arrow heads with a coordinate, radius or width beyond this are not drawn (ours); widths are taken as
- * this at most. Lines, arrows and circles are drawn on frames up to RDS_OSD_MAX_SHAPE_FRAME pixels a side (ours):
- * with both limits every fixed-point product fits in 64 bits. */
-#define RDS_OSD_MAX_COORD 2097152
-#define RDS_OSD_MAX_SHAPE_FRAME 1048576
 
 /* ---- building commands (host): each returns the number of commands written, 0 when nothing would be drawn ---- */
 
@@ -266,7 +270,7 @@ unsigned rds_osd_shape_mask (RdsOsdCmd * out, int32_t x, int32_t y, int32_t mask
 
 /* Draws @cmds in order onto the RGBA plane @data (@width × @height pixels, @stride bytes a row), each shape over its
  * bounding box: the same pixels as rds_osd_shade_pixel over the whole frame. */
-void rds_osd_shade_commands (const RdsOsdCmd * cmds, size_t n, const uint8_t * masks, uint8_t * data, int32_t width,
+void rds_osd_shade_commands (const RdsOsdCmd * cmds, uint32_t n, const uint8_t * masks, uint8_t * data, int32_t width,
     int32_t height, size_t stride);
 
 #ifdef __cplusplus

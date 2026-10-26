@@ -3,8 +3,8 @@
  * A frame is drawn in two steps: its metas become draw commands (rds-osd-shapes.h: boxes for rectangle bands, fills
  * and text backgrounds, segments for lines and arrow shafts, wings and a bevel join for arrow heads, rings for
  * circles, coverage masks for text), in draw order; then rds_osd_shade_commands blends each command over its
- * bounding box into the RGBA plane. The coverage and blend are the code the GPU path runs, so both paths draw the
- * same bytes. Shapes have hard edges (as DeepStream 8.0's GPU mode draws them); text is rasterized by Pango into A8
+ * bounding box into the RGBA plane. The coverage and blend live in rds-osd-shapes.h, plain C written to compile for
+ * the planned GPU kernel too, so that both paths can draw the same bytes. Shapes have hard edges (as DeepStream 8.0's GPU mode draws them); text is rasterized by Pango into A8
  * masks with greyscale antialiasing, the only use of Cairo. The frame's own bytes, alpha included, are only ever
  * read and blended, never reinterpreted, and only the pixels a command covers are touched.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
@@ -216,6 +216,8 @@ build_text (RdsOsdDraw * d, const RdsOSD_TextParams * t)
   mh = (gint) y1 - (gint) y0 + 1;
   mstride = cairo_format_stride_for_width (CAIRO_FORMAT_A8, mw);
   offset = (d->masks_len + MASK_ALIGN - 1) / MASK_ALIGN * MASK_ALIGN;
+  /* ours: a text whose mask would end past 4 GiB in the frame's mask buffer (commands hold 32-bit offsets) is not
+   * drawn. Unreachable in practice: each mask is clipped to the frame and fonts to MAX_FONT_SIZE points. */
   if (offset + (gsize) mstride * mh > G_MAXUINT32)
     return;
   if (offset + (gsize) mstride * mh > d->masks_size) {
