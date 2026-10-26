@@ -407,3 +407,12 @@ test('rds_test3_dry_run',
   args : [rds_test3_exe, gst_inspect.found() and not asan ? gst_inspect.full_path() : '',
     rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : ''],
   suite : 'cpu', env : test_env, depends : rds_plugins)
+
+# rds-test3 end to end on four copies of the street clip with YOLO11n and the NvSORT tracker, --no-display (gpu; skips
+# without a device, rdsinfer, rdstracker, YOLO11n or the clip). Never in parallel with the other YOLO11n tests; the
+# first run compiles the batch-4 program.
+test('rds_test3_run',
+  find_program('samples/rds_test3_run.sh'),
+  args : [rds_test3_exe, meson.project_source_root(), meson.current_build_dir(),
+    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : ''],
+  suite : ['gpu', 'yolo'], env : test_env, is_parallel : false, timeout : 900, depends : rds_plugins)

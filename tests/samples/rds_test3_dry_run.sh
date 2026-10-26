@@ -23,6 +23,13 @@ fi
 out=$("$1" --dry-run --tracker-config tracker.yml file:///dev/null)
 echo "$out"
 echo "$out" | grep -A1 -x 'nvinfer -> rdsinfer' | grep -qx 'nvtracker -> rdstracker'
+# --no-display swaps the display sink for fakesink, nothing else
+out=$("$1" --dry-run --no-display file:///dev/null)
+echo "$out"
+echo "$out" | grep -A1 -x 'nvdsosd -> rdsosd' | grep -qx 'fakesink -> fakesink'
+if echo "$out" | grep -q nveglglessink; then
+  exit 1
+fi
 # an empty file name is refused
 if "$1" --dry-run --tracker-config '' file:///dev/null >/dev/null 2>&1; then
   exit 1

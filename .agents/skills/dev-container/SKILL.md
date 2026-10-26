@@ -81,13 +81,13 @@ $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst GST_DEBUG=rdsinfer:5 gst-launch-1.0 
   width=1280 height=720 ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=2 \
   ! fakesink sync=false filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
   filesrc location=.cache/media/smpte-1366x768.h264 ! h264parse ! rdsvideodec ! m.sink_1'
-# ... -> rdstracker (our NvSORT config) on the street clip (needs fetch-tracker-clip.sh); rdstracker:5 logs the
-# tracks reported, objects removed and targets kept per frame
-$RUN bash -c 'GST_DEBUG=rdstracker:5 GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 rdsstreammux name=m batch-size=2 \
-  width=1280 height=720 ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=2 \
-  ! rdstracker ll-config-file=samples/tracker/config_tracker_NvSORT.yml ! fakesink sync=false \
-  filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
-  filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse ! rdsvideodec ! m.sink_1'
+# rds-test3 end to end (mux -> infer -> NvSORT tracker -> tiler -> OSD) on the street clip (needs
+# fetch-tracker-clip.sh): one count line per frame and source; --no-display uses fakesink sync=false
+$RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 --no-display \
+  --tracker-config samples/tracker/config_tracker_NvSORT.yml \
+  file:///src/.cache/media/crosswalk-720p.h264 file:///src/.cache/media/crosswalk-720p.h264 | tail'
+# the same in a window (autovideosink -> ximagesink): add the X11 flags to docker run, drop --no-display
+#   -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -e XAUTHORITY=/tmp/.xauth -v $XAUTHORITY:/tmp/.xauth:ro
 # pre-build a program (exit 2: already up to date)
 $RUN build/tools/rds-compile -c samples/rds-test3/rds_test3_pgie_config.yml -b 4
 # autoplugging: -v shows GstRdsVideoDec inside the decodebin

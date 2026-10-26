@@ -96,15 +96,14 @@ GST_PLUGIN_PATH_1_0=build/gst GST_DEBUG=rdsinfer:5 gst-launch-1.0 rdsstreammux n
 The generated test clips (a bouncing ball, SMPTE bars) contain nothing YOLO11n detects, so expect 0 objects per
 frame: this checks that the pipeline runs, not what it finds.
 
-To see tracking, fetch the street clip (see "Getting started") and add `rdstracker` with the sample NvSORT config.
-`GST_DEBUG=rdstracker:5` logs, per frame, the tracks reported, the objects removed and the targets kept:
+To see tracking, fetch the street clip (see "Getting started") and run the sample with the NvSORT config. It prints
+each source's object counts per frame and shows the sources tiled, with boxes and track IDs, in a window
+(`--no-display` runs to a fakesink as fast as it can; `GST_DEBUG=rdstracker:5` adds the tracker's per-frame log):
 
 ```bash
-GST_DEBUG=rdstracker:5 GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 rdsstreammux name=m batch-size=2 width=1280 \
-  height=720 ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=2 \
-  ! rdstracker ll-config-file=samples/tracker/config_tracker_NvSORT.yml ! fakesink sync=false \
-  filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse ! rdsvideodec ! m.sink_0 \
-  filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse ! rdsvideodec ! m.sink_1
+GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 \
+  --tracker-config samples/tracker/config_tracker_NvSORT.yml \
+  file://$PWD/.cache/media/crosswalk-720p.h264 file://$PWD/.cache/media/crosswalk-720p.h264
 ```
 
 On that clip (56 s of a busy crosswalk, YOLO11n detections) the NvSORT sample config keeps 98.8 % of the confident

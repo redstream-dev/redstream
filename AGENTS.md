@@ -207,7 +207,8 @@ gst/rdstracker/    libgstrdstracker plugin: rdstracker (gstrdstracker.c: write-b
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its rdsinfer
                    and rdstracker config-key tables must match the key tables: the infer_config and tracker_config
                    tests check every row)
-samples/rds-test3/ clean-room test3-style multi-stream sample (walking skeleton, has --dry-run and --tracker-config)
+samples/rds-test3/ clean-room test3-style multi-stream sample (end to end: per-frame counts, tiler, OSD, display;
+                   --dry-run, --no-display, --pgie-config, --tracker-config)
 samples/tracker/   our IOU and NvSORT low-level tracker configs for rdstracker (tuned on the street clip)
 tools/rds-compile/ rds-compile: pre-builds rdsinfer's program with its config parser and engine (exit 2: up to date)
 tests/check/       GLib unit, element and pipeline tests (suites cpu/gpu); test clips are encoded in-process
