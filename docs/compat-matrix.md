@@ -254,7 +254,7 @@ Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream
 | `buffer-pool-size` | uint 4..10 | `5` | supported | buffers in the output pool; changeable only in NULL or READY |
 | `nvbuf-memory-type` | enum 0..3 | `2` (`nvbuf-mem-cuda-device`) | supported | memory of the output buffers; changeable only in NULL or READY |
 | `gpu-id` | uint | `0` | supported | changeable only in NULL or READY |
-| `compute-hw` | enum 0..2 | `0` | supported | `2` (VIC) fails at start |
+| `compute-hw` | enum 0..2 | `0` | supported | `2` (VIC) fails at start; changeable only in NULL or READY |
 | `custom-tile-config` | pointer, write-only | NULL | accepted no-op | reserved in DeepStream too; a non-NULL value logs one warning |
 | `qos` | boolean | `FALSE` | supported | GstBaseTransform's |
 
@@ -283,6 +283,8 @@ are silent, or **ours**: where 8.0 settles nothing or is clearly broken.
 | Two frames of one pad in a batch | ours | both drawn, the later on top; the later one's meta is kept |
 | `show-source` | matches nvmultistreamtiler (DeepStream 8.0) | by pad index: that frame stretched to the output with only its meta, scaled to the output; a pad that never had a frame or has ended: black and an empty frame meta; a value of at least rows × columns: element error on the next batch. Changes apply from the next batch |
 | `show-source` on a live pad missing from the batch | ours | black and an empty frame meta, as for an ended pad (8.0 not observed); the grid would repeat such a pad's last frame instead. The grid keeps its cached cells meanwhile, so switching back to -1 shows them |
+| Live changes with empty cells | ours | `rows`, `columns`, `square-seq-grid`, `width` or `height` changed while playing to values whose cells would be empty: ignored with one element warning, the current grid kept |
+| Input on another GPU | ours | device memory on a GPU other than `gpu-id` is an element error naming both |
 | A pad the grid cannot hold | ours | a pad index whose grid would have empty cells (narrower or lower than 2 pixels) is skipped, with one element warning, whether it comes from a frame meta or an `rds-pad-added` event (also one before the caps) (8.0: fatal composite error) |
 | Empty batch | ours | no frames: a black frame with an empty frame meta, as the docs say the muxer sends one to clear the tiler's output (8.0 crashes on it, per the docs' troubleshooting page). The cached cells and meta stay: the next batch repeats absent sources again |
 | Events | ours | every event goes downstream unchanged; FLUSH_STOP forgets every cached cell and meta |
