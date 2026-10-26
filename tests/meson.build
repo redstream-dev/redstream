@@ -235,6 +235,13 @@ if rds_infer_enabled
 endif
 
 if rds_tracker_enabled
+  # The core's sources, ';'-separated: tracker_replay checks the IDs pipeline_tracker saved against their hash, so
+  # only a change to the tracking code (not a rebuild with other flags) makes the replay skip.
+  rdstracker_core_files = []
+  foreach f : rdstracker_core_hashed
+    rdstracker_core_files += f.full_path()
+  endforeach
+  rdstracker_core_files = ';'.join(rdstracker_core_files)
   # The config parser on its own, against the corpus in check/tracker-configs; it also tests the shared YAML reader's
   # handling of the OpenCV-style "%YAML:1.0" line, and checks that docs/compat-matrix.md lists every config key as
   # the key table does. It uses no GStreamer, so it gets the environment without plugin paths.
@@ -269,7 +276,7 @@ if rds_tracker_enabled
       c_args : [
         '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
         '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
-        '-DRDS_TEST_TRACKER_CORE="@0@"'.format(rdstracker_core.full_path()),
+        '-DRDS_TEST_TRACKER_CORE="@0@"'.format(rdstracker_core_files),
       ]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 300)
 endif
@@ -280,8 +287,8 @@ if rds_tracker_enabled and rds_infer_enabled
   # pipeline_tracker_soak, also in the soak suite; with scale2 and scripted objects without YOLO11n, and a generated
   # clip without the street clip, so the leak check always runs). The YOLO11n programs are shared with infer_engine
   # and pipeline_infer. Never in parallel: one compile or soak at a time.
-  # It links rdstracker-core for the config parser only (no GTypes in it), and records the core library's hash with the
-  # detections it saves, for tracker_replay.
+  # It links rdstracker-core for the config parser only (no GTypes in it), and records the hash of the core's sources
+  # with the detections it saves, for tracker_replay.
   pipeline_tracker_exe = executable('pipeline_tracker', 'check' / 'pipeline_tracker.c',
     dependencies : pipeline_deps + [rdstracker_core_dep],
     c_args : [
@@ -290,7 +297,7 @@ if rds_tracker_enabled and rds_infer_enabled
       '-DRDS_TEST_CACHE_MEDIA="@0@"'.format(meson.project_source_root() / '.cache' / 'media'),
       '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
       '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
-      '-DRDS_TEST_TRACKER_CORE="@0@"'.format(rdstracker_core.full_path()),
+      '-DRDS_TEST_TRACKER_CORE="@0@"'.format(rdstracker_core_files),
     ])
   # two runs of up to 600 s each (a first YOLO11n compile in the first)
   test('pipeline_tracker', pipeline_tracker_exe, args : ['-p', '/gpu/tracker-yolo'],

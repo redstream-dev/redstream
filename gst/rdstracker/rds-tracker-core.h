@@ -52,9 +52,10 @@ typedef struct
 typedef struct
 {
   guint64 stream_id;
-  gint64 frame_num;
+  gint64 frame_num;             /* informational (logs, debugging): the core doesn't use it */
   gboolean detection_done;      /* FALSE: no inference ran on this frame */
-  gboolean reset;               /* a stream reset before this frame (as rds_tracker_core_stream_reset) */
+  gboolean reset;               /* a stream reset before this frame: the same as calling rds_tracker_core_stream_reset
+                                 * first, for callers that prefer a per-frame flag */
   const RdsTrackerDet *dets;
   guint n_dets;
 } RdsTrackerFrameIn;

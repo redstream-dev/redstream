@@ -112,7 +112,7 @@ $RUN bash -c 'GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 -v uridecodebin uri=f
 | mux/demux pipeline hangs (in preroll or after a few frames), no error | a demux branch without a `queue`, or more branches pinning batches than `rdsstreammux`'s `buffer-pool-size` (leave it unset) |
 | test process crashes at exit in libamdhip64 TLS destructors | the test `main()` must end with `gst_deinit ()` |
 | YOLO11n tests `SKIP` ("run tests/models/fetch-yolo11n.sh") | run the fetch script on the host; outputs go to `.cache/models` |
-| `pipeline_tracker` `SKIP`s; `tracker_replay` skips its clip case | run `tests/models/fetch-tracker-clip.sh` on the host; the replay needs a `pipeline_tracker` run after the last rebuild (its saved detections are stamped with the core library's hash) |
+| `pipeline_tracker` `SKIP`s; `tracker_replay` skips its clip case | run `tests/models/fetch-tracker-clip.sh` on the host; the replay needs a `pipeline_tracker` run after the last change to the tracker core's sources (its saved detections are stamped with their hash) |
 | `vp8dec`/VP8 not found in `redstream:dev` | expected: the image can't decode VP8; `fetch-tracker-clip.sh` decodes it in a python container |
 | a compat-matrix lint fails (`/cpu/*-config/compat-matrix`) | a config key changed: copy the expected row from the test's message into `docs/compat-matrix.md` |
 | MIOpen errors about `/dev/null/.config/miopen` in a GLib test | `G_TEST_OPTION_ISOLATE_DIRS` sets `HOME=/dev/null`: set `MIOPEN_USER_DB_PATH`, `MIOPEN_CUSTOM_CACHE_DIR` and `AMD_COMGR_CACHE_DIR` to writable dirs |

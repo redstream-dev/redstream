@@ -166,7 +166,6 @@ assert_defaults (const RdsTrackerConfig * cfg)
   g_assert_cmpfloat (cfg->process_noise_var4size, ==, 1.0f);
   g_assert_cmpfloat (cfg->process_noise_var4vel, ==, 0.1f);
   g_assert_cmpfloat (cfg->measurement_noise_var4detector, ==, 4.0f);
-  g_assert_cmpfloat (cfg->measurement_noise_var4tracker, ==, 16.0f);
   g_assert_cmpfloat (cfg->noise_weight_var4loc, ==, -0.1f);
   g_assert_cmpfloat (cfg->noise_weight_var4vel, ==, -0.1f);
   g_assert_false (cfg->use_aspect_ratio);
@@ -178,7 +177,6 @@ test_defaults (void)
 {
   RdsTrackerConfig *cfg = load_path_ok (NULL);
 
-  g_assert_null (cfg->config_path);
   assert_defaults (cfg);
   g_assert_cmpuint (cfg->warnings->len, ==, 0);
   rds_tracker_config_free (cfg);
@@ -199,7 +197,6 @@ test_iou (void)
 {
   RdsTrackerConfig *cfg = load_ok ("iou.yml");
 
-  g_assert_nonnull (strstr (cfg->config_path, "iou.yml"));
   g_assert_cmpint (cfg->tracker_type, ==, RDS_TRACKER_TYPE_IOU);
   g_assert_cmpstr (rds_tracker_type_name (cfg->tracker_type), ==, "IOU");
   g_assert_cmpfloat (cfg->min_detector_confidence, ==, 0.2f);
@@ -249,11 +246,10 @@ test_nvsort (void)
   g_assert_cmpfloat (cfg->process_noise_var4size, ==, 1.5f);
   g_assert_cmpfloat (cfg->process_noise_var4vel, ==, 0.25f);
   g_assert_cmpfloat (cfg->measurement_noise_var4detector, ==, 5.0f);
-  g_assert_cmpfloat (cfg->measurement_noise_var4tracker, ==, 12.0f);
   g_assert_cmpfloat (cfg->noise_weight_var4loc, ==, 0.08f);
   g_assert_cmpfloat (cfg->noise_weight_var4vel, ==, 0.005f);
   g_assert_true (cfg->use_aspect_ratio);
-  /* minTrackerConfidence is accepted silently (no effect for IOU and NvSORT) */
+  /* minTrackerConfidence and measurementNoiseVar4Tracker are accepted silently (no effect for IOU and NvSORT) */
   g_assert_cmpuint (cfg->warnings->len, ==, 0);
   rds_tracker_config_free (cfg);
 }

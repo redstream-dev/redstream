@@ -289,8 +289,8 @@ meson test -C build-rel --print-errorlogs
   `redstream:dev` decodes: the script decodes it with a pinned PyAV in a throwaway Python container and encodes it
   with `vah264enc` in the dev image. The encoding depends on the GPU and driver (another hash is only a warning), and
   `pipeline_tracker`'s budgets come from a run on the encoding with the recorded hash. `pipeline_tracker` saves the
-  clip's detections for `tracker_replay`, stamped with a hash of the `rdstracker-core` library: any rebuild changes
-  the hash, and the replay then skips until `pipeline_tracker` runs again.
+  clip's detections for `tracker_replay`, stamped with a hash of the `rdstracker-core` sources: a change to the
+  tracking code makes the replay skip until `pipeline_tracker` runs again.
 - **Ready-on-push:** a producer synchronizes its GPU work before pushing a `memory:RDS` buffer; downstream never
   waits on a stream. Library copies, memsets and staging syncs (`sync_for_cpu`/`sync_for_device`) are synchronous,
   on the calling thread's per-thread stream (`hipStreamPerThread`), so they don't wait for other streams' work. The

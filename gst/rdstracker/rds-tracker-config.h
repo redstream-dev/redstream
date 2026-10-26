@@ -31,7 +31,6 @@ typedef enum
 
 typedef struct
 {
-  gchar *config_path;                           /* the file as given to rds_tracker_config_load; NULL: defaults */
   RdsTrackerType tracker_type;
   /* BaseConfig */
   gfloat min_detector_confidence;
@@ -50,7 +49,7 @@ typedef struct
   /* StateEstimator */
   gint state_estimator_type;                    /* 0 none, 1 simple, 2 regular (3 is read as 2) */
   gfloat process_noise_var4loc, process_noise_var4size, process_noise_var4vel;
-  gfloat measurement_noise_var4detector, measurement_noise_var4tracker;
+  gfloat measurement_noise_var4detector;
   gfloat noise_weight_var4loc, noise_weight_var4vel;       /* > 0: height-proportional noise, else unset */
   gboolean use_aspect_ratio;
   /* Warnings found while loading (unknown keys and sections, ignored sections, no-op keys set to other than their

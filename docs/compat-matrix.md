@@ -483,15 +483,17 @@ rds-compile -c CONFIG [-b BATCH] [--fp16|--fp32] [-g GPU] [-o OUT.mxr] [--force]
 Names, types and defaults as nvtracker reports them in DeepStream 8.0 (7.1 is the same). The properties marked
 "NULL/READY" can be changed only in NULL or READY; the config file is read, and every property checked, when the
 element starts (READY to PAUSED), and an error there fails the state change with a message naming the file or the
-property. An accepted no-op property set to other than its default posts one warning at start.
+property. An accepted no-op property set to other than its default posts one warning at start, except the three
+marked "silent": `tracker-width`, `tracker-height` and `gpu-id` are ordinary settings that simply have no effect on
+a CPU tracker working in frame coordinates.
 
 | Property | Type | Range | Default | Status | Notes |
 |---|---|---|---|---|---|
 | `ll-lib-file` | string |  | NULL | supported | NULL/READY. Only the built-in tracker exists: unset, `libnvds_nvmultiobjecttracker.so` or `librdstracker-builtin.so` (bare or as a path; an INFO log says the built-in one is used). Any other library fails at start |
 | `ll-config-file` | string |  | NULL | supported | NULL/READY. An NvMultiObjectTracker YAML config (see "Tracker config files"); unset: every key's default, which is an IOU tracker |
-| `tracker-width` | uint | 0..`G_MAXUINT` | `960` | accepted no-op | NULL/READY. Boxes are tracked in the frame's (the mux's) pixels, so the tracker size has no effect, as observed with DeepStream 8.0's IOU and NvSORT. 0 is accepted and ignored (ours: 8.0 gives NaN boxes) |
-| `tracker-height` | uint | 0..`G_MAXUINT` | `544` | accepted no-op | as `tracker-width` |
-| `gpu-id` | uint | 0..`G_MAXUINT` | `0` | accepted no-op | NULL/READY. The tracker runs on the CPU, on the metadata only |
+| `tracker-width` | uint | 0..`G_MAXUINT` | `960` | accepted no-op | silent (no effect). NULL/READY. Boxes are tracked in the frame's (the mux's) pixels, so the tracker size has no effect, as observed with DeepStream 8.0's IOU and NvSORT. 0 is accepted and ignored (ours: 8.0 gives NaN boxes) |
+| `tracker-height` | uint | 0..`G_MAXUINT` | `544` | accepted no-op | silent (no effect). As `tracker-width` |
+| `gpu-id` | uint | 0..`G_MAXUINT` | `0` | accepted no-op | silent (no effect). NULL/READY. The tracker runs on the CPU, on the metadata only |
 | `display-tracking-id` | boolean |  | `TRUE` | supported | the ID is appended to each tracked object's `display_text` (see "Behaviour"); read per batch |
 | `tracking-id-reset-mode` | uint | 0..3 | `1` | supported | NULL/READY. 0: stream events change nothing; 1: a stream reset ends the stream's targets; 2: per-stream IDs, and a stream EOS ends the stream's targets and restarts its IDs at 0; 3: 1 and 2 together (see "Behaviour") |
 | `tracking-surface-type` | uint | 0..`G_MAXUINT` | `0` | accepted no-op | NULL/READY. Every surface of the batch is tracked; a warning when set |
@@ -626,7 +628,7 @@ tracker misc meta (past-frame data, shadow and terminated track lists, visibilit
 | `processNoiseVar4Size` | float | `1.0` | >= 0 | NvSORT, NvDeepSORT, NvDCF | supported |  |
 | `processNoiseVar4Vel` | float | `0.1` | >= 0 | NvSORT, NvDeepSORT, NvDCF | supported |  |
 | `measurementNoiseVar4Detector` | float | `4.0` | >= 0 | NvSORT, NvDeepSORT, NvDCF | supported |  |
-| `measurementNoiseVar4Tracker` | float | `16.0` | >= 0 | NvDCF | supported | the noise of the visual tracker's own estimates (NvDCF): no effect for NvSORT |
+| `measurementNoiseVar4Tracker` | float | `16.0` | >= 0 | NvDCF | ignored | used only by NvDCF (visual tracker), which is not supported |
 | `noiseWeightVar4Loc` | float | `-0.1` | any | NvSORT, NvDeepSORT, NvDCF | supported | with `noiseWeightVar4Vel`, both above 0: noise proportional to the box height |
 | `noiseWeightVar4Vel` | float | `-0.1` | any | NvSORT, NvDeepSORT, NvDCF | supported | see `noiseWeightVar4Loc` |
 | `useAspectRatio` | bool | `0` |  | NvSORT, NvDeepSORT, NvDCF | supported | the filter tracks w/h instead of w |

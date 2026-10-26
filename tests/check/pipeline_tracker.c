@@ -303,7 +303,7 @@ run_clip (const gchar * tracker_config)
   return r.dets;
 }
 
-/* Saves @dets (with their IDs, the config and the core library) into WORK_DIR, for tracker_replay. */
+/* Saves @dets (with their IDs, and hashes of the config and the core's sources) into WORK_DIR, for tracker_replay. */
 static void
 save_dets (const GArray * dets, const gchar * config, const gchar * name)
 {

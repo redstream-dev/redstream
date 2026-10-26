@@ -249,8 +249,8 @@ static const KeyInfo keys[] = {
       .field = F (process_noise_var4vel),.trackers = T_KF},
   {.name = "measurementNoiseVar4Detector",.section = SEC_STATE,.type = TYPE_FLOAT,.status = SUP, NONNEG_F,
       .def = "4.0",.field = F (measurement_noise_var4detector),.trackers = T_KF},
-  {.name = "measurementNoiseVar4Tracker",.section = SEC_STATE,.type = TYPE_FLOAT,.status = SUP, NONNEG_F,
-      .def = "16.0",.field = F (measurement_noise_var4tracker),.trackers = T_NVDCF},
+  {.name = "measurementNoiseVar4Tracker",.section = SEC_STATE,.type = TYPE_FLOAT,.status = IGN, NONNEG_F,
+      .def = "16.0",.trackers = T_NVDCF,.note = NOTE_DCF},
   /* > 0 means set; any value is accepted */
   {.name = "noiseWeightVar4Loc",.section = SEC_STATE,.type = TYPE_FLOAT,.status = SUP, ANY,.def = "-0.1",
       .field = F (noise_weight_var4loc),.trackers = T_KF},
@@ -675,7 +675,6 @@ rds_tracker_config_load (const gchar * path, GError ** error)
   }
 
   cfg = g_new0 (RdsTrackerConfig, 1);
-  cfg->config_path = g_strdup (path);
   cfg->warnings = warnings;
   apply_defaults (cfg);
   cfg->tracker_type = RDS_TRACKER_TYPE_IOU;
@@ -699,7 +698,6 @@ rds_tracker_config_free (RdsTrackerConfig * cfg)
 {
   if (!cfg)
     return;
-  g_free (cfg->config_path);
   if (cfg->warnings)
     g_ptr_array_unref (cfg->warnings);
   g_free (cfg);

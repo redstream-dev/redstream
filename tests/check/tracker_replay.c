@@ -2,7 +2,7 @@
  * - the street clip's YOLO11n detections that pipeline_tracker saves, replayed through the core: a consistency check,
  *   not a quality one. The core must give exactly the IDs the element gave (the element adds nothing to the core's
  *   decisions), and the metrics table is printed. Skipped unless pipeline_tracker has run in this build directory
- *   with the configs and the core library as they are now (the dump's header records both);
+ *   with the configs and the core's sources as they are now (the dump's header records both);
  * - a scripted scene with known identities (noisy boxes, misses, occlusions, crossings): ID switches and coverage
  *   against the truth.
  * With RDS_TRACKER_GRID=1, also the parameter grid the sample configs were chosen from, on both.

@@ -241,12 +241,35 @@ track_file_sha256 (const gchar * path)
   return sum;
 }
 
+/* The sha256 of the contents of the ';'-separated files @paths, in order (NULL if one can't be read). */
+static gchar *
+track_files_sha256 (const gchar * paths)
+{
+  gchar **list = g_strsplit (paths, ";", -1), *sum = NULL;
+  GChecksum *ck = g_checksum_new (G_CHECKSUM_SHA256);
+
+  for (guint i = 0; list[i]; i++) {
+    gchar *text = NULL;
+    gsize len = 0;
+
+    if (!g_file_get_contents (list[i], &text, &len, NULL))
+      goto out;
+    g_checksum_update (ck, (const guchar *) text, (gssize) len);
+    g_free (text);
+  }
+  sum = g_strdup (g_checksum_get_string (ck));
+out:
+  g_checksum_free (ck);
+  g_strfreev (list);
+  return sum;
+}
+
 /* A dump's first line: which tracker config (@config's sha256) and which tracking core (the sha256 of @core, the
- * built core library the element links) made its IDs. */
+ * core's source files, ';'-separated) made its IDs. */
 static gchar *
 track_dump_header (const gchar * config, const gchar * core)
 {
-  gchar *config_sum = track_file_sha256 (config), *core_sum = track_file_sha256 (core);
+  gchar *config_sum = track_file_sha256 (config), *core_sum = track_files_sha256 (core);
   gchar *head;
 
   g_assert_nonnull (config_sum);

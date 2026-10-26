@@ -1,7 +1,11 @@
 # Plugin-private code shared by the plugin and the tests: the config parser (YAML read through rds-plugin-common) and
 # the tracking core (GLib only).
+rdstracker_core_sources = files('rds-tracker-config.c', 'rds-tracker-core.c', 'rds-tracker-kf.c')
+# what decides the core's tracking output: the replay test checks saved IDs against a hash of these
+rdstracker_core_hashed = rdstracker_core_sources + files('rds-tracker-config.h', 'rds-tracker-core.h',
+  'rds-tracker-kf.h')
 rdstracker_core = static_library('rdstracker-core',
-  files('rds-tracker-config.c', 'rds-tracker-core.c', 'rds-tracker-kf.c'),
+  rdstracker_core_sources,
   c_args : ['-DG_LOG_DOMAIN="rdstracker"'],
   dependencies : [dependency('glib-2.0'), rds_plugin_common_dep],
   gnu_symbol_visibility : 'hidden',
