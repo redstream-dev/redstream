@@ -4,8 +4,9 @@
  * and text backgrounds, segments for lines and arrow shafts, wings and a bevel join for arrow heads, rings for
  * circles, coverage masks for text), in draw order; then rds_osd_shade_commands blends each command over its
  * bounding box into the RGBA plane. The coverage and blend live in rds-osd-shapes.h, plain C written to compile for
- * the planned GPU kernel too, so that both paths can draw the same bytes. Shapes have hard edges (as DeepStream 8.0's GPU mode draws them); text is rasterized by Pango into A8
- * masks with greyscale antialiasing, the only use of Cairo. The frame's own bytes, alpha included, are only ever
+ * the planned GPU kernel too, so that both paths can draw the same bytes. Shapes have hard edges (as DeepStream
+ * 8.0's GPU mode draws them); text is rasterized by Pango into A8 masks with greyscale antialiasing, the only use of
+ * Cairo. The frame's own bytes, alpha included, are only ever
  * read and blended, never reinterpreted, and only the pixels a command covers are touched.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-osd-draw.h"
