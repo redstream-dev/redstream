@@ -799,7 +799,7 @@ test_huge_widths (void)
   gint x0, y0, x1, y1;
 
   /* ours: widths far beyond the frame are clamped (the stroke covers the frame); huge radii are not drawn or
-   * clamped to the frame: no crash, and Cairo stays in range */
+   * clamped to the frame: no crash, and the fixed-point shapes stay in range */
   img_init (&im, 100, 80);
   frame_init (&f);
   dm = frame_add_display (&f);

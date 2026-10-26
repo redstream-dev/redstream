@@ -1,16 +1,15 @@
 /* Redstream: rdsosd's drawing core (see rds-osd-draw.h).
  *
- * Pixels: the frame is a plain RGBA plane, while Cairo's colour formats are premultiplied native-endian ARGB (BGRA
- * in memory here). Rather than swap and premultiply the whole frame around every draw, rectangles and text
- * backgrounds are filled by pixel loops, and every Cairo or Pango shape is drawn into a scratch A8 surface (a
- * coverage mask the size of the shape's box, clipped to the frame) that is then blended into the frame in the
- * shape's colour. So the frame's own bytes, alpha included, are only ever read and blended, never reinterpreted, and
- * only the pixels a shape covers are touched. Blending is out = a·src + (1 − a)·dst per channel, truncated
- * (DeepStream 8.0 behaviour: red at alpha 0.5 over 128 gives 191), with a = colour alpha × coverage; the alpha byte
- * blends the same way with src 255. Shapes are drawn with antialiasing off (hard edges, as DeepStream 8.0's GPU mode
- * draws them); text keeps greyscale antialiasing.
+ * A frame is drawn in two steps: its metas become draw commands (rds-osd-shapes.h: boxes for rectangle bands, fills
+ * and text backgrounds, segments for lines and arrow shafts, wings and a bevel join for arrow heads, rings for
+ * circles, coverage masks for text), in draw order; then rds_osd_shade_commands blends each command over its
+ * bounding box into the RGBA plane. The coverage and blend are the code the GPU path runs, so both paths draw the
+ * same bytes. Shapes have hard edges (as DeepStream 8.0's GPU mode draws them); text is rasterized by Pango into A8
+ * masks with greyscale antialiasing, the only use of Cairo. The frame's own bytes, alpha included, are only ever
+ * read and blended, never reinterpreted, and only the pixels a command covers are touched.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-osd-draw.h"
+#include "rds-osd-shapes.h"
 
 #include <math.h>
 #include <pango/pangocairo.h>
@@ -20,19 +19,8 @@
 #define TEXT_DPI 96.0
 /* font sizes above this are drawn this size (ours: keeps Pango's fixed-point sizes in range) */
 #define MAX_FONT_SIZE 1024
-/* arrow heads: an open V, its wings this far back from the tip and this far to each side (measured on DeepStream
- * 8.0's GPU mode output at arrow widths 2 and 4) */
-#define ARROW_HEAD_LENGTH 22.0
-#define ARROW_HEAD_HALF_WIDTH 7.0
-/* the ring of a circle whose circle_width is 0, in pixels (DeepStream 8.0 still outlines it, 3 px in GPU mode) */
-#define ZERO_CIRCLE_WIDTH 3
-/* circles and arrow heads with a coordinate, radius or width beyond this are not drawn (ours). Cairo works in 24.8
- * fixed point (about ±8.4 million): with centres and radii below 2^21, and widths and radii clamped to the frame
- * (below), every coordinate Cairo sees stays in range. Lines are clipped to the frame before Cairo sees them. */
-#define MAX_COORD 2097152.0
-/* added before truncating a blend, so that a sum that is exact in decimal (127.5 + 127.5) is not lost to binary
- * rounding (254.9999...) */
-#define BLEND_EPSILON 1e-6
+/* text masks start at multiples of this in the mask buffer */
+#define MASK_ALIGN 16
 
 struct _RdsOsdDraw
 {
@@ -40,94 +28,29 @@ struct _RdsOsdDraw
   PangoContext *context;
   PangoLayout *layout;
   GHashTable *fonts;            /* "name\x1fsize" -> PangoFontDescription */
-  guint8 *scratch;              /* the A8 coverage of the shape being drawn */
-  gsize scratch_size;
+  /* the frame being drawn: its commands and the text masks they point into */
+  RdsOsdCmd *cmds;
+  guint n_cmds, cmds_size;
+  guint8 *masks;
+  gsize masks_len, masks_size;
+  gint width, height;
 };
 
-typedef struct
+/* Room for @n more commands at d->cmds + d->n_cmds; the builder's count is then added to d->n_cmds. */
+static RdsOsdCmd *
+cmds_reserve (RdsOsdDraw * d, guint n)
 {
-  guint8 *data;
-  gint width, height, stride;
-} Plane;
-
-/* A colour ready to blend: the channel values (0..255, alpha 255), its alpha, and the blend of every destination
- * byte at full coverage. */
-typedef struct
-{
-  gdouble value[4];
-  gdouble alpha;
-  guint8 lut[4][256];
-} Paint;
-
-static gdouble
-clamp01 (gdouble v)
-{
-  return v > 0 ? (v < 1 ? v : 1) : 0;
-}
-
-/* FALSE when the colour is fully transparent (nothing to draw). */
-static gboolean
-paint_init (Paint * p, const RdsOSD_ColorParams * c)
-{
-  p->value[0] = clamp01 (c->red) * 255.0;
-  p->value[1] = clamp01 (c->green) * 255.0;
-  p->value[2] = clamp01 (c->blue) * 255.0;
-  p->value[3] = 255.0;
-  p->alpha = clamp01 (c->alpha);
-  if (p->alpha <= 0)
-    return FALSE;
-  for (guint i = 0; i < 4; i++)
-    for (guint d = 0; d < 256; d++)
-      p->lut[i][d] = (guint8) MIN (p->alpha * p->value[i] + (1.0 - p->alpha) * d + BLEND_EPSILON, 255.0);
-  return TRUE;
-}
-
-static inline void
-blend_full (guint8 * px, const Paint * p)
-{
-  px[0] = p->lut[0][px[0]];
-  px[1] = p->lut[1][px[1]];
-  px[2] = p->lut[2][px[2]];
-  px[3] = p->lut[3][px[3]];
-}
-
-static inline void
-blend_coverage (guint8 * px, const Paint * p, guint8 coverage)
-{
-  gdouble a;
-
-  if (coverage == 255) {
-    blend_full (px, p);
-    return;
+  if (d->n_cmds + n > d->cmds_size) {
+    d->cmds_size = MAX (2 * d->cmds_size, d->n_cmds + n);
+    d->cmds = g_renew (RdsOsdCmd, d->cmds, d->cmds_size);
   }
-  a = p->alpha * coverage / 255.0;
-  for (guint i = 0; i < 4; i++)
-    px[i] = (guint8) MIN (a * p->value[i] + (1.0 - a) * px[i] + BLEND_EPSILON, 255.0);
+  return d->cmds + d->n_cmds;
 }
 
-/* Blends the pixels x0..x1 (inclusive) of row y, clipped to the plane. */
-static void
-span (const Plane * pl, gint64 y, gint64 x0, gint64 x1, const Paint * p)
+static gboolean
+color_init (RdsOsdColor * c, const RdsOSD_ColorParams * p)
 {
-  guint8 *px;
-
-  if (y < 0 || y >= pl->height)
-    return;
-  x0 = MAX (x0, 0);
-  x1 = MIN (x1, (gint64) pl->width - 1);
-  if (x0 > x1)
-    return;
-  px = pl->data + (gsize) y * pl->stride + 4 * x0;
-  for (gint64 x = x0; x <= x1; x++, px += 4)
-    blend_full (px, p);
-}
-
-/* Blends the box x0..x1 × y0..y1 (inclusive), clipped to the plane. */
-static void
-box (const Plane * pl, gint64 x0, gint64 y0, gint64 x1, gint64 y1, const Paint * p)
-{
-  for (gint64 y = MAX (y0, 0); y <= MIN (y1, (gint64) pl->height - 1); y++)
-    span (pl, y, x0, x1, p);
+  return rds_osd_color_init (c, p->red, p->green, p->blue, p->alpha);
 }
 
 /* ---- rectangles ---- */
@@ -148,10 +71,10 @@ to_px (gfloat v)
  * covers only the inside, strictly within the bands: [L + hi + 1, R − hi − 1] (bw 0: [L + 1, R − 1]). Clipped to the
  * frame, never moved into it. Every pixel is blended once, so semi-transparent borders have even corners. */
 static void
-draw_rect (const Plane * pl, const RdsOSD_RectParams * r, RdsOsdDrawFlags * flags)
+build_rect (RdsOsdDraw * d, const RdsOSD_RectParams * r, RdsOsdDrawFlags * flags)
 {
-  gint64 L, T, R, B, bw = r->border_width, lo, hi;
-  Paint p;
+  gint64 L, T, R, B, bw = r->border_width, hi;
+  RdsOsdColor c;
 
   /* ours: a rect with a NaN field is not drawn */
   if (isnan (r->left) || isnan (r->top) || isnan (r->width) || isnan (r->height))
@@ -165,264 +88,61 @@ draw_rect (const Plane * pl, const RdsOSD_RectParams * r, RdsOsdDrawFlags * flag
     bw = RDS_OSD_MAX_BORDER_WIDTH;
     *flags |= RDS_OSD_DRAW_BORDER_CLAMPED;
   }
-  lo = bw > 0 ? (bw - 1) / 2 : 0;
   hi = bw / 2;
 
-  if (r->has_bg_color && paint_init (&p, &r->bg_color))
-    box (pl, L + hi + 1, T + hi + 1, R - hi - 1, B - hi - 1, &p);
-
-  if (bw == 0 || !paint_init (&p, &r->border_color))
-    return;
-  for (gint64 y = MAX (T - lo, 0); y <= MIN (B + lo, (gint64) pl->height - 1); y++) {
-    if (y <= T + hi || y >= B - hi) {
-      span (pl, y, L - lo, R + lo, &p);
-    } else if (L + hi + 1 >= R - hi) {
-      /* the side bands meet */
-      span (pl, y, L - lo, R + lo, &p);
-    } else {
-      span (pl, y, L - lo, L + hi, &p);
-      span (pl, y, R - hi, R + lo, &p);
-    }
-  }
+  if (r->has_bg_color && color_init (&c, &r->bg_color))
+    d->n_cmds += rds_osd_shape_box (cmds_reserve (d, 1), L + hi + 1, T + hi + 1, R - hi - 1, B - hi - 1, &c,
+        d->width, d->height);
+  if (bw > 0 && color_init (&c, &r->border_color))
+    d->n_cmds += rds_osd_shape_rect_border (cmds_reserve (d, 4), L, T, R, B, (guint) bw, &c, d->width, d->height);
 }
 
-/* ---- Cairo shapes through a coverage mask ---- */
-
-typedef struct
-{
-  cairo_surface_t *surface;
-  cairo_t *cr;
-  gint x0, y0, width, height, stride;
-} Mask;
-
-/* Starts a mask over the frame pixels x0..x1 × y0..y1 (inclusive, clipped to the frame), with the Cairo context in
- * frame coordinates. FALSE when nothing of it is in the frame. The mask is the shape's whole bounding box: cleared
- * here and scanned in mask_end, so its cost grows with the box's area, not the shape's. Boxes, labels and short lines
- * are small; a line across the whole frame diagonally costs a frame-sized A8 clear and scan (~1 MB at 1280×720). */
-static gboolean
-mask_begin (RdsOsdDraw * d, const Plane * pl, gdouble x0, gdouble y0, gdouble x1, gdouble y1, Mask * m)
-{
-  gsize size;
-
-  x0 = floor (MAX (x0, 0));
-  y0 = floor (MAX (y0, 0));
-  x1 = ceil (MIN (x1, pl->width - 1));
-  y1 = ceil (MIN (y1, pl->height - 1));
-  if (!(x0 <= x1 && y0 <= y1))
-    return FALSE;
-  m->x0 = (gint) x0;
-  m->y0 = (gint) y0;
-  m->width = (gint) x1 - m->x0 + 1;
-  m->height = (gint) y1 - m->y0 + 1;
-  m->stride = cairo_format_stride_for_width (CAIRO_FORMAT_A8, m->width);
-  size = (gsize) m->stride * m->height;
-  if (size > d->scratch_size) {
-    g_free (d->scratch);
-    d->scratch = g_malloc (size);
-    d->scratch_size = size;
-  }
-  memset (d->scratch, 0, size);
-  m->surface = cairo_image_surface_create_for_data (d->scratch, CAIRO_FORMAT_A8, m->width, m->height, m->stride);
-  m->cr = cairo_create (m->surface);
-  cairo_translate (m->cr, -m->x0, -m->y0);
-  cairo_set_antialias (m->cr, CAIRO_ANTIALIAS_NONE);
-  return TRUE;
-}
-
-/* Blends the mask into the frame in @p, and frees the Cairo objects. */
-static void
-mask_end (RdsOsdDraw * d, const Plane * pl, Mask * m, const Paint * p)
-{
-  cairo_surface_flush (m->surface);
-  for (gint y = 0; y < m->height; y++) {
-    const guint8 *cov = d->scratch + (gsize) y * m->stride;
-    guint8 *px = pl->data + (gsize) (m->y0 + y) * pl->stride + 4 * m->x0;
-
-    for (gint x = 0; x < m->width; x++, px += 4)
-      if (cov[x] != 0)
-        blend_coverage (px, p, cov[x]);
-  }
-  cairo_destroy (m->cr);
-  cairo_surface_destroy (m->surface);
-}
-
-/* Lines and arrow shafts: DeepStream 8.0 GPU mode draws (w − 1) / 2 pixels on each side of the segment (width 6 is
- * 5 pixels wide) and extends the ends as far. */
-static gdouble
-stroke_width (guint w, const Plane * pl)
-{
-  /* ours: a stroke wider than twice the frame covers it anyway; the clamp keeps Cairo in range */
-  guint max = 2 * (guint) MAX (pl->width, pl->height) + 1;
-
-  w = MIN (w, max);
-  return 2.0 * (w > 0 ? (w - 1) / 2 : 0) + 1.0;
-}
-
-/* Clips the segment to the box [lo, hi]² (Liang-Barsky); FALSE when it misses. */
-static gboolean
-clip_segment (gdouble * x1, gdouble * y1, gdouble * x2, gdouble * y2, gdouble xlo, gdouble ylo, gdouble xhi,
-    gdouble yhi)
-{
-  gdouble dx = *x2 - *x1, dy = *y2 - *y1, t0 = 0, t1 = 1;
-  gdouble p[4] = { -dx, dx, -dy, dy }, q[4] = { *x1 - xlo, xhi - *x1, *y1 - ylo, yhi - *y1 };
-
-  for (guint i = 0; i < 4; i++) {
-    if (p[i] == 0) {
-      if (q[i] < 0)
-        return FALSE;
-      continue;
-    }
-    gdouble t = q[i] / p[i];
-
-    if (p[i] < 0)
-      t0 = MAX (t0, t);
-    else
-      t1 = MIN (t1, t);
-  }
-  if (t0 > t1)
-    return FALSE;
-  *x2 = *x1 + t1 * dx;
-  *y2 = *y1 + t1 * dy;
-  *x1 = *x1 + t0 * dx;
-  *y1 = *y1 + t0 * dy;
-  return TRUE;
-}
-
-/* A segment between pixel centres, square caps; clipped first to a margin around the frame. */
-static void
-draw_segment (RdsOsdDraw * d, const Plane * pl, gdouble x1, gdouble y1, gdouble x2, gdouble y2, guint width,
-    const RdsOSD_ColorParams * color)
-{
-  gdouble w = stroke_width (width, pl), margin = w + 2;
-  Paint p;
-  Mask m;
-
-  if (!paint_init (&p, color)
-      || !clip_segment (&x1, &y1, &x2, &y2, -margin, -margin, pl->width + margin, pl->height + margin))
-    return;
-  if (!mask_begin (d, pl, MIN (x1, x2) - margin, MIN (y1, y2) - margin, MAX (x1, x2) + margin,
-          MAX (y1, y2) + margin, &m))
-    return;
-  cairo_set_line_width (m.cr, w);
-  cairo_set_line_cap (m.cr, CAIRO_LINE_CAP_SQUARE);
-  cairo_move_to (m.cr, x1 + 0.5, y1 + 0.5);
-  cairo_line_to (m.cr, x2 + 0.5, y2 + 0.5);
-  cairo_stroke (m.cr);
-  mask_end (d, pl, &m, &p);
-}
+/* ---- lines, arrows, circles ---- */
 
 static void
-draw_line (RdsOsdDraw * d, const Plane * pl, const RdsOSD_LineParams * l)
+build_line (RdsOsdDraw * d, const RdsOSD_LineParams * l)
 {
-  draw_segment (d, pl, l->x1, l->y1, l->x2, l->y2, l->line_width, &l->line_color);
-}
+  RdsOsdColor c;
 
-/* An open V at @tip pointing away from @from. */
-static void
-draw_arrow_head (RdsOsdDraw * d, const Plane * pl, gdouble tx, gdouble ty, gdouble fx, gdouble fy, guint width,
-    const Paint * p)
-{
-  gdouble len = hypot (tx - fx, ty - fy), ux, uy, w = stroke_width (width, pl), margin = w + 2;
-  gdouble ax, ay, bx, by;
-  Mask m;
-
-  if (len == 0)
-    return;
-  ux = (tx - fx) / len;
-  uy = (ty - fy) / len;
-  ax = tx - ARROW_HEAD_LENGTH * ux - ARROW_HEAD_HALF_WIDTH * uy;
-  ay = ty - ARROW_HEAD_LENGTH * uy + ARROW_HEAD_HALF_WIDTH * ux;
-  bx = tx - ARROW_HEAD_LENGTH * ux + ARROW_HEAD_HALF_WIDTH * uy;
-  by = ty - ARROW_HEAD_LENGTH * uy - ARROW_HEAD_HALF_WIDTH * ux;
-  if (!mask_begin (d, pl, MIN (tx, MIN (ax, bx)) - margin, MIN (ty, MIN (ay, by)) - margin,
-          MAX (tx, MAX (ax, bx)) + margin, MAX (ty, MAX (ay, by)) + margin, &m))
-    return;
-  cairo_set_line_width (m.cr, w);
-  cairo_set_line_join (m.cr, CAIRO_LINE_JOIN_BEVEL);
-  cairo_move_to (m.cr, ax + 0.5, ay + 0.5);
-  cairo_line_to (m.cr, tx + 0.5, ty + 0.5);
-  cairo_line_to (m.cr, bx + 0.5, by + 0.5);
-  cairo_stroke (m.cr);
-  mask_end (d, pl, &m, p);
+  if (color_init (&c, &l->line_color))
+    d->n_cmds += rds_osd_shape_line (cmds_reserve (d, 1), l->x1, l->y1, l->x2, l->y2, l->line_width, &c, d->width,
+        d->height);
 }
 
 /* The shaft like a line, a head at (x1, y1) for START, at (x2, y2) for END (DeepStream 8.0 behaviour), at both ends
- * for BOTH (ours: DeepStream 8.0 draws one head or nothing). Other head values draw the shaft only (ours). */
+ * for BOTH (ours: DeepStream 8.0 draws one head or nothing). Other head values draw the shaft only (ours). The shaft
+ * and each head are blended on their own. */
 static void
-draw_arrow (RdsOsdDraw * d, const Plane * pl, const RdsOSD_ArrowParams * a)
+build_arrow (RdsOsdDraw * d, const RdsOSD_ArrowParams * a)
 {
-  gdouble x1 = a->x1, y1 = a->y1, x2 = a->x2, y2 = a->y2;
-  Paint p;
+  RdsOsdColor c;
 
-  if (!paint_init (&p, &a->arrow_color))
+  if (!color_init (&c, &a->arrow_color))
     return;
-  draw_segment (d, pl, x1, y1, x2, y2, a->arrow_width, &a->arrow_color);
+  d->n_cmds += rds_osd_shape_line (cmds_reserve (d, 1), a->x1, a->y1, a->x2, a->y2, a->arrow_width, &c, d->width,
+      d->height);
   /* a head is drawn only near the frame (and its direction needs sane coordinates) */
-  if (MAX (MAX (x1, x2), MAX (y1, y2)) > MAX_COORD)
+  if (MAX (MAX (a->x1, a->x2), MAX (a->y1, a->y2)) > RDS_OSD_MAX_COORD)
     return;
   if (a->arrow_head == RDS_OSD_ARROW_START_HEAD || a->arrow_head == RDS_OSD_ARROW_BOTH_HEAD)
-    draw_arrow_head (d, pl, x1, y1, x2, y2, a->arrow_width, &p);
+    d->n_cmds += rds_osd_shape_arrow_head (cmds_reserve (d, 3), a->x1, a->y1, a->x2, a->y2, a->arrow_width, &c,
+        d->width, d->height);
   if (a->arrow_head == RDS_OSD_ARROW_END_HEAD || a->arrow_head == RDS_OSD_ARROW_BOTH_HEAD)
-    draw_arrow_head (d, pl, x2, y2, x1, y1, a->arrow_width, &p);
+    d->n_cmds += rds_osd_shape_arrow_head (cmds_reserve (d, 3), a->x2, a->y2, a->x1, a->y1, a->arrow_width, &c,
+        d->width, d->height);
 }
 
-/* A ring straddling the radius (DeepStream 8.0 behaviour, GPU mode): circle_width w covers the pixels whose
- * distance from the centre pixel is in [r - floor(w/2), r + ceil(w/2)] (w 3, r 60: 59..62); w 0 still draws a
- * ZERO_CIRCLE_WIDTH ring centred on r (59..61). has_bg_color fills inside the ring with bg_color. The band edges
- * lie half a pixel outside those distances, so no pixel centre sits on an edge. */
+/* A ring straddling the radius (DeepStream 8.0 behaviour, GPU mode, see rds_osd_shape_circle); has_bg_color fills
+ * inside the ring with bg_color first. */
 static void
-draw_circle (RdsOsdDraw * d, const Plane * pl, const RdsOSD_CircleParams * c)
+build_circle (RdsOsdDraw * d, const RdsOSD_CircleParams * c)
 {
-  gdouble w = MIN (c->circle_width, MAX_COORD), r = c->radius, lo, hi, dx, dy, near, far;
-  gdouble xc = c->xc + 0.5, yc = c->yc + 0.5, inner, outer;
-  Paint p;
-  Mask m;
+  RdsOsdColor ring, fill;
+  gboolean has_ring = color_init (&ring, &c->circle_color);
+  gboolean has_fill = c->has_bg_color && color_init (&fill, &c->bg_color);
 
-  if (c->xc > MAX_COORD || c->yc > MAX_COORD || c->radius > MAX_COORD)
-    return;
-  if (c->circle_width > 0) {
-    lo = floor (w / 2);
-    hi = ceil (w / 2);
-  } else {
-    lo = hi = (ZERO_CIRCLE_WIDTH - 1) / 2;
-  }
-  inner = r - lo - 0.5;
-  outer = r + hi + 0.5;
-  /* Only the band between the nearest and the farthest frame pixel can show: a ring outside it is not drawn, and
-   * the band is clamped to it (same pixels, and Cairo stays in range). */
-  dx = MAX (MAX (0.0 - xc, xc - pl->width), 0);
-  dy = MAX (MAX (0.0 - yc, yc - pl->height), 0);
-  near = hypot (dx, dy);
-  far = hypot (MAX (xc, pl->width - xc), MAX (yc, pl->height - yc));
-  if (outer < near - 1 || (inner > far + 1 && !c->has_bg_color))
-    return;
-  outer = MIN (outer, far + 2);
-  inner = MIN (inner, far + 1);
-  if (c->has_bg_color && inner > 0 && paint_init (&p, &c->bg_color)) {
-    if (far < inner) {
-      box (pl, 0, 0, pl->width - 1, pl->height - 1, &p);
-    } else if (mask_begin (d, pl, xc - inner, yc - inner, xc + inner, yc + inner, &m)) {
-      cairo_arc (m.cr, xc, yc, inner, 0, 2 * G_PI);
-      cairo_fill (m.cr);
-      mask_end (d, pl, &m, &p);
-    }
-  }
-  if (inner >= outer || !paint_init (&p, &c->circle_color))
-    return;
-  if (near > inner && far < outer) {
-    /* the band covers the frame */
-    box (pl, 0, 0, pl->width - 1, pl->height - 1, &p);
-  } else if (mask_begin (d, pl, xc - outer - 1, yc - outer - 1, xc + outer + 1, yc + outer + 1, &m)) {
-    /* the band as an annulus (filled, even-odd): robust for any width, unlike a stroke */
-    cairo_set_fill_rule (m.cr, CAIRO_FILL_RULE_EVEN_ODD);
-    cairo_arc (m.cr, xc, yc, outer, 0, 2 * G_PI);
-    if (inner > 0) {
-      cairo_new_sub_path (m.cr);
-      cairo_arc (m.cr, xc, yc, inner, 0, 2 * G_PI);
-    }
-    cairo_fill (m.cr);
-    mask_end (d, pl, &m, &p);
-  }
+  d->n_cmds += rds_osd_shape_circle (cmds_reserve (d, 2), c->xc, c->yc, c->radius, c->circle_width,
+      has_ring ? &ring : NULL, has_fill ? &fill : NULL, d->width, d->height);
 }
 
 /* ---- text ---- */
@@ -453,16 +173,19 @@ font_for (RdsOsdDraw * d, const gchar * name, guint size)
  * with set_bg_clr it is filled with text_bg_clr, then the text is drawn in font_color. Not moved into the frame,
  * clipped at its edges. font_size 0, NULL or empty text draw nothing, not even the box. */
 static void
-draw_text (RdsOsdDraw * d, const Plane * pl, const RdsOSD_TextParams * t)
+build_text (RdsOsdDraw * d, const RdsOSD_TextParams * t)
 {
   guint size = MIN (t->font_params.font_size, MAX_FONT_SIZE);
   gint64 bx = (gint64) t->x_offset + 1, by = (gint64) t->y_offset + 1, pad_x = size / 2, pad_y = size / 4;
   PangoRectangle ink, logical;
-  gdouble ox, oy;
-  Paint p;
-  Mask m;
+  gdouble ox, oy, x0, y0, x1, y1;
+  gint mw, mh, mstride;
+  gsize offset;
+  RdsOsdColor c;
+  cairo_surface_t *surface;
+  cairo_t *cr;
 
-  if (size == 0 || t->display_text == NULL || t->display_text[0] == '\0' || bx >= pl->width || by >= pl->height)
+  if (size == 0 || t->display_text == NULL || t->display_text[0] == '\0' || bx >= d->width || by >= d->height)
     return;
   pango_layout_set_font_description (d->layout, font_for (d, t->font_params.font_name, size));
   if (g_utf8_validate (t->display_text, -1, NULL)) {
@@ -476,18 +199,42 @@ draw_text (RdsOsdDraw * d, const Plane * pl, const RdsOSD_TextParams * t)
   }
   pango_layout_get_pixel_extents (d->layout, &ink, &logical);
 
-  if (t->set_bg_clr && paint_init (&p, &t->text_bg_clr))
-    box (pl, bx, by, bx + logical.width + 2 * pad_x - 1, by + logical.height + 2 * pad_y - 1, &p);
+  if (t->set_bg_clr && color_init (&c, &t->text_bg_clr))
+    d->n_cmds += rds_osd_shape_box (cmds_reserve (d, 1), bx, by, bx + logical.width + 2 * pad_x - 1,
+        by + logical.height + 2 * pad_y - 1, &c, d->width, d->height);
 
+  /* the glyphs: an A8 mask over their ink box (one pixel more around it), clipped to the frame */
   ox = (gdouble) (bx + pad_x - logical.x);
   oy = (gdouble) (by + pad_y - logical.y);
-  if (!paint_init (&p, &t->font_params.font_color)
-      || !mask_begin (d, pl, ox + ink.x - 1, oy + ink.y - 1, ox + ink.x + ink.width + 1,
-          oy + ink.y + ink.height + 1, &m))
+  x0 = floor (MAX (ox + ink.x - 1, 0));
+  y0 = floor (MAX (oy + ink.y - 1, 0));
+  x1 = ceil (MIN (ox + ink.x + ink.width + 1, d->width - 1));
+  y1 = ceil (MIN (oy + ink.y + ink.height + 1, d->height - 1));
+  if (!color_init (&c, &t->font_params.font_color) || !(x0 <= x1 && y0 <= y1))
     return;
-  cairo_move_to (m.cr, ox, oy);
-  pango_cairo_show_layout (m.cr, d->layout);
-  mask_end (d, pl, &m, &p);
+  mw = (gint) x1 - (gint) x0 + 1;
+  mh = (gint) y1 - (gint) y0 + 1;
+  mstride = cairo_format_stride_for_width (CAIRO_FORMAT_A8, mw);
+  offset = (d->masks_len + MASK_ALIGN - 1) / MASK_ALIGN * MASK_ALIGN;
+  if (offset + (gsize) mstride * mh > G_MAXUINT32)
+    return;
+  if (offset + (gsize) mstride * mh > d->masks_size) {
+    d->masks_size = MAX (2 * d->masks_size, offset + (gsize) mstride * mh);
+    d->masks = g_realloc (d->masks, d->masks_size);
+  }
+  d->masks_len = offset + (gsize) mstride * mh;
+  memset (d->masks + offset, 0, (gsize) mstride * mh);
+  surface = cairo_image_surface_create_for_data (d->masks + offset, CAIRO_FORMAT_A8, mw, mh, mstride);
+  cr = cairo_create (surface);
+  cairo_translate (cr, -x0, -y0);
+  cairo_set_antialias (cr, CAIRO_ANTIALIAS_NONE);
+  cairo_move_to (cr, ox, oy);
+  pango_cairo_show_layout (cr, d->layout);
+  cairo_destroy (cr);
+  cairo_surface_flush (surface);
+  cairo_surface_destroy (surface);
+  d->n_cmds += rds_osd_shape_mask (cmds_reserve (d, 1), (gint32) x0, (gint32) y0, mw, mh, (guint32) mstride,
+      (guint32) offset, &c, d->width, d->height);
 }
 
 /* ---- the frame ---- */
@@ -496,53 +243,56 @@ RdsOsdDrawFlags
 rds_osd_draw_frame (RdsOsdDraw * d, const RdsOsdDrawOptions * opt, const RdsFrameMeta * frame, guint8 * data,
     gint width, gint height, gint stride)
 {
-  Plane pl = {.data = data,.width = width,.height = height,.stride = stride };
   RdsOsdDrawFlags flags = 0;
   GList *objs = frame != NULL ? frame->obj_meta_list : NULL, *dms = frame != NULL ? frame->display_meta_list : NULL;
 
   g_return_val_if_fail (d != NULL && opt != NULL && data != NULL, 0);
   if (width <= 0 || height <= 0)
     return 0;
+  d->n_cmds = 0;
+  d->masks_len = 0;
+  d->width = width;
+  d->height = height;
 
   /* DeepStream 8.0 behaviour: every rect, then every text, lines, arrows, circles; objects before display metas;
    * list order within a kind (later on top); at most RDS_MAX_ELEMENTS_IN_DISPLAY_META of each kind per display meta */
   if (opt->display_bbox) {
     for (GList * l = objs; l != NULL; l = l->next)
-      draw_rect (&pl, &((RdsObjectMeta *) l->data)->rect_params, &flags);
+      build_rect (d, &((RdsObjectMeta *) l->data)->rect_params, &flags);
     for (GList * l = dms; l != NULL; l = l->next) {
       RdsDisplayMeta *dm = l->data;
 
       for (guint i = 0; i < MIN (dm->num_rects, RDS_MAX_ELEMENTS_IN_DISPLAY_META); i++)
-        draw_rect (&pl, &dm->rect_params[i], &flags);
+        build_rect (d, &dm->rect_params[i], &flags);
     }
   }
   if (opt->display_text) {
     for (GList * l = objs; l != NULL; l = l->next)
-      draw_text (d, &pl, &((RdsObjectMeta *) l->data)->text_params);
+      build_text (d, &((RdsObjectMeta *) l->data)->text_params);
     for (GList * l = dms; l != NULL; l = l->next) {
       RdsDisplayMeta *dm = l->data;
 
       for (guint i = 0; i < MIN (dm->num_labels, RDS_MAX_ELEMENTS_IN_DISPLAY_META); i++)
-        draw_text (d, &pl, &dm->text_params[i]);
+        build_text (d, &dm->text_params[i]);
     }
   }
   for (GList * l = dms; l != NULL; l = l->next) {
     RdsDisplayMeta *dm = l->data;
 
     for (guint i = 0; i < MIN (dm->num_lines, RDS_MAX_ELEMENTS_IN_DISPLAY_META); i++)
-      draw_line (d, &pl, &dm->line_params[i]);
+      build_line (d, &dm->line_params[i]);
   }
   for (GList * l = dms; l != NULL; l = l->next) {
     RdsDisplayMeta *dm = l->data;
 
     for (guint i = 0; i < MIN (dm->num_arrows, RDS_MAX_ELEMENTS_IN_DISPLAY_META); i++)
-      draw_arrow (d, &pl, &dm->arrow_params[i]);
+      build_arrow (d, &dm->arrow_params[i]);
   }
   for (GList * l = dms; l != NULL; l = l->next) {
     RdsDisplayMeta *dm = l->data;
 
     for (guint i = 0; i < MIN (dm->num_circles, RDS_MAX_ELEMENTS_IN_DISPLAY_META); i++)
-      draw_circle (d, &pl, &dm->circle_params[i]);
+      build_circle (d, &dm->circle_params[i]);
   }
 
   /* the clock is text like any other, without a box (DeepStream 8.0 behaviour: hidden by display-text too) */
@@ -557,8 +307,10 @@ rds_osd_draw_frame (RdsOsdDraw * d, const RdsOsdDrawOptions * opt, const RdsFram
           .font_color = opt->clock_color},
     };
 
-    draw_text (d, &pl, &clock);
+    build_text (d, &clock);
   }
+
+  rds_osd_shade_commands (d->cmds, d->n_cmds, d->masks, data, width, height, (gsize) stride);
   return flags;
 }
 
@@ -670,6 +422,7 @@ rds_osd_draw_free (RdsOsdDraw * d)
   g_object_unref (d->layout);
   g_object_unref (d->context);
   g_object_unref (d->font_map);
-  g_free (d->scratch);
+  g_free (d->cmds);
+  g_free (d->masks);
   g_free (d);
 }

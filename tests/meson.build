@@ -327,6 +327,9 @@ if rds_osd_enabled
   # rdsosd's drawing core on host buffers (no GStreamer, no GPU); prints the draw time of a 720p frame.
   test('osd_draw', executable('osd_draw', 'check' / 'osd_draw.c', dependencies : [rdsosd_core_dep]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
+  # rdsosd's shared shapes (the coverage and blend the CPU path and the GPU kernel share) on host buffers.
+  test('osd_shapes', executable('osd_shapes', 'check' / 'osd_shapes.c', dependencies : [rdsosd_core_dep]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
   # rdsosd: properties (cpu); drawing on memory:RDS batches and demuxed views (gpu).
   element_osd_exe = executable('element_osd', 'check' / 'element_osd.c', dependencies : test_deps)
   test('element_osd_cpu', element_osd_exe, args : ['-p', '/cpu/osd-element'],

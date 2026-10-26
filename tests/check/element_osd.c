@@ -791,8 +791,8 @@ test_timing (void)
 }
 
 /* Two rdsosd instances drawing at the same time, each pushed from its own thread (so each draws on that thread, as
- * on two demux branches), with text in different fonts: every output equals the one drawn alone. Cairo, Pango and
- * fontconfig are shared by both. */
+ * on two demux branches), with text in different fonts: every output equals the one drawn alone. Pango (with
+ * Cairo for its text masks) and fontconfig are shared by both. */
 #define C_FRAMES 40
 #define C_OBJECTS 8
 

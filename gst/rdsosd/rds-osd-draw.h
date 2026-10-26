@@ -1,6 +1,7 @@
-/* Redstream: rdsosd's drawing core. Draws one frame's object meta, display meta and clock onto a CPU RGBA plane, with
- * Cairo (antialiasing off) for lines, arrows and circles, Pango for text, and plain pixel loops for rectangles. No
- * GStreamer and no GPU: the element maps and syncs the surface, the tests draw onto plain host buffers.
+/* Redstream: rdsosd's drawing core. Draws one frame's object meta, display meta and clock onto a CPU RGBA plane, as
+ * the draw commands of rds-osd-shapes.h (hard-edged boxes, segments, rings; Pango text rendered into coverage
+ * masks), shaded with the per-pixel coverage and blend that also compile for the GPU. No GStreamer and no GPU: the
+ * element maps and syncs the surface, the tests draw onto plain host buffers.
  *
  * The geometry follows DeepStream 8.0's default (GPU) mode, where its docs are silent ("DeepStream 8.0 behaviour" in
  * rds-osd-draw.c); our own choices say "ours". docs/compat-matrix.md lists both.

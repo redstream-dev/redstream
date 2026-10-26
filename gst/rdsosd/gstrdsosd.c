@@ -1,7 +1,7 @@
 /* Redstream: rdsosd, draws each frame's object meta, display meta and the clock onto its RGBA surface, on the CPU
- * (rds-osd-draw: Cairo and Pango). Property names, ranges and defaults follow DeepStream's nvdsosd as gst-inspect
- * shows it for 8.0; drawing behaviour the docs leave open matches DeepStream 8.0's default GPU mode ("DeepStream 8.0
- * behaviour") except where marked "ours". Every such choice has a row in docs/compat-matrix.md.
+ * (rds-osd-draw: hard-edged shapes, Pango text). Property names, ranges and defaults follow DeepStream's nvdsosd as
+ * gst-inspect shows it for 8.0; drawing behaviour the docs leave open matches DeepStream 8.0's default GPU mode
+ * ("DeepStream 8.0 behaviour") except where marked "ours". Every such choice has a row in docs/compat-matrix.md.
  *
  * In place: the base class hands transform_ip a writable buffer, and the WRITE map gives this element memory it owns
  * (a shared surface or a read-only surface view, as rdsstreamdemux pushes, is replaced by a private copy first; the
@@ -106,7 +106,7 @@ gst_rds_osd_mode_get_type (void)
 {
   static GType type = 0;
   static const GEnumValue values[] = {
-    {MODE_CPU, "CPU (Cairo and Pango)", "MODE_CPU"},
+    {MODE_CPU, "CPU", "MODE_CPU"},
     {MODE_GPU, "GPU in DeepStream; drawn on the CPU here, with the GPU mode's geometry", "MODE_GPU"},
     {0, NULL, NULL},
   };
@@ -133,8 +133,7 @@ gst_rds_osd_start (GstBaseTransform * trans)
   mode = self->process_mode;
   GST_OBJECT_UNLOCK (self);
 
-  GST_INFO_OBJECT (self, "process-mode %d: drawing on the CPU with Cairo and Pango, with the GPU mode's geometry",
-      mode);
+  GST_INFO_OBJECT (self, "process-mode %d: drawing on the CPU, with the GPU mode's geometry", mode);
   self->draw = rds_osd_draw_new ();
   rds_osd_draw_warm_up (self->draw);
   self->border_warned = FALSE;

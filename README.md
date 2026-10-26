@@ -65,7 +65,7 @@ Jetson-specific hardware blocks.
   merges the sources' metadata into it, scaled into the tiles, as DeepStream 8.0 does; `show-source` shows one
   source alone.
 - **`rdsosd`** (`nvdsosd`): draws object boxes and labels, and display meta (rectangles, text, lines, arrows,
-  circles) and the clock, in the geometry of DeepStream 8.0's GPU mode. It draws on the CPU with Cairo and Pango for
+  circles) and the clock, in the geometry of DeepStream 8.0's GPU mode. It draws on the CPU (Pango for text) for
   now; a GPU path comes before the first release. Masks and blur are not drawn yet.
 - **`rdslogger`** (`nvdslogger`): prints each stream's frame rate in DeepStream's `**PERF` line format.
 - **`rdsvideosink`** (`nveglglessink`, `nv3dsink`): shows frames in a window through a stock GStreamer sink

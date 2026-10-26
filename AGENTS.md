@@ -18,7 +18,7 @@ far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, s
 views of the batch), `rdsinfer` (MIGraphX primary detector: nvinfer configs, custom bbox parsers, object and
 tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs),
 `rdsmultistreamtiler` (batches into one tiled frame), `rdsosd` (boxes, text, lines, arrows, circles and the clock,
-drawn on the CPU with Cairo and Pango), `rdslogger` (per-stream FPS lines) and `rdsvideosink` (display through a stock
+drawn on the CPU, Pango for text), `rdslogger` (per-stream FPS lines) and `rdsvideosink` (display through a stock
 GStreamer sink). Nothing here is stable.
 
 ## Architecture principles
@@ -195,9 +195,11 @@ gst/rdstiler/      libgstrdstiler plugin: rdsmultistreamtiler (gstrdsmultistream
                    built
 gst/rdsosd/        libgstrdsosd plugin: rdsosd (gstrdsosd.c: in place on RGBA memory:RDS, each frame meta drawn on its
                    batch_id slot, synced to the CPU and back; views and shared memory are drawn on a private copy).
-                   rds-osd-draw is the drawing core (rects by pixel loops; shapes and text through Cairo/Pango A8
-                   coverage masks blended into the RGBA plane; GLib, Cairo and Pango only), the static rdsosd-core the
-                   tests link. Optional (-Dosd, default auto): needs cairo and pangocairo
+                   rds-osd-draw is the drawing core (metas -> draw commands, text rasterized by Pango into A8 masks;
+                   GLib, Cairo and Pango only); rds-osd-shapes.h the commands and their per-pixel coverage and blend
+                   (plain C that also compiles as HIP device code: exact integer coverage, no FMA in the blend);
+                   together the static rdsosd-core the tests link. Optional (-Dosd, default auto): needs cairo
+                   and pangocairo
 gst/rdssink/       libgstrdssink plugin: rdslogger (gstrdslogger.c: passthrough, counts frames per source_id and prints
                    the **PERF line on a periodic pipeline-clock id) and rdsvideosink (gstrdsvideosink.c: a bin of
                    rdsvideoconvert, BGRx videoconvert and the video-sink factory; forwards the DeepStream sink

@@ -1,8 +1,9 @@
-# The drawing core (Cairo/Pango onto a CPU RGBA plane; no GStreamer, no GPU; the meta structs come from the libgstrds
-# headers), shared by the plugin and the tests.
+# The drawing core (shapes as draw commands shaded onto a CPU RGBA plane, Pango for text masks; no GStreamer, no GPU;
+# the meta structs come from the libgstrds headers), shared by the plugin and the tests. No fused multiply-add: the
+# blend must round as the same code does compiled for the GPU (rds-osd-shapes.h).
 rdsosd_core = static_library('rdsosd-core',
-  files('rds-osd-draw.c'),
-  c_args : ['-DG_LOG_DOMAIN="rdsosd"'],
+  files('rds-osd-draw.c', 'rds-osd-shapes.c'),
+  c_args : ['-DG_LOG_DOMAIN="rdsosd"', '-ffp-contract=off'],
   dependencies : [dependency('glib-2.0'), rds_dep.partial_dependency(includes : true), cairo_dep, pangocairo_dep,
     cc.find_library('m', required : false)],
   gnu_symbol_visibility : 'hidden',
