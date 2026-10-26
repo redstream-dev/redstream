@@ -20,6 +20,8 @@
 #include <string.h>
 
 #include <rds/rds_compat.h>
+/* YAML PGIE configs are read for their label file with the YAML reader rdsinfer uses, an in-tree helper that is not
+ * installed: an app built outside this tree uses a key-file config, or its own YAML reader. */
 #if RDS_TEST3_HAVE_YAML
 #include "rds-keyfile-yaml.h"
 #endif
@@ -88,8 +90,9 @@ read_pgie_config (const gchar * path, GError ** error)
 
 /* Looks up "person" and "car" in the label file of the PGIE config at @pgie_config. The label file is read as
  * rdsinfer reads it: labelfile-path relative to the config file's directory, one label per line (or all on one
- * ';'-separated line), whitespace around labels ignored; the line number is the class id. Without a label file both
- * stay -1 (counted as 0), with a warning. */
+ * ';'-separated line), whitespace around labels ignored; the line number is the class id, and only the first
+ * num-detected-classes labels count. Without a label file or num-detected-classes both stay -1 (counted as 0), with
+ * a warning. */
 static CountedClasses
 lookup_counted_classes (const gchar * pgie_config)
 {
@@ -97,9 +100,12 @@ lookup_counted_classes (const gchar * pgie_config)
   GError *err = NULL;
   GKeyFile *kf = read_pgie_config (pgie_config, &err);
   gchar *label_path = NULL, *text = NULL;
+  gint num_classes = 0;
 
-  if (kf)
+  if (kf) {
     label_path = g_key_file_get_string (kf, "property", "labelfile-path", NULL);
+    num_classes = g_key_file_get_integer (kf, "property", "num-detected-classes", NULL);
+  }
   if (label_path && *label_path && !g_path_is_absolute (label_path)) {
     gchar *config_abs = g_canonicalize_filename (pgie_config, NULL);
     gchar *config_dir = g_path_get_dirname (config_abs);
@@ -110,7 +116,9 @@ lookup_counted_classes (const gchar * pgie_config)
     g_free (label_path);
     label_path = abs;
   }
-  if (label_path && *label_path && g_file_get_contents (label_path, &text, NULL, &err)) {
+  if (num_classes <= 0) {
+    g_printerr ("Warning: %s has no num-detected-classes: person and car counts stay 0\n", pgie_config);
+  } else if (label_path && *label_path && g_file_get_contents (label_path, &text, NULL, &err)) {
     const gchar *start = g_str_has_prefix (text, "\xEF\xBB\xBF") ? text + 3 : text;  /* UTF-8 byte order mark */
     gchar **labels = g_strsplit (start, "\n", -1);
     guint n = g_strv_length (labels);
@@ -129,8 +137,12 @@ lookup_counted_classes (const gchar * pgie_config)
       n = g_strv_length (labels);
       for (guint i = 0; i < n; i++)
         g_strstrip (labels[i]);
+      if (n > 0 && !*labels[n - 1]) {
+        g_free (labels[n - 1]);
+        labels[--n] = NULL;
+      }
     }
-    for (guint i = 0; i < n; i++) {
+    for (guint i = 0; i < n && i < (guint) num_classes; i++) {
       const gchar *label = labels[i];
 
       if (ids.person < 0 && strcmp (label, "person") == 0)
@@ -168,6 +180,7 @@ count_objects_probe (GstPad * pad G_GNUC_UNUSED, GstPadProbeInfo * info, gpointe
     for (NvDsMetaList * l_obj = frame_meta->obj_meta_list; l_obj != NULL; l_obj = l_obj->next) {
       NvDsObjectMeta *obj_meta = l_obj->data;
 
+      /* -1: the label file doesn't name the class, so nothing is counted for it */
       if (ids->person >= 0 && obj_meta->class_id == ids->person)
         persons++;
       else if (ids->car >= 0 && obj_meta->class_id == ids->car)
@@ -350,7 +363,8 @@ main (int argc, char **argv)
 
   guint num_sources = uris ? g_strv_length (uris) : 0;
   if (num_sources == 0) {
-    g_printerr ("Usage: %s [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE] URI [URI...]\n", argv[0]);
+    g_printerr ("Usage: %s [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE] URI [URI...]\n",
+        argv[0]);
     return 1;
   }
   if (tracker_config && !*tracker_config) {

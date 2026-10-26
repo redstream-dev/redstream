@@ -40,8 +40,8 @@ test_deps = [rds_dep, gst_check_dep, hip_dep]
 
 # GPU-free tests (hosted CI runs `meson test --suite cpu`): no device needed at run time, but building still
 # needs the ROCm headers and libamdhip64.
-cpu_tests = ['compat_remap', 'compat_header', 'compat_header_nomacros', 'buf_surface', 'memory', 'surface_view', 'buffer_pool',
-  'allocation', 'meta_batch', 'meta_children',
+cpu_tests = ['compat_remap', 'compat_header', 'compat_header_nomacros', 'buf_surface', 'memory', 'surface_view',
+  'buffer_pool', 'allocation', 'meta_batch', 'meta_children',
   'meta_copy', 'event', 'compat_meta', 'compat_aliases', 'transform_params']
 foreach t : cpu_tests
   test(t, executable(t, 'check' / (t + '.c'), dependencies : test_deps),

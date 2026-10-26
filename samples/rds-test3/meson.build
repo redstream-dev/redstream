@@ -1,5 +1,6 @@
 # The YAML reader that rdsinfer and rdstracker use (plugin-internal, linked in statically) reads a .yml PGIE config
-# for the label file; it is built whenever rdsinfer is. Without it, only key-file PGIE configs give labels.
+# for the label file; it is built whenever rdsinfer is. Without it, only key-file PGIE configs give labels. It is an
+# in-tree helper, not installed: an app built outside this tree uses a key-file config or its own YAML reader.
 rds_test3_deps = [rds_dep, cc.find_library('m', required : false)]
 rds_test3_have_yaml = is_variable('rds_plugin_common_dep')
 if rds_test3_have_yaml
