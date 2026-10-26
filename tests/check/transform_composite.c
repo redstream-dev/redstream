@@ -554,12 +554,31 @@ test_clip (void)
   sources_clear (&s);
 }
 
-/* An odd origin on a 4:2:0 destination is rounded up to even and an odd right or bottom edge rounded down (unless
- * on the surface edge), DeepStream 8.0 behaviour; the source is scaled onto that rect. RGB destinations take odd
- * rects as given (ours). */
+/* An odd origin on a 4:2:0 destination is rounded up to even (DeepStream 8.0 behaviour) and an odd right or bottom
+ * edge rounded down unless it is the surface edge (ours); the source is scaled onto that rect. RGB destinations take
+ * odd rects as given (ours). */
 static void
 test_odd_origin (void)
 {
+  static const struct
+  {
+    RdsBufSurfaceColorFormat fmt;
+    guint w, h;
+    RdsBufSurfTransformRect dr[3], want[3];
+  } cases[] = {
+    /* odd origins, then odd right and bottom edges inside the surface: [602, 700) x [402, 450), [802, 900) x
+     * [502, 550) */
+    {RDS_BUF_COLOR_FORMAT_NV12, W, H,
+        {{51, 101, 333, 201}, {401, 601, 100, 50}, {501, 801, 101, 51}},
+        {{52, 102, 332, 200}, {402, 602, 98, 48}, {502, 802, 100, 50}}},
+    /* odd right and bottom edges on the odd surface edge are kept */
+    {RDS_BUF_COLOR_FORMAT_NV12, 641, 361,
+        {{51, 101, 540, 310}, {11, 11, 100, 50}, {201, 301, 30, 30}},
+        {{52, 102, 539, 309}, {12, 12, 98, 48}, {202, 302, 28, 28}}},
+    {RDS_BUF_COLOR_FORMAT_RGBA, W, H,
+        {{51, 101, 333, 201}, {401, 601, 100, 50}, {501, 801, 101, 51}},
+        {{51, 101, 333, 201}, {401, 601, 100, 50}, {501, 801, 101, 51}}},
+  };
   Sources s;
 
   RDS_TEST_REQUIRE_GPU ();
@@ -567,24 +586,22 @@ test_odd_origin (void)
   for (guint i = 0; i < N_SRC; i++)
     fill_random (s.single[i], 0, 50 + i);
   sources_sync (&s);
-  s.batch.numFilled = 2;
+  s.batch.numFilled = 3;
 
-  for (guint d = 0; d < 2; d++) {
-    RdsBufSurfaceColorFormat fmt = d == 0 ? RDS_BUF_COLOR_FORMAT_NV12 : RDS_BUF_COLOR_FORMAT_RGBA;
-    RdsBufSurface *dst = create_surf (fmt, W, H, 1), *ref = create_surf (fmt, W, H, 1);
-    RdsBufSurfTransformRect sr[N_SRC] = { rect (0, 0, W, H), rect (7, 3, 501, 301) };
-    RdsBufSurfTransformRect dr[N_SRC] = { rect (101, 51, 333, 201), rect (601, 401, 101, 51) };
-    /* NV12: [102, 434) x [52, 252) and [602, 702) x [402, 452) */
-    RdsBufSurfTransformRect want[N_SRC] = { rect (102, 52, 332, 200), rect (602, 402, 100, 50) };
+  for (guint d = 0; d < G_N_ELEMENTS (cases); d++) {
+    RdsBufSurface *dst = create_surf (cases[d].fmt, cases[d].w, cases[d].h, 1);
+    RdsBufSurface *ref = create_surf (cases[d].fmt, cases[d].w, cases[d].h, 1);
+    RdsBufSurfTransformRect sr[N_SRC] = { rect (0, 0, W, H), rect (7, 3, 501, 301), rect (640, 0, 640, 720) };
+    RdsBufSurfTransformRect dr[N_SRC], want[N_SRC];
     RdsBufSurfTransformCompositeParams cp = composite_params (sr, dr, RdsBufSurfTransformInter_Bilinear);
     HostImage got, exp;
 
-    if (d == 1)
-      memcpy (want, dr, sizeof (want));
+    memcpy (dr, cases[d].dr, sizeof (cases[d].dr));
+    memcpy (want, cases[d].want, sizeof (cases[d].want));
     fill_random (dst, 0, 61);
     fill_random (ref, 0, 61);
     g_assert_cmpint (rds_buf_surf_transform_composite (&s.batch, dst, &cp), ==, RdsBufSurfTransformError_Success);
-    reference (&s, 2, ref, sr, want, RdsBufSurfTransformInter_Bilinear);
+    reference (&s, 3, ref, sr, want, RdsBufSurfTransformInter_Bilinear);
     snapshot (dst, 0, &got);
     snapshot (ref, 0, &exp);
     g_assert_cmpuint (max_diff (&got, &exp, TRUE), ==, 0);

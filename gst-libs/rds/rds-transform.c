@@ -649,7 +649,7 @@ composite_validate (const RdsBufSurface * src, const RdsBufSurface * dst,
  * destination rect after clipping. The source rect is cut to its surface (ours); the destination rect keeps its
  * size, so the scaling is that of the whole rect, and only the window inside the surface is written. On 4:2:0 the
  * rect is aligned inward: left and top rounded up to even, an odd right or bottom edge rounded down unless it is
- * the surface edge (DeepStream 8.0 behaviour for the origin). */
+ * the surface edge (DeepStream 8.0 behaviour for the origin, ours for the right and bottom edges). */
 static gboolean
 build_composite_job (const RdsBufSurface * src, const RdsBufSurface * dst,
     const RdsBufSurfTransformCompositeParams * cp, guint i, gboolean bilinear, RdsKernelJob * job)

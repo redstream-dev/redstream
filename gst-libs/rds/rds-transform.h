@@ -40,7 +40,8 @@ typedef enum
 
 typedef enum
 {
-  RdsBufSurfTransformError_ROI_Error = -4,     /* a rect is empty or not inside its surface (never clamped) */
+  RdsBufSurfTransformError_ROI_Error = -4,     /* rds_buf_surf_transform: a rect is empty or not
+                                                * inside its surface (never clamped) */
   RdsBufSurfTransformError_Invalid_Params = -3,
   RdsBufSurfTransformError_Execution_Error = -2,
   RdsBufSurfTransformError_Unsupported = -1,
@@ -60,8 +61,9 @@ typedef enum
   RDS_BUFSURF_TRANSFORM_ALLOW_ODD_CROP = 1 << 5,
 } RdsBufSurfTransform_Transform_Flag;
 
-/* A rectangle in pixels of its surface: top-left corner (top, left) and size (width, height). It must be
- * non-empty and lie inside the surface, or the transform returns ROI_Error; it is never clamped. */
+/* A rectangle in pixels of its surface: top-left corner (top, left) and size (width, height). For
+ * rds_buf_surf_transform it must be non-empty and lie inside the surface, or the call returns ROI_Error; it is never
+ * clamped. rds_buf_surf_transform_composite clips its rects instead. */
 typedef struct
 {
   guint32 top;
