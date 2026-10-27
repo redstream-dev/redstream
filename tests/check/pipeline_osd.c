@@ -1,9 +1,9 @@
 /* rdsmultistreamtiler and rdsosd end to end (gpu): four copies of a public street clip through the decoder, the mux,
  * rdsinfer (YOLO11n), rdstracker (NvSORT), the tiler (2x2) and rdsosd, as rds-test3 runs them
  * (rds-test-osd-pipeline.h). The tiler's one frame meta per batch carries every source's objects, scaled into their
- * cells; rdsosd draws their boxes on the tiled frame; no errors or warnings. Runs with rdsosd in its default
- * process-mode (1, the GPU) and in 0 (the CPU). Prints the frame rate and the tiler's and rdsosd's time per batch.
- * Skips without the clip or YOLO11n.
+ * cells; rdsosd draws their boxes on the tiled frame; no errors or warnings. Runs with process-mode 1 (the GPU,
+ * the default) and 0 (the CPU). Prints the frame rate and the tiler's and rdsosd's time per batch. Skips without the
+ * clip or YOLO11n.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-surface.h"

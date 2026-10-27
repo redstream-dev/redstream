@@ -14,8 +14,10 @@
 #define SOAK_MIN_BATCHES 3000
 #define SOAK_SAMPLE_EVERY 300   /* batches between memory samples */
 #define SOAK_MAX_SAMPLES 16
-/* rdsosd's text-mask heap (RDS_OSD_MASK_HEAP_SIZE) and a lower bound on a label's mask bytes (a size-10 label of a
- * few words is wider than 32 px and taller than 8 px): the soak's labels must fill the heap several times over */
+/* rdsosd's text-mask heap (RDS_OSD_MASK_HEAP_SIZE) and an assumed minimum mask size per label (a size-10 label of a
+ * few words is wider than 32 px and taller than 8 px). rdsosd exposes no eviction count, so this is not one measured:
+ * the soak requires enough relabelled objects to fill the heap 4 times over at that size, a margin that covers labels
+ * clipped at the frame edge or not drawn */
 #define SOAK_MASK_HEAP (8 * 1024 * 1024)
 #define SOAK_MASK_MIN_BYTES 256
 
@@ -138,8 +140,8 @@ test_osd_soak (void)
   g_assert_cmpuint (st.n_samples, >=, 3);
   host_growth = (gssize) st.host[st.n_samples - 1] - (gssize) st.host[1];
   gpu_delta = (gssize) st.gpu_used[st.n_samples - 1] - (gssize) st.gpu_used[1];
-  g_test_message ("%u batches of %u in %.1f s (%.0f fps, %.1f tiled frames/s), %u objects drawn, %u distinct "
-      "labels; " RDS_TEST_HOST_MEMORY_NAME " growth batch %u -> %u: %+.2f MiB; GPU used delta: %+.2f MiB", st.batches,
+  g_test_message ("%u batches of %u in %.1f s (%.0f fps, %.1f tiled frames/s), %u objects drawn, %u relabelled "
+      "objects; " RDS_TEST_HOST_MEMORY_NAME " growth batch %u -> %u: %+.2f MiB; GPU used delta: %+.2f MiB", st.batches,
       SOURCES, secs, SOURCES * st.batches / secs, st.batches / secs, st.objects, st.labels, 2 * SOAK_SAMPLE_EVERY,
       st.n_samples * SOAK_SAMPLE_EVERY, MIB (host_growth), MIB (gpu_delta));
   g_assert_cmpuint (st.batches, ==, CLIP_FRAMES * loops);

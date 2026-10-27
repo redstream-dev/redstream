@@ -355,9 +355,9 @@ if rds_osd_enabled and rds_tracker_enabled and rds_infer_enabled
   # rdsmultistreamtiler and rdsosd end to end as rds-test3 runs them: four copies of the street clip, YOLO11n, NvSORT,
   # the 2x2 tiler and rdsosd (pipeline_osd: merged meta, drawn boxes, frame rate, with rdsosd on the GPU and on the
   # CPU), and the soak (pipeline_osd_soak, 4068 batches of 4 with a new label on every object of every batch, also in
-  # the soak suite). Both skip until tests/models/fetch-tracker-clip.sh and
-  # fetch-yolo11n.sh have run. The YOLO11n programs are shared with infer_engine, pipeline_infer and pipeline_tracker
-  # (a first batch-4 compile takes minutes). Never in parallel: one compile or soak at a time.
+  # the soak suite). Both skip until tests/models/fetch-tracker-clip.sh and fetch-yolo11n.sh have run. The YOLO11n
+  # programs are shared with infer_engine, pipeline_infer and pipeline_tracker (a first batch-4 compile takes
+  # minutes). Never in parallel: one compile or soak at a time.
   osd_pipeline_args = [
     '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
     '-DRDS_TEST_CACHE_MEDIA="@0@"'.format(meson.project_source_root() / '.cache' / 'media'),
