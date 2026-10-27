@@ -52,6 +52,9 @@ drawn on the GPU by default or on the CPU, the same pixels, Pango for text), `rd
 | `nveglglessink` / `nv3dsink` | `rdsvideosink` | display sink |
 | `nvdslogger` | `rdslogger` | per-stream FPS |
 | `nvv4l2h264enc` / `nvv4l2h265enc` | `rdsh264enc` / `rdsh265enc` | VA (VCN) encode with DeepStream property names (M2) |
+| `nvstreammux` / `nvstreamdemux` (audio) | `rdsstreammux` / `rdsstreamdemux` | later: batches of mono S16LE/F32LE audio, as the new mux does |
+| `nvinferaudio` | `rdsinferaudio` | later: audio classifier on MIGraphX, log-mel spectrogram (`audio-transform`) on the GPU |
+| `nvdsaudiotemplate` | `rdsaudiotemplate` | later: custom-library hook for single or batched audio |
 | `NvDsBatchMeta` & co. | `RdsBatchMeta` & co. + `rds/rds_compat.h` | |
 
 The authoritative runtime mapping is the alias table in `gst-libs/rds/rds-compat-remap.c`.
@@ -247,7 +250,7 @@ tests/models/      committed tiny ONNX test models (make-test-models.py); fetch-
                    test reference data (street photo, Ultralytics detections, parity tensors) into .cache/models
                    (host, Docker; AGPL, never committed); fetch-tracker-clip.sh transcodes a CC0 street clip for
                    the tracker tests into .cache/media (host, Docker, GPU)
-spikes/            Phase 0 experiments (rocdec-hip, migraphx-devptr); reference code, not built by meson
+spikes/            design spikes (rocdec-hip, migraphx-devptr); reference code, not built by meson
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
 ```
 

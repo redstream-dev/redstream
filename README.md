@@ -22,7 +22,7 @@ surface so existing applications can move over without a rewrite.
 ## Goals
 
 - **Functional parity** with the core of DeepStream: multi-stream decode, batching, primary and secondary
-  inference, tracking, on-screen display, analytics, encode.
+  inference, tracking, on-screen display, analytics, encode, and audio inference.
 - **Easy porting.** An existing DeepStream app should port with only small, mechanical changes:
   - element names swapped behind an `#ifdef`
   - the same `nvinfer` / `nvstreammux` / tracker config files
@@ -148,21 +148,25 @@ build).
 
 ## How it maps to DeepStream
 
-| DeepStream | Redstream |
-|---|---|
-| `nvv4l2decoder`, `nvurisrcbin` | `rdsvideodec` (rocDecode), `rdsurisrcbin` |
-| `nvvideoconvert` | `rdsvideoconvert` |
-| `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` |
-| `nvinfer` | `rdsinfer` (MIGraphX) |
-| `nvtracker` | `rdstracker` |
-| `nvdsosd` | `rdsosd` |
-| `nvmultistreamtiler` | `rdsmultistreamtiler` |
-| `nvdsanalytics` | `rdsanalytics` |
-| `nveglglessink`, `nv3dsink` | `rdsvideosink` |
-| `nvdslogger` | `rdslogger` |
-| `nvv4l2h264enc`, `nvv4l2h265enc` | `rdsh264enc`, `rdsh265enc` |
-| `NvDsBatchMeta`, `NvDsObjectMeta`, … | `Rds*` + `rds/rds_compat.h` |
-| TensorRT `.engine` | MIGraphX `.mxr` (compiled from ONNX, cached) |
+| DeepStream | Redstream | Status |
+|---|---|---|
+| `nvv4l2decoder` | `rdsvideodec` (rocDecode) | works |
+| `nvurisrcbin` | `rdsurisrcbin` | planned |
+| `nvvideoconvert` | `rdsvideoconvert` | works |
+| `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` | works (default mux; the new mux is planned) |
+| `nvinfer` | `rdsinfer` (MIGraphX) | works (primary detector) |
+| `nvtracker` | `rdstracker` | works (IOU, NvSORT) |
+| `nvdsosd` | `rdsosd` | works |
+| `nvmultistreamtiler` | `rdsmultistreamtiler` | works |
+| `nvdsanalytics` | `rdsanalytics` | planned |
+| `nveglglessink`, `nv3dsink` | `rdsvideosink` | works |
+| `nvdslogger` | `rdslogger` | works |
+| `nvv4l2h264enc`, `nvv4l2h265enc` | `rdsh264enc`, `rdsh265enc` | planned |
+| `nvstreammux` / `nvstreamdemux` with audio | `rdsstreammux` / `rdsstreamdemux` | planned |
+| `nvinferaudio` | `rdsinferaudio` (MIGraphX) | planned |
+| `nvdsaudiotemplate` | `rdsaudiotemplate` | planned |
+| `NvDsBatchMeta`, `NvDsObjectMeta`, … | `Rds*` + `rds/rds_compat.h` | works |
+| TensorRT `.engine` | MIGraphX `.mxr` (compiled from ONNX, cached) | works |
 
 ## Roadmap
 
@@ -178,11 +182,18 @@ build).
 - Metadata edits in pad probes.
 - ROI and line-crossing analytics, RTSP reconnect handling, and an H.264 recording branch.
 
+**Later: audio analytics**
+- Audio streams batched by `rdsstreammux` and split again by `rdsstreamdemux`, as DeepStream's new mux does.
+- `rdsinferaudio` (`nvinferaudio`): audio classification on MIGraphX, with the log-mel spectrogram front end on the
+  GPU, and the same config files.
+- The audio batch buffer and its metadata (frame and classifier meta), and `rdsaudiotemplate` for custom audio
+  processing libraries.
+
 ## Hardware
 
-Developed and tested on an RDNA2 APU (Ryzen 7000 iGPU, gfx1036). Any ROCm-capable GPU with a VCN video
-engine should work: Radeon RDNA2/3/4, Ryzen AI APUs (Strix Point / Strix Halo). Some Instinct SKUs lack
-video decode engines.
+Only one GPU has been tested so far: the RDNA2 iGPU of a Ryzen 7000 desktop CPU (gfx1036). Other ROCm-capable GPUs
+with a VCN video engine (Radeon RDNA2/3/4, Ryzen AI APUs such as Strix Point and Strix Halo) are expected to work,
+but are untested; reports, good or bad, are welcome in the issues. Some Instinct SKUs lack video decode engines.
 
 Early numbers on a 2-CU Ryzen 9 7900X iGPU:
 - VA-API H.264 1080p decode: about 600 fps.
@@ -210,12 +221,25 @@ docker run -it --rm --device=/dev/kfd --device=/dev/dri \
   --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
   --security-opt seccomp=unconfined -v "$PWD":/src -w /src redstream:dev
 
-# inside the container
+# inside the container: check that the GPU and the video engine are visible
 rocminfo | grep gfx
-gst-inspect-1.0 hip
-gst-launch-1.0 filesrc location=sample.mkv ! matroskademux ! h264parse ! vah264dec \
-  ! hipupload ! hipconvertscale ! "video/x-raw(memory:HIPMemory),format=RGBA,width=640,height=640" \
-  ! fakesink sync=false
+vainfo --display drm --device /dev/dri/renderD128
+```
+
+Build and run the tests (inside the container):
+
+```bash
+meson setup build && meson test -C build --print-errorlogs
+```
+
+Then a first check with Redstream's own elements, on a clip generated with the VA encoder: decode with rocDecode and
+convert to RGBA on the GPU.
+
+```bash
+tests/media/make-test-media.sh   # writes .cache/media/*.h264
+GST_PLUGIN_PATH_1_0=build/gst gst-inspect-1.0 rdsvideodec
+GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-720p.h264 ! h264parse ! rdsvideodec \
+  ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA,width=640,height=640" ! fakesink sync=false
 ```
 
 The YOLO11n tests and the detector example need the model, exported on your machine (on the host: it needs Docker
@@ -234,10 +258,9 @@ git-ignored `.cache/media/` and is never committed; the tests that need it skip 
 tests/models/fetch-tracker-clip.sh
 ```
 
-Build and run the tests (inside the container):
+More tools from the build tree:
 
 ```bash
-meson setup build && meson test -C build --print-errorlogs
 build/samples/rds-test3/rds-test3 --dry-run file:///a.mp4   # shows the DeepStream → Redstream element mapping
 build/tools/rds-compile -c config.txt   # pre-builds rdsinfer's MIGraphX program, like trtexec (docs/compat-matrix.md)
 ```
@@ -247,8 +270,10 @@ On other GPUs, pass your gfx target and unset the override.
 
 ## Contributing
 
-The project is in its design phase, so issues and design discussion are the most useful contributions right now.
-Design discussion happens in GitHub issues. If you use AI coding agents, read [`AGENTS.md`](AGENTS.md) first.
+Redstream is pre-alpha, and issues and pull requests are welcome: bug reports, results on GPUs we have not tested,
+DeepStream behaviour we get wrong, and fixes or new elements. For anything large, open an issue first so the design
+can be discussed there. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the ground rules; if you use AI coding agents, read
+[`AGENTS.md`](AGENTS.md) first.
 
 This is a clean-room implementation: do not contribute code, headers or documentation copied from the
 NVIDIA DeepStream SDK. Commits are signed off under the Developer Certificate of Origin; see

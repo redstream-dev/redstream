@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-// Spike 0b: MIGraphX with offload_copy=false on caller-owned HIP buffers, run_async on our stream,
+// Spike: MIGraphX with offload_copy=false on caller-owned HIP buffers, run_async on our stream,
 // partial-batch padding, .mxr save/load, FP16. Usage: mgx_spike model.onnx
 #include <migraphx/migraphx.hpp>
 #include <hip/hip_fp16.h>
@@ -349,7 +349,7 @@ int main(int argc, char **argv) {
   HIP_CHECK(hipStreamDestroy(ns));
 
   HIP_CHECK(hipStreamDestroy(s));
-  printf("%s (%d failures)\n", failures ? "SPIKE 0b FAIL" : (dc < 1e-3f ? "SPIKE 0b PASS ([5] inconclusive)" : "SPIKE 0b PASS"),
+  printf("%s (%d failures)\n", failures ? "SPIKE FAIL" : (dc < 1e-3f ? "SPIKE PASS ([5] inconclusive)" : "SPIKE PASS"),
          failures);
   return failures ? 3 : 0;
 }
