@@ -1,8 +1,9 @@
 /* rdsmultistreamtiler and rdsosd end to end (gpu): four copies of a public street clip through the decoder, the mux,
  * rdsinfer (YOLO11n), rdstracker (NvSORT), the tiler (2x2) and rdsosd, as rds-test3 runs them
  * (rds-test-osd-pipeline.h). The tiler's one frame meta per batch carries every source's objects, scaled into their
- * cells; rdsosd draws their boxes on the tiled frame; no errors or warnings. Prints the frame rate and the tiler's
- * and rdsosd's time per batch. Skips without the clip or YOLO11n.
+ * cells; rdsosd draws their boxes on the tiled frame; no errors or warnings. Runs with process-mode 1 (the GPU,
+ * the default) and 0 (the CPU). Prints the frame rate and the tiler's and rdsosd's time per batch. Skips without the
+ * clip or YOLO11n.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-surface.h"
@@ -191,9 +192,11 @@ on_sample (GstAppSink * sink, gpointer user_data)
   return GST_FLOW_OK;
 }
 
+/* @data: rdsosd's process-mode */
 static void
-test_clip (void)
+test_clip (gconstpointer data)
 {
+  gint mode = GPOINTER_TO_INT (data);
   OsdRun r = { 0 };
   GstAppSinkCallbacks cb = {.new_sample = on_sample };
   GstElement *pipe, *el;
@@ -208,6 +211,9 @@ test_clip (void)
   pgie = pgie_config ();
   r.expected = g_array_new (FALSE, FALSE, sizeof (Rect));
   pipe = osd_pipeline_new (pgie, FALSE, "appsink sync=false");
+  el = gst_bin_get_by_name (GST_BIN (pipe), "osd");
+  g_object_set (el, "process-mode", mode, NULL);
+  gst_object_unref (el);
   add_probe (pipe, "tiler", "sink", tiler_in_probe, &r);
   add_probe (pipe, "tiler", "src", tiler_out_probe, &r);
   add_probe (pipe, "osd", "sink", osd_in_probe, &r);
@@ -231,8 +237,8 @@ test_clip (void)
       "readback included); %u objects (per source %u %u %u %u)", r.batches, SOURCES, SOURCES * r.batches, secs,
       SOURCES * r.batches / secs, r.batches / secs, r.objects, r.source_objects[0], r.source_objects[1],
       r.source_objects[2], r.source_objects[3]);
-  g_test_message ("rdsmultistreamtiler %.3f ms per batch, rdsosd %.3f ms per frame (%.1f objects per frame)",
-      r.tiler_us / 1e3 / MAX (r.batches, 1), r.osd_us / 1e3 / MAX (r.frames, 1),
+  g_test_message ("rdsmultistreamtiler %.3f ms per batch, rdsosd process-mode=%d %.3f ms per frame (%.1f objects per "
+      "frame)", r.tiler_us / 1e3 / MAX (r.batches, 1), mode, r.osd_us / 1e3 / MAX (r.frames, 1),
       (gdouble) r.objects / MAX (r.batches, 1));
   g_test_message ("box edges: %u of %u sampled have their left border band drawn", r.red_edges, r.edges);
   g_assert_cmpuint (r.batches, ==, CLIP_FRAMES);
@@ -257,7 +263,8 @@ main (int argc, char **argv)
   set_compile_caches ();
   gst_init (&argc, &argv);
   g_test_init (&argc, &argv, NULL);
-  g_test_add_func ("/gpu/osd-yolo/clip", test_clip);
+  g_test_add_data_func ("/gpu/osd-yolo/clip", GINT_TO_POINTER (1), test_clip);
+  g_test_add_data_func ("/gpu/osd-yolo/clip-cpu", GINT_TO_POINTER (0), test_clip);
   ret = g_test_run ();
   /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at process
    * exit otherwise */

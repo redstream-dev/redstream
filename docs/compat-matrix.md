@@ -32,7 +32,7 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvinfer` | `rdsinfer` | supported | primary detector only (`process-mode=1`, `network-type` 0 or 100) on MIGraphX; nvinfer config files (key file or YAML); properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
 | `nvtracker` | `rdstracker` | supported | the IOU and NvSORT trackers of NvMultiObjectTracker, on the CPU, with its YAML config files; NvDCF and NvDeepSORT configs run as NvSORT. Matches observed DeepStream 8.0 behaviour where the docs are silent; properties, config keys and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker) |
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | supported | NV12 and RGBA `memory:RDS` batches into one tiled frame of the same format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
-| `nvdsosd` | `rdsosd` | supported | RGBA `memory:RDS` frames (single or batched), drawn on the CPU with Cairo and Pango in the geometry of DeepStream 8.0's default GPU mode; masks and blur not yet; optional (`-Dosd`, needs cairo and pangocairo); properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
+| `nvdsosd` | `rdsosd` | supported | RGBA `memory:RDS` frames (single or batched), drawn on the GPU (`process-mode` 1, the default) or the CPU (`process-mode=0`), the same pixels either way, in the geometry of DeepStream 8.0's default GPU mode (Pango for text); masks and blur not yet; optional (`-Dosd`, needs cairo and pangocairo); properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
 | `nvdsanalytics` | `rdsanalytics` | planned | M2 | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsanalytics) |
 | `nvdslogger` | `rdslogger` | supported | passthrough, any caps; prints each stream's frame rate to stdout in DeepStream 8.0's `**PERF` line format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
 | `nveglglessink` | `rdsvideosink` | supported | display bin: `rdsvideoconvert` to system-memory BGRx, then a stock GStreamer sink (`video-sink`, default `autovideosink`); one frame per buffer; properties and behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
@@ -294,7 +294,8 @@ are silent, or **ours**: where 8.0 settles nothing or is clearly broken.
 
 ### `rdsosd` (`nvdsosd`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd))
 
-Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0. Enum nicks as in DeepStream.
+Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0. Enum nicks as in DeepStream
+(`process-mode`'s `MODE_VIC` is ours).
 
 | Property | Type | Default | Status | Notes |
 |---|---|---|---|---|
@@ -305,8 +306,8 @@ Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream
 | `clock-font-size` | uint 0..60 | `0` | supported | points; 0: 12. Changeable only in NULL or READY |
 | `x-clock-offset`, `y-clock-offset` | uint | `0` | supported | changeable only in NULL or READY |
 | `clock-color` | uint | `0` | supported | 0xRRGGBBAA; never set: opaque red; set to 0: invisible. Changeable only in NULL or READY |
-| `process-mode` | enum 0..1 (`MODE_CPU`, `MODE_GPU`) | `1` | accepted | both draw on the CPU with the GPU mode's geometry; logged at start. Changeable only in NULL or READY |
-| `gpu-id` | uint | `0` | accepted | frames are drawn where they are (synced to the CPU and back). Changeable only in NULL or READY |
+| `process-mode` | enum 0..2 (`MODE_CPU`, `MODE_GPU`, `MODE_VIC`) | `1` | supported | `0` draws on the CPU; `1` on the GPU (the default, as in DeepStream 8.0); `2` (ours: DeepStream 8.0's dGPU enum stops at 1, and VIC is a Jetson unit) on the GPU too, with one debug-log warning per element. The same pixels in every mode. Changeable only in NULL or READY |
+| `gpu-id` | uint | `0` | supported | the GPU the GPU modes draw on: one that is not there is an element error at start, frames in device memory on another GPU an element error; the CPU mode ignores it. Changeable only in NULL or READY |
 | `display-mask` | boolean | `FALSE` | accepted no-op | masks are not drawn yet; `TRUE` logs one warning |
 | `blur-bbox` | boolean | `FALSE` | accepted no-op | objects are not blurred yet; `TRUE` logs one warning. Changeable only in NULL or READY |
 | `blur-on-gie-class-ids` | string | NULL | accepted no-op | as `blur-bbox` |
@@ -314,9 +315,11 @@ Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream
 
 Pads: `sink` and `src`, `video/x-raw(memory:RDS)` RGBA only (ours: DeepStream 8.0's GPU mode also takes NV12), in
 place. A buffer whose memory is shared or a read-only surface view (`rdsstreamdemux` output) is drawn on a private
-copy; the batch it came from is never written. Frames with nothing to draw (under the current switches) are not
-synced, and a buffer with nothing to draw passes through unmapped, without a copy. A failed map or CPU/GPU sync is an
-element error.
+copy, made on the device; the batch it came from is never written. In the GPU modes the frames stay on the GPU: no
+CPU staging, no sync to the CPU and back; frames in system memory are an element error. Frames with nothing to draw
+(under the current switches) are not touched, and a buffer with nothing to draw passes through unmapped, without a
+copy. A GPU failure (no GPU at start, a failed draw) is an element error, never a fall back to the CPU; in the CPU
+mode, so is a failed map or CPU/GPU sync.
 
 #### Drawing behaviour
 
@@ -346,7 +349,7 @@ where the docs are silent, or **ours**: where 8.0 settles nothing or is clearly 
 | Other `arrow_head` values, zero-length arrows | ours | the shaft only |
 | Circles | matches nvdsosd (DeepStream 8.0) | a ring straddling the radius: `circle_width` w covers the pixels at distances r − ⌊w/2⌋ .. r + ⌈w/2⌉ from the centre (w 3, r 60: 59..62); `has_bg_color` fills inside the ring with `bg_color`; clipped at the frame |
 | `circle_width` 0 | matches nvdsosd (DeepStream 8.0) | still outlined, 3 px centred on the radius (r 60: 59..61), so zeroed circles stay visible |
-| Huge coordinates and widths | ours | circles and arrow heads with a coordinate, radius or width beyond 2^21 (2097152) pixels are not drawn (a wider `circle_width` is taken as 2^21); `line_width` and `arrow_width` above twice the frame's larger side are clamped to it (the stroke covers the frame); lines are clipped to the frame first |
+| Huge coordinates and widths | ours | circles and arrow heads with a coordinate, radius or width beyond 2^21 (2097152) pixels are not drawn (a wider `circle_width` is taken as 2^21); `line_width` and `arrow_width` above twice the frame's larger side are clamped to it (the stroke covers the frame); lines are clipped to the frame first; lines, arrows and circles are not drawn on frames wider or taller than 2^20 (1048576) pixels; a text whose coverage mask (its glyphs' ink box clipped to the frame, a byte a pixel) is larger than the 8 MiB mask heap is not drawn, its background box is (only huge fonts on large frames); nothing is drawn on frames wider or taller than 2^21 pixels or of more than 2^20 32 × 32 tiles (32768 × 32768; rdsosd takes 16384 × 16384 at most) |
 | Clock | matches nvdsosd (DeepStream 8.0) | `YYYY-MM-DD HH:MM:SS`, the process's local time read once per buffer, drawn like text without a box at the clock offsets; default font a serif; one per frame |
 | A buffer without frame meta | ours | passes through untouched, except that it gets the clock on every frame when `display-clock` is on |
 | Masks | ours | not drawn yet (`display-mask` accepted, one warning); 8.0 draws them only with `display-mask=1` |
@@ -354,8 +357,8 @@ where the docs are silent, or **ours**: where 8.0 settles nothing or is clearly 
 | Batched input | ours | each frame meta drawn on its own surface, the slot at its `batch_id` (8.0 draws every frame's meta on surface 0); a `batch_id` outside the batch is skipped with one element warning |
 | Tracker-created objects | matches nvdsosd (DeepStream 8.0) | drawn like any other object (confidence −0.1 changes nothing); nothing is added (no id text) |
 | `has_color_info`, `color_id` | ours | ignored (Jetson colour table) |
-| `process-mode` | ours | both values draw on the CPU with the GPU mode's geometry |
-| Ready on push | ours | the CPU/GPU syncs are synchronous; the frame is complete when pushed |
+| `process-mode` | ours | `0` draws on the CPU and `1` on the GPU, byte for byte the same (DeepStream 8.0's CPU mode draws differently); `2` (VIC on Jetson) draws on the GPU, with one debug-log warning per element |
+| Ready on push | ours | the GPU modes wait for the element's stream after each pass, the CPU mode's syncs are synchronous: the frame is complete when pushed |
 
 ### `rdslogger` (`nvdslogger`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger.md))
 

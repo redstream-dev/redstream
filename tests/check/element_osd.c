@@ -1,11 +1,13 @@
-/* rdsosd: factory, properties, caps and accepted no-ops (cpu); drawing through the element on memory:RDS device
- * surfaces: single frames, batches (each frame on its own surface), demuxed read-only views (drawn on a private
- * copy, the batch untouched), tracker-created objects, the clock, clamped borders, two instances drawing at once
- * (gpu, skipped without a ROCm device).
+/* rdsosd: factory, properties, caps and accepted no-ops, and no GPU (cpu); drawing through the element on memory:RDS
+ * device surfaces: single frames, batches (each frame on its own surface), demuxed read-only views (drawn on a
+ * private copy, the batch untouched), tracker-created objects, the clock, clamped borders, two instances drawing at
+ * once, each in process-mode 0 (CPU) and 1 (GPU); the same bytes in every mode, no CPU staging in the GPU modes, a
+ * failed GPU draw as an element error (gpu, skipped without a ROCm device).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-surface.h"
 
+#include <gmodule.h>
 #include <gst/check/gstharness.h>
 #include <rds/rds.h>
 #include <string.h>
@@ -15,6 +17,48 @@
 #define GREY 128
 
 static GstAllocator *dev_alloc;
+/* the process-mode of the elements a test makes (the /gpu tests run in 0 and 1) */
+static gint osd_mode = 1;
+
+/* the plugin's test hooks (gstrdsosd.h) */
+typedef void (*GetCountsFunc) (GstElement * element, guint64 * cpu_frames, guint64 * gpu_passes);
+typedef void (*FailNextPassFunc) (GstElement * element);
+static GetCountsFunc hook_get_counts;
+static FailNextPassFunc hook_fail_next_pass;
+
+static void
+load_hooks (void)
+{
+  GstPlugin *found = gst_registry_find_plugin (gst_registry_get (), "rdsosd"), *plugin;
+  GModule *module;
+
+  g_assert_nonnull (found);
+  plugin = gst_plugin_load (found);
+  g_assert_nonnull (plugin);
+  gst_object_unref (found);
+  module = g_module_open (gst_plugin_get_filename (plugin), G_MODULE_BIND_LOCAL);
+  g_assert_nonnull (module);
+  g_assert_true (g_module_symbol (module, "rds_osd_test_get_counts", (gpointer *) & hook_get_counts));
+  g_assert_true (g_module_symbol (module, "rds_osd_test_fail_next_pass", (gpointer *) & hook_fail_next_pass));
+  /* the module stays open: the plugin is never unloaded either */
+  gst_object_unref (plugin);
+}
+
+/* The element drew as its process-mode says: no frame synced to the CPU in the GPU modes (no CPU staging), no GPU
+ * pass in the CPU mode. */
+static void
+assert_drawn_by_mode (GstElement * e)
+{
+  guint64 cpu_frames = 0, gpu_passes = 0;
+  gint mode;
+
+  g_object_get (e, "process-mode", &mode, NULL);
+  hook_get_counts (e, &cpu_frames, &gpu_passes);
+  if (mode == 0)
+    g_assert_cmpuint (gpu_passes, ==, 0);
+  else
+    g_assert_cmpuint (cpu_frames, ==, 0);
+}
 
 /* ---- cpu ---- */
 
@@ -64,7 +108,9 @@ test_properties (void)
   ec = g_type_class_ref (ps->value_type);
   g_assert_cmpstr (g_enum_get_value (ec, 0)->value_nick, ==, "MODE_CPU");
   g_assert_cmpstr (g_enum_get_value (ec, 1)->value_nick, ==, "MODE_GPU");
-  g_assert_null (g_enum_get_value (ec, 2));
+  /* ours: Jetson's VIC mode is accepted and draws on the GPU (DeepStream 8.0's dGPU enum stops at 1) */
+  g_assert_cmpstr (g_enum_get_value (ec, 2)->value_nick, ==, "MODE_VIC");
+  g_assert_null (g_enum_get_value (ec, 3));
   g_type_class_unref (ec);
 
   g_object_set (e, "display-text", FALSE, "display-bbox", FALSE, "display-clock", TRUE, "clock-font", "Sans",
@@ -209,7 +255,7 @@ typedef struct
 static void
 osd_init (Osd * o, const gchar * props)
 {
-  gchar *desc = g_strdup_printf ("rdsosd %s", props != NULL ? props : "");
+  gchar *desc = g_strdup_printf ("rdsosd process-mode=%d %s", osd_mode, props != NULL ? props : "");
   GError *err = NULL;
   GstElement *e = gst_parse_launch (desc, &err);
 
@@ -225,6 +271,7 @@ osd_init (Osd * o, const gchar * props)
 static void
 osd_clear (Osd * o)
 {
+  assert_drawn_by_mode (o->h->element);
   gst_element_set_bus (o->h->element, NULL);
   gst_bus_set_flushing (o->bus, TRUE);
   gst_harness_teardown (o->h);
@@ -241,21 +288,21 @@ test_mutable_ready (void)
 
   /* the properties gst-inspect marks "changeable only in NULL or READY" keep their value while PLAYING, with a
    * warning; the others change */
-  osd_init (&o, NULL);
+  osd_init (&o, "process-mode=0");
   g_assert_cmpint (GST_STATE (o.h->element), ==, GST_STATE_PLAYING);
   g_test_expect_message ("rdsosd", G_LOG_LEVEL_WARNING, "*clock-font-size*NULL or READY*");
   g_test_expect_message ("rdsosd", G_LOG_LEVEL_WARNING, "*x-clock-offset*NULL or READY*");
   g_test_expect_message ("rdsosd", G_LOG_LEVEL_WARNING, "*clock-color*NULL or READY*");
   g_test_expect_message ("rdsosd", G_LOG_LEVEL_WARNING, "*process-mode*NULL or READY*");
   g_object_set (o.h->element, "clock-font-size", 20u, "x-clock-offset", 5u, "clock-color", 0x00ff00ffu,
-      "process-mode", 0, "display-text", FALSE, NULL);
+      "process-mode", 1, "display-text", FALSE, NULL);
   g_test_assert_expected_messages ();
   g_object_get (o.h->element, "clock-font-size", &size, "x-clock-offset", &x, "clock-color", &color,
       "process-mode", &mode, "display-text", &text, NULL);
   g_assert_cmpuint (size, ==, 0);
   g_assert_cmpuint (x, ==, 0);
   g_assert_cmpuint (color, ==, 0);
-  g_assert_cmpint (mode, ==, 1);
+  g_assert_cmpint (mode, ==, 0);
   g_assert_false (text);
   osd_clear (&o);
 }
@@ -634,18 +681,17 @@ test_switches (void)
 
 /* ---- timing ---- */
 
-#define TW 1920
-#define TH 1080
 #define T_OBJECTS 60
 
-/* A device batch of @n grey 1920x1080 RGBA slots, each with a frame meta holding T_OBJECTS objects styled as
- * rdsinfer styles them (a 3 px red box, a white size-10 label on black above it). */
+/* A device batch of @n grey @w x @h RGBA slots, each with a frame meta holding T_OBJECTS objects styled as rdsinfer
+ * styles them (a 3 px red box, a white size-10 label on black above it), on a 10 x 6 grid. */
 static GstBuffer *
-make_timing_batch (guint n)
+make_timing_batch_sized (guint n, guint w, guint h)
 {
-  RdsBufSurfaceCreateParams cp = {.width = TW,.height = TH,.layout = RDS_BUF_LAYOUT_PITCH,
+  RdsBufSurfaceCreateParams cp = {.width = w,.height = h,.layout = RDS_BUF_LAYOUT_PITCH,
     .colorFormat = RDS_BUF_COLOR_FORMAT_RGBA
   };
+  guint step_x = (w - 200) / 9, step_y = (h - 200) / 5;
   GstBuffer *buf = gst_buffer_new ();
   RdsBatchMeta *bm = rds_create_batch_meta (n);
   RdsBufSurface *s;
@@ -662,12 +708,12 @@ make_timing_batch (guint n)
     rds_add_frame_meta_to_batch (bm, fm);
     for (guint k = 0; k < T_OBJECTS; k++) {
       RdsObjectMeta *om = rds_acquire_obj_meta_from_pool (bm);
-      gfloat l = 30 + (k % 10) * 185, t = 60 + (k / 10) * 170;
+      gfloat l = 30 + (k % 10) * step_x, t = 60 + (k / 10) * step_y;
       RdsOSD_TextParams *tp = &om->text_params;
 
       om->rect_params = box_at (l, t, 3);
-      om->rect_params.width = 140;
-      om->rect_params.height = 120;
+      om->rect_params.width = MIN (140, step_x - 20);
+      om->rect_params.height = MIN (120, step_y - 20);
       om->object_id = k;
       om->confidence = 0.8f;
       tp->display_text = g_strdup_printf ("person %u", k);
@@ -689,6 +735,12 @@ make_timing_batch (guint n)
   return buf;
 }
 
+static GstBuffer *
+make_timing_batch (guint n)
+{
+  return make_timing_batch_sized (n, 1920, 1080);
+}
+
 /* A demuxed view of slot @slot of @batch, with that frame's meta (batch_id 0), as rdsstreamdemux pushes it. */
 static GstBuffer *
 timing_view (GstBuffer * batch, guint slot)
@@ -703,26 +755,20 @@ timing_view (GstBuffer * batch, guint slot)
   return view;
 }
 
-/* Prints rdsosd's cost per 1920x1080 frame with T_OBJECTS objects: in place on an owned buffer (sync to the CPU,
- * draw, sync back), and on demuxed read-only views (plus the private copy of the slot, its staging allocation and
- * the frees), with the copy's share on its own. The times are only printed; the one check is that the owned buffer is
- * drawn in place (its memory is never replaced by a copy). */
-static void
-test_timing (void)
+/* rdsosd's time per frame on an owned @w x @hgt buffer with T_OBJECTS objects: the same writable buffer through
+ * again and again (its staging mirror stays, as a pool buffer's does). It is drawn in place every time, never
+ * copied. */
+static gdouble
+owned_ms (GstHarness * h, guint w, guint hgt, guint iterations)
 {
-  const guint iterations = 40;
-  GstHarness *h;
-  GstBuffer *buf, *batch;
-  gint64 t0, view_us = 0, copy_us = 0;
-  gdouble owned_ms, view_ms, copy_ms = 0, copy_sync_ms = 0;
+  gchar *caps = g_strdup_printf ("video/x-raw(memory:RDS),format=RGBA,width=%u,height=%u,framerate=25/1", w, hgt);
+  GstBuffer *buf = make_timing_batch_sized (1, w, hgt);
   GstMemory *mem;
+  gint64 t0;
+  gdouble ms;
 
-  RDS_TEST_REQUIRE_GPU ();
-  h = gst_harness_new ("rdsosd");
-  gst_harness_set_src_caps_str (h, "video/x-raw(memory:RDS),format=RGBA,width=1920,height=1080,framerate=25/1");
-
-  /* owned: the same writable buffer through again and again (its staging mirror stays, as a pool buffer's does) */
-  buf = make_timing_batch (1);
+  gst_harness_set_src_caps_str (h, caps);
+  g_free (caps);
   g_assert_cmpint (gst_harness_push (h, buf), ==, GST_FLOW_OK);
   buf = gst_harness_pull (h);
   mem = gst_buffer_peek_memory (buf, 0);
@@ -731,10 +777,35 @@ test_timing (void)
     g_assert_cmpint (gst_harness_push (h, buf), ==, GST_FLOW_OK);
     buf = gst_harness_pull (h);
   }
-  /* drawn in place every time, never copied */
   g_assert_true (gst_buffer_peek_memory (buf, 0) == mem);
-  owned_ms = (g_get_monotonic_time () - t0) / 1e3 / iterations;
+  ms = (g_get_monotonic_time () - t0) / 1e3 / iterations;
   gst_buffer_unref (buf);
+  return ms;
+}
+
+/* Prints rdsosd's cost per frame with T_OBJECTS objects: in place on an owned 1280x720 and 1920x1080 buffer (on the
+ * GPU, or synced to the CPU, drawn and synced back), and on demuxed read-only 1920x1080 views (plus the private copy
+ * of the slot and the frees, and in the CPU mode its staging allocation), with the copy's share on its own. The
+ * times are only printed; the one check is that the owned buffer is drawn in place (its memory is never replaced by a
+ * copy). */
+static void
+test_timing (void)
+{
+  const guint iterations = 40;
+  GstHarness *h;
+  GstBuffer *batch;
+  gint64 t0, view_us = 0, copy_us = 0;
+  gdouble owned_720_ms, owned_1080_ms, view_ms, copy_ms = 0, copy_sync_ms = 0;
+  GstElement *e;
+
+  RDS_TEST_REQUIRE_GPU ();
+  e = gst_element_factory_make ("rdsosd", NULL);
+  g_object_set (e, "process-mode", osd_mode, NULL);
+  h = gst_harness_new_with_element (e, "sink", "src");
+  gst_object_unref (e);
+
+  owned_720_ms = owned_ms (h, 1280, 720, iterations);
+  owned_1080_ms = owned_ms (h, 1920, 1080, iterations);
 
   /* views of slot 1 of a batch of 2: each one copied, drawn, freed */
   batch = make_timing_batch (2);
@@ -783,16 +854,18 @@ test_timing (void)
     gst_buffer_unref (view);
   }
   gst_buffer_unref (batch);
+  assert_drawn_by_mode (h->element);
   gst_harness_teardown (h);
 
-  g_test_message ("rdsosd per 1920x1080 frame with %u objects: owned buffer %.3f ms, demuxed view %.3f ms "
-      "(+%.3f ms); the view's private copy alone %.3f ms, with its first CPU sync %.3f ms", T_OBJECTS, owned_ms,
-      view_ms, view_ms - owned_ms, copy_ms, copy_sync_ms);
+  g_test_message ("rdsosd process-mode=%d per frame with %u objects: owned 1280x720 buffer %.3f ms; 1920x1080: owned "
+      "buffer %.3f ms, demuxed view %.3f ms (+%.3f ms); the view's private copy alone %.3f ms, with its first CPU "
+      "sync %.3f ms", osd_mode, T_OBJECTS, owned_720_ms, owned_1080_ms, view_ms, view_ms - owned_1080_ms, copy_ms,
+      copy_sync_ms);
 }
 
 /* Two rdsosd instances drawing at the same time, each pushed from its own thread (so each draws on that thread, as
- * on two demux branches), with text in different fonts: every output equals the one drawn alone. Cairo, Pango and
- * fontconfig are shared by both. */
+ * on two demux branches), with text in different fonts: every output equals the one drawn alone. Pango (with
+ * Cairo for its text masks) and fontconfig are shared by both. */
 #define C_FRAMES 40
 #define C_OBJECTS 8
 
@@ -917,6 +990,386 @@ test_concurrent (void)
   }
 }
 
+/* ---- modes ---- */
+
+static RdsOSD_ColorParams
+rich_color (GRand * r)
+{
+  return (RdsOSD_ColorParams) {
+  g_rand_double (r), g_rand_double (r), g_rand_double (r), g_rand_int_range (r, 0, 3) ? 1 : g_rand_double_range (r,
+        0.2, 1)};
+}
+
+/* A grey device frame with every kind of shape, some translucent, some wide or huge, and labels in two fonts, as
+ * @seed picks them. */
+static GstBuffer *
+make_rich_frame (guint seed)
+{
+  static const gchar *const words[] = { "car", "person 12", "bike", "Wq", "0.93" };
+  RdsBufSurfaceCreateParams cp = {.width = W,.height = H,.layout = RDS_BUF_LAYOUT_PITCH,
+    .colorFormat = RDS_BUF_COLOR_FORMAT_RGBA
+  };
+  GstBuffer *buf = gst_buffer_new ();
+  RdsBatchMeta *bm = rds_create_batch_meta (1);
+  RdsFrameMeta *fm = rds_acquire_frame_meta_from_pool (bm);
+  RdsDisplayMeta *dm;
+  GRand *r = g_rand_new_with_seed (seed);
+  RdsBufSurface *s;
+
+  gst_buffer_append_memory (buf, rds_allocator_alloc_surface (dev_alloc, 1, &cp));
+  s = rds_buffer_get_surface (buf);
+  g_assert_cmpint (rds_buf_surface_memset (s, 0, 0, GREY), ==, 0);
+  rds_add_frame_meta_to_batch (bm, fm);
+  for (guint k = 0; k < 12; k++) {
+    RdsObjectMeta *om = rds_acquire_obj_meta_from_pool (bm);
+    RdsOSD_TextParams *tp = &om->text_params;
+
+    om->rect_params = (RdsOSD_RectParams) {.left = g_rand_int_range (r, -30, W),.top = g_rand_int_range (r, -30, H),
+      .width = g_rand_int_range (r, 0, W / 2),.height = g_rand_int_range (r, 0, H / 2),.border_width =
+          g_rand_int_range (r, 0, 7),.border_color = rich_color (r),.has_bg_color = g_rand_int_range (r, 0, 3) == 0,
+      .bg_color = rich_color (r)
+    };
+    om->object_id = k;
+    om->confidence = 0.8f;
+    if (g_rand_boolean (r)) {
+      tp->display_text = g_strdup (words[g_rand_int_range (r, 0, G_N_ELEMENTS (words))]);
+      tp->x_offset = g_rand_int_range (r, 0, W);
+      tp->y_offset = g_rand_int_range (r, 0, H);
+      tp->font_params.font_name = (gchar *) concurrent_fonts[g_rand_int_range (r, 0, 2)];
+      tp->font_params.font_size = g_rand_int_range (r, 6, 20);
+      tp->font_params.font_color = rich_color (r);
+      tp->set_bg_clr = g_rand_boolean (r);
+      tp->text_bg_clr = rich_color (r);
+    }
+    rds_add_obj_meta_to_frame (fm, om, NULL);
+  }
+  dm = rds_acquire_display_meta_from_pool (bm);
+  dm->num_rects = 2;
+  for (guint i = 0; i < dm->num_rects; i++)
+    dm->rect_params[i] = (RdsOSD_RectParams) {.left = g_rand_int_range (r, 0, W),.top = g_rand_int_range (r, 0, H),
+      .width = 50,.height = 30,.border_width = 2,.border_color = rich_color (r),.has_bg_color = 1,.bg_color =
+          rich_color (r)
+    };
+  dm->num_labels = 2;
+  for (guint i = 0; i < dm->num_labels; i++)
+    dm->text_params[i] = (RdsOSD_TextParams) {.display_text = g_strdup_printf ("label %u", i),.x_offset =
+          g_rand_int_range (r, 0, W),.y_offset = g_rand_int_range (r, 0, H),.font_params = {.font_name =
+            (gchar *) "Sans",.font_size = 12,.font_color = rich_color (r)}
+    };
+  dm->num_lines = 4;
+  for (guint i = 0; i < dm->num_lines; i++)
+    dm->line_params[i] = (RdsOSD_LineParams) {.x1 = g_rand_int_range (r, 0, W + 40),.y1 = g_rand_int_range (r, 0,
+          H + 40),.x2 = g_rand_int_range (r, 0, W + 40),.y2 = g_rand_int_range (r, 0, H + 40),.line_width =
+          i == 0 ? 30 : g_rand_int_range (r, 1, 8),.line_color = rich_color (r)
+    };
+  dm->num_arrows = 3;
+  for (guint i = 0; i < dm->num_arrows; i++)
+    dm->arrow_params[i] = (RdsOSD_ArrowParams) {.x1 = g_rand_int_range (r, 0, W),.y1 = g_rand_int_range (r, 0, H),
+      .x2 = g_rand_int_range (r, 0, W),.y2 = g_rand_int_range (r, 0, H),.arrow_width = g_rand_int_range (r, 1, 8),
+      .arrow_head = (RdsOSD_Arrow_Head_Direction) i,.arrow_color = rich_color (r)
+    };
+  dm->num_circles = 3;
+  for (guint i = 0; i < dm->num_circles; i++)
+    dm->circle_params[i] = (RdsOSD_CircleParams) {.xc = i == 0 ? 3 * W : g_rand_int_range (r, 0, W),.yc =
+          i == 0 ? 2 * H : g_rand_int_range (r, 0, H),.radius = i == 0 ? 3 * W : g_rand_int_range (r, 5, 60),
+      .circle_width = g_rand_int_range (r, 0, 6),.circle_color = rich_color (r),.has_bg_color = g_rand_boolean (r),
+      .bg_color = rich_color (r)
+    };
+  rds_add_display_meta_to_frame (fm, dm);
+  g_rand_free (r);
+  s->numFilled = 1;
+  g_assert_nonnull (rds_buffer_add_batch_meta (buf, bm));
+  GST_BUFFER_PTS (buf) = 0;
+  return buf;
+}
+
+#define N_INPUTS 7
+
+/* Input @which of the mode comparison: the same bytes and metas every time. */
+static GstBuffer *
+make_input (guint which)
+{
+  GstBuffer *batch, *view;
+
+  switch (which) {
+    case 0:
+      return make_batch (3);
+    case 1:
+      return make_concurrent_frame (0, 3);
+    case 2:
+      return make_concurrent_frame (1, 5);
+    case 3:
+    case 4:
+      return make_rich_frame (which);
+    case 5:
+      return make_timing_batch (2);
+    default:
+      batch = make_timing_batch (2);
+      view = timing_view (batch, 1);
+      gst_buffer_unref (batch);
+      return view;
+  }
+}
+
+/* Draws @in with a new rdsosd in process-mode @mode; returns the output's @n slots as host images. */
+static HostImage *
+draw_in_mode (gint mode, GstBuffer * in, guint * n)
+{
+  const RdsBufSurfaceParams *p = &rds_buffer_get_surface (in)->surfaceList[0];
+  gchar *caps = g_strdup_printf ("video/x-raw(memory:RDS),format=RGBA,width=%u,height=%u,framerate=25/1",
+      p->width, p->height);
+  guint64 cpu_frames = 0, gpu_passes = 0;
+  gint saved = osd_mode;
+  HostImage *imgs;
+  GstBuffer *out;
+  RdsBufSurface *s;
+  Osd o;
+
+  osd_mode = mode;
+  osd_init (&o, NULL);
+  osd_mode = saved;
+  gst_harness_set_src_caps_str (o.h, caps);
+  g_free (caps);
+  out = osd_run (&o, in);
+  s = rds_buffer_get_surface (out);
+  *n = s->numFilled;
+  imgs = g_new0 (HostImage, *n);
+  for (guint i = 0; i < *n; i++)
+    snapshot (s, i, &imgs[i]);
+  gst_buffer_unref (out);
+  hook_get_counts (o.h->element, &cpu_frames, &gpu_passes);
+  g_assert_cmpuint (mode == 0 ? cpu_frames : gpu_passes, >, 0);
+  g_assert_cmpuint (count_messages (o.bus, GST_MESSAGE_ERROR), ==, 0);
+  osd_clear (&o);
+  return imgs;
+}
+
+static void
+test_modes_identical (void)
+{
+  /* process-mode 1 (GPU) and 2 (ours: GPU) draw the same bytes as 0 (CPU) */
+  RDS_TEST_REQUIRE_GPU ();
+  for (guint which = 0; which < N_INPUTS; which++) {
+    guint n_ref, n;
+    HostImage *ref = draw_in_mode (0, make_input (which), &n_ref);
+
+    for (gint mode = 1; mode <= 2; mode++) {
+      HostImage *imgs = draw_in_mode (mode, make_input (which), &n);
+
+      g_assert_cmpuint (n, ==, n_ref);
+      for (guint i = 0; i < n; i++) {
+        if (max_diff (&imgs[i], &ref[i], TRUE) != 0)
+          g_error ("input %u slot %u: process-mode %d differs from process-mode 0", which, i, mode);
+        host_image_clear (&imgs[i]);
+      }
+      g_free (imgs);
+    }
+    for (guint i = 0; i < n_ref; i++)
+      host_image_clear (&ref[i]);
+    g_free (ref);
+  }
+}
+
+/* Restarts the harness's element (NULL, then PLAYING) and sends the stream's events again. */
+static void
+osd_restart (Osd * o)
+{
+  g_assert_cmpint (gst_element_set_state (o->h->element, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+  g_assert_cmpint (gst_element_set_state (o->h->element, GST_STATE_PLAYING), ==, GST_STATE_CHANGE_SUCCESS);
+  g_assert_true (gst_harness_push_event (o->h, gst_event_new_stream_start ("osd-restart")));
+  gst_harness_set_src_caps_str (o->h, "video/x-raw(memory:RDS),format=RGBA,width=320,height=240,framerate=25/1");
+}
+
+static gint vic_logs;
+
+static void
+count_vic_logs (GstDebugCategory * category, GstDebugLevel level, G_GNUC_UNUSED const gchar * file,
+    G_GNUC_UNUSED const gchar * function, G_GNUC_UNUSED gint line, G_GNUC_UNUSED GObject * object,
+    GstDebugMessage * message, G_GNUC_UNUSED gpointer user_data)
+{
+  if (level == GST_LEVEL_WARNING && g_strcmp0 (gst_debug_category_get_name (category), "rdsosd") == 0
+      && strstr (gst_debug_message_get (message), "process-mode=2") != NULL)
+    g_atomic_int_inc (&vic_logs);
+}
+
+static void
+test_vic_mode (void)
+{
+  Osd o;
+  guint64 cpu_frames = 0, gpu_passes = 0;
+  HostImage img;
+
+  /* ours: process-mode=2 (Jetson's VIC) draws on the GPU, with one debug-log warning per element */
+  RDS_TEST_REQUIRE_GPU ();
+  gst_debug_set_threshold_for_name ("rdsosd", GST_LEVEL_WARNING);
+  gst_debug_add_log_function (count_vic_logs, NULL, NULL);
+  g_atomic_int_set (&vic_logs, 0);
+  osd_mode = 2;
+  osd_init (&o, NULL);
+  osd_mode = 1;
+  for (guint k = 0; k < 3; k++) {
+    GstBuffer *out;
+
+    if (k == 2)
+      osd_restart (&o);
+    out = osd_run (&o, make_batch (1));
+    snapshot (rds_buffer_get_surface (out), 0, &img);
+    assert_slot_box (&img, 0, 1);
+    host_image_clear (&img);
+    gst_buffer_unref (out);
+  }
+  hook_get_counts (o.h->element, &cpu_frames, &gpu_passes);
+  g_assert_cmpuint (gpu_passes, ==, 1);
+  g_assert_cmpuint (cpu_frames, ==, 0);
+  g_assert_cmpuint (count_messages (o.bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING), ==, 0);
+  osd_clear (&o);
+  gst_debug_remove_log_function (count_vic_logs);
+  gst_debug_unset_threshold_for_name ("rdsosd");
+  g_assert_cmpint (g_atomic_int_get (&vic_logs), ==, 1);
+}
+
+static void
+test_gpu_error (void)
+{
+  Osd o;
+  GstBuffer *out;
+  GstMessage *m;
+  GError *err = NULL;
+  HostImage ref, img;
+
+  /* a failed GPU draw is an element error, never a fall back to the CPU; the element draws again afterwards, and
+   * after a restart */
+  RDS_TEST_REQUIRE_GPU ();
+  osd_init (&o, NULL);
+  out = osd_run (&o, make_concurrent_frame (0, 1));
+  snapshot (rds_buffer_get_surface (out), 0, &ref);
+  gst_buffer_unref (out);
+
+  hook_fail_next_pass (o.h->element);
+  g_assert_cmpint (gst_harness_push (o.h, make_concurrent_frame (0, 1)), ==, GST_FLOW_ERROR);
+  m = gst_bus_pop_filtered (o.bus, GST_MESSAGE_ERROR);
+  g_assert_nonnull (m);
+  gst_message_parse_error (m, &err, NULL);
+  g_assert_error (err, GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_FAILED);
+  g_assert_nonnull (strstr (err->message, "GPU"));
+  g_error_free (err);
+  gst_message_unref (m);
+
+  /* the masks the failed pass may have left half uploaded are uploaded again */
+  for (guint k = 0; k < 2; k++) {
+    if (k == 1)
+      osd_restart (&o);
+    out = osd_run (&o, make_concurrent_frame (0, 1));
+    snapshot (rds_buffer_get_surface (out), 0, &img);
+    g_assert_cmpuint (max_diff (&img, &ref, TRUE), ==, 0);
+    host_image_clear (&img);
+    gst_buffer_unref (out);
+  }
+  host_image_clear (&ref);
+  g_assert_cmpuint (count_messages (o.bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING), ==, 0);
+  osd_clear (&o);
+}
+
+/* ---- the first draw of a process ---- */
+
+/* Each runs alone in a fresh process (its own meson test entry): the first GPU draw of the process is correct, on an
+ * owned buffer and on a view (drawn on its private device copy). */
+static void
+test_first_buffer (void)
+{
+  Osd o;
+  GstBuffer *out;
+  HostImage img;
+
+  RDS_TEST_REQUIRE_GPU ();
+  osd_init (&o, NULL);
+  out = osd_run (&o, make_batch (1));
+  snapshot (rds_buffer_get_surface (out), 0, &img);
+  assert_slot_box (&img, 0, 1);
+  host_image_clear (&img);
+  gst_buffer_unref (out);
+  g_assert_cmpuint (count_messages (o.bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING), ==, 0);
+  osd_clear (&o);
+}
+
+static void
+test_first_view (void)
+{
+  RDS_TEST_REQUIRE_GPU ();
+  test_view_copied ();
+}
+
+/* ---- cpu: no GPU ---- */
+
+static void
+test_no_gpu (void)
+{
+  GstElement *e;
+  GstBus *bus;
+  GstMessage *m;
+
+  /* without a device, the default GPU mode is an element error at start (not a crash); the CPU mode starts */
+  if (rds_test_have_gpu ()) {
+    g_test_skip ("a ROCm device is visible");
+    return;
+  }
+  e = gst_element_factory_make ("rdsosd", NULL);
+  bus = gst_bus_new ();
+  gst_element_set_bus (e, bus);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_PAUSED), ==, GST_STATE_CHANGE_FAILURE);
+  m = gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR);
+  g_assert_nonnull (m);
+  gst_message_unref (m);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+  g_object_set (e, "process-mode", 0, NULL);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_PAUSED), !=, GST_STATE_CHANGE_FAILURE);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+  g_assert_null (gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR));
+  gst_element_set_bus (e, NULL);
+  gst_object_unref (bus);
+  gst_object_unref (e);
+}
+
+/* ---- both modes ---- */
+
+typedef struct
+{
+  gint mode;
+  GTestFunc func;
+} ModeTest;
+
+/* static: GLib frees a test's data only when the test runs */
+static ModeTest mode_tests[16][2];
+static guint n_mode_tests;
+
+static void
+run_in_mode (gconstpointer data)
+{
+  const ModeTest *t = data;
+
+  osd_mode = t->mode;
+  t->func ();
+  osd_mode = 1;
+}
+
+/* Adds /gpu/osd-element/@name-mode-0 and /gpu/osd-element/@name-mode-1: @func in process-mode 0 (CPU) and 1 (GPU).
+ * Flat names: -p runs the test cases of a suite, not those of its sub-suites. */
+static void
+add_both_modes (const gchar * name, GTestFunc func)
+{
+  g_assert_cmpuint (n_mode_tests, <, G_N_ELEMENTS (mode_tests));
+  for (gint mode = 0; mode <= 1; mode++) {
+    ModeTest *t = &mode_tests[n_mode_tests][mode];
+    gchar *path = g_strdup_printf ("/gpu/osd-element/%s-mode-%d", name, mode);
+
+    *t = (ModeTest) {
+    mode, func};
+    g_test_add_data_func (path, t, run_in_mode);
+    g_free (path);
+  }
+  n_mode_tests++;
+}
+
 int
 main (int argc, char **argv)
 {
@@ -925,24 +1378,31 @@ main (int argc, char **argv)
   gst_init (&argc, &argv);
   g_test_init (&argc, &argv, NULL);
   dev_alloc = rds_allocator_new (0, RDS_BUF_MEM_DEFAULT);
+  load_hooks ();
 
   g_test_add_func ("/cpu/osd-element/properties", test_properties);
   g_test_add_func ("/cpu/osd-element/noops-warn-once", test_noops_warn_once);
   g_test_add_func ("/cpu/osd-element/caps", test_caps);
   g_test_add_func ("/cpu/osd-element/mutable-ready", test_mutable_ready);
-  g_test_add_func ("/gpu/osd-element/single", test_single);
-  g_test_add_func ("/gpu/osd-element/batch", test_batch);
-  g_test_add_func ("/gpu/osd-element/view-copied", test_view_copied);
-  g_test_add_func ("/gpu/osd-element/shared-copied", test_shared_copied);
-  g_test_add_func ("/gpu/osd-element/nothing-to-draw", test_nothing_to_draw);
-  g_test_add_func ("/gpu/osd-element/tracker-object", test_tracker_object);
-  g_test_add_func ("/gpu/osd-element/clock", test_clock);
-  g_test_add_func ("/gpu/osd-element/no-frame-meta", test_no_frame_meta);
-  g_test_add_func ("/gpu/osd-element/batch-id-outside", test_batch_id_outside);
-  g_test_add_func ("/gpu/osd-element/border-clamped", test_border_clamped);
-  g_test_add_func ("/gpu/osd-element/switches", test_switches);
-  g_test_add_func ("/gpu/osd-element/concurrent", test_concurrent);
-  g_test_add_func ("/gpu/osd-element/timing", test_timing);
+  g_test_add_func ("/cpu/osd-element/no-gpu", test_no_gpu);
+  add_both_modes ("single", test_single);
+  add_both_modes ("batch", test_batch);
+  add_both_modes ("view-copied", test_view_copied);
+  add_both_modes ("shared-copied", test_shared_copied);
+  add_both_modes ("nothing-to-draw", test_nothing_to_draw);
+  add_both_modes ("tracker-object", test_tracker_object);
+  add_both_modes ("clock", test_clock);
+  add_both_modes ("no-frame-meta", test_no_frame_meta);
+  add_both_modes ("batch-id-outside", test_batch_id_outside);
+  add_both_modes ("border-clamped", test_border_clamped);
+  add_both_modes ("switches", test_switches);
+  add_both_modes ("concurrent", test_concurrent);
+  add_both_modes ("timing", test_timing);
+  g_test_add_func ("/gpu/osd-element/modes-identical", test_modes_identical);
+  g_test_add_func ("/gpu/osd-element/vic-mode", test_vic_mode);
+  g_test_add_func ("/gpu/osd-element/gpu-error", test_gpu_error);
+  g_test_add_func ("/gpu/osd-first-draw/buffer", test_first_buffer);
+  g_test_add_func ("/gpu/osd-first-draw/view", test_first_view);
   ret = g_test_run ();
 
   gst_object_unref (dev_alloc);

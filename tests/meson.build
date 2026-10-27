@@ -327,20 +327,37 @@ if rds_osd_enabled
   # rdsosd's drawing core on host buffers (no GStreamer, no GPU); prints the draw time of a 720p frame.
   test('osd_draw', executable('osd_draw', 'check' / 'osd_draw.c', dependencies : [rdsosd_core_dep]),
     suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
-  # rdsosd: properties (cpu); drawing on memory:RDS batches and demuxed views (gpu).
-  element_osd_exe = executable('element_osd', 'check' / 'element_osd.c', dependencies : test_deps)
+  # rdsosd's shared shapes (the coverage and blend the CPU path and the GPU kernel share) on host buffers.
+  test('osd_shapes', executable('osd_shapes', 'check' / 'osd_shapes.c', dependencies : [rdsosd_core_dep]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
+  # rdsosd's draw planner (command order, tile binning, the text-mask cache and passes) on host buffers.
+  test('osd_plan', executable('osd_plan', 'check' / 'osd_plan.c', dependencies : [rdsosd_core_dep]),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
+  # rdsosd's GPU drawing against the CPU path, byte for byte; prints the draw time of a 720p frame and a 1080p batch.
+  test('osd_gpu', executable('osd_gpu', 'check' / 'osd_gpu.c', dependencies : [rdsosd_gpu_dep, gst_dep]),
+    suite : 'gpu', env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 300)
+  # rdsosd: properties, no GPU (cpu); drawing on memory:RDS batches and demuxed views in both process modes, the same
+  # bytes in each, GPU errors (gpu; the test hooks are looked up in the plugin with GModule).
+  element_osd_exe = executable('element_osd', 'check' / 'element_osd.c',
+    dependencies : test_deps + [dependency('gmodule-2.0')])
   test('element_osd_cpu', element_osd_exe, args : ['-p', '/cpu/osd-element'],
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
   test('element_osd', element_osd_exe, args : ['-p', '/gpu/osd-element'],
     suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+  # the first GPU draw of a fresh process, on an owned buffer and on a view
+  foreach first : ['buffer', 'view']
+    test('element_osd_first_' + first, element_osd_exe, args : ['-p', '/gpu/osd-first-draw/' + first],
+      suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, depends : rds_plugins)
+  endforeach
 endif
 
 if rds_osd_enabled and rds_tracker_enabled and rds_infer_enabled
   # rdsmultistreamtiler and rdsosd end to end as rds-test3 runs them: four copies of the street clip, YOLO11n, NvSORT,
-  # the 2x2 tiler and rdsosd (pipeline_osd: merged meta, drawn boxes, frame rate), and the soak (pipeline_osd_soak,
-  # 4068 batches of 4, also in the soak suite). Both skip until tests/models/fetch-tracker-clip.sh and
-  # fetch-yolo11n.sh have run. The YOLO11n programs are shared with infer_engine, pipeline_infer and pipeline_tracker
-  # (a first batch-4 compile takes minutes). Never in parallel: one compile or soak at a time.
+  # the 2x2 tiler and rdsosd (pipeline_osd: merged meta, drawn boxes, frame rate, with rdsosd on the GPU and on the
+  # CPU), and the soak (pipeline_osd_soak, 4068 batches of 4 with a new label on every object of every batch, also in
+  # the soak suite). Both skip until tests/models/fetch-tracker-clip.sh and fetch-yolo11n.sh have run. The YOLO11n
+  # programs are shared with infer_engine, pipeline_infer and pipeline_tracker (a first batch-4 compile takes
+  # minutes). Never in parallel: one compile or soak at a time.
   osd_pipeline_args = [
     '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
     '-DRDS_TEST_CACHE_MEDIA="@0@"'.format(meson.project_source_root() / '.cache' / 'media'),
