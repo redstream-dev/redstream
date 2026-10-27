@@ -30,6 +30,8 @@ static const RdsCompatAlias aliases[] = {
   {"nv3dsink", "rdsvideosink"},
   {"nvv4l2h264enc", "rdsh264enc"},
   {"nvv4l2h265enc", "rdsh265enc"},
+  {"nvinferaudio", "rdsinferaudio"},
+  {"nvdsaudiotemplate", "rdsaudiotemplate"},
 };
 
 static void

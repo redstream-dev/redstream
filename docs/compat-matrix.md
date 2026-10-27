@@ -981,6 +981,21 @@ The object meta fields the tracker writes (`object_id`, `tracker_bbox_info`, `tr
 `text_params.display_text`) are those of `RdsObjectMeta` under "Metadata"; `RDS_UNTRACKED_OBJECT_ID` is
 `G_MAXUINT64`.
 
+## Audio (planned)
+
+DeepStream also batches and infers on audio. None of it is implemented yet. The two audio elements are already in the
+remap table (they fail to create, naming the Redstream element, until they exist); the audio side of the mux and demux
+and the audio batch buffer have no counterpart yet. The plan: `rdsinferaudio` runs its model on MIGraphX, like
+`rdsinfer`, and computes the log-mel spectrogram on the GPU.
+
+| DeepStream name | Redstream name | Status | Notes | Source |
+|---|---|---|---|---|
+| `nvinferaudio` | `rdsinferaudio` | planned | audio inference on batched audio with batch meta attached: the `audio-transform` property selects a log-mel spectrogram (`melsdb`: FFT length, hop, window, mel bins, sample rate, power-to-dB limits), applied before the model; `audio-framesize` and `audio-hopsize` set the frame and hop size the transform uses; outputs frame meta and classifier meta. Config files in key-file format, `[property]` and `[class-attrs-all]` / `[class-attrs-<id>]` groups | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/text/DS_plugin_gst-nvinferaudio.html) |
+| `nvdsaudiotemplate` | `rdsaudiotemplate` | planned | runs a custom library on single or batched S16LE/F32LE audio (`customlib-name`, `customlib-props`) | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/text/DS_plugin_gst-nvdsaudiotemplate.html) |
+| `nvstreammux` (audio input) | `rdsstreammux` | planned | the new mux only: mono S16LE or F32LE buffers from any number of sources, all pads with the same fixed caps (rate, format), batched into one audio buffer with batch meta; `rdsstreammux` is the default (video) mux today | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/text/DS_plugin_gst-nvstreammux2.html) |
+| `nvstreamdemux` (audio batches) | `rdsstreamdemux` | planned | splits an audio batch back into per-source streams (the multi-stream audio template pipeline) | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/text/DS_plugin_gst-nvdsaudiotemplate.html), [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/text/DS_plugin_gst-nvstreammux2.html) |
+| `NvBufAudio` | `RdsBufAudio` | planned | the batched audio buffer the new mux outputs (the counterpart of `NvBufSurface`); its layout is not on the public pages, so ours will be designed independently | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/text/DS_plugin_gst-nvstreammux2.html) |
+
 ## NvBufSurface
 
 Types are `typedef`s, functions and enumerators are object-like macros (taking a function's address works).

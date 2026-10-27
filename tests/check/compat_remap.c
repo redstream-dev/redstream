@@ -10,6 +10,9 @@ test_map_known (void)
   g_assert_cmpstr (rds_compat_map_factory_name ("nvstreammux"), ==, "rdsstreammux");
   g_assert_cmpstr (rds_compat_map_factory_name ("nveglglessink"), ==, "rdsvideosink");
   g_assert_cmpstr (rds_compat_map_factory_name ("nv3dsink"), ==, "rdsvideosink");
+  /* Planned elements are aliased before they exist. */
+  g_assert_cmpstr (rds_compat_map_factory_name ("nvinferaudio"), ==, "rdsinferaudio");
+  g_assert_cmpstr (rds_compat_map_factory_name ("nvdsaudiotemplate"), ==, "rdsaudiotemplate");
 }
 
 static void

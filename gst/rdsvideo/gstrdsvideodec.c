@@ -31,7 +31,7 @@ GST_DEBUG_CATEGORY_STATIC (gst_rds_video_dec_debug);
 #define MAX_DROP_FRAME_INTERVAL 30
 #define DEFAULT_SKIP_FRAMES GST_RDS_SKIP_FRAMES_DECODE_ALL
 #define DEFAULT_LOW_LATENCY_MODE FALSE
-/* Decode surfaces on top of the stream's minimum: headroom for pictures held for display (spike 0a). */
+/* Decode surfaces on top of the stream's minimum: headroom for pictures held for display (spikes/rocdec-hip). */
 #define EXTRA_DECODE_SURFACES 4
 /* Output pool: minimum buffers in flight downstream. */
 #define OUTPUT_MIN_BUFFERS 4
