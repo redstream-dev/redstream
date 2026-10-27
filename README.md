@@ -191,7 +191,8 @@ Early numbers on a 2-CU Ryzen 9 7900X iGPU:
   about 50 fps; about 48 fps with `rdstracker` (NvSORT) after it; about 44–46 fps through the whole `rds-test3`
   chain (tracker, tiler and OSD, to a fakesink).
 - `rdsosd` at 1280×720 with about 60 objects, release build: about 0.3 ms per frame on the GPU (about 1.2 ms with
-  `process-mode=0`, the CPU drawing and the GPU↔CPU syncs included).
+  `process-mode=0`, the CPU drawing and the GPU↔CPU syncs included). On 1920×1080 frames from `rdsstreamdemux`,
+  which it draws on a private copy: about 0.9 ms on the GPU, about 7 ms on the CPU (the copy's CPU staging).
 
 **Known issue (ROCm 10.1):** with more HIP streams than hardware queues, which a multi-stream pipeline easily has,
 an SDMA copy can occasionally fault and abort the process with `Memory access fault by GPU ... on address 0x401000`.

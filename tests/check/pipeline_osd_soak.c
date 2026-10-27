@@ -1,6 +1,8 @@
 /* rdsmultistreamtiler and rdsosd soak (gpu, soak suite): the pipeline of pipeline_osd (rds-test-osd-pipeline.h) with
  * the street clip looped into four appsrcs until at least 3000 batches have gone through, checking that neither host
- * nor GPU memory grows (rds-test-soak.h). Skips without the clip or YOLO11n.
+ * nor GPU memory grows (rds-test-soak.h). rdsosd draws on the GPU (its default process-mode), and every label gets
+ * its batch number appended, so each batch's texts are new masks and the text-mask cache evicts all along. Skips
+ * without the clip or YOLO11n.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-soak.h"
@@ -12,13 +14,44 @@
 #define SOAK_MIN_BATCHES 3000
 #define SOAK_SAMPLE_EVERY 300   /* batches between memory samples */
 #define SOAK_MAX_SAMPLES 16
+/* rdsosd's text-mask heap (RDS_OSD_MASK_HEAP_SIZE) and a lower bound on a label's mask bytes (a size-10 label of a
+ * few words is wider than 32 px and taller than 8 px): the soak's labels must fill the heap several times over */
+#define SOAK_MASK_HEAP (8 * 1024 * 1024)
+#define SOAK_MASK_MIN_BYTES 256
 
 typedef struct
 {
   guint batches, objects;
+  guint in_batches, labels;     /* batches into rdsosd, and the labels made unique there */
   guint n_samples;
   gsize host[SOAK_MAX_SAMPLES], gpu_used[SOAK_MAX_SAMPLES];
 } OsdSoakStats;
+
+/* On rdsosd's sink pad: appends " #<batch>" to every object's label, so no label repeats from one batch to the next
+ * and each batch rasterizes new masks. */
+static GstPadProbeReturn
+osd_label_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  OsdSoakStats *st = user_data;
+  RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (GST_PAD_PROBE_INFO_BUFFER (info));
+
+  g_assert_nonnull (bm);
+  rds_acquire_meta_lock (bm);
+  for (GList * f = bm->frame_meta_list; f; f = f->next)
+    for (GList * o = ((RdsFrameMeta *) f->data)->obj_meta_list; o; o = o->next) {
+      RdsOSD_TextParams *tp = &((RdsObjectMeta *) o->data)->text_params;
+      gchar *old = tp->display_text;
+
+      if (old == NULL)
+        continue;
+      tp->display_text = g_strdup_printf ("%s #%u", old, st->in_batches);
+      g_free (old);
+      st->labels++;
+    }
+  rds_release_meta_lock (bm);
+  st->in_batches++;
+  return GST_PAD_PROBE_OK;
+}
 
 /* On rdsosd's source pad: counts tiled frames and their objects, and samples memory use every SOAK_SAMPLE_EVERY
  * batches. */
@@ -46,7 +79,7 @@ static void
 test_osd_soak (void)
 {
   OsdSoakStats st = { 0 };
-  GstElement *pipe, *src[SOURCES];
+  GstElement *pipe, *osd, *src[SOURCES];
   GBytes *stream;
   gchar *pgie, *data = NULL;
   gsize len = 0;
@@ -54,6 +87,7 @@ test_osd_soak (void)
   gint64 t0, t1;
   gssize host_growth, gpu_delta;
   gdouble secs;
+  gint mode = -1;
 
   RDS_TEST_REQUIRE_GPU ();
   if (!have_assets ())
@@ -64,6 +98,11 @@ test_osd_soak (void)
   loops = (SOAK_MIN_BATCHES + CLIP_FRAMES - 1) / CLIP_FRAMES;
 
   pipe = osd_pipeline_new (pgie, TRUE, "fakesink sync=false enable-last-sample=false");
+  osd = gst_bin_get_by_name (GST_BIN (pipe), "osd");
+  g_object_get (osd, "process-mode", &mode, NULL);
+  g_assert_cmpint (mode, ==, 1);
+  gst_object_unref (osd);
+  add_probe (pipe, "osd", "sink", osd_label_probe, &st);
   add_probe (pipe, "osd", "src", osd_soak_probe, &st);
   for (guint i = 0; i < SOURCES; i++) {
     gchar name[4];
@@ -99,13 +138,14 @@ test_osd_soak (void)
   g_assert_cmpuint (st.n_samples, >=, 3);
   host_growth = (gssize) st.host[st.n_samples - 1] - (gssize) st.host[1];
   gpu_delta = (gssize) st.gpu_used[st.n_samples - 1] - (gssize) st.gpu_used[1];
-  g_test_message ("%u batches of %u in %.1f s (%.0f fps, %.1f tiled frames/s), %u objects drawn; "
-      RDS_TEST_HOST_MEMORY_NAME " growth batch %u -> %u: %+.2f MiB; GPU used delta: %+.2f MiB", st.batches, SOURCES,
-      secs, SOURCES * st.batches / secs, st.batches / secs, st.objects, 2 * SOAK_SAMPLE_EVERY,
+  g_test_message ("%u batches of %u in %.1f s (%.0f fps, %.1f tiled frames/s), %u objects drawn, %u distinct "
+      "labels; " RDS_TEST_HOST_MEMORY_NAME " growth batch %u -> %u: %+.2f MiB; GPU used delta: %+.2f MiB", st.batches,
+      SOURCES, secs, SOURCES * st.batches / secs, st.batches / secs, st.objects, st.labels, 2 * SOAK_SAMPLE_EVERY,
       st.n_samples * SOAK_SAMPLE_EVERY, MIB (host_growth), MIB (gpu_delta));
   g_assert_cmpuint (st.batches, ==, CLIP_FRAMES * loops);
   g_assert_cmpuint (st.batches, >=, SOAK_MIN_BATCHES);
   g_assert_cmpuint (st.objects, >, 0);
+  g_assert_cmpuint (st.labels, >, 4 * SOAK_MASK_HEAP / SOAK_MASK_MIN_BYTES);
   g_assert_cmpuint (warnings, ==, 0);
   g_assert_cmpint (host_growth, <, 8 * 1024 * 1024);
   g_assert_cmpint (ABS (gpu_delta), <, 16 * 1024 * 1024);
