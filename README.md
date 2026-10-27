@@ -8,6 +8,11 @@
 > `rdslogger`, `rdsvideosink`) and the `rds-compile` tool (see "What works" below). APIs and element names will
 > change.
 
+![A street clip with detection boxes, class labels and track IDs drawn by rdsosd](docs/media/demo.gif)
+
+*A 720p street clip (CC0, Wikimedia Commons) through `rdsvideodec` → `rdsstreammux` → `rdsinfer` (YOLO11n) →
+`rdstracker` (NvSORT) → `rdsosd` → `rdsvideosink` on a Ryzen 7000 iGPU; the command is under "See it" below.*
+
 ## Why
 
 NVIDIA DeepStream is the de-facto toolkit for multi-stream video analytics pipelines, but it only runs
