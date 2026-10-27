@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Download the public test model into the git-ignored cache and verify its pinned sha256.
 set -eu
 mkdir -p .cache/models

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Dev image: ROCm 10.1 + MIGraphX + rocDecode/RPP + GStreamer 1.28 (va, hip, analytics) built from source.
 #
 #   docker build -f docker/Dockerfile.dev -t redstream:dev .

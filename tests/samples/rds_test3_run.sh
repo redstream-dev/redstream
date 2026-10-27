@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Usage: rds_test3_run.sh <rds-test3> <source dir> <work dir> [infer] [tracker] [osd]
 # rds-test3 end to end: four copies of the street clip, YOLO11n, the NvSORT tracker, tiler, OSD and fakesink
 # (--no-display). Checks the exit status, one count line per frame of each source, and that most frames have objects;

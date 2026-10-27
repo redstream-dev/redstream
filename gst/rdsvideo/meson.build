@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 rdsvideo_util_src = files('rds-video-util.c')
 gstrdsvideo = library('gstrdsvideo',
   files('plugin.c', 'gstrdsvideoconvert.c', 'gstrdsvideodec.c') + rdsvideo_util_src,

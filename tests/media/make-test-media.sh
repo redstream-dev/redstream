@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Generate small H.264 test clips with the VA encoder (no GPL encoders needed).
 # Usage: tests/media/make-test-media.sh [outdir]   (default: .cache/media)
 set -eu

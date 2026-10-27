@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 common_test_env = {
   'LSAN_OPTIONS' : 'suppressions=@0@:print_suppressions=0'.format(meson.current_source_dir() / 'lsan.supp'),
   # Let impossible allocations return NULL under ASan, as they do with glibc (buf_surface tests this).

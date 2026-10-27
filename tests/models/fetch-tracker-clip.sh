@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Downloads the public-domain (CC0) street clip for the rdstracker tests from Wikimedia Commons and transcodes it to
 # .cache/media/crosswalk-720p.h264: 1280x720 H.264 Annex-B, as rdsvideodec decodes it (see README.md). Runs on the
 # host and needs Docker, network access and the GPU (the encoder is vah264enc in redstream:dev).

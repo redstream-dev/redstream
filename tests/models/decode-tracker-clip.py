@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Decodes the tracker test clip (VP8 WebM) and writes its frames to stdout as raw I420 at the clip's own size, for
 fetch-tracker-clip.sh to scale and encode. Run by that script in a throwaway Python container with PyAV pinned in
 tracker-clip-requirements.txt; the clip's sha256 is checked before this runs.

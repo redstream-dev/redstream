@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # The layout core (grid, cells, meta scaling; GLib only, the meta structs come from the libgstrds headers), shared by
 # the plugin and the tests.
 rdstiler_core = static_library('rdstiler-core',

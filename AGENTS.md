@@ -77,6 +77,8 @@ Naming convention: elements `rds<name>`, types `Rds<Name>`, functions `rds_<name
   descriptions ("a multi-camera people-analytics app") and public sample media/models.
 - **Do not bundle models or large media.** Tests download public assets (e.g. Ultralytics/ONNX zoo models,
   public sample videos) into a git-ignored cache.
+- **Licences.** Code is LGPL-2.1-or-later; `samples/` is MIT. Every new source, build or script file starts with
+  an `SPDX-License-Identifier` line for its licence (MIT under `samples/`). Never add code under another licence.
 - Keep changes small and scoped; follow the existing style of the surrounding code.
 
 ## Development environment

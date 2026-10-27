@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # rdslogger (per-stream FPS) and rdsvideosink (display bin); no dependencies beyond GStreamer and libgstrds, so always
 # built.
 gstrdssink = library('gstrdssink',

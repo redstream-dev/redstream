@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Usage: rds_compile.sh <rds-compile> <gst-launch-1.0> <scale2.onnx> <work dir>
 # rds-compile on the scale2 test model in <work dir>/rds-compile: build, up to date, --force, overrides, -o, option
 # and config errors, then rdsinfer in gst-launch-1.0 loading the program instead of building it. An empty

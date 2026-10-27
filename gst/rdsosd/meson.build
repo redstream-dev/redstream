@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # The drawing core (shapes as draw commands shaded onto a CPU RGBA plane, Pango for text masks; no GStreamer, no GPU;
 # the meta structs come from the libgstrds headers), shared by the plugin and the tests. No fused multiply-add: the
 # blend must round as the same code does compiled for the GPU (rds-osd-shapes.h). GCC ignores the header's

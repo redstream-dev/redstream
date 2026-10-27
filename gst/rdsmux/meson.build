@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # The scaling mux compiles in the rdsvideo helpers (system-memory upload); they hold no GTypes.
 gstrdsmux = library('gstrdsmux',
   files('plugin.c', 'gstrdsstreammux.c', 'gstrdsstreamdemux.c') + rdsvideo_util_src,

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Writes the small ONNX test models next to this script (deterministic: re-running gives identical bytes).
 
   scale2.onnx     images float[batch,3,height,width] -> output0 = images * 2.0 (batch, height and width

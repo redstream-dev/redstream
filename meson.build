@@ -1,6 +1,8 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 project('redstream', 'c',
   version : '0.0.1',
-  license : 'LGPL-2.1-or-later',
+  license : 'LGPL-2.1-or-later AND MIT',
+  license_files : ['LICENSE', 'samples/LICENSE'],
   meson_version : '>= 1.4',
   default_options : ['c_std=gnu11', 'cpp_std=c++17', 'warning_level=2', 'werror=true'])
 

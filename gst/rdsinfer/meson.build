@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Plugin-private code shared by the plugin, rds-compile and the tests: the config parser (YAML read through
 # rds-plugin-common), the parser loader with the built-in YOLO parser, the detection post-processing, and the
 # MIGraphX engine with its program cache (and the ONNX reader it uses). The loader and the engine are C++, so whatever
