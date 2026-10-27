@@ -251,11 +251,21 @@ The project is in its design phase, so issues and design discussion are the most
 Design discussion happens in GitHub issues. If you use AI coding agents, read [`AGENTS.md`](AGENTS.md) first.
 
 This is a clean-room implementation: do not contribute code, headers or documentation copied from the
-NVIDIA DeepStream SDK.
+NVIDIA DeepStream SDK. Commits are signed off under the Developer Certificate of Origin; see
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 
-TBD (expected: LGPL-2.1-or-later for plugins and libraries, matching GStreamer).
+The libraries, plugins, tools and tests are licensed under the GNU Lesser General Public License, version 2.1 or
+(at your option) any later version ([`LICENSE`](LICENSE)), as GStreamer is. Applications that use Redstream through
+its shared libraries and plugins may have any licence; changes to Redstream itself that you distribute must be
+published under the same terms.
+
+The samples in [`samples/`](samples) (code and configs) are under the MIT licence ([`samples/LICENSE`](samples/LICENSE)),
+so you can copy them into your own applications freely.
+
+Each source file names its licence in an `SPDX-License-Identifier` line. Files without one (the test config fixtures)
+are under the LGPL like the rest of the tree outside `samples/`.
 
 ## Trademarks
 

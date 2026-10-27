@@ -1,7 +1,6 @@
 .cache/
 build/
-build-asan/
-build-rel/
+build-*/
 *.mxr
 *.mxr.json
 *.onnx

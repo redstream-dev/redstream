@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Command-line tools.
 if rds_infer_enabled
   # rds-compile builds rdsinfer's compiled program ahead of time (trtexec's role for nvinfer), with the element's own

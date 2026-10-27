@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Downloads Ultralytics YOLO11n and exports it to .cache/models/yolo11n.onnx (+ coco-labels.txt) for the rdsinfer
 # tests, with their reference data: a public-domain street photo as raw RGBA, Ultralytics' detections on it, and an
 # input/output pair from ONNX Runtime for the engine parity test (see README.md). Runs on the host and needs Docker

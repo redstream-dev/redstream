@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 option('rocm_path', type : 'string', value : '/opt/rocm',
   description : 'ROCm prefix holding include/hip and lib/libamdhip64.so')
 option('offload_arch', type : 'string', value : 'gfx10-3-generic,gfx11-generic,gfx12-generic',

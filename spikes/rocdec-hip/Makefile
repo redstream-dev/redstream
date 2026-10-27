@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 ROCM_INC := /opt/rocm/core-10.1/include
 ROCM_LIB := /opt/rocm/core-10.1/lib
 GST      := $(shell pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)

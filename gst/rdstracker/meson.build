@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Plugin-private code shared by the plugin and the tests: the config parser (YAML read through rds-plugin-common) and
 # the tracking core (GLib only).
 rdstracker_core_sources = files('rds-tracker-config.c', 'rds-tracker-core.c', 'rds-tracker-kf.c')

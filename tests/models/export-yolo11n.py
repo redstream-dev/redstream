@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Exports Ultralytics YOLO11n to ONNX for the rdsinfer tests and writes their reference data. Run by
 fetch-yolo11n.sh inside a throwaway container with the pins in export-requirements.txt; not meant to be run directly.
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Plugin-private code shared by several plugins (never installed): the YAML config reader and the config value
 # parsers, for rdsinfer and rdstracker. Built only for those plugins (both need libyaml, so it is found here).
 if rds_infer_enabled or rds_tracker_enabled

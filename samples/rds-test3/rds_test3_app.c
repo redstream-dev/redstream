@@ -14,7 +14,7 @@
  * counted before the tiler (which merges the batch into one frame). The class ids of "person" and "car" come from
  * the PGIE config's label file; a label the file doesn't have is counted as 0.
  *
- * SPDX-License-Identifier: LGPL-2.1-or-later */
+ * SPDX-License-Identifier: MIT */
 #include <math.h>
 #include <stdio.h>
 #include <string.h>

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 MGX_INC := /opt/rocm/extras-10/include
 MGX_LIB := /opt/rocm/extras-10/lib
 

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Usage: rds_test3_dry_run.sh <path-to-rds-test3> [<path-to-gst-inspect-1.0> [infer] [tracker] [osd]]
 # The third, fourth and fifth arguments are 'infer', 'tracker' and 'osd' when the build has rdsinfer, rdstracker and
 # rdsosd: then they are inspected too.

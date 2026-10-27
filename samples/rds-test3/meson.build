@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # The YAML reader that rdsinfer and rdstracker use (plugin-internal, linked in statically) reads a .yml PGIE config
 # for the label file; it is built whenever rdsinfer is. Without it, only key-file PGIE configs give labels. It is an
 # in-tree helper, not installed: an app built outside this tree uses a key-file config or its own YAML reader.
