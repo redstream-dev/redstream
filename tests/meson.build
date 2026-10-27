@@ -343,7 +343,12 @@ if rds_osd_enabled
   test('element_osd_cpu', element_osd_exe, args : ['-p', '/cpu/osd-element'],
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
   test('element_osd', element_osd_exe, args : ['-p', '/gpu/osd-element'],
-    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 240, depends : rds_plugins)
+    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+  # the first GPU draw of a fresh process, on an owned buffer and on a view
+  foreach first : ['buffer', 'view']
+    test('element_osd_first_' + first, element_osd_exe, args : ['-p', '/gpu/osd-first-draw/' + first],
+      suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, depends : rds_plugins)
+  endforeach
 endif
 
 if rds_osd_enabled and rds_tracker_enabled and rds_infer_enabled

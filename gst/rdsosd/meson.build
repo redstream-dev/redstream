@@ -15,7 +15,6 @@ rdsosd_core_dep = declare_dependency(link_with : rdsosd_core,
   dependencies : [dependency('glib-2.0'), rds_dep.partial_dependency(includes : true), cairo_dep, pangocairo_dep,
     cc.find_library('m', required : false)])
 
-
 # The GPU drawing kernels, built like rdsinfer's (gst/rdsinfer/meson.build), with contraction off: the kernel blends
 # with the same code as the CPU path and must round alike (amdclang's default is fast-honor-pragmas). The context
 # (rds-osd-gpu.c) and the kernel object make the static rdsosd-gpu, for the plugin and the tests.

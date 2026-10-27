@@ -143,7 +143,8 @@ GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/cross
 On that clip (56 s of a busy crosswalk, YOLO11n detections) the NvSORT sample config keeps 98.8 % of the confident
 detections tracked, with 4 ID switches over 283 tracks; the tracker itself takes about 0.01 ms per batch on the CPU.
 Four copies of the clip through the whole `rds-test3` chain run at about 44–46 fps on the iGPU below (`--no-display`):
-the detector sets the pace, and the tiler and OSD add about 2.5 ms per batch.
+the detector sets the pace, and the tiler and OSD add about 2.5 ms per batch (2.1 ms tiling, 0.4 ms drawing; release
+build).
 
 ## How it maps to DeepStream
 
@@ -189,7 +190,7 @@ Early numbers on a 2-CU Ryzen 9 7900X iGPU:
 - `rdsinfer` with YOLO11n FP32, four 720p sources at batch 4 (decode, batching, inference and post-processing):
   about 50 fps; about 48 fps with `rdstracker` (NvSORT) after it; about 44–46 fps through the whole `rds-test3`
   chain (tracker, tiler and OSD, to a fakesink).
-- `rdsosd` at 1280×720 with about 60 objects: about 0.3 ms per frame on the GPU (about 1.2 ms with
+- `rdsosd` at 1280×720 with about 60 objects, release build: about 0.3 ms per frame on the GPU (about 1.2 ms with
   `process-mode=0`, the CPU drawing and the GPU↔CPU syncs included).
 
 **Known issue (ROCm 10.1):** with more HIP streams than hardware queues, which a multi-stream pipeline easily has,

@@ -335,7 +335,8 @@ draw_gpu (GstRdsOsd * self)
       n_surfaces = 0;
     ok = rds_osd_gpu_draw_pass (self->gpu, self->plan, &pass, (const RdsOsdGpuSurface *) self->surfaces->data,
         n_surfaces, &error);
-    if (ok)
+    /* a pass with neither commands nor uploads sends nothing to the GPU */
+    if (ok && (pass.n_cmds > 0 || pass.n_uploads > 0))
       self->gpu_passes++;
   }
   (void) hipSetDevice (prev);

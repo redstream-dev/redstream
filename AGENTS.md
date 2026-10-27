@@ -139,10 +139,13 @@ Known gotchas:
   it too but slowed `rds-test3` from ~45 to ~29 fps. Seen in `memory_hip`'s concurrent views test (~2 % of runs
   under `meson test`, whose `MALLOC_PERTURB_` changes the timing); no standalone HIP reproducer yet.
 - HIP loads a library's kernels lazily, at their first launch (`HIP_ENABLE_DEFERRED_LOADING`, on by default). In
-  ROCm 10.1 the first launch of `rdsosd`'s drawing kernel from the plugin, a `dlopen`ed library, on its non-blocking
-  stream completed without drawing anything (no error; the same kernel linked into a test executable was fine).
-  `rds_osd_gpu_new` loads the kernels up front with `hipFuncGetAttributes`; do the same for new kernels in plugins
-  whose first launch matters.
+  ROCm 10.1 the launch that loads the code object is not ordered after the work queued before it on the same stream:
+  `rdsosd`'s first pass copies its commands to the device (`hipMemcpyAsync`) and launches the kernel on its
+  non-blocking stream, and the kernel read the device block before the copy landed and drew nothing, with no error
+  (`element_osd_first_*`, each a fresh process). With `HIP_ENABLE_DEFERRED_LOADING=0`, `AMD_SERIALIZE_KERNEL=3` or a
+  stream sync between the copy and the launch it drew correctly; `HIP_LAUNCH_BLOCKING=1` and SDMA copies did not
+  help. `rds_osd_gpu_new` loads its kernels up front with `hipFuncGetAttributes`; do the same for a kernel whose first
+  launch follows other work on its stream.
 - MIOpen (MIGraphX's convolutions) keeps its databases under `$HOME/.config/miopen`. GLib tests with
   `G_TEST_OPTION_ISOLATE_DIRS` set `HOME=/dev/null`, so such tests point `MIOPEN_USER_DB_PATH` and
   `MIOPEN_CUSTOM_CACHE_DIR` somewhere writable, and `AMD_COMGR_CACHE_DIR` too, since the isolated

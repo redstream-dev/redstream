@@ -1270,6 +1270,35 @@ test_gpu_error (void)
   osd_clear (&o);
 }
 
+/* ---- the first draw of a process ---- */
+
+/* Each runs alone in a fresh process (its own meson test entry): the first GPU draw of the process is correct, on an
+ * owned buffer and on a view (drawn on its private device copy). */
+static void
+test_first_buffer (void)
+{
+  Osd o;
+  GstBuffer *out;
+  HostImage img;
+
+  RDS_TEST_REQUIRE_GPU ();
+  osd_init (&o, NULL);
+  out = osd_run (&o, make_batch (1));
+  snapshot (rds_buffer_get_surface (out), 0, &img);
+  assert_slot_box (&img, 0, 1);
+  host_image_clear (&img);
+  gst_buffer_unref (out);
+  g_assert_cmpuint (count_messages (o.bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING), ==, 0);
+  osd_clear (&o);
+}
+
+static void
+test_first_view (void)
+{
+  RDS_TEST_REQUIRE_GPU ();
+  test_view_copied ();
+}
+
 /* ---- cpu: no GPU ---- */
 
 static void
@@ -1372,6 +1401,8 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/osd-element/modes-identical", test_modes_identical);
   g_test_add_func ("/gpu/osd-element/vic-mode", test_vic_mode);
   g_test_add_func ("/gpu/osd-element/gpu-error", test_gpu_error);
+  g_test_add_func ("/gpu/osd-first-draw/buffer", test_first_buffer);
+  g_test_add_func ("/gpu/osd-first-draw/view", test_first_view);
   ret = g_test_run ();
 
   gst_object_unref (dev_alloc);
