@@ -1,11 +1,27 @@
 /* rds-test3: multi-stream detection sample in the style of a DeepStream application.
  * Built against Redstream's compat header, so DeepStream factory names are remapped at runtime.
  *
- *   rds-test3 [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE] URI [URI...]
+ *   rds-test3 [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE]
+ *             [--rtsp-reconnect-interval S] [--rtsp-reconnect-attempts N] [--select-rtp-protocol P] URI [URI...]
  *
  * --pgie-config defaults to rds_test3_pgie_config.yml in this sample's source directory. --tracker-config adds a
  * tracker (nvtracker, with that low-level config file) after the primary detector; without it there is none, as in
  * DeepStream's test3. --no-display replaces the display sink with "fakesink sync=false" (as fast as it goes).
+ *
+ * Each URI is an nvurisrcbin (file, RTSP, anything GStreamer has a source for), its source-id the URI's position, its
+ * vsrc_0 linked to the muxer's sink_<position>. For RTSP URIs, --rtsp-reconnect-interval (seconds, default 0: no
+ * reconnection, as DeepStream 8.0), --rtsp-reconnect-attempts (default -1: unlimited) and --select-rtp-protocol (4:
+ * TCP; default: nvurisrcbin's) set the properties of the same names on every source, and the reconnection messages
+ * are printed as they come:
+ *
+ *   source <source_id>: reconnecting, attempt <n> (<reason>)
+ *   source <source_id>: reconnected
+ *   source <source_id>: gave up reconnecting
+ *
+ * Ctrl-C (SIGINT) stops with an EOS: the sources end their streams, and the muxer ends each source that never had a
+ * stream (no vsrc_0 yet: such a source never sends an EOS, so the app treats it as already stopped). Should the EOS
+ * still not come within 10 s, the app stops anyway and says so; a second Ctrl-C stops at once, also while the
+ * pipeline is going to NULL.
  *
  * For every frame of every source it prints
  *
@@ -15,7 +31,9 @@
  * the PGIE config's label file; a label the file doesn't have is counted as 0.
  *
  * SPDX-License-Identifier: MIT */
+#include <glib-unix.h>
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -31,6 +49,8 @@
 #define MUXER_BATCH_TIMEOUT_USEC 40000
 #define TILED_WIDTH 1280
 #define TILED_HEIGHT 720
+/* how long Ctrl-C waits for the EOS */
+#define EOS_TIMEOUT_S 10
 
 #ifndef RDS_TEST3_SOURCE_DIR
 #define RDS_TEST3_SOURCE_DIR "."
@@ -197,22 +217,83 @@ typedef struct
 {
   GMainLoop *loop;
   gboolean error;
+  GstElement *pipeline;
+  GPtrArray *mux_pads;          /* the muxer's sink pad of each source */
+  gint stopping;                /* atomic: Ctrl-C came */
+  guint eos_timeout;
 } BusState;
 
 static void
-on_pad_added (GstElement * decodebin, GstPad * pad, gpointer user_data)
+on_pad_added (GstElement * srcbin, GstPad * pad, gpointer user_data)
 {
   GstPad *mux_pad = GST_PAD (user_data);
   GstCaps *caps = gst_pad_get_current_caps (pad);
 
   if (caps == NULL)
     caps = gst_pad_query_caps (pad, NULL);
+  /* a vsrc_%u pad (video, in memory:RDS); also after Ctrl-C (the source's EOS ends it then), as an unlinked pad
+   * would fail upstream with not-linked */
   if (g_str_has_prefix (gst_structure_get_name (gst_caps_get_structure (caps, 0)), "video/")
       && !gst_pad_is_linked (mux_pad)) {
     if (gst_pad_link (pad, mux_pad) != GST_PAD_LINK_OK)
-      g_printerr ("Failed to link %s to the stream muxer\n", GST_ELEMENT_NAME (decodebin));
+      g_printerr ("Failed to link %s to the stream muxer\n", GST_ELEMENT_NAME (srcbin));
   }
   gst_caps_unref (caps);
+}
+
+static gboolean
+on_eos_timeout (gpointer user_data)
+{
+  BusState *state = user_data;
+
+  g_printerr ("No end of stream within %d s: stopping anyway\n", EOS_TIMEOUT_S);
+  state->eos_timeout = 0;
+  g_main_loop_quit (state->loop);
+  return G_SOURCE_REMOVE;
+}
+
+/* Ctrl-C: an EOS from every source; a source with no stream yet (its muxer pad unlinked) is stopped already, so its
+ * muxer pad gets the EOS directly. A second Ctrl-C stops at once. */
+static gboolean
+on_sigint (gpointer user_data)
+{
+  BusState *state = user_data;
+
+  if (!g_atomic_int_compare_and_exchange (&state->stopping, FALSE, TRUE)) {
+    g_main_loop_quit (state->loop);
+    return G_SOURCE_CONTINUE;
+  }
+  g_print ("Stopping: sending EOS\n");
+  gst_element_send_event (state->pipeline, gst_event_new_eos ());
+  for (guint i = 0; i < state->mux_pads->len; i++) {
+    GstPad *mux_pad = g_ptr_array_index (state->mux_pads, i);
+
+    if (!gst_pad_is_linked (mux_pad))
+      gst_pad_send_event (mux_pad, gst_event_new_eos ());
+  }
+  state->eos_timeout = g_timeout_add_seconds (EOS_TIMEOUT_S, on_eos_timeout, state);
+  return G_SOURCE_CONTINUE;
+}
+
+/* The reconnection messages of the sources (their source-id is the URI's position). */
+static void
+print_reconnection (GstMessage * msg)
+{
+  const GstStructure *st = gst_message_get_structure (msg);
+  gint id = -1, attempt = 0;
+  guint uid;
+
+  if (gst_structure_has_name (st, "rds-reconnect")) {
+    gst_structure_get_int (st, "source-id", &id);
+    gst_structure_get_int (st, "attempt", &attempt);
+    g_print ("source %d: reconnecting, attempt %d (%s)\n", id, attempt, gst_structure_get_string (st, "reason"));
+  } else if (gst_structure_has_name (st, "rds-reconnected")) {
+    gst_structure_get_int (st, "source-id", &id);
+    g_print ("source %d: reconnected\n", id);
+  } else if (gst_structure_has_name (st, "attempt-exceeded")) {
+    gst_structure_get_uint (st, "source-id", &uid);
+    g_print ("source %u: gave up reconnecting\n", uid);
+  }
 }
 
 static gboolean
@@ -224,6 +305,9 @@ on_bus_message (GstBus * bus G_GNUC_UNUSED, GstMessage * msg, gpointer user_data
     case GST_MESSAGE_EOS:
       g_print ("End of stream\n");
       g_main_loop_quit (state->loop);
+      break;
+    case GST_MESSAGE_ELEMENT:
+      print_reconnection (msg);
       break;
     case GST_MESSAGE_ERROR:{
       GError *err = NULL;
@@ -242,6 +326,12 @@ on_bus_message (GstBus * bus G_GNUC_UNUSED, GstMessage * msg, gpointer user_data
   return TRUE;
 }
 
+static void
+unref_mux_pad (gpointer data, GClosure * closure G_GNUC_UNUSED)
+{
+  gst_object_unref (data);
+}
+
 /* The element made from DeepStream factory @name, or NULL if this run has none. */
 static GstElement *
 element_for (const gchar ** factories, GstElement ** elements, guint n, const gchar * name)
@@ -252,9 +342,17 @@ element_for (const gchar ** factories, GstElement ** elements, guint n, const gc
   return NULL;
 }
 
+/* The RTSP options: negative (attempts: G_MININT) when not given. */
+typedef struct
+{
+  gint reconnect_interval;
+  gint reconnect_attempts;
+  gint rtp_protocol;
+} SourceOptions;
+
 static int
 run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const gchar * tracker_config,
-    gboolean display)
+    gboolean display, const SourceOptions * opts)
 {
   const gchar *factories[MAX_FACTORIES];
   guint n_factories = pipeline_factories (tracker_config != NULL, display, factories);
@@ -303,39 +401,60 @@ run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const
   gst_pad_add_probe (count_pad, GST_PAD_PROBE_TYPE_BUFFER, count_objects_probe, &ids, NULL);
   gst_object_unref (count_pad);
 
+  BusState state = { g_main_loop_new (NULL, FALSE), FALSE, pipeline,
+    g_ptr_array_new_with_free_func (gst_object_unref), FALSE, 0
+  };
+
   for (guint i = 0; i < num_sources; i++) {
-    GstElement *src = gst_element_factory_make ("uridecodebin", NULL);
+    GstElement *src = gst_element_factory_make ("nvurisrcbin", NULL);
 
     if (src == NULL) {
-      g_printerr ("Element uridecodebin is not available\n");
+      g_printerr ("Element nvurisrcbin (%s) is not available\n", rds_compat_map_factory_name ("nvurisrcbin"));
+      g_ptr_array_unref (state.mux_pads);
+      g_main_loop_unref (state.loop);
       gst_object_unref (pipeline);
       return 1;
     }
-    GstPad *mux_pad = gst_element_request_pad_simple (mux, "sink_%u");
+    gchar *pad_name = g_strdup_printf ("sink_%u", i);
+    GstPad *mux_pad = gst_element_request_pad_simple (mux, pad_name);
 
-    g_object_set (src, "uri", uris[i], NULL);
-    g_signal_connect_data (src, "pad-added", G_CALLBACK (on_pad_added), mux_pad,
-        (GClosureNotify) (void (*)(void)) gst_object_unref, 0);
+    g_free (pad_name);
+    g_ptr_array_add (state.mux_pads, gst_object_ref (mux_pad));
+    g_object_set (src, "uri", uris[i], "source-id", (gint) i, NULL);
+    if (opts->reconnect_interval >= 0)
+      g_object_set (src, "rtsp-reconnect-interval", (guint) opts->reconnect_interval, NULL);
+    if (opts->reconnect_attempts != G_MININT)
+      g_object_set (src, "rtsp-reconnect-attempts", opts->reconnect_attempts, NULL);
+    if (opts->rtp_protocol >= 0)
+      g_object_set (src, "select-rtp-protocol", opts->rtp_protocol, NULL);
+    g_signal_connect_data (src, "pad-added", G_CALLBACK (on_pad_added), mux_pad, unref_mux_pad, 0);
     gst_bin_add (GST_BIN (pipeline), src);
   }
   for (guint i = 0; i + 1 < n_factories; i++) {
     if (!gst_element_link (elements[i], elements[i + 1])) {
       g_printerr ("Failed to link %s -> %s\n", factories[i], factories[i + 1]);
+      g_ptr_array_unref (state.mux_pads);
+      g_main_loop_unref (state.loop);
       gst_object_unref (pipeline);
       return 1;
     }
   }
 
-  BusState state = { g_main_loop_new (NULL, FALSE), FALSE };
   GstBus *bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
   guint watch = gst_bus_add_watch (bus, on_bus_message, &state);
+  guint sigint = g_unix_signal_add (SIGINT, on_sigint, &state);
   gst_object_unref (bus);
 
   gst_element_set_state (pipeline, GST_STATE_PLAYING);
   g_main_loop_run (state.loop);
+  /* from here a Ctrl-C ends the process, also should stopping hang */
+  g_source_remove (sigint);
   gst_element_set_state (pipeline, GST_STATE_NULL);
 
+  if (state.eos_timeout)
+    g_source_remove (state.eos_timeout);
   g_source_remove (watch);
+  g_ptr_array_unref (state.mux_pads);
   g_main_loop_unref (state.loop);
   gst_object_unref (pipeline);
   return state.error ? 1 : 0;
@@ -345,6 +464,7 @@ int
 main (int argc, char **argv)
 {
   gboolean dry_run = FALSE, no_display = FALSE;
+  SourceOptions opts = { -1, G_MININT, -1 };
   gchar *pgie_config = NULL, *tracker_config = NULL;
   gchar **uris = NULL;
   GOptionEntry entries[] = {
@@ -355,6 +475,13 @@ main (int argc, char **argv)
         "Primary inference config file (default: " DEFAULT_PGIE_CONFIG ")", "FILE"},
     {"tracker-config", 0, 0, G_OPTION_ARG_FILENAME, &tracker_config,
         "Add a tracker after the primary detector, with this low-level tracker config file", "FILE"},
+    {"rtsp-reconnect-interval", 0, 0, G_OPTION_ARG_INT, &opts.reconnect_interval,
+        "RTSP: seconds without data before reconnecting (default 0: no reconnection, as in DeepStream 8.0)", "S"},
+    {"rtsp-reconnect-attempts", 0, 0, G_OPTION_ARG_INT, &opts.reconnect_attempts,
+        "RTSP: reconnection attempts before giving up (default -1: unlimited)", "N"},
+    {"select-rtp-protocol", 0, 0, G_OPTION_ARG_INT, &opts.rtp_protocol,
+        "RTSP: the sources' select-rtp-protocol: 0, 1 (UDP), 2 (UDP multicast), 4 (TCP), 7 (any of the three, "
+        "nvurisrcbin's default), 10 (HTTP), 20 (TLS)", "P"},
     {G_OPTION_REMAINING, 0, 0, G_OPTION_ARG_STRING_ARRAY, &uris, NULL, "URI..."},
     {NULL, 0, 0, 0, NULL, NULL, NULL},
   };
@@ -374,8 +501,17 @@ main (int argc, char **argv)
 
   guint num_sources = uris ? g_strv_length (uris) : 0;
   if (num_sources == 0) {
-    g_printerr ("Usage: %s [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE] URI [URI...]\n",
+    g_printerr ("Usage: %s [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE] "
+        "[--rtsp-reconnect-interval S] [--rtsp-reconnect-attempts N] [--select-rtp-protocol P] URI [URI...]\n",
         argv[0]);
+    return 1;
+  }
+  if (opts.rtp_protocol >= 0 && opts.rtp_protocol != 0 && opts.rtp_protocol != 1 && opts.rtp_protocol != 2
+      && opts.rtp_protocol != 4 && opts.rtp_protocol != 7 && opts.rtp_protocol != 10 && opts.rtp_protocol != 20) {
+    g_printerr ("--select-rtp-protocol: %d is none of 0, 1, 2, 4, 7, 10 and 20\n", opts.rtp_protocol);
+    g_strfreev (uris);
+    g_free (pgie_config);
+    g_free (tracker_config);
     return 1;
   }
   if (tracker_config && !*tracker_config) {
@@ -392,12 +528,13 @@ main (int argc, char **argv)
 
     g_print ("sources: %u\n", num_sources);
     g_print ("pgie config: %s\n", pgie_config ? pgie_config : DEFAULT_PGIE_CONFIG);
+    g_print ("nvurisrcbin -> %s\n", rds_compat_map_factory_name ("nvurisrcbin"));
     for (guint i = 0; i < n; i++)
       g_print ("%s -> %s\n", factories[i], rds_compat_map_factory_name (factories[i]));
     ret = 0;
   } else {
     ret = run_pipeline (uris, num_sources, pgie_config ? pgie_config : DEFAULT_PGIE_CONFIG, tracker_config,
-        !no_display);
+        !no_display, &opts);
   }
 
   g_strfreev (uris);

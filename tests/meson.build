@@ -507,3 +507,23 @@ test('rds_test3_run',
   args : [rds_test3_exe, meson.project_source_root(), meson.current_build_dir(),
     rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
   suite : ['gpu', 'yolo'], env : test_env, is_parallel : false, timeout : 900, depends : rds_plugins)
+
+# rds-test3 on RTSP sources from rds-rtsp-serve: a cut and a reconnection, a source that never connects, and a clean
+# EOS on SIGINT, with the committed scale2 model as the detector (gpu; skips without a device, rdsinfer, rdsosd,
+# gst-rtsp-server or the VA encoder).
+test('rds_test3_rtsp',
+  find_program('samples/rds_test3_rtsp.sh'),
+  args : [rds_test3_exe, rds_rtsp_serve_path, meson.project_source_root(), meson.current_build_dir(),
+    rds_infer_enabled ? 'infer' : '', rds_osd_enabled ? 'osd' : ''],
+  suite : 'gpu', env : test_env, is_parallel : false, timeout : 120, depends : [rds_plugins, rds_rtsp_serve_depends])
+
+# The RTSP soak, manual: in the soak suite only, and it skips unless DURATION is set, so neither `--suite gpu` nor a
+# plain `meson test` runs it. rds-test3 on four rds-rtsp-serve streams through their relays, with a seeded random
+# schedule of cuts and freezes, for DURATION seconds (1800 is the usual run; the script's header has the rest). Prints
+# reconnections, frames per minute and RSS. Longer runs than the timeout need `-t`.
+test('rds_test3_rtsp_soak',
+  find_program('samples/rds_test3_rtsp_soak.sh'),
+  args : [rds_test3_exe, rds_rtsp_serve_path, meson.project_source_root(), meson.current_build_dir(),
+    rds_infer_enabled ? 'infer' : '', rds_osd_enabled ? 'osd' : '', asan ? 'asan' : ''],
+  suite : 'soak', env : test_env, is_parallel : false, timeout : 2400,
+  depends : [rds_plugins, rds_rtsp_serve_depends])

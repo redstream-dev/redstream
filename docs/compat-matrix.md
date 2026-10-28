@@ -24,7 +24,7 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 
 | DeepStream name | Redstream name | Status | Notes | Source |
 |---|---|---|---|---|
-| `nvurisrcbin` | `rdsurisrcbin` | planned | decodes file and other non-RTSP URIs (uridecodebin3, first video stream only) to `memory:RDS` NV12 on `vsrc_0`, with `file-loop` and `drop-frame-interval`; RTSP URIs through `rtspsrc` and `rdsvideodec` (H.264 and H.265), with reconnection after timeouts, errors and the server's EOS; properties and reconnection behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin) |
+| `nvurisrcbin` | `rdsurisrcbin` | supported | decodes file and other non-RTSP URIs (uridecodebin3, first video stream only) to `memory:RDS` NV12 on `vsrc_0`, with `file-loop` and `drop-frame-interval`; RTSP URIs through `rtspsrc` and `rdsvideodec` (H.264 and H.265), with reconnection after timeouts, errors and the server's EOS; properties and reconnection behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin) |
 | `nvv4l2decoder` | `rdsvideodec` | supported | rocDecode: H.264/H.265 8-bit 4:2:0 to NV12; rank primary+10, so `uridecodebin` picks it over the VA decoders; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideo4linux2), [name](https://docs.nvidia.com/deepstream/text/DS_FAQ) |
 | `nvvideoconvert` | `rdsvideoconvert` | supported | single frames (batch size 1); `memory:RDS` and system memory on either side; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideoconvert) |
 | `nvstreammux` | `rdsstreammux` | supported | the default (scaling) mux only; the new mux is not implemented yet. GstAggregator-based; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreammux) |
@@ -56,8 +56,8 @@ a non-default value.
 | Property | Type | Default | Status | Notes |
 |---|---|---|---|---|
 | `uri` | string | NULL | supported | checked at start (NULL to READY): unset or empty, not a valid URI, or a scheme no source element handles is an error naming `uri`; the message names the scheme, never the whole URI (it may hold credentials). Decoded by `uridecodebin3`, except `rtsp*://` URIs: `rtspsrc` (made going from READY to PAUSED; the bin is live, PAUSED returns NO_PREROLL), then the H.264 or H.265 depayloader, parser (`config-interval=-1`) and `rdsvideodec`. Only H.264 and H.265 video streams are set up; another video codec (JPEG, say) is an error (STREAM, CODEC_NOT_FOUND) naming its `encoding-name`. Without reconnection, an `rtspsrc` error reaches the bus as it is, and the end of the stream (the server's EOS, or a closed TCP connection, which `rtspsrc` takes as one) is EOS on `vsrc_0` |
-| `type` | enum `auto` (0), `uri` (1), `rtsp` (2) | `auto` | supported | the source follows the URI's scheme whatever the value; `rtsp` with a URI that is not `rtsp*://` is an error at start naming `type` |
-| `file-loop` | boolean | `FALSE` | supported | DeepStream 8.0 behaviour: at the end of a `file://` URI the file plays again from the start, with no EOS, flush, second SEGMENT or STREAM_START downstream; the one SEGMENT is open-ended, PTS and DTS go on from the end of the previous pass, and each pass's first buffer is DISCONT. A flushing seek from downstream goes through as usual. An EOS the application sends to the bin or pipeline gets out as EOS and ends the loop (ours: DeepStream 8.0 not observed). On a URI that is not `file://`: a warning at start, and the URI plays once |
+| `type` | enum `auto` (0), `uri` (1), `rtsp` (2) | `auto` | supported | the source follows the URI's scheme whatever the value; `rtsp` with a URI that is not `rtsp*://` is an error at start naming `type` (ours: DeepStream 8.0 accepts the URI and plays it) |
+| `file-loop` | boolean | `FALSE` | supported | DeepStream 8.0 behaviour: at the end of a `file://` URI the file plays again from the start, with no EOS, flush, second SEGMENT or STREAM_START downstream; the one SEGMENT is open-ended, PTS go on from the end of the previous pass (DTS too: ours, DeepStream 8.0 offsets PTS only), and each pass's first buffer is DISCONT. A flushing seek from downstream goes through as usual. An EOS the application sends to the bin or pipeline gets out as EOS and ends the loop (ours: DeepStream 8.0 not observed). On a URI that is not `file://`: a `GST_WARNING` log at start (no WARNING message), and the URI plays once |
 | `latency` | uint | `100` | supported | milliseconds: `rtspsrc`'s `latency` (RTSP) |
 | `drop-on-latency` | boolean | `TRUE` | supported | `rtspsrc`'s `drop-on-latency` (RTSP), taken when the session starts (READY to PAUSED) |
 | `select-rtp-protocol` | enum `rtp-unknown` (0), `rtp-udp` (1), `rtp-udp-mcast` (2), `rtp-tcp` (4), `rtp-udp-udpmcast-tcp` (7), `rtp-http` (10), `rtp-tls` (20) | `rtp-udp-udpmcast-tcp` | supported | DeepStream 8.0 behaviour; the docs' default is 0 (`rtp-multi`). `rtspsrc`'s `protocols` (RTSP): UDP, UDP multicast, TCP, all three, HTTP + TCP, TLS + TCP; 0 leaves `rtspsrc`'s default (UDP, UDP multicast and TCP). `rtspsrc` gets a 100 ms `teardown-timeout` too (ours) |
@@ -96,15 +96,15 @@ a non-default value.
 | `max-size-buffers` | uint | `200` | accepted no-op | DeepStream 8.0 behaviour; the docs' example value is 0 |
 | `disable-passthrough` | boolean | `TRUE` | accepted no-op | DeepStream 8.0 behaviour; the docs' example value is 0 |
 
-Pads: `vsrc_%u` (sometimes): `NV12` in `memory:RDS`, what `rdsvideodec` outputs, or in system memory. As in
-DeepStream 8.0 behaviour, a new bin has no pad. For a non-RTSP URI it adds the ghost pad `vsrc_0` when the first
-video stream is decoded (one STREAM_START, CAPS and SEGMENT, then the frames), keeps it across file loops and
-removes it going from PAUSED to READY; there is never a second pad. A decoder that can't output `memory:RDS` (JPEG,
-say) gets `rdsvideoconvert` behind it, so `vsrc_0` carries `memory:RDS` NV12 either way. For an RTSP URI, `vsrc_0` is
-added when `rdsvideodec` has its first caps, so the application's `pad-added` sees them as the pad's current caps;
-then one STREAM_START, CAPS and SEGMENT, and the frames. An RTSP stream in a codec other than H.264 or H.265 gets no
-pad.
-There is no audio pad template: audio is ignored. Rank none: `uridecodebin` and `decodebin3` never pick it.
+Pads: `vsrc_%u` (sometimes): `NV12` in `memory:RDS`, what `rdsvideodec` outputs, or in system memory. As in DeepStream
+8.0 behaviour, a new bin has no pad. For a non-RTSP URI it adds the ghost pad `vsrc_0` when the first video stream is
+decoded (one STREAM_START, CAPS and SEGMENT, then the frames), keeps it across file loops and removes it going from
+PAUSED to READY (ours: DeepStream 8.0 removes it at NULL); there is never a second pad. A decoder that can't output
+`memory:RDS` (JPEG, say) gets `rdsvideoconvert` behind it, so `vsrc_0` carries `memory:RDS` NV12 either way. For an RTSP
+URI, `vsrc_0` is added when `rdsvideodec` has its first caps, so the application's `pad-added` sees them as the pad's
+current caps; then one STREAM_START, CAPS and SEGMENT, and the frames. An RTSP stream in a codec other than H.264 or
+H.265 gets no pad. There is no audio pad template: audio is ignored. Rank none: `uridecodebin` and `decodebin3` never
+pick it.
 
 #### `rdsurisrcbin` reconnection behaviour
 
@@ -117,13 +117,13 @@ on GStreamer's thread pool, one at a time; the watchdog ticks once a second on t
 | an ERROR, or the server's EOS (or a closed TCP connection) | waits for the watchdog | an attempt at once (ours); reason `error` or `eos`; the EOS never leaves the bin. The EOS the application sends goes through |
 | the session's ERRORs while reconnection is on | posted as WARNINGs | the same; the bin's own about a session it can't use (no video stream, a codec it can't decode) too, each a failed attempt (ours) |
 | the application's EOS | not observed while the source is down | ends the stream in any state (ours): no attempt after it, EOS on `vsrc_0` through the decoder. With no `vsrc_0` yet the attempts just stop and no EOS can reach the pipeline's sinks (nothing is linked), so the application waits for the EOS message with a timeout, or treats a source with no `vsrc_0` as already stopped |
-| each attempt | a WARNING | a WARNING (STREAM, FAILED) and the element message `rds-reconnect`: `source-id` (int), `attempt` (int, from 1), `reason` (string) (ours) |
+| each attempt | a WARNING for the first two attempts only | a WARNING (STREAM, FAILED) on every attempt, and the element message `rds-reconnect`: `source-id` (int), `attempt` (int, from 1), `reason` (string) (both ours) |
 | a failed attempt (an error, or no buffer within the interval) | the next attempt | the next attempt an interval after it started; nothing goes downstream |
-| attempts run out (`rtsp-reconnect-attempts` N ≥ 0 failed) | the element message `attempt-exceeded`: `source-id` (uint, −1 as 4294967295), `attempt_exceeded` (boolean TRUE); nothing downstream, so a muxer waits for the source forever | the same message and a WARNING, then EOS on `vsrc_0` (ours: `rdsstreammux` ends the source and batches the others); before any connection, the message and then an ERROR (RESOURCE, OPEN_READ; ours). No attempt after it |
-| downstream after a reconnection | a new stream: the running time starts again | the same stream (ours): no EOS or STREAM_START, the running time and PTS go on; the new session's frames start at a key frame (delta units before it are dropped, and the leading pictures of an open GOP after it; it is DISCONT), preceded by one FLUSH_START / FLUSH_STOP pair (reset-time FALSE) and the SEGMENT again, so `rdsstreammux` sends one `rds-stream-reset` for the source; then the element message `rds-reconnected` (`source-id`, int) |
+| attempts run out (`rtsp-reconnect-attempts` N ≥ 0 failed) | the element message `attempt-exceeded`: `source-id` (uint, −1 as 4294967295), `attempt_exceeded` (boolean TRUE); nothing downstream, so a muxer waits for the source forever | a WARNING (ours), then the same message, then EOS on `vsrc_0` (ours: `rdsstreammux` ends the source and batches the others); before any connection, the message and then an ERROR (RESOURCE, OPEN_READ; ours). No attempt after it |
+| downstream after a reconnection | a FLUSH_START/STOP pair (reset-time TRUE), a new STREAM_START and a sticky reset event per attempt, then a new SEGMENT; without a muxer the running time restarts | the same stream (ours): no EOS or STREAM_START, the running time and PTS go on; the new session's frames start at a key frame (delta units before it are dropped, and the leading pictures of an open GOP after it; it is DISCONT), preceded by one FLUSH_START / FLUSH_STOP pair (reset-time FALSE) and the SEGMENT again, so `rdsstreammux` sends one `rds-stream-reset` for the source; then the element message `rds-reconnected` (`source-id`, int) |
 | the first connection fails | retries every `rtsp-reconnect-interval` s | retries every `init-rtsp-reconnect-interval` s if above 0 (ours), else every `rtsp-reconnect-interval` s; the attempts limit applies (running out is an ERROR); `vsrc_0` comes with the first frames, with no flush; with both 0, an ERROR |
 | stopping during an attempt | about 1 ms | waits for the attempt under way; a hanging session stops within `rtspsrc`'s 100 ms `teardown-timeout` |
-| a new session at another size | not observed | a normal reconnection, with new CAPS on `vsrc_0` (`rdsvideodec` reconfigures or recreates its decoder); `rdsstreammux` takes them as any caps change and scales the frames into its fixed-size slots |
+| a new session at another size | new CAPS on `vsrc_0`, no error, the stream goes on; without a muxer the running time restarts | a normal reconnection, with new CAPS on `vsrc_0` (`rdsvideodec` reconfigures or recreates its decoder); `rdsstreammux` takes them as any caps change and scales the frames into its fixed-size slots |
 | a new session in another codec (H.264 to H.265, say) | an ERROR for every attempt: it never recovers | a normal reconnection (ours): a new parser in front of the same `rdsvideodec`, which switches its own parser to the new caps; `vsrc_0` stays, with new CAPS if the size changes |
 
 ### `rdsvideoconvert` (`nvvideoconvert`) properties

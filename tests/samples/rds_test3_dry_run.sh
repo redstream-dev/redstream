@@ -7,6 +7,7 @@ set -eu
 out=$("$1" --dry-run file:///dev/null file:///dev/null)
 echo "$out"
 echo "$out" | grep -qx 'sources: 2'
+echo "$out" | grep -qx 'nvurisrcbin -> rdsurisrcbin'
 echo "$out" | grep -qx 'nvstreammux -> rdsstreammux'
 echo "$out" | grep -qx 'nvinfer -> rdsinfer'
 echo "$out" | grep -qx 'nvmultistreamtiler -> rdsmultistreamtiler'
@@ -31,16 +32,23 @@ echo "$out" | grep -A1 -x 'nvdsosd -> rdsosd' | grep -qx 'fakesink -> fakesink'
 if echo "$out" | grep -q nveglglessink; then
   exit 1
 fi
+# the RTSP options are accepted
+"$1" --dry-run --rtsp-reconnect-interval 2 --rtsp-reconnect-attempts 3 --select-rtp-protocol 4 \
+  rtsp://127.0.0.1:1/test >/dev/null
+"$1" --help | grep -q -- '--rtsp-reconnect-interval'
+if "$1" --dry-run --select-rtp-protocol 3 rtsp://127.0.0.1:1/test >/dev/null 2>&1; then
+  exit 1
+fi
 # an empty file name is refused
 if "$1" --dry-run --tracker-config '' file:///dev/null >/dev/null 2>&1; then
   exit 1
 fi
 
-# nvv4l2decoder, nvvideoconvert, nvmultistreamtiler, nveglglessink and (when built) nvinfer, nvtracker and nvdsosd
-# map to real elements of the build tree (GST_PLUGIN_PATH_1_0 comes from the test environment).
+# nvurisrcbin, nvv4l2decoder, nvvideoconvert, nvmultistreamtiler, nveglglessink and (when built) nvinfer, nvtracker and
+# nvdsosd map to real elements of the build tree (GST_PLUGIN_PATH_1_0 comes from the test environment).
 if [ -n "${2:-}" ]; then
   # one element per call: given several names, gst-inspect-1.0 only looks at the last one
-  elements='rdsvideodec rdsvideoconvert rdsmultistreamtiler rdsvideosink'
+  elements='rdsurisrcbin rdsvideodec rdsvideoconvert rdsmultistreamtiler rdsvideosink'
   if [ "${3:-}" = infer ]; then
     elements="$elements rdsinfer"
   fi

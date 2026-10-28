@@ -3,10 +3,10 @@
 **GStreamer video and audio analytics on AMD GPUs: an open-source, ROCm-based functional equivalent of NVIDIA DeepStream.**
 
 > Status: **pre-alpha.** The first milestone's pipeline runs end to end on an AMD GPU: decode → batch → detect →
-> track → tile → on-screen display → window, with the core library `libgstrds`, ten elements (`rdsvideodec`,
-> `rdsvideoconvert`, `rdsstreammux`, `rdsstreamdemux`, `rdsinfer`, `rdstracker`, `rdsmultistreamtiler`, `rdsosd`,
-> `rdslogger`, `rdsvideosink`) and the `rds-compile` tool (see "What works" below). APIs and element names will
-> change.
+> track → tile → on-screen display → window, from files or RTSP streams, with the core library `libgstrds`, eleven
+> elements (`rdsurisrcbin`, `rdsvideodec`, `rdsvideoconvert`, `rdsstreammux`, `rdsstreamdemux`, `rdsinfer`,
+> `rdstracker`, `rdsmultistreamtiler`, `rdsosd`, `rdslogger`, `rdsvideosink`) and the `rds-compile` tool (see "What
+> works" below). APIs and element names will change.
 
 ![A street clip with detection boxes, class labels and track IDs drawn by rdsosd](docs/media/demo.gif)
 
@@ -45,6 +45,13 @@ Jetson-specific hardware blocks.
 - **`rds_buf_surf_transform`:** batched crop, scale (nearest, bilinear) and colour conversion between NV12, I420,
   RGBA, BGRA, RGBx, BGRx, RGB, BGR and GRAY8 on the GPU, shaped like `NvBufSurfTransform`; and
   `rds_buf_surf_transform_composite`, many surfaces into one (`NvBufSurfTransformComposite`).
+- **`rdsurisrcbin`** (`nvurisrcbin`): a source bin for file and RTSP URIs, decoded with `rdsvideodec` to
+  `memory:RDS` NV12 on `vsrc_0`, with `nvurisrcbin`'s properties: `file-loop`, `drop-frame-interval`, RTSP latency
+  and transport, and reconnection (`rtsp-reconnect-interval`, `rtsp-reconnect-attempts`,
+  `init-rtsp-reconnect-interval`). An RTSP source that stalls, drops the connection or refuses it is reconnected
+  without ending the stream (same pad, running time going on), also when it comes back at another size or in another
+  codec; the reconnection messages are DeepStream 8.0's, plus a few of ours. Tested against gst-rtsp-server (with a
+  fault relay), not yet against real cameras.
 - **`rdsvideodec`** (`nvv4l2decoder`): H.264 and H.265 (8-bit 4:2:0) decoding with rocDecode into `memory:RDS` NV12,
   bit-exact with the stock VA decoders. It ranks above them, so `uridecodebin` picks it; it falls back to system
   memory for ordinary sinks.
@@ -78,8 +85,8 @@ Jetson-specific hardware blocks.
   (`autovideosink` by default), with the DeepStream sinks' property names.
 - **`rds-compile`** (`trtexec`): compiles and caches `rdsinfer`'s MIGraphX program ahead of time.
 - **Compat header** `rds/rds_compat.h`: DeepStream names for the above, plus runtime remapping of element names
-  (`nvv4l2decoder` → `rdsvideodec`, `nvstreammux` → `rdsstreammux`, `nvinfer` → `rdsinfer`, `nvtracker` →
-  `rdstracker`, `nvdsosd` → `rdsosd`, …).
+  (`nvurisrcbin` → `rdsurisrcbin`, `nvv4l2decoder` → `rdsvideodec`, `nvstreammux` → `rdsstreammux`, `nvinfer` →
+  `rdsinfer`, `nvtracker` → `rdstracker`, `nvdsosd` → `rdsosd`, …).
 
 [`docs/compat-matrix.md`](docs/compat-matrix.md) lists every mapped name and property with its status. Built from
 this repository (see "Getting started"; `tests/media/make-test-media.sh` generates the clips), a decode and convert
@@ -156,7 +163,7 @@ build).
 | DeepStream | Redstream | Status |
 |---|---|---|
 | `nvv4l2decoder` | `rdsvideodec` (rocDecode) | works |
-| `nvurisrcbin` | `rdsurisrcbin` | planned |
+| `nvurisrcbin` | `rdsurisrcbin` | works (file and RTSP URIs, RTSP reconnection) |
 | `nvvideoconvert` | `rdsvideoconvert` | works |
 | `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` | works (default mux; the new mux is planned) |
 | `nvinfer` | `rdsinfer` (MIGraphX) | works (primary detector) |
@@ -177,15 +184,15 @@ build).
 
 **M1: multi-stream detector**
 - File/RTSP sources → rocDecode decode (`rdsvideodec`) → `rdsstreammux` → `rdsinfer` (YOLO + custom bbox parser) → `rdstracker` → `rdsosd`.
-- Done: the pipeline runs end to end from files, with tiling, on-screen display and a display sink. Left: RTSP
-  sources (`rdsurisrcbin`) and the ported `deepstream-test3`.
+- Done: the pipeline runs end to end from files and RTSP streams (with reconnection; tested against gst-rtsp-server),
+  with tiling, on-screen display and a display sink. Left: the ported `deepstream-test3`.
 - Acceptance test: NVIDIA's `deepstream-test3` sample, ported with `#ifdef`s only, produces equivalent detections.
 
 **M2: production-style multi-model pipeline**
 - Pose detector with keypoints.
 - Secondary models on object crops, with raw tensor output (ReID embeddings, attribute classifiers).
 - Metadata edits in pad probes.
-- ROI and line-crossing analytics, RTSP reconnect handling, and an H.264 recording branch.
+- ROI and line-crossing analytics, and an H.264 recording branch.
 
 **Later: audio analytics**
 - Audio streams batched by `rdsstreammux` and split again by `rdsstreamdemux`, as DeepStream's new mux does.
@@ -264,6 +271,18 @@ tests/models/fetch-tracker-clip.sh
 ```
 
 More tools from the build tree:
+
+RTSP: `rds-rtsp-serve` serves a test pattern over RTSP, with a fault relay in front of it (here the connection is cut
+10 s in); `rds-test3` reconnects to it (`rtsp-reconnect-interval` 2) and prints the reconnection as it goes. Only
+RTSP over TCP goes through the relay, hence `--select-rtp-protocol 4`. `rds-test3`'s default detector is YOLO11n
+(`tests/models/fetch-yolo11n.sh`). Ctrl-C stops `rds-test3`; `kill %1` then stops the server.
+
+```bash
+build/tools/rds-rtsp-serve/rds-rtsp-serve --proxy-port 8555 --faults 10:cut &   # rtsp://127.0.0.1:8555/test
+GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 --no-display --rtsp-reconnect-interval 2 \
+  --select-rtp-protocol 4 rtsp://127.0.0.1:8555/test rtsp://127.0.0.1:8554/test
+kill %1
+```
 
 ```bash
 build/samples/rds-test3/rds-test3 --dry-run file:///a.mp4   # shows the DeepStream → Redstream element mapping

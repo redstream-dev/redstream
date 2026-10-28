@@ -2,8 +2,8 @@
  *
  * Pads: one sometimes src template, vsrc_%u, for NV12 frames (memory:RDS, as rdsvideodec outputs them, or system
  * memory). As in DeepStream 8.0 behaviour, a new bin has no pad: the ghost pad vsrc_0 comes when the first video
- * stream is decoded (with its caps already set), stays across file loops, and goes from PAUSED to READY. Audio is
- * ignored: there is no asrc_%u template.
+ * stream is decoded (with its caps already set) and stays across file loops. It goes from PAUSED to READY (ours:
+ * DeepStream 8.0 removes it at NULL). Audio is ignored: there is no asrc_%u template.
  *
  * URIs other than rtsp*:// are decoded by a uridecodebin3 (made going from NULL to READY), with only the first video
  * stream selected. Its decoded pad becomes vsrc_0's target, directly when the decoder can output memory:RDS
@@ -12,8 +12,9 @@
  * 8.0 behaviour:
  *
  *   - file-loop on a file:// URI: no EOS, flush, second SEGMENT or STREAM_START downstream at the end of the file;
- *     the SEGMENT is open-ended, PTS and DTS go on from the end of the previous pass, and each pass's first buffer is
- *     DISCONT. A seek from downstream goes through; an EOS the application sends ends the loop (ours)
+ *     the SEGMENT is open-ended, PTS go on from the end of the previous pass (DTS too: ours, DeepStream 8.0 offsets
+ *     PTS only), and each pass's first buffer is DISCONT. A seek from downstream goes through; an EOS the application
+ *     sends ends the loop (ours)
  *   - drop-frame-interval N: frames 0, N, 2N, ... of the decoded stream, counted across loops (0 and 1: every frame),
  *     dropped before any conversion
  *
@@ -27,7 +28,7 @@
  *   - rtspsrc gets latency, drop-on-latency, udp-buffer-size and protocols from select-rtp-protocol (below), and a
  *     100 ms teardown-timeout (ours)
  *   - the bin is live: PAUSED returns NO_PREROLL
- *   - drop-frame-interval applies as for files; file-loop does not (a warning at start)
+ *   - drop-frame-interval applies as for files; file-loop does not (a GST_WARNING log at start)
  *   - without reconnection (rtsp-reconnect-interval 0, the default), an rtspsrc ERROR reaches the bus as it is, and the
  *     end of the stream (a server's EOS, or a closed TCP connection, which rtspsrc takes as one) is EOS on vsrc_0
  *   - an ERROR or WARNING from a session being stopped, or from the current one while the bin stops, is dropped: it is
@@ -43,26 +44,26 @@
  *     attempt (ours)
  *   - the application's EOS ends the stream whatever the source's state (ours): no attempt after it, the session goes
  *     and the EOS goes through the parser and decoder to vsrc_0 (with no vsrc_0 yet, the attempts just stop)
- *   - an attempt replaces the session (the old one stopped with its state locked) and posts a WARNING (STREAM,
- *     FAILED) and the element message rds-reconnect (source-id int, attempt int, reason string). It fails on an
- *     error, or without a buffer within the interval; the next one follows an interval after it started. The attempt
- *     count is consecutive failures, reset by a buffer
- *   - rtsp-reconnect-attempts N >= 0 (negative: unlimited): when attempt N fails (at once with N 0), the element
- *     message attempt-exceeded (source-id uint, -1 as G_MAXUINT; attempt_exceeded boolean TRUE, as in DeepStream 8.0)
- *     and a WARNING; then (ours) EOS on vsrc_0, so a muxer ends the source. Before any connection, attempt-exceeded
- *     and then an ERROR (RESOURCE, OPEN_READ; ours). No attempt after it
+ *   - an attempt replaces the session (the old one stopped with its state locked) and posts a WARNING (STREAM, FAILED;
+ *     ours on every attempt: DeepStream 8.0 posts one for the first two attempts only) and the element message
+ *     rds-reconnect (source-id int, attempt int, reason string; ours). It fails on an error, or without a buffer within
+ *     the interval; the next one follows an interval after it started. The attempt count is consecutive failures, reset
+ *     by a buffer
+ *   - rtsp-reconnect-attempts N >= 0 (negative: unlimited): when attempt N fails (at once with N 0), a WARNING (ours:
+ *     DeepStream 8.0 posts the message alone), then the element message attempt-exceeded (source-id uint, -1 as
+ *     G_MAXUINT; attempt_exceeded boolean TRUE, as in DeepStream 8.0), then (ours) EOS on vsrc_0, so a muxer ends the
+ *     source. Before vsrc_0 exists, attempt-exceeded and then an ERROR (RESOURCE, OPEN_READ; ours). No attempt after it
  *   - downstream (ours; DeepStream 8.0 restarts the running time): a reconnection is no new stream. The new session's
  *     STREAM_START and SEGMENT stop at the decoder's sink pad; the parser's src pad drops delta units until a key frame
  *     (marked DISCONT), and the leading pictures of an open GOP after it; the running time and PTS go on, as rtspsrc
- *     timestamps in the pipeline's running time. Before the first frame
- *     of the new session, once frames went out before, FLUSH_START and FLUSH_STOP (reset-time FALSE) leave vsrc_0,
- *     then the SEGMENT again (rdsstreammux sends one rds-stream-reset for the source); and the element message
- *     rds-reconnected (source-id int). A picture of the old session the decoder still held goes out before that.
- *     Failed attempts send nothing downstream
- *   - a new session at another size: new CAPS on vsrc_0 with its first frame (rdsvideodec reconfigures or recreates
- *     its decoder), the reconnection otherwise as above. In another codec (H.264 to H.265, say; ours: DeepStream 8.0
- *     fails every attempt): a new parser in front of the same rdsvideodec, which switches its own parser to the new
- *     caps; vsrc_0 stays, and the reconnection is as above
+ *     timestamps in the pipeline's running time. Before the first frame of the new session, once frames went out
+ *     before, FLUSH_START and FLUSH_STOP (reset-time FALSE) leave vsrc_0, then the SEGMENT again (rdsstreammux sends
+ *     one rds-stream-reset for the source); and the element message rds-reconnected (source-id int). A picture of the
+ *     old session the decoder still held goes out before that. Failed attempts send nothing downstream
+ *   - a new session at another size: new CAPS on vsrc_0 with its first frame, as in DeepStream 8.0 behaviour
+ *     (rdsvideodec reconfigures or recreates its decoder), the reconnection otherwise as above. In another codec (H.264
+ *     to H.265, say; ours: DeepStream 8.0 fails every attempt): a new parser in front of the same rdsvideodec, which
+ *     switches its own parser to the new caps; vsrc_0 stays, and the reconnection is as above
  *   - the start: when the first connection fails, the bin retries every init-rtsp-reconnect-interval s if above 0
  *     (ours: it does nothing in DeepStream 8.0), else every rtsp-reconnect-interval s if above 0 (DeepStream 8.0
  *     behaviour), else the ERROR goes up. Retries post the same messages; vsrc_0 comes with the first frames
@@ -75,8 +76,9 @@
  *
  *   - uri: set, a valid URI, and a scheme some source element handles; else an error naming the property
  *   - smart-record: anything but smart-rec-disable is an error (smart record is not implemented)
- *   - type=rtsp needs an rtsp URI; else an error naming the property
- *   - file-loop on a URI that is not file://: a warning, and the bin starts (and plays the URI once)
+ *   - type=rtsp needs an rtsp URI; else an error naming the property (ours: DeepStream 8.0 accepts the URI and plays
+ *     it)
+ *   - file-loop on a URI that is not file://: a GST_WARNING log, and the bin starts (and plays the URI once)
  *
  * source-id goes into the reconnection messages; gpu-id is stored and read back, and does nothing else yet.
  * The DeepStream properties with no counterpart here (decoder surfaces and memory, smart record's settings, IPC,
@@ -456,9 +458,19 @@ loop_seek (GstElement * element, G_GNUC_UNUSED gpointer user_data)
   gst_object_unref (target);
 }
 
+/* Events, on vsrc_0's target, so nothing it drops leaves the bin (decoded_probe, upstream of the conversion, does the
+ * frames).
+ *
+ * file-loop: the probe drops the EOS at the end of the file and, from another thread (gst_element_call_async), sends a
+ * flushing seek to 0 upstream. That seek's FLUSH_START, FLUSH_STOP and SEGMENT (told apart by its seqnum) stay
+ * inside: they reach and reset the demuxer, decoder and converter, and the next pass's timestamps are shifted to
+ * follow the previous pass. The flushes and SEGMENT of a seek from downstream go through. (A non-flushing segment
+ * seek would need no timestamp rewriting, but it needs segment seeks from every demuxer and parser; a flushing seek
+ * to 0 is what any seekable source does, MP4, AVI and raw H.264 alike.) */
 static GstPadProbeReturn
-target_event (GstRdsUriSrcBin * self, GstPadProbeInfo * info)
+target_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
+  GstRdsUriSrcBin *self = user_data;
   GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info);
   gboolean loop = FALSE, drop = FALSE, foreign;
 
@@ -632,20 +644,6 @@ decoded_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user
   return GST_PAD_PROBE_OK;
 }
 
-/* Events, on vsrc_0's target, so nothing it drops leaves the bin (decoded_probe, upstream of the conversion, does the
- * frames).
- *
- * file-loop: the probe drops the EOS at the end of the file and, from another thread (gst_element_call_async), sends a
- * flushing seek to 0 upstream. That seek's FLUSH_START, FLUSH_STOP and SEGMENT (told apart by its seqnum) stay
- * inside: they reach and reset the demuxer, decoder and converter, and the next pass's timestamps are shifted to
- * follow the previous pass. The flushes and SEGMENT of a seek from downstream go through. (A
- * non-flushing segment seek would need no timestamp rewriting, but it needs segment seeks from every demuxer and
- * parser; a flushing seek to 0 is what any seekable source does, MP4, AVI and raw H.264 alike.) */
-static GstPadProbeReturn
-target_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
-{
-  return target_event (user_data, info);
-}
 
 /* RTSP: the first CAPS on vsrc_0 (stored on the pad before probes run, so the application's pad-added sees the
  * current caps) adds the pad to the bin. Linked from pad-added, inside this probe, the pad sends its STREAM_START
@@ -1091,8 +1089,13 @@ make_decoder (GstRdsUriSrcBin * self, RdsUriSrcCodec codec)
   }
   add_dynamic (self, dec);
   if (!gst_element_link (parse, dec)) {
-    GST_ELEMENT_ERROR (self, CORE, NEGOTIATION, ("Could not link %s to rdsvideodec", GST_OBJECT_NAME
-            (gst_element_get_factory (parse))), (NULL));
+    GST_ELEMENT_ERROR (self, CORE, NEGOTIATION, ("Could not link %s to rdsvideodec", parser_name (codec)), (NULL));
+    /* both go, so the next session makes a pair of its own and finds no other */
+    GST_OBJECT_LOCK (self);
+    self->dynamic = g_list_remove (g_list_remove (self->dynamic, parse), dec);
+    GST_OBJECT_UNLOCK (self);
+    remove_element (self, parse);
+    remove_element (self, dec);
     return NULL;
   }
   pad = gst_element_get_static_pad (dec, "sink");
@@ -1380,7 +1383,8 @@ reason_text (RdsUriSrcReconnectReason reason)
   }
 }
 
-/* An attempt: our WARNING (DeepStream 8.0 behaviour: one per attempt) and rds-reconnect. */
+/* An attempt: a WARNING (ours: one per attempt; DeepStream 8.0 posts one for the first two attempts only) and
+ * rds-reconnect (ours). */
 static void
 reconnect_announce (GstElement * element, guint attempt, RdsUriSrcReconnectReason reason)
 {
@@ -1540,6 +1544,8 @@ remove_children (GstRdsUriSrcBin * self)
   remove_pad (self);
   GST_OBJECT_LOCK (self);
   decodebin = g_steal_pointer (&self->decodebin);
+  /* the next start takes the uri again */
+  self->is_file = self->is_rtsp = FALSE;
   GST_OBJECT_UNLOCK (self);
   if (decodebin != NULL)
     remove_element (self, decodebin);
@@ -1614,8 +1620,10 @@ gst_rds_uri_src_bin_change_state (GstElement * element, GstStateChange transitio
       /* the parent's change of state takes the session to PAUSED with the other children */
       if (rtsp) {
         rds_urisrc_reconnect_start_run (self->reconnect, interval, init_interval, attempts);
-        if (!add_session (self))
+        if (!add_session (self)) {
+          rds_urisrc_reconnect_stop (self->reconnect);
           return GST_STATE_CHANGE_FAILURE;
+        }
       }
       break;
     case GST_STATE_CHANGE_PAUSED_TO_PLAYING:

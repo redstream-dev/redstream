@@ -10,16 +10,17 @@ DeepStream on AMD GPUs (ROCm)**. Porting an existing DeepStream application shou
 mechanical changes: element factory names behind an `#ifdef`, the same config files, and the same
 metadata-traversal code via a compatibility header.
 
-Status: **pre-alpha.** M1's pipeline runs end to end from files (decode → mux → infer → tracker → tiler → OSD →
-display, `samples/rds-test3`). The libgstrds core is in place (surfaces, `memory:RDS`, pools, metadata, events,
-read-only surface views, the `rds_buf_surf_transform` GPU transform and its many-to-one composite). The elements so
-far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
+Status: **pre-alpha.** M1's pipeline runs end to end from files and RTSP streams (decode → mux → infer → tracker →
+tiler → OSD → display, `samples/rds-test3`). The libgstrds core is in place (surfaces, `memory:RDS`, pools,
+metadata, events, read-only surface views, the `rds_buf_surf_transform` GPU transform and its many-to-one composite).
+The elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
 `rdsstreammux` (the default scaling mux: batches of fixed-size slots), `rdsstreamdemux` (zero-copy per-source
 views of the batch), `rdsinfer` (MIGraphX primary detector: nvinfer configs, custom bbox parsers, object and
 tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs),
 `rdsmultistreamtiler` (batches into one tiled frame), `rdsosd` (boxes, text, lines, arrows, circles and the clock,
-drawn on the GPU by default or on the CPU, the same pixels, Pango for text), `rdslogger` (per-stream FPS lines) and
-`rdsvideosink` (display through a stock GStreamer sink). Nothing here is stable.
+drawn on the GPU by default or on the CPU, the same pixels, Pango for text), `rdslogger` (per-stream FPS lines),
+`rdsvideosink` (display through a stock GStreamer sink) and `rdsurisrcbin` (file and RTSP sources, with RTSP
+reconnection). Nothing here is stable.
 
 ## Architecture principles
 
@@ -40,7 +41,7 @@ drawn on the GPU by default or on the CPU, the same pixels, Pango for text), `rd
 
 | DeepStream | Redstream | Notes |
 |---|---|---|
-| `nvurisrcbin` | `rdsurisrcbin` | RTSP reconnect lives in the bin |
+| `nvurisrcbin` | `rdsurisrcbin` | file and RTSP URIs; RTSP reconnection lives in the bin |
 | `nvv4l2decoder` | `rdsvideodec` | rocDecode-backed: stock VA output is tiled on AMD, so it is not used for analytics |
 | `nvvideoconvert` | `rdsvideoconvert` | convert, scale and crop on `memory:RDS`; copies stock VA input via a linear path |
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | |
@@ -68,7 +69,7 @@ Naming convention: elements `rds<name>`, types `Rds<Name>`, functions `rds_<name
   sample ported with `#ifdef`s only, producing equivalent detections to DeepStream on the same video and model.
 - **M2, production-style multi-model app.** Pose primary detector (custom parser, keypoints), secondary models in
   `process-mode=2` with `output-tensor-meta` (ReID embeddings, attribute classifiers), metadata writes in probes
-  (add/remove objects, edit rects), analytics (ROI / line crossing), RTSP reconnect events, H.264 recording branch.
+  (add/remove objects, edit rects), analytics (ROI / line crossing), H.264 recording branch.
 
 ## Hard rules
 
@@ -249,8 +250,9 @@ docs/              compat-matrix.md: what the compat header and the elements map
                    and rdstracker config-key tables must match the key tables: the infer_config and tracker_config
                    tests check every row; element_compat_matrix checks the tiler, OSD, logger, sink and URI source
                    bin property tables against the elements' properties)
-samples/rds-test3/ clean-room test3-style multi-stream sample (end to end: per-frame counts, tiler, OSD, display;
-                   --dry-run, --no-display, --pgie-config, --tracker-config)
+samples/rds-test3/ clean-room test3-style multi-stream sample (end to end: nvurisrcbin sources, per-frame counts, tiler,
+                   OSD, display; --dry-run, --no-display, --pgie-config, --tracker-config, the RTSP options; Ctrl-C
+                   stops with an EOS)
 samples/tracker/   our IOU and NvSORT low-level tracker configs for rdstracker (tuned on the street clip)
 tools/rds-compile/ rds-compile: pre-builds rdsinfer's program with its config parser and engine (exit 2: up to date)
 tools/rds-rtsp-serve/ rds-rtsp-serve: a test pattern or a looped file over RTSP, with a TCP fault relay in front (freeze,
