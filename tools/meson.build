@@ -10,3 +10,7 @@ if rds_infer_enabled
     install_rpath : rds_infer_install_rpath,
     install : true)
 endif
+
+# rds-rtsp-serve serves a test pattern or a file over RTSP, with a TCP relay in front that injects faults on a
+# schedule (freeze, cut, refuse), for manual checks and soaks of RTSP clients; its server is shared with the tests.
+subdir('rds-rtsp-serve')

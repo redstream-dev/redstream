@@ -17,6 +17,9 @@ gst_base_dep = dependency('gstreamer-base-1.0', version : '>= 1.28')
 gst_video_dep = dependency('gstreamer-video-1.0', version : '>= 1.28')
 gst_check_dep = dependency('gstreamer-check-1.0', version : '>= 1.28')
 gst_app_dep = dependency('gstreamer-app-1.0', version : '>= 1.28')   # tests only (appsrc/appsink helpers)
+gst_rtsp_dep = dependency('gstreamer-rtsp-1.0', version : '>= 1.28')   # rdsurisrcbin (RTSP lower transports)
+# Optional: an in-process RTSP server for tests.
+gst_rtsp_server_dep = dependency('gstreamer-rtsp-server-1.0', version : '>= 1.28', required : false)
 
 # The ROCm image ships no hip.pc; locate the HIP runtime directly.
 fs = import('fs')

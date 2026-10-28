@@ -402,6 +402,13 @@ test('element_videosink_cpu', element_videosink_exe, args : ['-p', '/cpu/videosi
 test('element_videosink', element_videosink_exe, args : ['-p', '/gpu/videosink'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 
+# The RTSP test server and its TCP fault relay (tools/rds-rtsp-serve), which the rdsurisrcbin stream tests build on:
+# playback through the relay and direct, H.265 and JPEG, freeze, cut, refuse, a stream changed between sessions, the
+# session count, and freeing with clients connected (gpu; skips without the VA encoder or gst-rtsp-server).
+test('rtsp_test_server', executable('rtsp_test_server', 'check' / 'rtsp_test_server.c',
+    dependencies : [gst_dep, rtsp_test_server_dep]),
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 180)
+
 element_streamdemux_exe = executable('element_streamdemux', 'check' / 'element_streamdemux.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep, cc.find_library('m', required : false)])
 test('element_streamdemux_cpu', element_streamdemux_exe, args : ['-p', '/cpu/demux'],
@@ -449,6 +456,24 @@ test('rds_compile', find_program('tools/rds_compile.sh'), args : rds_compile_arg
     'AMD_COMGR_CACHE_DIR' : meson.current_build_dir() / 'comgr',
   }),
   depends : rds_compile_depends)
+
+# rds-rtsp-serve: options, 30 frames through its relay with gst-launch-1.0, a scheduled cut, SIGTERM (gpu; skips without
+# gst-rtsp-server or the VA encoder). No plugin paths and a registry of its own: under ASan the uninstrumented
+# gst-launch-1.0 must never scan our sanitized plugins in-process.
+rds_rtsp_serve_path = ''
+rds_rtsp_serve_depends = []
+if gst_rtsp_server_dep.found()
+  rds_rtsp_serve_path = rds_rtsp_serve_exe.full_path()
+  rds_rtsp_serve_depends += rds_rtsp_serve_exe
+endif
+test('rds_rtsp_serve', find_program('tools/rds_rtsp_serve.sh'),
+  args : [rds_rtsp_serve_path, gst_launch.found() ? gst_launch.full_path() : '', meson.current_build_dir()],
+  suite : 'gpu', is_parallel : false, timeout : 120,
+  env : environment(common_test_env + {
+    'GST_PLUGIN_PATH_1_0' : '',
+    'GST_REGISTRY_1_0' : meson.current_build_dir() / 'registry-rtsp-serve.bin',
+  }),
+  depends : rds_rtsp_serve_depends)
 
 # The dry run checks the compat mapping, the default PGIE config and --tracker-config; gst-inspect-1.0 (when found)
 # checks that the mapped decoder, converter, tiler and display sink (and rdsinfer, rdstracker and rdsosd, when built)

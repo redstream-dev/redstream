@@ -242,6 +242,11 @@ samples/rds-test3/ clean-room test3-style multi-stream sample (end to end: per-f
                    --dry-run, --no-display, --pgie-config, --tracker-config)
 samples/tracker/   our IOU and NvSORT low-level tracker configs for rdstracker (tuned on the street clip)
 tools/rds-compile/ rds-compile: pre-builds rdsinfer's program with its config parser and engine (exit 2: up to date)
+tools/rds-rtsp-serve/ rds-rtsp-serve: a test pattern or a looped file over RTSP, with a TCP fault relay in front (freeze,
+                   cut, refuse on a schedule). Its server and relay (rtsp-test-server, gst-rtsp-server on its own thread
+                   and context) are the static rtsp-test-server library the tests link (its shared option gives every
+                   client one media, so a later client joins mid-GOP); without gst-rtsp-server a stub whose constructor
+                   returns NULL, so the RTSP tests skip
 tests/check/       GLib unit, element and pipeline tests (suites cpu/gpu); test clips are encoded in-process
                    (rds-test-media.h, needs the VA encoder); soak memory probes in rds-test-soak.h
 tests/samples/     sample-level tests
