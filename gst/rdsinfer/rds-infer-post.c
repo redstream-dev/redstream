@@ -59,7 +59,7 @@ typedef struct
   guint index;                  /* in the parser output */
   guint class_id;
   gfloat confidence;
-  gfloat left, top, right, bottom, area;
+  gdouble left, top, right, bottom, area;
 } Candidate;
 
 static gboolean
@@ -90,12 +90,12 @@ index_cmp (gconstpointer pa, gconstpointer pb)
   return a->index < b->index ? -1 : a->index > b->index;
 }
 
-static gfloat
+static gdouble
 iou (const Candidate * a, const Candidate * b)
 {
-  gfloat iw = MIN (a->right, b->right) - MAX (a->left, b->left);
-  gfloat ih = MIN (a->bottom, b->bottom) - MAX (a->top, b->top);
-  gfloat inter, uni;
+  gdouble iw = MIN (a->right, b->right) - MAX (a->left, b->left);
+  gdouble ih = MIN (a->bottom, b->bottom) - MAX (a->top, b->top);
+  gdouble inter, uni;
 
   if (iw <= 0 || ih <= 0)
     return 0;
@@ -173,9 +173,9 @@ rds_infer_postprocess (const RdsInferConfig * cfg, const RdsInferLetterbox * lb,
     k->confidence = o->detectionConfidence;
     k->left = o->left;
     k->top = o->top;
-    k->right = o->left + o->width;
-    k->bottom = o->top + o->height;
-    k->area = o->width * o->height;
+    k->right = (gdouble) o->left + o->width;
+    k->bottom = (gdouble) o->top + o->height;
+    k->area = (gdouble) o->width * o->height;
     n++;
   }
 

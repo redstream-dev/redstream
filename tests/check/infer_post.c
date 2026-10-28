@@ -524,6 +524,32 @@ test_nms (void)
   cfg->class_attrs[0].nms_iou_threshold = 0.5f;
   cfg->class_attrs[1].nms_iou_threshold = 0.5f;
   {
+    /* Large partially overlapping boxes: IoU is 1/3, and both intersect the frame. */
+    RdsInferObjectDetectionInfo in[] = {
+      obj (0, -1e20f, 0, 2e20f, 2e20f, 0.9f),
+      obj (0, 0, 0, 2e20f, 2e20f, 0.8f),
+    };
+    const guint keep[] = { 0 };
+
+    cfg->class_attrs[0].nms_iou_threshold = 0.3f;
+    out = post_identity (cfg, in, G_N_ELEMENTS (in));
+    assert_kept (out, in, keep, G_N_ELEMENTS (keep));
+    g_array_unref (out);
+    cfg->class_attrs[0].nms_iou_threshold = 0.5f;
+  }
+  {
+    /* Identical finite boxes: their areas overflow float, but their IoU is 1. */
+    RdsInferObjectDetectionInfo in[] = {
+      obj (0, 0, 0, 2e20f, 2e20f, 0.9f),
+      obj (0, 0, 0, 2e20f, 2e20f, 0.8f),
+    };
+    const guint keep[] = { 0 };
+
+    out = post_identity (cfg, in, G_N_ELEMENTS (in));
+    assert_kept (out, in, keep, G_N_ELEMENTS (keep));
+    g_array_unref (out);
+  }
+  {
     /* Different classes: both survive. The same class: the lower confidence goes, wherever it is in the input. */
     RdsInferObjectDetectionInfo in[] = {
       obj (0, 0, 0, 10, 10, 0.9f),

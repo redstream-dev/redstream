@@ -16,19 +16,19 @@ enum
   REF_KEPT,
 };
 
-static gfloat
+static gdouble
 ref_iou (const RdsInferObjectDetectionInfo * a, const RdsInferObjectDetectionInfo * b)
 {
-  gfloat iw = MIN (a->left + a->width, b->left + b->width) - MAX (a->left, b->left);
-  gfloat ih = MIN (a->top + a->height, b->top + b->height) - MAX (a->top, b->top);
-  gfloat inter, uni;
+  gdouble iw = MIN ((gdouble) a->left + a->width, (gdouble) b->left + b->width) - MAX (a->left, b->left);
+  gdouble ih = MIN ((gdouble) a->top + a->height, (gdouble) b->top + b->height) - MAX (a->top, b->top);
+  gdouble inter, uni;
 
   if (iw < 0)
     iw = 0;
   if (ih < 0)
     ih = 0;
   inter = iw * ih;
-  uni = a->width * a->height + b->width * b->height - inter;
+  uni = (gdouble) a->width * a->height + (gdouble) b->width * b->height - inter;
   if (uni <= 0)
     return 0;
   return inter / uni;
