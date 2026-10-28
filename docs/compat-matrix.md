@@ -24,7 +24,7 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 
 | DeepStream name | Redstream name | Status | Notes | Source |
 |---|---|---|---|---|
-| `nvurisrcbin` | `rdsurisrcbin` | planned |  | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin) |
+| `nvurisrcbin` | `rdsurisrcbin` | planned | decodes file and other non-RTSP URIs (uridecodebin3, first video stream only) to `memory:RDS` NV12 on `vsrc_0`, with `file-loop` and `drop-frame-interval`; RTSP URIs through `rtspsrc` and `rdsvideodec` (H.264 and H.265), with no reconnection yet; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin) |
 | `nvv4l2decoder` | `rdsvideodec` | supported | rocDecode: H.264/H.265 8-bit 4:2:0 to NV12; rank primary+10, so `uridecodebin` picks it over the VA decoders; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideo4linux2), [name](https://docs.nvidia.com/deepstream/text/DS_FAQ) |
 | `nvvideoconvert` | `rdsvideoconvert` | supported | single frames (batch size 1); `memory:RDS` and system memory on either side; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideoconvert) |
 | `nvstreammux` | `rdsstreammux` | supported | the default (scaling) mux only; the new mux is not implemented yet. GstAggregator-based; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreammux) |
@@ -39,6 +39,71 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nv3dsink` | `rdsvideosink` | supported | as `nveglglessink` (nv3dsink's properties are a subset of nveglglessink's) | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nvv4l2h264enc` | `rdsh264enc` | planned | VA (VCN) encode, M2 | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nvv4l2h265enc` | `rdsh265enc` | planned | VA (VCN) encode, M2 | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
+
+### `rdsurisrcbin` (`nvurisrcbin`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin))
+
+Names, types, ranges and defaults follow DeepStream 8.0 behaviour (the element as shipped), and so does which
+properties are changeable only in the NULL or READY state (`GST_PARAM_MUTABLE_READY`). Where NVIDIA's nvurisrcbin
+pages differ, the Notes column says so: the pages document `select-rtp-protocol`'s default as 0, and give only an
+example value, with no default, for `source-id`, `buffer-mode`, `leaky`, `max-size-buffers`, `disable-passthrough`,
+`rtsp-reconnect-interval` and `rtsp-reconnect-attempts`. Two properties DeepStream 8.0 lacks come from the 9.2 page:
+`simulate-fps-interval-ms` and `ipc-frame-copy`. The bin decodes URIs other than `rtsp*://` with `uridecodebin3`, and
+`rtsp*://` URIs with `rtspsrc`, the RTP depayloader, `h264parse` or `h265parse` and `rdsvideodec`; it does not
+reconnect yet. "Accepted" below means the value is stored and read back and does nothing else so far. Accepted
+no-ops log a warning (`GST_WARNING`, category `rdsurisrcbin`) whenever they are set to a non-default value.
+
+| Property | Type | Default | Status | Notes |
+|---|---|---|---|---|
+| `uri` | string | NULL | supported | checked at start (NULL to READY): unset or empty, not a valid URI, or a scheme no source element handles is an error naming `uri`; the message names the scheme, never the whole URI (it may hold credentials). Decoded by `uridecodebin3`, except `rtsp*://` URIs: `rtspsrc` (made going from READY to PAUSED; the bin is live, PAUSED returns NO_PREROLL), then the H.264 or H.265 depayloader, parser (`config-interval=-1`) and `rdsvideodec`. Only H.264 and H.265 video streams are set up; another video codec (JPEG, say) is an error (STREAM, CODEC_NOT_FOUND) naming its `encoding-name`. Without reconnection, an `rtspsrc` error reaches the bus as it is, and the end of the stream (the server's EOS, or a closed TCP connection, which `rtspsrc` takes as one) is EOS on `vsrc_0` |
+| `type` | enum `auto` (0), `uri` (1), `rtsp` (2) | `auto` | supported | the source follows the URI's scheme whatever the value; `rtsp` with a URI that is not `rtsp*://` is an error at start naming `type` |
+| `file-loop` | boolean | `FALSE` | supported | DeepStream 8.0 behaviour: at the end of a `file://` URI the file plays again from the start, with no EOS, flush, second SEGMENT or STREAM_START downstream; the one SEGMENT is open-ended, PTS and DTS go on from the end of the previous pass, and each pass's first buffer is DISCONT. A flushing seek from downstream goes through as usual. An EOS the application sends to the bin or pipeline gets out as EOS and ends the loop (ours: DeepStream 8.0 not observed). On a URI that is not `file://`: a warning at start, and the URI plays once |
+| `latency` | uint | `100` | supported | milliseconds: `rtspsrc`'s `latency` (RTSP) |
+| `drop-on-latency` | boolean | `TRUE` | supported | `rtspsrc`'s `drop-on-latency` (RTSP), taken when the session starts (READY to PAUSED) |
+| `select-rtp-protocol` | enum `rtp-unknown` (0), `rtp-udp` (1), `rtp-udp-mcast` (2), `rtp-tcp` (4), `rtp-udp-udpmcast-tcp` (7), `rtp-http` (10), `rtp-tls` (20) | `rtp-udp-udpmcast-tcp` | supported | DeepStream 8.0 behaviour; the docs' default is 0 (`rtp-multi`). `rtspsrc`'s `protocols` (RTSP): UDP, UDP multicast, TCP, all three, HTTP + TCP, TLS + TCP; 0 leaves `rtspsrc`'s default (UDP, UDP multicast and TCP). `rtspsrc` gets a 100 ms `teardown-timeout` too (ours) |
+| `udp-buffer-size` | uint | `524288` | supported | bytes: `rtspsrc`'s `udp-buffer-size` (RTSP; at most G_MAXINT) |
+| `rtsp-reconnect-interval` | uint | `0` | accepted | seconds; 0: no reconnect on a timeout. DeepStream 8.0 behaviour; the docs' example value is 10 |
+| `rtsp-reconnect-attempts` | int | `-1` | accepted | any negative value: unlimited (ours; the docs give −1 and a range from −1). DeepStream 8.0 behaviour; the docs' example value is 4 |
+| `init-rtsp-reconnect-interval` | uint | `0` | accepted | seconds |
+| `drop-frame-interval` | uint 0..30 | `0` | supported | DeepStream 8.0 behaviour: N keeps decoded frames 0, N, 2N, … (counted across file loops) and drops the rest, durations unchanged; 0 and 1 keep every frame. Frames are dropped before any conversion |
+| `source-id` | int −1.. | `-1` | accepted | DeepStream 8.0 behaviour; the docs' example value is 0 |
+| `gpu-id` | uint | `0` | accepted | |
+| `disable-audio` | boolean | `TRUE` | supported | audio is never decoded or exposed, whatever the value: for files only the first video stream is selected; for RTSP, TRUE refuses every stream that is not video before SETUP, and FALSE sets them up and discards them inside the bin. Taken when the session starts (READY to PAUSED). An RTSP source with no video stream is an error (STREAM, CODEC_NOT_FOUND) |
+| `message-forward` | boolean | `FALSE` | supported | GstBin's own |
+| `async-handling` | boolean | `TRUE` | supported | GstBin's own (GstBin's default is FALSE; nvurisrcbin's is TRUE) |
+| `smart-record` | enum `smart-rec-disable` (0), `smart-rec-cloud` (1), `smart-rec-multi` (2) | `smart-rec-disable` | unsupported | anything but 0 is an error at start naming `smart-record` |
+| `smart-rec-status` | boolean, read-only | `FALSE` | supported | always FALSE: smart record never runs |
+| `smart-rec-dir-path` | string | NULL | accepted no-op | |
+| `smart-rec-file-prefix` | string | `Smart_Record` | accepted no-op | |
+| `smart-rec-video-cache`, `smart-rec-cache` | uint | `0` | accepted no-op | |
+| `smart-rec-container` | enum `smart-rec-mp4` (0), `smart-rec-mkv` (1) | `smart-rec-mp4` | accepted no-op | |
+| `smart-rec-mode` | enum `smart-rec-mode-av` (0), `smart-rec-mode-video` (1), `smart-rec-mode-audio` (2) | `smart-rec-mode-av` | accepted no-op | |
+| `smart-rec-default-duration` | uint | `20` | accepted no-op | |
+| `num-extra-surfaces` | uint | `1` | accepted no-op | |
+| `cudadec-memtype` | enum `memtype_device` (0), `memtype_pinned` (1), `memtype_unified` (2) | `memtype_device` | accepted no-op | |
+| `dec-skip-frames` | enum `decode_all` (0), `decode_non_ref` (1), `decode_key` (2) | `decode_all` | accepted no-op | |
+| `low-latency-mode` | boolean | `FALSE` | accepted no-op | |
+| `ipc-buffer-timestamp-copy` | boolean | `FALSE` | accepted no-op | |
+| `ipc-frame-copy` | boolean | `FALSE` | accepted no-op | from the 9.2 page; DeepStream 8.0 does not have it |
+| `ipc-connection-attempts` | int −1.. | `-1` | accepted no-op | |
+| `ipc-connection-interval` | uint64 | `1000000` | accepted no-op | microseconds |
+| `ipc-socket-path` | string | NULL | accepted no-op | |
+| `extract-sei-type5-data` | boolean | `FALSE` | accepted no-op | |
+| `sei-uuid` | string | NULL | accepted no-op | |
+| `simulate-fps-interval-ms` | uint 0..1000 | `0` | accepted no-op | from the 9.2 page; DeepStream 8.0 does not have it |
+| `buffer-mode` | enum `unknown` (0), `slave` (1), `buffer` (2), `auto` (3), `synced` (4) | `auto` | accepted no-op | DeepStream 8.0 behaviour; the docs' example value is 0 |
+| `leaky` | enum `no-leak` (0), `upstream-leak` (1), `downstream-leak` (2) | `no-leak` | accepted no-op | DeepStream 8.0 behaviour; the docs' example value is 0 |
+| `max-size-buffers` | uint | `200` | accepted no-op | DeepStream 8.0 behaviour; the docs' example value is 0 |
+| `disable-passthrough` | boolean | `TRUE` | accepted no-op | DeepStream 8.0 behaviour; the docs' example value is 0 |
+
+Pads: `vsrc_%u` (sometimes): `NV12` in `memory:RDS`, what `rdsvideodec` outputs, or in system memory. As in
+DeepStream 8.0 behaviour, a new bin has no pad. For a non-RTSP URI it adds the ghost pad `vsrc_0` when the first
+video stream is decoded (one STREAM_START, CAPS and SEGMENT, then the frames), keeps it across file loops and
+removes it going from PAUSED to READY; there is never a second pad. A decoder that can't output `memory:RDS` (JPEG,
+say) gets `rdsvideoconvert` behind it, so `vsrc_0` carries `memory:RDS` NV12 either way. For an RTSP URI, `vsrc_0` is
+added when `rdsvideodec` has its first caps, so the application's `pad-added` sees them as the pad's current caps;
+then one STREAM_START, CAPS and SEGMENT, and the frames. An RTSP stream in a codec other than H.264 or H.265 gets no
+pad.
+There is no audio pad template: audio is ignored. Rank none: `uridecodebin` and `decodebin3` never pick it.
 
 ### `rdsvideoconvert` (`nvvideoconvert`) properties
 

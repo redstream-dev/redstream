@@ -224,6 +224,12 @@ gst/rdssink/       libgstrdssink plugin: rdslogger (gstrdslogger.c: passthrough,
                    the **PERF line on a periodic pipeline-clock id) and rdsvideosink (gstrdsvideosink.c: a bin of
                    rdsvideoconvert, BGRx videoconvert and the video-sink factory; forwards the DeepStream sink
                    properties the inner sink has; refuses batches). Always built
+gst/rdsurisrcbin/  libgstrdsurisrcbin plugin: rdsurisrcbin (gstrdsurisrcbin.c: a GstBin with nvurisrcbin's properties
+                   that checks its settings at start; non-RTSP URIs through uridecodebin3 to the ghost pad vsrc_0,
+                   file-loop and drop-frame-interval in pad probes on the decoded pad and vsrc_0's target; RTSP URIs
+                   through an RTSP session, then the parser and rdsvideodec, which outlive sessions; no reconnection
+                   yet). rds-urisrc-session is the session: rtspsrc and the depayloader in their own GstBin, made and
+                   dropped whole. Needs gstreamer-rtsp; always built
 gst/common/        static rds-plugin-common, shared by the plugins: rds-keyfile-yaml (YAML config -> GKeyFile, with the
                    OpenCV-style "%YAML:1.0" line), rds-config-parse (number and bool parsing for the key tables),
                    rds-object-style.h (the drawing defaults of the object metas rdsinfer and rdstracker create).
@@ -236,8 +242,8 @@ gst/rdstracker/    libgstrdstracker plugin: rdstracker (gstrdstracker.c: write-b
                    default auto): needs only libyaml, not MIGraphX
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its rdsinfer
                    and rdstracker config-key tables must match the key tables: the infer_config and tracker_config
-                   tests check every row; element_compat_matrix checks the tiler, OSD, logger and sink property
-                   tables against the elements' properties)
+                   tests check every row; element_compat_matrix checks the tiler, OSD, logger, sink and URI source
+                   bin property tables against the elements' properties)
 samples/rds-test3/ clean-room test3-style multi-stream sample (end to end: per-frame counts, tiler, OSD, display;
                    --dry-run, --no-display, --pgie-config, --tracker-config)
 samples/tracker/   our IOU and NvSORT low-level tracker configs for rdstracker (tuned on the street clip)
@@ -347,9 +353,9 @@ meson test -C build-rel --print-errorlogs
   builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
   check the rdsinfer key tables in `docs/compat-matrix.md`. A new or changed config key needs its row there; the
   test's message prints the expected row. `/cpu/elements/compat-matrix` does the same for the property tables of
-  `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger` and `rdsvideosink`: every property except those of
-  GstObject, GstElement and GstBin needs a row (GstBaseTransform's `qos` included), and a row naming no property
-  fails too.
+  `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger`, `rdsvideosink` and `rdsurisrcbin`: every property
+  except those of GstObject, GstElement and GstBin needs a row (GstBaseTransform's `qos` included; GstBin's may have
+  one), and a row naming no property fails too.
 - **Tracker, tiler, OSD, logger and sink behaviour.** Where NVIDIA's docs are silent, `rdstracker`,
   `rdsmultistreamtiler`, `rdsosd`, `rdslogger` and `rdsvideosink` match observed DeepStream 8.0 behaviour, except where
   8.0 is clearly broken; there they do the sane thing. Code comments say "DeepStream 8.0 behaviour" or "ours", and

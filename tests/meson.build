@@ -387,7 +387,7 @@ test('element_logger', executable('element_logger', 'check' / 'element_logger.c'
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
 # docs/compat-matrix.md has a property-table row for every property of rdsmultistreamtiler, rdsosd (when built),
-# rdslogger and rdsvideosink, and none for a property they lack.
+# rdslogger, rdsvideosink and rdsurisrcbin, and none for a property they lack.
 test('element_compat_matrix', executable('element_compat_matrix', 'check' / 'element_compat_matrix.c',
     dependencies : test_deps,
     c_args : ['-DRDS_HAVE_OSD=@0@'.format(rds_osd_enabled ? 1 : 0),
@@ -401,6 +401,16 @@ test('element_videosink_cpu', element_videosink_exe, args : ['-p', '/cpu/videosi
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 test('element_videosink', element_videosink_exe, args : ['-p', '/gpu/videosink'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+
+# rdsurisrcbin: factory, properties, no-op warnings, the nvurisrcbin remap, the settings checked at start, RTSP state
+# changes, protocols and an undecodable codec (cpu); decoding file URIs, file-loop and drop-frame-interval, and RTSP
+# streams from the test server (gpu).
+element_urisrcbin_exe = executable('element_urisrcbin', 'check' / 'element_urisrcbin.c',
+  dependencies : test_deps + [gst_app_dep, gst_video_dep, rtsp_test_server_dep])
+test('element_urisrcbin_cpu', element_urisrcbin_exe, args : ['-p', '/cpu/urisrcbin'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_urisrcbin', element_urisrcbin_exe, args : ['-p', '/gpu/urisrcbin'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 240, depends : rds_plugins)
 
 # The RTSP test server and its TCP fault relay (tools/rds-rtsp-serve), which the rdsurisrcbin stream tests build on:
 # playback through the relay and direct, H.265 and JPEG, freeze, cut, refuse, a stream changed between sessions, the

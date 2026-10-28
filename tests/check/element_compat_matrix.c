@@ -1,9 +1,10 @@
-/* docs/compat-matrix.md has a property table for rdsmultistreamtiler, rdsosd, rdslogger and rdsvideosink: one row per
- * property the element has, and no row for a property it lacks (cpu).
+/* docs/compat-matrix.md has a property table for rdsmultistreamtiler, rdsosd, rdslogger, rdsvideosink and rdsurisrcbin:
+ * one row per property the element has, and no row for a property it lacks (cpu).
  *
  * The properties checked are those g_object_class_list_properties returns, minus the ones GstObject, GstElement and
  * GstBin install (`name`, `parent`, `async-handling`, `message-forward`): every GStreamer element has them, and
- * DeepStream's tables leave them out too. GstBaseTransform's `qos` is kept, since DeepStream 8.0's gst-inspect shows
+ * DeepStream's tables mostly leave them out. A table may still have a row for one (nvurisrcbin's page documents
+ * `async-handling` and `message-forward`). GstBaseTransform's `qos` is kept, since DeepStream 8.0's gst-inspect shows
  * it for the transforms.
  *
  * An element's table is the one under the "### `<element>` (" heading; its rows start with "| `" and the first cell
@@ -12,7 +13,7 @@
 #include <gst/gst.h>
 #include <string.h>
 
-static const gchar *const elements[] = { "rdsmultistreamtiler", "rdsosd", "rdslogger", "rdsvideosink" };
+static const gchar *const elements[] = { "rdsmultistreamtiler", "rdsosd", "rdslogger", "rdsvideosink", "rdsurisrcbin" };
 
 static gboolean
 is_common_property (GParamSpec * pspec)
@@ -106,8 +107,11 @@ test_compat_matrix (void)
     }
     props = g_object_class_list_properties (G_OBJECT_GET_CLASS (el), &n_props);
     for (guint i = 0; i < n_props; i++) {
-      if (is_common_property (props[i]))
+      if (is_common_property (props[i])) {
+        /* a row is allowed, not needed */
+        g_hash_table_remove (rows, props[i]->name);
         continue;
+      }
       if (!g_hash_table_remove (rows, props[i]->name)) {
         gchar *row = expected_row (props[i]);
 
