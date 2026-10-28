@@ -165,7 +165,7 @@ build).
 | `nvv4l2decoder` | `rdsvideodec` (rocDecode) | works |
 | `nvurisrcbin` | `rdsurisrcbin` | works (file and RTSP URIs, RTSP reconnection) |
 | `nvvideoconvert` | `rdsvideoconvert` | works |
-| `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` | works (default mux; the new mux is planned) |
+| `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` | works (video; the default, scaling mux. DeepStream's zero-copy "new mux" mode is planned) |
 | `nvinfer` | `rdsinfer` (MIGraphX) | works (primary detector) |
 | `nvtracker` | `rdstracker` | works (IOU, NvSORT) |
 | `nvdsosd` | `rdsosd` | works |
@@ -174,7 +174,7 @@ build).
 | `nveglglessink`, `nv3dsink` | `rdsvideosink` | works |
 | `nvdslogger` | `rdslogger` | works |
 | `nvv4l2h264enc`, `nvv4l2h265enc` | `rdsh264enc`, `rdsh265enc` | planned |
-| `nvstreammux` / `nvstreamdemux` with audio | `rdsstreammux` / `rdsstreamdemux` | planned |
+| Audio batching in `nvstreammux` / `nvstreamdemux` | audio in `rdsstreammux` / `rdsstreamdemux` | planned |
 | `nvinferaudio` | `rdsinferaudio` (MIGraphX) | planned |
 | `nvdsaudiotemplate` | `rdsaudiotemplate` | planned |
 | `NvDsBatchMeta`, `NvDsObjectMeta`, … | `Rds*` + `rds/rds_compat.h` | works |
