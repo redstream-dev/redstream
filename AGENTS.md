@@ -53,9 +53,9 @@ reconnection). Nothing here is stable.
 | `nveglglessink` / `nv3dsink` | `rdsvideosink` | display sink |
 | `nvdslogger` | `rdslogger` | per-stream FPS |
 | `nvv4l2h264enc` / `nvv4l2h265enc` | `rdsh264enc` / `rdsh265enc` | VA (VCN) encode with DeepStream property names (M2) |
-| `nvstreammux` / `nvstreamdemux` (audio) | `rdsstreammux` / `rdsstreamdemux` | later: batches of mono S16LE/F32LE audio, as the new mux does |
-| `nvinferaudio` | `rdsinferaudio` | later: audio classifier on MIGraphX, log-mel spectrogram (`audio-transform`) on the GPU |
-| `nvdsaudiotemplate` | `rdsaudiotemplate` | later: custom-library hook for single or batched audio |
+| `nvstreammux` / `nvstreamdemux` (audio) | `rdsstreammux` / `rdsstreamdemux` | on request: batches of mono S16LE/F32LE audio, as the new mux does |
+| `nvinferaudio` | `rdsinferaudio` | on request: audio classifier on MIGraphX, log-mel spectrogram (`audio-transform`) on the GPU |
+| `nvdsaudiotemplate` | `rdsaudiotemplate` | on request: custom-library hook for single or batched audio |
 | `NvDsBatchMeta` & co. | `RdsBatchMeta` & co. + `rds/rds_compat.h` | |
 
 The authoritative runtime mapping is the alias table in `gst-libs/rds/rds-compat-remap.c`.

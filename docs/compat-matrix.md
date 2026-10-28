@@ -1067,9 +1067,10 @@ The object meta fields the tracker writes (`object_id`, `tracker_bbox_info`, `tr
 `text_params.display_text`) are those of `RdsObjectMeta` under "Metadata"; `RDS_UNTRACKED_OBJECT_ID` is
 `G_MAXUINT64`.
 
-## Audio (planned)
+## Audio (on request)
 
-DeepStream also batches and infers on audio. None of it is implemented yet. The two audio elements are already in the
+DeepStream 8.0 batches and infers on audio; NVIDIA has since moved audio AI out of DeepStream (to Riva) and removed
+the audio plugins in 9.2. None of it is implemented here, and it is built only if users ask for it. The two audio elements are already in the
 remap table (they fail to create, naming the Redstream element, until they exist); the audio side of the mux and demux
 and the audio batch buffer have no counterpart yet. The plan: `rdsinferaudio` runs its model on MIGraphX, like
 `rdsinfer`, and computes the log-mel spectrogram on the GPU.

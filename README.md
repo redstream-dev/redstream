@@ -174,9 +174,9 @@ build).
 | `nveglglessink`, `nv3dsink` | `rdsvideosink` | works |
 | `nvdslogger` | `rdslogger` | works |
 | `nvv4l2h264enc`, `nvv4l2h265enc` | `rdsh264enc`, `rdsh265enc` | planned |
-| Audio batching in `nvstreammux` / `nvstreamdemux` | audio in `rdsstreammux` / `rdsstreamdemux` | planned |
-| `nvinferaudio` | `rdsinferaudio` (MIGraphX) | planned |
-| `nvdsaudiotemplate` | `rdsaudiotemplate` | planned |
+| Audio batching in `nvstreammux` / `nvstreamdemux` | audio in `rdsstreammux` / `rdsstreamdemux` | on request |
+| `nvinferaudio` | `rdsinferaudio` (MIGraphX) | on request |
+| `nvdsaudiotemplate` | `rdsaudiotemplate` | on request |
 | `NvDsBatchMeta`, `NvDsObjectMeta`, … | `Rds*` + `rds/rds_compat.h` | works |
 | TensorRT `.engine` | MIGraphX `.mxr` (compiled from ONNX, cached) | works |
 
@@ -194,7 +194,10 @@ build).
 - Metadata edits in pad probes.
 - ROI and line-crossing analytics, and an H.264 recording branch.
 
-**Later: audio analytics**
+**On request: audio analytics**
+
+DeepStream dropped its audio support (8.0 points to NVIDIA Riva; 9.2 removed the audio plugins), so these come
+only if users ask for them:
 - Audio streams batched by `rdsstreammux` and split again by `rdsstreamdemux`, as DeepStream's new mux does.
 - `rdsinferaudio` (`nvinferaudio`): audio classification on MIGraphX, with the log-mel spectrogram front end on the
   GPU, and the same config files.
