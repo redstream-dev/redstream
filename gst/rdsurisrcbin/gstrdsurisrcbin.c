@@ -28,10 +28,46 @@
  *     100 ms teardown-timeout (ours)
  *   - the bin is live: PAUSED returns NO_PREROLL
  *   - drop-frame-interval applies as for files; file-loop does not (a warning at start)
- *   - there is no reconnection yet: an rtspsrc ERROR reaches the bus as it is, and the end of the stream (a server's
- *     EOS, or a closed TCP connection, which rtspsrc takes as one) is EOS on vsrc_0 (the session's EOS goes through
- *     on_session_eos, where reconnection will drop it instead)
- *   - an ERROR or WARNING from a session being stopped is dropped: it is about the teardown
+ *   - without reconnection (rtsp-reconnect-interval 0, the default), an rtspsrc ERROR reaches the bus as it is, and the
+ *     end of the stream (a server's EOS, or a closed TCP connection, which rtspsrc takes as one) is EOS on vsrc_0
+ *   - an ERROR or WARNING from a session being stopped, or from the current one while the bin stops, is dropped: it is
+ *     about the teardown
+ *
+ * Reconnection (rds-urisrc-reconnect decides when; the attempts run on GStreamer's thread pool):
+ *
+ *   - triggers, with rtsp-reconnect-interval above 0: no buffer out of the session for the interval (DeepStream 8.0
+ *     behaviour: a watchdog on the system clock, ticking every second while PLAYING; reason "timeout"); and, at once
+ *     (ours), an ERROR from the session or its EOS, which is dropped (reasons "error", "eos"). While reconnection is on,
+ *     the session's ERRORs are posted as WARNINGs (DeepStream 8.0 behaviour), and so are the bin's own about a
+ *     session it can't use (no video, or a codec it can't decode), each a failed
+ *     attempt (ours)
+ *   - the application's EOS ends the stream whatever the source's state (ours): no attempt after it, the session goes
+ *     and the EOS goes through the parser and decoder to vsrc_0 (with no vsrc_0 yet, the attempts just stop)
+ *   - an attempt replaces the session (the old one stopped with its state locked) and posts a WARNING (STREAM,
+ *     FAILED) and the element message rds-reconnect (source-id int, attempt int, reason string). It fails on an
+ *     error, or without a buffer within the interval; the next one follows an interval after it started. The attempt
+ *     count is consecutive failures, reset by a buffer
+ *   - rtsp-reconnect-attempts N >= 0 (negative: unlimited): when attempt N fails (at once with N 0), the element
+ *     message attempt-exceeded (source-id uint, -1 as G_MAXUINT; attempt_exceeded boolean TRUE, as in DeepStream 8.0)
+ *     and a WARNING; then (ours) EOS on vsrc_0, so a muxer ends the source. Before any connection, attempt-exceeded
+ *     and then an ERROR (RESOURCE, OPEN_READ; ours). No attempt after it
+ *   - downstream (ours; DeepStream 8.0 restarts the running time): a reconnection is no new stream. The new session's
+ *     STREAM_START and SEGMENT stop at the decoder's sink pad; the parser's src pad drops delta units until a key frame
+ *     (marked DISCONT), and the leading pictures of an open GOP after it; the running time and PTS go on, as rtspsrc
+ *     timestamps in the pipeline's running time. Before the first frame
+ *     of the new session, once frames went out before, FLUSH_START and FLUSH_STOP (reset-time FALSE) leave vsrc_0,
+ *     then the SEGMENT again (rdsstreammux sends one rds-stream-reset for the source); and the element message
+ *     rds-reconnected (source-id int). A picture of the old session the decoder still held goes out before that.
+ *     Failed attempts send nothing downstream
+ *   - a new session at another size: new CAPS on vsrc_0 with its first frame (rdsvideodec reconfigures or recreates
+ *     its decoder), the reconnection otherwise as above. In another codec (H.264 to H.265, say; ours: DeepStream 8.0
+ *     fails every attempt): a new parser in front of the same rdsvideodec, which switches its own parser to the new
+ *     caps; vsrc_0 stays, and the reconnection is as above
+ *   - the start: when the first connection fails, the bin retries every init-rtsp-reconnect-interval s if above 0
+ *     (ours: it does nothing in DeepStream 8.0), else every rtsp-reconnect-interval s if above 0 (DeepStream 8.0
+ *     behaviour), else the ERROR goes up. Retries post the same messages; vsrc_0 comes with the first frames
+ *   - PAUSED to READY stops the watchdog and waits for an attempt under way; rtspsrc's 100 ms teardown-timeout keeps
+ *     stopping a hanging session short
  *
  * The properties are nvurisrcbin's, with the names, types, ranges, defaults and NULL-or-READY flags of DeepStream 8.0
  * behaviour, where those differ from NVIDIA's nvurisrcbin pages (docs/compat-matrix.md lists each one and its
@@ -42,19 +78,20 @@
  *   - type=rtsp needs an rtsp URI; else an error naming the property
  *   - file-loop on a URI that is not file://: a warning, and the bin starts (and plays the URI once)
  *
- * The reconnect intervals and attempts, source-id and gpu-id are stored and read back, and do nothing else yet.
+ * source-id goes into the reconnection messages; gpu-id is stored and read back, and does nothing else yet.
  * The DeepStream properties with no counterpart here (decoder surfaces and memory, smart record's settings, IPC,
  * SEI, buffering of the internal queue, ...) are accepted no-ops: stored and read back, and a non-default value logs
  * a warning. message-forward and async-handling are GstBin's; nvurisrcbin has async-handling TRUE by default, so it
  * starts TRUE here.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsurisrcbin.h"
+#include "rds-urisrc-reconnect.h"
 #include "rds-urisrc-session.h"
 
 #include <gst/rtsp/gstrtsptransport.h>
 #include <rds/rds.h>
 
-/* shared with rds-urisrc-session.c */
+/* shared with rds-urisrc-session.c and rds-urisrc-reconnect.c */
 GST_DEBUG_CATEGORY (gst_rds_uri_src_bin_debug);
 #define GST_CAT_DEFAULT gst_rds_uri_src_bin_debug
 
@@ -250,6 +287,7 @@ struct _GstRdsUriSrcBin
   GstPad *vsrc;                 /* vsrc_0 (RTSP: made with the decoder, added to the bin at its first caps) */
   gboolean have_video;          /* a decoded video pad was taken for vsrc_0 (RTSP: vsrc_0 was added) */
   gboolean stopping;            /* from PAUSED to READY: no new loop */
+  RdsUriSrcReconnect *reconnect;        /* RTSP: when to replace the session (made once, its own lock) */
 
   /* the stream on vsrc_0 (object lock; reset going from READY to PAUSED) */
   gboolean seen_stream_start, seen_segment;
@@ -263,6 +301,14 @@ struct _GstRdsUriSrcBin
   GstClockTimeDiff offset;      /* added to PTS and DTS */
   GstClockTime end;             /* the latest end of a decoded frame (offset applied) */
   guint64 frame;                /* decoded frames seen, for drop-frame-interval */
+  /* RTSP reconnection */
+  gboolean dec_stream_start, dec_segment;       /* the decoder had the run's first STREAM_START, SEGMENT */
+  gboolean gate;                /* a new session: delta units are dropped until a key frame */
+  guint gate_dropped;
+  GstClockTime gate_pts;        /* that key frame's PTS: decoded frames before it are the old session's */
+  gboolean gate_leading;        /* after the key frame: delta units before it in PTS are dropped too */
+  gboolean reset_pending;       /* a new session after frames went out: flush downstream before the next frame */
+  gboolean reconnected_pending; /* an attempt was made: rds-reconnected at the next frame */
 };
 
 #define VSRC_FIELDS "format = (string) NV12, width = (int) [ 1, 16384 ], height = (int) [ 1, 16384 ], " \
@@ -370,6 +416,7 @@ loop_seek (GstElement * element, G_GNUC_UNUSED gpointer user_data)
     if (self->eos_requested) {
       self->looping = FALSE;
       eos = !self->eos_out;
+      self->eos_out = TRUE;
     } else {
       target = gst_object_ref (self->target);
       self->loop_seqnum = gst_event_get_seqnum (seek);
@@ -397,6 +444,7 @@ loop_seek (GstElement * element, G_GNUC_UNUSED gpointer user_data)
     stopping = self->stopping;
     self->looping = FALSE;
     self->loop_failed = TRUE;
+    self->eos_out = !stopping;
     GST_OBJECT_UNLOCK (self);
     if (!stopping) {
       GST_ELEMENT_WARNING (self, STREAM, FAILED, ("Could not seek back to the start of the file for file-loop"),
@@ -478,8 +526,33 @@ target_event (GstRdsUriSrcBin * self, GstPadProbeInfo * info)
   return GST_PAD_PROBE_OK;
 }
 
+/* RTSP (ours): before the first frame of a new session, once frames went out, a flush out of vsrc_0 that keeps the
+ * running time (FLUSH_STOP's reset-time FALSE): downstream drops what it holds of the old session, and rdsstreammux
+ * sends rds-stream-reset for the source. Then the SEGMENT again, as FLUSH_STOP took it off the pad. On the streaming
+ * thread, in order with the frames. (DeepStream 8.0 restarts the running time instead.) */
+static void
+reset_downstream (GstRdsUriSrcBin * self, GstPad * vsrc)
+{
+  GstEvent *segment = gst_pad_get_sticky_event (vsrc, GST_EVENT_SEGMENT, 0);
+  guint32 seqnum = gst_util_seqnum_next ();
+  GstEvent *ev;
+
+  GST_INFO_OBJECT (self, "first frame from the new RTSP session: flushing downstream");
+  ev = gst_event_new_flush_start ();
+  gst_event_set_seqnum (ev, seqnum);
+  gst_pad_push_event (vsrc, ev);
+  ev = gst_event_new_flush_stop (FALSE);
+  gst_event_set_seqnum (ev, seqnum);
+  gst_pad_push_event (vsrc, ev);
+  /* FLUSH_STOP took the TAG event off the pad too; it isn't pushed again, as nothing needs it */
+  if (segment != NULL)
+    gst_pad_push_event (vsrc, segment);
+}
+
 /* Frames, on the decoded pad: drop-frame-interval there, so dropped frames are never converted, and file-loop's
- * timestamps from every decoded frame, so the next pass starts after the last frame decoded, kept or not. */
+ * timestamps from every decoded frame, so the next pass starts after the last frame decoded, kept or not. RTSP: the
+ * first frame after a reconnection attempt posts rds-reconnected, after reset_downstream when frames went out
+ * before. */
 static GstPadProbeReturn
 decoded_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
@@ -488,7 +561,9 @@ decoded_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user
   GstClockTime pts = GST_BUFFER_PTS (buf), dts = GST_BUFFER_DTS (buf);
   GstClockTime ts = GST_CLOCK_TIME_IS_VALID (pts) ? pts : dts;
   GstClockTimeDiff offset;
-  gboolean keep, discont = FALSE;
+  gboolean keep, discont = FALSE, reconnected = FALSE;
+  GstPad *reset = NULL;
+  gint source_id = 0;
 
   GST_LOG_OBJECT (self, "buffer %" GST_PTR_FORMAT, buf);
   GST_OBJECT_LOCK (self);
@@ -519,11 +594,31 @@ decoded_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user
   if (keep) {
     discont = self->discont;
     self->discont = FALSE;
+    /* not before the new session's first key frame: the decoder may still hold a picture of the old one, which the
+     * key frame pushes out first */
+    reconnected = self->reconnected_pending && !self->gate && (!GST_CLOCK_TIME_IS_VALID (ts)
+        || !GST_CLOCK_TIME_IS_VALID (self->gate_pts) || ts >= self->gate_pts);
+    if (reconnected) {
+      if (self->reset_pending && self->vsrc != NULL)
+        reset = gst_object_ref (self->vsrc);
+      self->reconnected_pending = self->reset_pending = FALSE;
+    }
+    source_id = self->source_id;
   }
   GST_OBJECT_UNLOCK (self);
 
   if (!keep)
     return GST_PAD_PROBE_DROP;
+  if (reconnected) {
+    if (reset != NULL) {
+      reset_downstream (self, reset);
+      gst_object_unref (reset);
+      discont = TRUE;
+    }
+    GST_INFO_OBJECT (self, "reconnected to the RTSP source");
+    gst_element_post_message (GST_ELEMENT (self), gst_message_new_element (GST_OBJECT (self),
+            gst_structure_new ("rds-reconnected", "source-id", G_TYPE_INT, source_id, NULL)));
+  }
   if (offset != 0 || discont) {
     buf = gst_buffer_make_writable (buf);
     if (offset != 0 && GST_CLOCK_TIME_IS_VALID (pts))
@@ -737,9 +832,10 @@ typedef enum
   FROM_RETIRING,                /* the RTSP session being stopped */
 } MessageOrigin;
 
-/* Which RTSP session @msg comes from, if any. */
+/* Which RTSP session @msg comes from, if any; FROM_SESSION puts the current session in *@session (no ref: a token for
+ * the reconnection). */
 static MessageOrigin
-message_origin (GstRdsUriSrcBin * self, GstMessage * msg)
+message_origin (GstRdsUriSrcBin * self, GstMessage * msg, gpointer * session_out)
 {
   GstObject *session = NULL, *retiring = NULL;
   MessageOrigin origin = FROM_ELSEWHERE;
@@ -751,9 +847,10 @@ message_origin (GstRdsUriSrcBin * self, GstMessage * msg)
     retiring = gst_object_ref (GST_OBJECT (self->retiring));
   GST_OBJECT_UNLOCK (self);
   /* unlocked: walking up from an element outside the sessions takes this bin's lock */
-  if (session != NULL && gst_object_has_as_ancestor (GST_MESSAGE_SRC (msg), session))
+  if (session != NULL && gst_object_has_as_ancestor (GST_MESSAGE_SRC (msg), session)) {
     origin = FROM_SESSION;
-  else if (retiring != NULL && gst_object_has_as_ancestor (GST_MESSAGE_SRC (msg), retiring))
+    *session_out = session;
+  } else if (retiring != NULL && gst_object_has_as_ancestor (GST_MESSAGE_SRC (msg), retiring))
     origin = FROM_RETIRING;
   gst_clear_object (&session);
   gst_clear_object (&retiring);
@@ -765,14 +862,40 @@ gst_rds_uri_src_bin_handle_message (GstBin * bin, GstMessage * msg)
 {
   GstRdsUriSrcBin *self = GST_RDS_URI_SRC_BIN (bin);
   gboolean failure = GST_MESSAGE_TYPE (msg) == GST_MESSAGE_ERROR || GST_MESSAGE_TYPE (msg) == GST_MESSAGE_WARNING;
+  gpointer session = NULL, lost = NULL;
+  gboolean stopping;
 
   if (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_STREAM_COLLECTION && GST_IS_ELEMENT (GST_MESSAGE_SRC (msg)))
     select_video (self, msg);
   if (failure) {
-    switch (message_origin (self, msg)) {
+    switch (message_origin (self, msg, &session)) {
       case FROM_SESSION:
-        /* rtsp-reconnect-interval 0: no reconnection, the session's errors go up as they are */
+        GST_OBJECT_LOCK (self);
+        stopping = self->stopping;
+        GST_OBJECT_UNLOCK (self);
+        if (stopping) {
+          /* about the teardown */
+          GST_DEBUG_OBJECT (self, "dropped, from the RTSP session while stopping: %" GST_PTR_FORMAT, msg);
+          gst_message_unref (msg);
+          return;
+        }
         GST_INFO_OBJECT (self, "from the RTSP session: %" GST_PTR_FORMAT, msg);
+        if (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_ERROR && rds_urisrc_reconnect_active (self->reconnect)) {
+          GError *err = NULL;
+          gchar *dbg = NULL;
+          GstMessage *warning;
+
+          /* DeepStream 8.0 behaviour: while reconnecting, the session's errors are warnings (without reconnection
+           * they go up as they are) */
+          gst_message_parse_error (msg, &err, &dbg);
+          warning = gst_message_new_warning (GST_MESSAGE_SRC (msg), err, dbg);
+          gst_message_set_seqnum (warning, gst_message_get_seqnum (msg));
+          g_clear_error (&err);
+          g_free (dbg);
+          gst_message_unref (msg);
+          msg = warning;
+          lost = session;
+        }
         break;
       case FROM_RETIRING:
         /* about the teardown of a session that is going anyway */
@@ -784,6 +907,8 @@ gst_rds_uri_src_bin_handle_message (GstBin * bin, GstMessage * msg)
     }
   }
   GST_BIN_CLASS (gst_rds_uri_src_bin_parent_class)->handle_message (bin, msg);
+  if (lost != NULL)
+    rds_urisrc_reconnect_lost (self->reconnect, lost, RDS_URISRC_RECONNECT_ERROR);
 }
 
 /* NULL to READY, after check_settings: a uridecodebin3 for any URI but RTSP. FALSE after posting an error. */
@@ -836,33 +961,143 @@ remove_element (GstRdsUriSrcBin * self, GstElement * element)
 
 /* ---- RTSP ---- */
 
+/* At the decoder's sink pad, which outlives sessions and parsers (ours): a new session's STREAM_START and SEGMENT are
+ * dropped after the run's first ones, so a reconnection starts no new stream downstream. The parser in front gets
+ * them (a new parser, for another codec, needs them). The running time goes on without help: a live rtspsrc added to
+ * the running pipeline timestamps in its running time, as the first one did. */
+static GstPadProbeReturn
+decoder_sink_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstRdsUriSrcBin *self = user_data;
+  GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info);
+  gboolean *seen, drop;
+
+  switch (GST_EVENT_TYPE (ev)) {
+    case GST_EVENT_STREAM_START:
+      seen = &self->dec_stream_start;
+      break;
+    case GST_EVENT_SEGMENT:
+      seen = &self->dec_segment;
+      break;
+    default:
+      return GST_PAD_PROBE_OK;
+  }
+  GST_OBJECT_LOCK (self);
+  drop = *seen;
+  *seen = TRUE;
+  GST_OBJECT_UNLOCK (self);
+  if (!drop)
+    return GST_PAD_PROBE_OK;
+  GST_DEBUG_OBJECT (self, "dropped, from a new RTSP session: %" GST_PTR_FORMAT, ev);
+  /* HANDLED, not DROP: a dropped sticky event stays pending on the pad */
+  gst_event_unref (ev);
+  return GST_PAD_PROBE_HANDLED;
+}
+
+/* At the parser's src pad (ours): after a reconnection, the delta units before the first key frame are dropped, so
+ * the decoder never gets a picture whose references were the old session's, and that key frame goes on DISCONT. The
+ * parser sets the flags, and its config-interval -1 puts the parameter sets in front of every key frame. A key frame
+ * may open a GOP whose leading pictures (B or RASL, after it in decode order and before it in PTS) refer to pictures
+ * before it: h264parse takes any I picture for a key frame, h265parse a CRA. Those are dropped too, up to the first
+ * picture after the key frame in PTS. */
+static GstPadProbeReturn
+gate_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstRdsUriSrcBin *self = user_data;
+  GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info);
+  GstClockTime pts = GST_BUFFER_PTS (buf);
+  guint dropped;
+
+  GST_OBJECT_LOCK (self);
+  if (self->gate_leading) {
+    gboolean leading = GST_BUFFER_FLAG_IS_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT) && GST_CLOCK_TIME_IS_VALID (pts)
+        && GST_CLOCK_TIME_IS_VALID (self->gate_pts) && pts < self->gate_pts;
+
+    /* over once a picture after the key frame passes (or one whose order can't be told) */
+    if (!leading && (!GST_CLOCK_TIME_IS_VALID (pts) || !GST_CLOCK_TIME_IS_VALID (self->gate_pts)
+            || pts > self->gate_pts))
+      self->gate_leading = FALSE;
+    GST_OBJECT_UNLOCK (self);
+    if (leading) {
+      GST_DEBUG_OBJECT (self, "dropped a leading picture of the first key frame: %" GST_PTR_FORMAT, buf);
+      return GST_PAD_PROBE_DROP;
+    }
+    return GST_PAD_PROBE_OK;
+  }
+  if (!self->gate) {
+    GST_OBJECT_UNLOCK (self);
+    return GST_PAD_PROBE_OK;
+  }
+  if (GST_BUFFER_FLAG_IS_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT)) {
+    self->gate_dropped++;
+    GST_OBJECT_UNLOCK (self);
+    return GST_PAD_PROBE_DROP;
+  }
+  self->gate = FALSE;
+  self->gate_pts = pts;
+  self->gate_leading = TRUE;
+  dropped = self->gate_dropped;
+  GST_OBJECT_UNLOCK (self);
+  GST_INFO_OBJECT (self, "first key frame from the new RTSP session: dropped %u delta units before it", dropped);
+  buf = gst_buffer_make_writable (buf);
+  GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
+  GST_PAD_PROBE_INFO_DATA (info) = buf;
+  return GST_PAD_PROBE_OK;
+}
+
+static const gchar *
+parser_name (RdsUriSrcCodec codec)
+{
+  return codec == RDS_URISRC_CODEC_H264 ? "h264parse" : "h265parse";
+}
+
+/* RTSP: the parser for @codec, in the bin (in NULL), with the key-frame gate on its src pad; NULL when it is
+ * missing. */
+static GstElement *
+make_parser (GstRdsUriSrcBin * self, RdsUriSrcCodec codec)
+{
+  GstElement *parse = gst_element_factory_make (parser_name (codec), NULL);
+  GstPad *pad;
+
+  if (parse == NULL)
+    return NULL;
+  /* SPS and PPS (and VPS) with every key frame, so the decoder can start on any of them */
+  g_object_set (parse, "config-interval", -1, NULL);
+  pad = gst_element_get_static_pad (parse, "src");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, gate_probe, self, NULL);
+  gst_object_unref (pad);
+  add_dynamic (self, parse);
+  return parse;
+}
+
 /* RTSP: the parser and rdsvideodec for @codec (on the session's streaming thread), with vsrc_0 on the decoder's src
  * pad, not yet in the bin; NULL after posting an error, else the parser (a ref). */
 static GstElement *
 make_decoder (GstRdsUriSrcBin * self, RdsUriSrcCodec codec)
 {
-  const gchar *parse_name = codec == RDS_URISRC_CODEC_H264 ? "h264parse" : "h265parse";
-  GstElement *parse = gst_element_factory_make (parse_name, NULL);
-  GstElement *dec = gst_element_factory_make ("rdsvideodec", NULL);
+  GstElement *parse, *dec = gst_element_factory_make ("rdsvideodec", NULL);
   GstPadTemplate *templ = gst_element_class_get_pad_template (GST_ELEMENT_GET_CLASS (self), "vsrc_%u");
-  GstPad *target, *vsrc;
+  GstPad *target, *vsrc, *pad;
   gulong decoded_id, target_id;
 
-  if (parse == NULL || dec == NULL) {
-    GST_ELEMENT_ERROR (self, CORE, MISSING_PLUGIN, ("%s is missing", parse == NULL ? parse_name : "rdsvideodec"),
-        (NULL));
-    gst_clear_object (&parse);
-    gst_clear_object (&dec);
+  if (dec == NULL) {
+    GST_ELEMENT_ERROR (self, CORE, MISSING_PLUGIN, ("rdsvideodec is missing"), (NULL));
     return NULL;
   }
-  /* SPS and PPS (and VPS) with every key frame, so the decoder can start on any of them */
-  g_object_set (parse, "config-interval", -1, NULL);
-  add_dynamic (self, parse);
+  if ((parse = make_parser (self, codec)) == NULL) {
+    GST_ELEMENT_ERROR (self, CORE, MISSING_PLUGIN, ("%s is missing", parser_name (codec)), (NULL));
+    gst_object_unref (dec);
+    return NULL;
+  }
   add_dynamic (self, dec);
   if (!gst_element_link (parse, dec)) {
-    GST_ELEMENT_ERROR (self, CORE, NEGOTIATION, ("Could not link %s to rdsvideodec", parse_name), (NULL));
+    GST_ELEMENT_ERROR (self, CORE, NEGOTIATION, ("Could not link %s to rdsvideodec", GST_OBJECT_NAME
+            (gst_element_get_factory (parse))), (NULL));
     return NULL;
   }
+  pad = gst_element_get_static_pad (dec, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, decoder_sink_probe, self, NULL);
+  gst_object_unref (pad);
 
   /* the decoder's output is memory:RDS NV12 already: it is vsrc_0's target, with both probes */
   target = gst_element_get_static_pad (dec, "src");
@@ -885,46 +1120,137 @@ make_decoder (GstRdsUriSrcBin * self, RdsUriSrcCodec codec)
   return gst_object_ref (parse);
 }
 
-/* The session's video pad (its streaming thread): to the parser, made for the first session's codec. The parser and
- * decoder outlive sessions, so a later session must bring the same codec. */
+/* A session the bin can't use (its codec): an ERROR (STREAM, CODEC_NOT_FOUND) saying @text, or while reconnection is
+ * on a WARNING and a failed attempt, as for the session's own errors. */
+static void
+session_failed (GstRdsUriSrcBin * self, RdsUriSrcSession * session, const gchar * text)
+{
+  gboolean stopping;
+
+  GST_OBJECT_LOCK (self);
+  stopping = self->stopping;
+  GST_OBJECT_UNLOCK (self);
+  if (stopping) {
+    /* about a session going anyway */
+    GST_DEBUG_OBJECT (self, "while stopping: %s", text);
+    return;
+  }
+  if (!rds_urisrc_reconnect_active (self->reconnect)) {
+    GST_ELEMENT_ERROR (self, STREAM, CODEC_NOT_FOUND, ("%s", text), (NULL));
+    return;
+  }
+  GST_ELEMENT_WARNING (self, STREAM, CODEC_NOT_FOUND, ("%s", text), (NULL));
+  rds_urisrc_reconnect_lost (self->reconnect, session, RDS_URISRC_RECONNECT_ERROR);
+}
+
+/* Buffers leaving a session: the reconnection's watchdog counts from the last one. */
+static GstPadProbeReturn
+session_buffer_probe (GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gpointer user_data)
+{
+  GstRdsUriSrcBin *self = user_data;
+
+  rds_urisrc_reconnect_buffer (self->reconnect, GST_PAD_PARENT (pad));
+  return GST_PAD_PROBE_OK;
+}
+
+/* RTSP (ours): a session in another codec than the last (H.264 to H.265, say). A parser for it replaces the old one
+ * in front of the same decoder: rdsvideodec takes the new caps and makes a rocDecode parser for them, after showing
+ * the pictures of the old stream it still held. vsrc_0 stays, and the reconnection goes on as any other (the key-frame
+ * gate, one flush, the SEGMENT again). The old parser is idle: its session is gone. On the new session's thread;
+ * safe against stopping, as PAUSED to READY stops the session (joining its threads, this one too) before remove_pad
+ * takes the parser and decoder away. NULL after session_failed, with no parser left (the next session makes one for
+ * its codec), else the new parser (a ref). */
+static GstElement *
+swap_parser (GstRdsUriSrcBin * self, RdsUriSrcSession * session, RdsUriSrcCodec codec)
+{
+  GstElement *parse = make_parser (self, codec), *old, *dec;
+  GstPad *src, *decpad;
+  gchar *text;
+
+  GST_OBJECT_LOCK (self);
+  old = g_steal_pointer (&self->parser);
+  self->codec = RDS_URISRC_CODEC_NONE;
+  dec = gst_object_ref (GST_PAD_PARENT (self->target));
+  GST_OBJECT_UNLOCK (self);
+  GST_INFO_OBJECT (self, "the RTSP stream is %s now: a new parser", rds_urisrc_codec_name (codec));
+  decpad = gst_element_get_static_pad (dec, "sink");
+  gst_object_unref (dec);
+  if (old != NULL) {
+    GST_OBJECT_LOCK (self);
+    self->dynamic = g_list_remove (self->dynamic, old);
+    GST_OBJECT_UNLOCK (self);
+    src = gst_element_get_static_pad (old, "src");
+    gst_pad_unlink (src, decpad);
+    gst_object_unref (src);
+    /* the list's ref, then self->parser's */
+    remove_element (self, old);
+    gst_object_unref (old);
+  }
+  if (parse == NULL) {
+    text = g_strdup_printf ("%s is missing: the RTSP stream changed to %s", parser_name (codec),
+        rds_urisrc_codec_name (codec));
+  } else {
+    src = gst_element_get_static_pad (parse, "src");
+    text = gst_pad_link (src, decpad) == GST_PAD_LINK_OK ? NULL :
+        g_strdup_printf ("Could not link %s to rdsvideodec", parser_name (codec));
+    gst_object_unref (src);
+  }
+  gst_object_unref (decpad);
+  if (text != NULL) {
+    if (parse != NULL) {
+      GST_OBJECT_LOCK (self);
+      self->dynamic = g_list_remove (self->dynamic, parse);
+      GST_OBJECT_UNLOCK (self);
+      remove_element (self, parse);
+    }
+    session_failed (self, session, text);
+    g_free (text);
+    return NULL;
+  }
+  gst_element_sync_state_with_parent (parse);
+  GST_OBJECT_LOCK (self);
+  self->parser = gst_object_ref (parse);
+  self->codec = codec;
+  GST_OBJECT_UNLOCK (self);
+  return gst_object_ref (parse);
+}
+
+/* The session's video pad (its streaming thread): to the parser, made with the decoder for the first session's
+ * codec. The decoder outlives sessions; the parser too, unless a later session is in another codec (swap_parser). */
 static void
 on_session_video (RdsUriSrcSession * session, GstPad * pad, RdsUriSrcCodec codec, gpointer user_data)
 {
   GstRdsUriSrcBin *self = user_data;
-  RdsUriSrcCodec had;
+  gboolean have_decoder;
   GstElement *parse = NULL;
   GstPad *sinkpad;
 
   GST_OBJECT_LOCK (self);
-  if (session != self->session) {
+  if (session != self->session || self->stopping) {
     /* a session being stopped */
     GST_OBJECT_UNLOCK (self);
     GST_DEBUG_OBJECT (self, "video from a session that is not the current one: ignored");
     return;
   }
-  had = self->codec;
-  if (had == RDS_URISRC_CODEC_NONE)
+  have_decoder = self->target != NULL;
+  if (!have_decoder)
     self->codec = codec;
-  else if (self->parser != NULL)
+  else if (self->parser != NULL && self->codec == codec)
     parse = gst_object_ref (self->parser);
   GST_OBJECT_UNLOCK (self);
-  if (had != RDS_URISRC_CODEC_NONE && had != codec) {
-    gst_clear_object (&parse);
-    GST_ELEMENT_ERROR (self, STREAM, CODEC_NOT_FOUND, ("The RTSP stream changed from %s to %s, which is not "
-            "supported", rds_urisrc_codec_name (had), rds_urisrc_codec_name (codec)), (NULL));
-    return;
-  }
-  if (had == RDS_URISRC_CODEC_NONE && (parse = make_decoder (self, codec)) == NULL) {
+  if (!have_decoder && (parse = make_decoder (self, codec)) == NULL) {
     /* no decoder for it: the next session tries again */
     GST_OBJECT_LOCK (self);
     self->codec = RDS_URISRC_CODEC_NONE;
     GST_OBJECT_UNLOCK (self);
     return;
   }
-  if (parse == NULL)
+  if (parse == NULL && (parse = swap_parser (self, session, codec)) == NULL)
     return;
   sinkpad = gst_element_get_static_pad (parse, "sink");
   GST_DEBUG_OBJECT (self, "%s stream from the RTSP session", rds_urisrc_codec_name (codec));
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, session_buffer_probe, self,
+      NULL);
   if (gst_pad_link (pad, sinkpad) != GST_PAD_LINK_OK)
     GST_ELEMENT_ERROR (self, CORE, NEGOTIATION, ("Could not link the RTSP stream to the parser"), (NULL));
   gst_object_unref (sinkpad);
@@ -933,29 +1259,41 @@ on_session_video (RdsUriSrcSession * session, GstPad * pad, RdsUriSrcCodec codec
 
 /* The session found no video stream it can give the decoder (rtspsrc's threads). */
 static void
-on_session_no_video (G_GNUC_UNUSED RdsUriSrcSession * session, const gchar * encoding, gpointer user_data)
+on_session_no_video (RdsUriSrcSession * session, const gchar * encoding, gpointer user_data)
 {
   GstRdsUriSrcBin *self = user_data;
+  gchar *text;
 
   /* the encoding-name only: the URI may hold credentials */
   if (encoding != NULL)
-    GST_ELEMENT_ERROR (self, STREAM, CODEC_NOT_FOUND, ("The RTSP source's video is %s (its encoding-name), which "
-            "cannot be decoded: only H.264 and H.265 are supported. Select the camera's H.264 or H.265 stream "
-            "(profile)", encoding), (NULL));
+    text = g_strdup_printf ("The RTSP source's video is %s (its encoding-name), which cannot be decoded: only H.264 "
+        "and H.265 are supported. Select the camera's H.264 or H.265 stream (profile)", encoding);
   else
-    GST_ELEMENT_ERROR (self, STREAM, CODEC_NOT_FOUND, ("The RTSP source has no video stream"), (NULL));
+    text = g_strdup ("The RTSP source has no video stream");
+  session_failed (self, session, text);
+  g_free (text);
 }
 
 /* An EOS leaving the session (its streaming thread): the server ended the stream, or rtspsrc took a closed
- * connection as its end. With no reconnection, it goes on to vsrc_0 as the end of the stream; this is where
- * reconnection drops it and starts a new session instead. */
+ * connection as its end. With no reconnection, it goes on to vsrc_0 as the end of the stream; with reconnection it
+ * is dropped and a new session replaces this one (ours: at once). (The application's EOS is the bin's to send: see
+ * gst_rds_uri_src_bin_send_event.) */
 static gboolean
-on_session_eos (G_GNUC_UNUSED RdsUriSrcSession * session, gpointer user_data)
+on_session_eos (RdsUriSrcSession * session, gpointer user_data)
 {
   GstRdsUriSrcBin *self = user_data;
+  gboolean requested;
 
-  GST_DEBUG_OBJECT (self, "EOS from the RTSP session: no reconnection, passed on");
-  return TRUE;
+  GST_OBJECT_LOCK (self);
+  requested = self->eos_requested;
+  GST_OBJECT_UNLOCK (self);
+  if (requested || !rds_urisrc_reconnect_active (self->reconnect)) {
+    GST_DEBUG_OBJECT (self, "EOS from the RTSP session: passed on");
+    return TRUE;
+  }
+  GST_DEBUG_OBJECT (self, "EOS from the RTSP session: dropped, reconnecting");
+  rds_urisrc_reconnect_lost (self->reconnect, session, RDS_URISRC_RECONNECT_EOS);
+  return FALSE;
 }
 
 /* A new RTSP session from the properties, added to the bin (in NULL: the caller sets its state). FALSE after posting
@@ -994,6 +1332,7 @@ add_session (GstRdsUriSrcBin * self)
     GST_ELEMENT_ERROR (self, CORE, MISSING_PLUGIN, ("rtspsrc is missing"), (NULL));
     return FALSE;
   }
+  rds_urisrc_reconnect_set_session (self->reconnect, session);
   GST_OBJECT_LOCK (self);
   self->session = gst_object_ref (session);
   GST_OBJECT_UNLOCK (self);
@@ -1002,7 +1341,8 @@ add_session (GstRdsUriSrcBin * self)
 }
 
 /* The current RTSP session goes (rds_urisrc_session_stop: NULL, unlinked from the parser, removed). Until it is out of
- * the bin it is the retiring session, so its late messages are still told apart. Not on a session's thread. */
+ * the bin it is the retiring session, so its late messages are still told apart; its state is locked first, so a
+ * change of the bin's state meanwhile can't start it again. Not on a session's thread. */
 static void
 remove_session (GstRdsUriSrcBin * self)
 {
@@ -1010,16 +1350,141 @@ remove_session (GstRdsUriSrcBin * self)
 
   GST_OBJECT_LOCK (self);
   session = g_steal_pointer (&self->session);
-  self->retiring = session;
+  /* only when there is one: a second caller must not clear the first one's */
+  if (session != NULL)
+    self->retiring = session;
   GST_OBJECT_UNLOCK (self);
   if (session == NULL)
     return;
+  gst_element_set_locked_state (GST_ELEMENT (session), TRUE);
   rds_urisrc_session_stop (session);
   GST_OBJECT_LOCK (self);
-  self->retiring = NULL;
+  if (self->retiring == session)
+    self->retiring = NULL;
   GST_OBJECT_UNLOCK (self);
   gst_object_unref (session);
 }
+
+/* ---- RTSP reconnection (rds-urisrc-reconnect decides when; GStreamer's thread pool) ---- */
+
+static const gchar *
+reason_text (RdsUriSrcReconnectReason reason)
+{
+  switch (reason) {
+    case RDS_URISRC_RECONNECT_ERROR:
+      return "the stream failed";
+    case RDS_URISRC_RECONNECT_EOS:
+      return "the stream ended";
+    default:
+      return "no data within the reconnect interval";
+  }
+}
+
+/* An attempt: our WARNING (DeepStream 8.0 behaviour: one per attempt) and rds-reconnect. */
+static void
+reconnect_announce (GstElement * element, guint attempt, RdsUriSrcReconnectReason reason)
+{
+  GstRdsUriSrcBin *self = GST_RDS_URI_SRC_BIN (element);
+  gint source_id;
+
+  GST_OBJECT_LOCK (self);
+  source_id = self->source_id;
+  GST_OBJECT_UNLOCK (self);
+  GST_ELEMENT_WARNING (self, STREAM, FAILED, ("Reconnecting to the RTSP source, attempt %u: %s", attempt,
+          reason_text (reason)), (NULL));
+  gst_element_post_message (element, gst_message_new_element (GST_OBJECT (self), gst_structure_new ("rds-reconnect",
+              "source-id", G_TYPE_INT, source_id, "attempt", G_TYPE_INT, (gint) attempt, "reason", G_TYPE_STRING,
+              rds_urisrc_reconnect_reason_name (reason), NULL)));
+}
+
+/* An attempt: a new session for the old one, its first frames gated to a key frame. Failed attempts send nothing
+ * downstream: the flush waits for the first frame. */
+static void
+reconnect_replace (GstElement * element)
+{
+  GstRdsUriSrcBin *self = GST_RDS_URI_SRC_BIN (element);
+  RdsUriSrcSession *session = NULL;
+
+  remove_session (self);
+  GST_OBJECT_LOCK (self);
+  self->gate = TRUE;
+  self->gate_leading = FALSE;
+  self->gate_dropped = 0;
+  self->gate_pts = GST_CLOCK_TIME_NONE;
+  /* never on the first connection (start-up retries) */
+  self->reset_pending = self->frame > 0;
+  self->reconnected_pending = TRUE;
+  GST_OBJECT_UNLOCK (self);
+  if (!add_session (self))
+    return;
+  GST_OBJECT_LOCK (self);
+  if (self->session != NULL)
+    session = gst_object_ref (self->session);
+  GST_OBJECT_UNLOCK (self);
+  if (session != NULL) {
+    gst_element_sync_state_with_parent (GST_ELEMENT (session));
+    gst_object_unref (session);
+  }
+}
+
+/* RTSP: the stream ends here, once: the session goes, and an EOS goes through the parser and decoder to vsrc_0 (none
+ * without a parser yet, or once an EOS went out). Not on a session's thread. */
+static void
+end_stream (GstRdsUriSrcBin * self)
+{
+  GstPad *sinkpad = NULL;
+
+  remove_session (self);
+  GST_OBJECT_LOCK (self);
+  if (!self->stopping && !self->eos_out && self->parser != NULL)
+    sinkpad = gst_element_get_static_pad (self->parser, "sink");
+  GST_OBJECT_UNLOCK (self);
+  if (sinkpad != NULL) {
+    gst_pad_send_event (sinkpad, gst_event_new_eos ());
+    gst_object_unref (sinkpad);
+  }
+}
+
+/* The attempts ran out: attempt-exceeded (DeepStream 8.0's name and fields: source-id a uint, so -1 reads as
+ * G_MAXUINT). With vsrc_0, a WARNING, then (ours) the stream ends with an EOS, so a muxer ends the source instead of
+ * waiting for it. Without (ours; never connected, or never decoded to caps): an ERROR, as there is no vsrc_0 to end.
+ * DeepStream 8.0 posts the message alone either way. */
+static void
+reconnect_give_up (GstElement * element, guint attempts)
+{
+  GstRdsUriSrcBin *self = GST_RDS_URI_SRC_BIN (element);
+  gboolean connected;
+  gint source_id;
+
+  GST_OBJECT_LOCK (self);
+  source_id = self->source_id;
+  connected = self->have_video;
+  GST_OBJECT_UNLOCK (self);
+  if (connected)
+    GST_ELEMENT_WARNING (self, STREAM, FAILED, ("Could not reconnect to the RTSP source: giving up after %u attempts",
+            attempts), (NULL));
+  gst_element_post_message (element, gst_message_new_element (GST_OBJECT (self),
+          gst_structure_new ("attempt-exceeded", "source-id", G_TYPE_UINT, (guint) source_id, "attempt_exceeded",
+              G_TYPE_BOOLEAN, TRUE, NULL)));
+  if (connected) {
+    end_stream (self);
+    return;
+  }
+  remove_session (self);
+  GST_ELEMENT_ERROR (self, RESOURCE, OPEN_READ, ("Could not connect to the RTSP source after %u attempts",
+          attempts), (NULL));
+}
+
+/* The application's EOS (its own job, after any attempt under way, and never in another run). */
+static void
+reconnect_end (GstElement * element)
+{
+  end_stream (GST_RDS_URI_SRC_BIN (element));
+}
+
+static const RdsUriSrcReconnectCallbacks reconnect_callbacks = { reconnect_announce, reconnect_replace,
+  reconnect_give_up, reconnect_end
+};
 
 /* PAUSED to READY, once the children are in READY: vsrc_0 and the elements pad-added made go. */
 static void
@@ -1092,19 +1557,34 @@ reset_stream (GstRdsUriSrcBin * self)
   self->offset = 0;
   self->end = GST_CLOCK_TIME_NONE;
   self->frame = 0;
+  self->dec_stream_start = self->dec_segment = FALSE;
+  self->gate = self->gate_leading = self->reset_pending = self->reconnected_pending = FALSE;
+  self->gate_dropped = 0;
+  self->gate_pts = GST_CLOCK_TIME_NONE;
   GST_OBJECT_UNLOCK (self);
 }
 
-/* An EOS the application sends (to stop) leaves the bin as EOS, file-loop or not (ours). */
+/* An EOS the application sends (to stop) leaves the bin as EOS, file-loop or not (ours). For RTSP the bin ends the
+ * stream itself, in a job of the reconnection's (any thread may send the EOS, a session's too; stopping waits for the
+ * job, and a job of an earlier run does nothing): rtspsrc pushes an EOS only into a stream that is set up, so a
+ * source that is down (connecting, refused, between attempts) would never end, and the attempts would go on. Without
+ * vsrc_0 yet the attempts stop, and nothing goes downstream. */
 static gboolean
 gst_rds_uri_src_bin_send_event (GstElement * element, GstEvent * event)
 {
   GstRdsUriSrcBin *self = GST_RDS_URI_SRC_BIN (element);
+  gboolean rtsp = FALSE;
 
   if (GST_EVENT_TYPE (event) == GST_EVENT_EOS) {
     GST_OBJECT_LOCK (self);
     self->eos_requested = TRUE;
+    rtsp = self->is_rtsp;
     GST_OBJECT_UNLOCK (self);
+  }
+  if (rtsp) {
+    gst_event_unref (event);
+    rds_urisrc_reconnect_end (self->reconnect);
+    return TRUE;
   }
   return GST_ELEMENT_CLASS (gst_rds_uri_src_bin_parent_class)->send_event (element, event);
 }
@@ -1114,10 +1594,15 @@ gst_rds_uri_src_bin_change_state (GstElement * element, GstStateChange transitio
 {
   GstRdsUriSrcBin *self = GST_RDS_URI_SRC_BIN (element);
   GstStateChangeReturn ret;
+  guint interval, init_interval;
+  gint attempts;
   gboolean rtsp;
 
   GST_OBJECT_LOCK (self);
   rtsp = self->is_rtsp;
+  interval = self->reconnect_interval;
+  init_interval = self->init_reconnect_interval;
+  attempts = self->reconnect_attempts;
   GST_OBJECT_UNLOCK (self);
   switch (transition) {
     case GST_STATE_CHANGE_NULL_TO_READY:
@@ -1127,13 +1612,25 @@ gst_rds_uri_src_bin_change_state (GstElement * element, GstStateChange transitio
     case GST_STATE_CHANGE_READY_TO_PAUSED:
       reset_stream (self);
       /* the parent's change of state takes the session to PAUSED with the other children */
-      if (rtsp && !add_session (self))
-        return GST_STATE_CHANGE_FAILURE;
+      if (rtsp) {
+        rds_urisrc_reconnect_start_run (self->reconnect, interval, init_interval, attempts);
+        if (!add_session (self))
+          return GST_STATE_CHANGE_FAILURE;
+      }
+      break;
+    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+      if (rtsp)
+        rds_urisrc_reconnect_play (self->reconnect);
+      break;
+    case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
+      rds_urisrc_reconnect_pause (self->reconnect);
       break;
     case GST_STATE_CHANGE_PAUSED_TO_READY:
       GST_OBJECT_LOCK (self);
       self->stopping = TRUE;
       GST_OBJECT_UNLOCK (self);
+      /* no attempt from now on, and the one under way finishes first */
+      rds_urisrc_reconnect_stop (self->reconnect);
       break;
     default:
       break;
@@ -1148,8 +1645,10 @@ gst_rds_uri_src_bin_change_state (GstElement * element, GstStateChange transitio
       break;
     case GST_STATE_CHANGE_READY_TO_PAUSED:
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
-      if (ret == GST_STATE_CHANGE_FAILURE && transition == GST_STATE_CHANGE_READY_TO_PAUSED)
+      if (ret == GST_STATE_CHANGE_FAILURE && transition == GST_STATE_CHANGE_READY_TO_PAUSED) {
+        rds_urisrc_reconnect_stop (self->reconnect);
         remove_session (self);
+      }
       /* live, as rtspsrc is: no preroll */
       else if (rtsp && ret != GST_STATE_CHANGE_FAILURE)
         ret = GST_STATE_CHANGE_NO_PREROLL;
@@ -1311,6 +1810,7 @@ gst_rds_uri_src_bin_finalize (GObject * object)
   g_free (self->uri);
   for (guint i = 0; i < N_NOOPS; i++)
     g_value_unset (&self->noops[i]);
+  rds_urisrc_reconnect_free (self->reconnect);
   G_OBJECT_CLASS (gst_rds_uri_src_bin_parent_class)->finalize (object);
 }
 
@@ -1334,6 +1834,7 @@ gst_rds_uri_src_bin_init (GstRdsUriSrcBin * self)
 
   /* nvurisrcbin's default */
   g_object_set (self, "async-handling", TRUE, NULL);
+  self->reconnect = rds_urisrc_reconnect_new (GST_ELEMENT (self), &reconnect_callbacks);
 
   /* no pad here: vsrc_0 comes from the vsrc_%u template when the first video stream is decoded */
 }

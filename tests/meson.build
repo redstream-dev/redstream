@@ -403,14 +403,17 @@ test('element_videosink', element_videosink_exe, args : ['-p', '/gpu/videosink']
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 
 # rdsurisrcbin: factory, properties, no-op warnings, the nvurisrcbin remap, the settings checked at start, RTSP state
-# changes, protocols and an undecodable codec (cpu); decoding file URIs, file-loop and drop-frame-interval, and RTSP
-# streams from the test server (gpu).
+# changes, protocols and an undecodable codec (cpu); decoding file URIs, file-loop and drop-frame-interval, RTSP
+# streams from the test server (gpu); element_urisrcbin_reconnect below runs the reconnection tests.
 element_urisrcbin_exe = executable('element_urisrcbin', 'check' / 'element_urisrcbin.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep, rtsp_test_server_dep])
 test('element_urisrcbin_cpu', element_urisrcbin_exe, args : ['-p', '/cpu/urisrcbin'],
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 test('element_urisrcbin', element_urisrcbin_exe, args : ['-p', '/gpu/urisrcbin'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 240, depends : rds_plugins)
+# RTSP reconnection through the test server's fault relay, size and codec changes, and state cycles (gpu)
+test('element_urisrcbin_reconnect', element_urisrcbin_exe, args : ['-p', '/gpu/urisrcbin-reconnect'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 480, depends : rds_plugins)
 
 # The RTSP test server and its TCP fault relay (tools/rds-rtsp-serve), which the rdsurisrcbin stream tests build on:
 # playback through the relay and direct, H.265 and JPEG, freeze, cut, refuse, a stream changed between sessions, the

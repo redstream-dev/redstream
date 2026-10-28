@@ -19,6 +19,7 @@ struct _RdsUriSrcSession
   /* (object lock) */
   gchar *refused;               /* the encoding-name of the first video stream refused for its codec */
   gboolean refused_any;         /* some stream was refused (for its codec, or disable_audio) */
+  gboolean video_selected;      /* select-stream took an H.264 or H.265 video stream */
   gboolean have_video;          /* the video pad was taken for "src" */
   gboolean reported;            /* no_video was called */
 };
@@ -88,6 +89,7 @@ select_stream (G_GNUC_UNUSED GstElement * rtspsrc, guint num, GstCaps * caps, Rd
     GST_OBJECT_LOCK (self);
     if (!select && self->refused == NULL)
       self->refused = g_strdup (encoding != NULL ? encoding : "(no encoding-name)");
+    self->video_selected |= select;
     GST_OBJECT_UNLOCK (self);
   }
   if (!select) {
@@ -193,7 +195,8 @@ on_no_more_pads (G_GNUC_UNUSED GstElement * rtspsrc, RdsUriSrcSession * self)
 }
 
 /* rtspsrc's error for having no stream to set up, after select-stream refused some (a video codec, or audio with
- * disable_audio), is no_video instead (its message is about transports and extension plugins). */
+ * disable_audio) and selected no video, is no_video instead (its message is about transports and extension plugins).
+ * With a video stream selected, the same error is about something else and goes up as it is. */
 static void
 rds_urisrc_session_handle_message (GstBin * bin, GstMessage * msg)
 {
@@ -205,7 +208,7 @@ rds_urisrc_session_handle_message (GstBin * bin, GstMessage * msg)
 
     gst_message_parse_error (msg, &err, NULL);
     GST_OBJECT_LOCK (self);
-    nothing = g_error_matches (err, GST_STREAM_ERROR, GST_STREAM_ERROR_CODEC_NOT_FOUND) && !self->have_video
+    nothing = g_error_matches (err, GST_STREAM_ERROR, GST_STREAM_ERROR_CODEC_NOT_FOUND) && !self->video_selected
         && self->refused_any;
     GST_OBJECT_UNLOCK (self);
     g_clear_error (&err);

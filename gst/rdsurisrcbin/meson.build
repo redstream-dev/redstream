@@ -2,7 +2,7 @@
 # rdsurisrcbin (file and RTSP sources to memory:RDS frames); needs gstreamer-rtsp for the RTSP lower transports, so
 # always built with GStreamer's base libraries.
 gstrdsurisrcbin = library('gstrdsurisrcbin',
-  files('plugin.c', 'gstrdsurisrcbin.c', 'rds-urisrc-session.c'),
+  files('plugin.c', 'gstrdsurisrcbin.c', 'rds-urisrc-session.c', 'rds-urisrc-reconnect.c'),
   c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdsurisrcbin"'],
   dependencies : [rds_dep, gst_dep, gst_rtsp_dep],
   gnu_symbol_visibility : 'hidden',

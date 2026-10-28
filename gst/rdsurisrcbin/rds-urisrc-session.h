@@ -15,7 +15,8 @@
  * callback says so, once.
  *
  * An EOS leaving "src" (the server ended the stream, or rtspsrc took a closed connection as its end) goes through the
- * eos callback first, which decides whether it leaves the session.
+ * eos callback first, which decides whether it leaves the session. A dropped EOS still leaves "src" flagged EOS, which
+ * is fine: a session whose EOS is dropped is being replaced.
  *
  * The callbacks run on rtspsrc's threads (pad-added, message handling, streaming).
  * SPDX-License-Identifier: LGPL-2.1-or-later */

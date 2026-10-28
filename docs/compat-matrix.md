@@ -24,7 +24,7 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 
 | DeepStream name | Redstream name | Status | Notes | Source |
 |---|---|---|---|---|
-| `nvurisrcbin` | `rdsurisrcbin` | planned | decodes file and other non-RTSP URIs (uridecodebin3, first video stream only) to `memory:RDS` NV12 on `vsrc_0`, with `file-loop` and `drop-frame-interval`; RTSP URIs through `rtspsrc` and `rdsvideodec` (H.264 and H.265), with no reconnection yet; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin) |
+| `nvurisrcbin` | `rdsurisrcbin` | planned | decodes file and other non-RTSP URIs (uridecodebin3, first video stream only) to `memory:RDS` NV12 on `vsrc_0`, with `file-loop` and `drop-frame-interval`; RTSP URIs through `rtspsrc` and `rdsvideodec` (H.264 and H.265), with reconnection after timeouts, errors and the server's EOS; properties and reconnection behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin) |
 | `nvv4l2decoder` | `rdsvideodec` | supported | rocDecode: H.264/H.265 8-bit 4:2:0 to NV12; rank primary+10, so `uridecodebin` picks it over the VA decoders; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideo4linux2), [name](https://docs.nvidia.com/deepstream/text/DS_FAQ) |
 | `nvvideoconvert` | `rdsvideoconvert` | supported | single frames (batch size 1); `memory:RDS` and system memory on either side; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideoconvert) |
 | `nvstreammux` | `rdsstreammux` | supported | the default (scaling) mux only; the new mux is not implemented yet. GstAggregator-based; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreammux) |
@@ -48,9 +48,10 @@ pages differ, the Notes column says so: the pages document `select-rtp-protocol`
 example value, with no default, for `source-id`, `buffer-mode`, `leaky`, `max-size-buffers`, `disable-passthrough`,
 `rtsp-reconnect-interval` and `rtsp-reconnect-attempts`. Two properties DeepStream 8.0 lacks come from the 9.2 page:
 `simulate-fps-interval-ms` and `ipc-frame-copy`. The bin decodes URIs other than `rtsp*://` with `uridecodebin3`, and
-`rtsp*://` URIs with `rtspsrc`, the RTP depayloader, `h264parse` or `h265parse` and `rdsvideodec`; it does not
-reconnect yet. "Accepted" below means the value is stored and read back and does nothing else so far. Accepted
-no-ops log a warning (`GST_WARNING`, category `rdsurisrcbin`) whenever they are set to a non-default value.
+`rtsp*://` URIs with `rtspsrc`, the RTP depayloader, `h264parse` or `h265parse` and `rdsvideodec`, and reconnects
+them (see the reconnection behaviour below). "Accepted" below means the value is stored and read back and does
+nothing else so far. Accepted no-ops log a warning (`GST_WARNING`, category `rdsurisrcbin`) whenever they are set to
+a non-default value.
 
 | Property | Type | Default | Status | Notes |
 |---|---|---|---|---|
@@ -61,11 +62,11 @@ no-ops log a warning (`GST_WARNING`, category `rdsurisrcbin`) whenever they are 
 | `drop-on-latency` | boolean | `TRUE` | supported | `rtspsrc`'s `drop-on-latency` (RTSP), taken when the session starts (READY to PAUSED) |
 | `select-rtp-protocol` | enum `rtp-unknown` (0), `rtp-udp` (1), `rtp-udp-mcast` (2), `rtp-tcp` (4), `rtp-udp-udpmcast-tcp` (7), `rtp-http` (10), `rtp-tls` (20) | `rtp-udp-udpmcast-tcp` | supported | DeepStream 8.0 behaviour; the docs' default is 0 (`rtp-multi`). `rtspsrc`'s `protocols` (RTSP): UDP, UDP multicast, TCP, all three, HTTP + TCP, TLS + TCP; 0 leaves `rtspsrc`'s default (UDP, UDP multicast and TCP). `rtspsrc` gets a 100 ms `teardown-timeout` too (ours) |
 | `udp-buffer-size` | uint | `524288` | supported | bytes: `rtspsrc`'s `udp-buffer-size` (RTSP; at most G_MAXINT) |
-| `rtsp-reconnect-interval` | uint | `0` | accepted | seconds; 0: no reconnect on a timeout. DeepStream 8.0 behaviour; the docs' example value is 10 |
-| `rtsp-reconnect-attempts` | int | `-1` | accepted | any negative value: unlimited (ours; the docs give −1 and a range from −1). DeepStream 8.0 behaviour; the docs' example value is 4 |
-| `init-rtsp-reconnect-interval` | uint | `0` | accepted | seconds |
+| `rtsp-reconnect-interval` | uint | `0` | supported | seconds without a buffer from the RTSP session before an attempt; 0: no reconnection. Above 0, the session's errors and its EOS start an attempt too, at once (ours), and its ERRORs are posted as WARNINGs. DeepStream 8.0 behaviour; the docs' example value is 10 |
+| `rtsp-reconnect-attempts` | int | `-1` | supported | consecutive failed attempts before giving up (a buffer resets the count); any negative value: unlimited (ours; the docs give −1 and a range from −1). DeepStream 8.0 behaviour; the docs' example value is 4 |
+| `init-rtsp-reconnect-interval` | uint | `0` | supported | seconds between retries while the first connection fails (ours: DeepStream 8.0 accepts it and does nothing); 0: retry every `rtsp-reconnect-interval` (DeepStream 8.0 behaviour), and with both 0 the first failure is an ERROR |
 | `drop-frame-interval` | uint 0..30 | `0` | supported | DeepStream 8.0 behaviour: N keeps decoded frames 0, N, 2N, … (counted across file loops) and drops the rest, durations unchanged; 0 and 1 keep every frame. Frames are dropped before any conversion |
-| `source-id` | int −1.. | `-1` | accepted | DeepStream 8.0 behaviour; the docs' example value is 0 |
+| `source-id` | int −1.. | `-1` | supported | the `source-id` field of the reconnection messages (`attempt-exceeded` has it as a uint, −1 as 4294967295, as in DeepStream 8.0). DeepStream 8.0 behaviour; the docs' example value is 0 |
 | `gpu-id` | uint | `0` | accepted | |
 | `disable-audio` | boolean | `TRUE` | supported | audio is never decoded or exposed, whatever the value: for files only the first video stream is selected; for RTSP, TRUE refuses every stream that is not video before SETUP, and FALSE sets them up and discards them inside the bin. Taken when the session starts (READY to PAUSED). An RTSP source with no video stream is an error (STREAM, CODEC_NOT_FOUND) |
 | `message-forward` | boolean | `FALSE` | supported | GstBin's own |
@@ -104,6 +105,26 @@ added when `rdsvideodec` has its first caps, so the application's `pad-added` se
 then one STREAM_START, CAPS and SEGMENT, and the frames. An RTSP stream in a codec other than H.264 or H.265 gets no
 pad.
 There is no audio pad template: audio is ignored. Rank none: `uridecodebin` and `decodebin3` never pick it.
+
+#### `rdsurisrcbin` reconnection behaviour
+
+An attempt replaces the RTSP session (`rtspsrc` and the depayloader); the parser and `rdsvideodec` stay. Attempts run
+on GStreamer's thread pool, one at a time; the watchdog ticks once a second on the system clock while PLAYING.
+
+| Behaviour | DeepStream 8.0 | `rdsurisrcbin` |
+|---|---|---|
+| no buffer for `rtsp-reconnect-interval` s | an attempt (watchdog) | the same; reason `timeout` |
+| an ERROR, or the server's EOS (or a closed TCP connection) | waits for the watchdog | an attempt at once (ours); reason `error` or `eos`; the EOS never leaves the bin. The EOS the application sends goes through |
+| the session's ERRORs while reconnection is on | posted as WARNINGs | the same; the bin's own about a session it can't use (no video stream, a codec it can't decode) too, each a failed attempt (ours) |
+| the application's EOS | not observed while the source is down | ends the stream in any state (ours): no attempt after it, EOS on `vsrc_0` through the decoder. With no `vsrc_0` yet the attempts just stop and no EOS can reach the pipeline's sinks (nothing is linked), so the application waits for the EOS message with a timeout, or treats a source with no `vsrc_0` as already stopped |
+| each attempt | a WARNING | a WARNING (STREAM, FAILED) and the element message `rds-reconnect`: `source-id` (int), `attempt` (int, from 1), `reason` (string) (ours) |
+| a failed attempt (an error, or no buffer within the interval) | the next attempt | the next attempt an interval after it started; nothing goes downstream |
+| attempts run out (`rtsp-reconnect-attempts` N ≥ 0 failed) | the element message `attempt-exceeded`: `source-id` (uint, −1 as 4294967295), `attempt_exceeded` (boolean TRUE); nothing downstream, so a muxer waits for the source forever | the same message and a WARNING, then EOS on `vsrc_0` (ours: `rdsstreammux` ends the source and batches the others); before any connection, the message and then an ERROR (RESOURCE, OPEN_READ; ours). No attempt after it |
+| downstream after a reconnection | a new stream: the running time starts again | the same stream (ours): no EOS or STREAM_START, the running time and PTS go on; the new session's frames start at a key frame (delta units before it are dropped, and the leading pictures of an open GOP after it; it is DISCONT), preceded by one FLUSH_START / FLUSH_STOP pair (reset-time FALSE) and the SEGMENT again, so `rdsstreammux` sends one `rds-stream-reset` for the source; then the element message `rds-reconnected` (`source-id`, int) |
+| the first connection fails | retries every `rtsp-reconnect-interval` s | retries every `init-rtsp-reconnect-interval` s if above 0 (ours), else every `rtsp-reconnect-interval` s; the attempts limit applies (running out is an ERROR); `vsrc_0` comes with the first frames, with no flush; with both 0, an ERROR |
+| stopping during an attempt | about 1 ms | waits for the attempt under way; a hanging session stops within `rtspsrc`'s 100 ms `teardown-timeout` |
+| a new session at another size | not observed | a normal reconnection, with new CAPS on `vsrc_0` (`rdsvideodec` reconfigures or recreates its decoder); `rdsstreammux` takes them as any caps change and scales the frames into its fixed-size slots |
+| a new session in another codec (H.264 to H.265, say) | an ERROR for every attempt: it never recovers | a normal reconnection (ours): a new parser in front of the same `rdsvideodec`, which switches its own parser to the new caps; `vsrc_0` stays, with new CAPS if the size changes |
 
 ### `rdsvideoconvert` (`nvvideoconvert`) properties
 

@@ -129,6 +129,9 @@ Known gotchas:
 - rocDecode decode surfaces of 1 MiB or less (Mesa slab-allocates them) lose their first decoded picture unless they
   are exported to HIP before the first decode. `rdsvideodec` maps every surface right after creating the decoder
   and again after `rocDecReconfigureDecoder`; keep that if you touch decoder setup.
+- `rdsvideodec` (rocDecode's parser) holds the last picture fed until the next one arrives, as end of picture is only
+  known then: a stream that stops mid-flow (an RTSP reconnection) gets its last picture out only when new data or an
+  EOS comes. `rdsurisrcbin` tells such a leftover from the new session's frames by PTS.
 - Stock `vah26xdec` exports tiled NV12 DMABufs (AMD modifier `0x0200000000401b03`). Never read them as linear.
 - Run docker with `--user $(id -u):$(id -g)` so build outputs aren't root-owned. From zsh, wrap `$RUN`-style
   variables in `bash -c` (zsh doesn't word-split them).
@@ -227,9 +230,11 @@ gst/rdssink/       libgstrdssink plugin: rdslogger (gstrdslogger.c: passthrough,
 gst/rdsurisrcbin/  libgstrdsurisrcbin plugin: rdsurisrcbin (gstrdsurisrcbin.c: a GstBin with nvurisrcbin's properties
                    that checks its settings at start; non-RTSP URIs through uridecodebin3 to the ghost pad vsrc_0,
                    file-loop and drop-frame-interval in pad probes on the decoded pad and vsrc_0's target; RTSP URIs
-                   through an RTSP session, then the parser and rdsvideodec, which outlive sessions; no reconnection
-                   yet). rds-urisrc-session is the session: rtspsrc and the depayloader in their own GstBin, made and
-                   dropped whole. Needs gstreamer-rtsp; always built
+                   through an RTSP session, then the parser and rdsvideodec, which outlive sessions, so a reconnection
+                   replaces only the session). rds-urisrc-session is the session: rtspsrc and the depayloader in their
+                   own GstBin, made and dropped whole; rds-urisrc-reconnect decides when to reconnect (the watchdog on
+                   the system clock, the attempt count, the attempt jobs on GStreamer's thread pool). Needs
+                   gstreamer-rtsp; always built
 gst/common/        static rds-plugin-common, shared by the plugins: rds-keyfile-yaml (YAML config -> GKeyFile, with the
                    OpenCV-style "%YAML:1.0" line), rds-config-parse (number and bool parsing for the key tables),
                    rds-object-style.h (the drawing defaults of the object metas rdsinfer and rdstracker create).
