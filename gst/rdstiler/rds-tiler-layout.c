@@ -105,17 +105,26 @@ scale_rect (const RdsTilerScale * s, RdsOSD_RectParams * r)
   r->height = (gfloat) (r->height * s->sy);
 }
 
+/* The metadata values and scale factors are nonnegative. Avoid undefined/out-of-range float-to-uint casts. */
+static guint
+scale_uint (gdouble value)
+{
+  if (value > G_MAXUINT)
+    return G_MAXUINT;
+  return (guint) value;
+}
+
 /* truncated toward zero, as DeepStream 8.0 stores its integer coordinates */
 static guint
 scale_x (const RdsTilerScale * s, guint x)
 {
-  return (guint) (s->ox + x * s->sx);
+  return scale_uint (s->ox + x * s->sx);
 }
 
 static guint
 scale_y (const RdsTilerScale * s, guint y)
 {
-  return (guint) (s->oy + y * s->sy);
+  return scale_uint (s->oy + y * s->sy);
 }
 
 static void
@@ -163,6 +172,6 @@ rds_tiler_scale_display (const RdsTilerScale * scale, RdsDisplayMeta * d)
 
     p->xc = scale_x (scale, p->xc);
     p->yc = scale_y (scale, p->yc);
-    p->radius = (guint) (p->radius * smin);
+    p->radius = scale_uint (p->radius * smin);
   }
 }

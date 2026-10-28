@@ -278,6 +278,43 @@ test_scale_display (void)
   g_assert_cmpuint (d.circle_params[0].radius, ==, 25);
 }
 
+static void
+test_scale_integer_saturation (void)
+{
+  RdsTilerScale s = { .sx = 1.0, .sy = 1.0, .ox = G_MAXUINT, .oy = 0 };
+  RdsObjectMeta o = make_object ();
+  RdsDisplayMeta d;
+
+  o.text_params.x_offset = 0;
+  rds_tiler_scale_object (&s, &o);
+  g_assert_cmpuint (o.text_params.x_offset, ==, G_MAXUINT);
+
+  o.text_params.x_offset = 1;
+  rds_tiler_scale_object (&s, &o);
+  g_assert_cmpuint (o.text_params.x_offset, ==, G_MAXUINT);
+
+  memset (&d, 0, sizeof d);
+  d.num_circles = 1;
+  d.circle_params[0].radius = G_MAXUINT;
+  s.ox = s.oy = 0;
+  s.sx = s.sy = 2.0;
+  rds_tiler_scale_display (&s, &d);
+  g_assert_cmpuint (d.circle_params[0].radius, ==, G_MAXUINT);
+
+  /* In-range fractional values keep truncating toward zero. */
+  memset (&d, 0, sizeof d);
+  d.num_lines = 1;
+  d.line_params[0].x1 = 3;
+  d.line_params[0].y1 = 5;
+  s.sx = 0.5;
+  s.sy = 0.5;
+  s.ox = 2;
+  s.oy = 1;
+  rds_tiler_scale_display (&s, &d);
+  g_assert_cmpuint (d.line_params[0].x1, ==, 3);
+  g_assert_cmpuint (d.line_params[0].y1, ==, 3);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -291,5 +328,6 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/tiler/scale/object", test_scale_object);
   g_test_add_func ("/cpu/tiler/scale/full-output", test_scale_full_output);
   g_test_add_func ("/cpu/tiler/scale/display", test_scale_display);
+  g_test_add_func ("/cpu/tiler/scale/integer-saturation", test_scale_integer_saturation);
   return g_test_run ();
 }

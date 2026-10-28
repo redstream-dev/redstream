@@ -54,13 +54,15 @@ typedef struct
 
 void rds_tiler_scale_init (RdsTilerScale * scale, guint frame_width, guint frame_height, const RdsTilerRect * dst);
 
-/* rect_params mapped as floats; text_params x/y_offset truncated to integers. Everything else is left as it is:
+/* rect_params mapped as floats; text_params x/y_offset are truncated to integers and saturate at G_MAXUINT when the
+ * scaled value exceeds it. In-range conversions retain truncation toward zero. Everything else is left as it is:
  * font_size, border_width, detector_bbox_info, tracker_bbox_info, mask_params, ids, class, confidence, labels. */
 void rds_tiler_scale_object (const RdsTilerScale * scale, RdsObjectMeta * obj);
 
 /* The first num_* entries (at most RDS_MAX_ELEMENTS_IN_DISPLAY_META) of each kind: rects as floats; text offsets,
- * line and arrow end points and circle centres truncated to integers; circle radius × min (sx, sy), truncated.
- * Widths and font sizes are left as they are. */
+ * line and arrow end points and circle centres are truncated to integers; circle radius × min (sx, sy), truncated.
+ * Scaled values above G_MAXUINT saturate at G_MAXUINT. In-range conversions retain truncation toward zero. Widths
+ * and font sizes are left as they are. */
 void rds_tiler_scale_display (const RdsTilerScale * scale, RdsDisplayMeta * display);
 
 G_END_DECLS
