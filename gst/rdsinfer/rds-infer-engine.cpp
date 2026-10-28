@@ -23,6 +23,41 @@
 
 G_DEFINE_QUARK (rds-infer-engine-error-quark, rds_infer_engine_error)
 
+gboolean
+rds_infer_engine_validate_tensor_size (const gsize * dims, guint n_dims, guint batch_size,
+    gsize max_elements, guint * narrowed_dims, gsize * elements, gsize * bytes, GError ** error)
+{
+  gsize count = 1;
+
+  for (guint i = 0; i < n_dims; i++) {
+    if (dims[i] == 0 || dims[i] > G_MAXUINT) {
+      g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL,
+          "tensor dimension %u (%" G_GSIZE_FORMAT ") must be nonzero and fit in guint", i, dims[i]);
+      return FALSE;
+    }
+    if (count > G_MAXSIZE / dims[i] || count > max_elements / dims[i]) {
+      g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL,
+          "tensor element count exceeds the supported limit (%" G_GSIZE_FORMAT ")", max_elements);
+      return FALSE;
+    }
+    count *= dims[i];
+  }
+  if (count > max_elements || batch_size == 0 || count > G_MAXSIZE / batch_size
+      || count * batch_size > G_MAXSIZE / sizeof (gfloat)) {
+    g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL,
+        "tensor batch size %u or packed float32 byte size exceeds the supported limit", batch_size);
+    return FALSE;
+  }
+  if (narrowed_dims)
+    for (guint i = 0; i < n_dims; i++)
+      narrowed_dims[i] = (guint) dims[i];
+  if (elements)
+    *elements = count;
+  if (bytes)
+    *bytes = count * batch_size * sizeof (gfloat);
+  return TRUE;
+}
+
 /* Bump when the manifest's fields or their meaning change: older manifests then no longer match. */
 #define MANIFEST_FORMAT 1
 /* The MIGraphX headers this was built against (the library has no runtime version query); its soname carries
@@ -42,13 +77,15 @@ struct EngineOutput
   migraphx::shape shape;        /* with the batch dim */
   guint dims[MAX_DIMS];         /* per image */
   guint ndims;
-  gsize elements;               /* per image */
+  gsize elements;               /* per image, validated to fit RdsInferDims.numElements */
+  gsize bytes;                  /* checked batch size in bytes */
 };
 
 struct _RdsInferEngine
 {
   migraphx::program program;
   guint batch, gpu_id, c, h, w;
+  gsize input_bytes;
   std::string input_name;
   migraphx::shape input_shape;
   std::vector<EngineOutput> outputs;
@@ -444,6 +481,13 @@ read_parameters (RdsInferEngine * e, const std::vector<size_t> &input_lens, cons
       return FALSE;
     }
     g_free (text);
+    guint dims[MAX_DIMS];
+    gsize elements, bytes;
+    guint ndims = (guint) lens.size () - 1;
+
+    if (!rds_infer_engine_validate_tensor_size (lens.data () + 1, ndims, e->batch, G_MAXUINT, dims,
+            &elements, &bytes, error))
+      return FALSE;
     EngineOutput & o = e->outputs[i];
     o.param = p;
     o.shape = s;
@@ -452,12 +496,10 @@ read_parameters (RdsInferEngine * e, const std::vector<size_t> &input_lens, cons
       o.name = names[i];
     else
       o.name = "output_" + std::to_string (i);
-    o.ndims = (guint) lens.size () - 1;
-    o.elements = 1;
-    for (guint d = 0; d < o.ndims; d++) {
-      o.dims[d] = (guint) lens[d + 1];
-      o.elements *= lens[d + 1];
-    }
+    o.ndims = ndims;
+    memcpy (o.dims, dims, ndims * sizeof (guint));
+    o.elements = elements;
+    o.bytes = bytes;
   }
   return TRUE;
 }
@@ -522,6 +564,11 @@ input_lens_get (const RdsInferOnnxValue * in, const RdsInferEngineOptions * opts
       }
       lens[i] = opts->infer_dims[i - 1];
     } else if (model > 0) {
+      if ((guint64) model > G_MAXSIZE) {
+        g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL,
+            "input %s: dimension %u exceeds the supported size", in->name, i);
+        return FALSE;
+      }
       lens[i] = (size_t) model;
     } else {
       g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL,
@@ -639,13 +686,13 @@ warm_up (RdsInferEngine * e, GError ** error)
   std::vector<float *> outs (e->outputs.size (), nullptr);
   float *input = nullptr;
   hipStream_t stream = nullptr;
-  gsize in_bytes = (gsize) e->batch * e->c * e->h * e->w * sizeof (float);
+  gsize in_bytes = e->input_bytes;
   gboolean ok = HIP_CHECK (hipStreamCreateWithFlags (&stream, hipStreamNonBlocking), error)
       && HIP_CHECK (hipMalloc ((void **) &input, in_bytes), error)
       && HIP_CHECK (hipMemsetAsync (input, 0, in_bytes, stream), error);
 
   for (size_t i = 0; ok && i < outs.size (); i++)
-    ok = HIP_CHECK (hipMalloc ((void **) &outs[i], e->batch * e->outputs[i].elements * sizeof (float)), error);
+    ok = HIP_CHECK (hipMalloc ((void **) &outs[i], e->outputs[i].bytes), error);
   ok = ok && run_async (e, input, outs.data (), stream, error)
       && HIP_CHECK (hipStreamSynchronize (stream), error);
   for (float *o : outs)
@@ -714,6 +761,8 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
   std::unique_ptr < RdsInferEngine, EngineFree > e;
   RdsInferOnnxValue *in;
   std::vector<size_t> input_lens;
+  guint input_dims[3];
+  gsize input_bytes;
   std::vector<std::string> names;
   std::string reason;
   /* With output_file, only that file is looked up and written. */
@@ -768,7 +817,9 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
     return NULL;
   }
   in = (RdsInferOnnxValue *) g_ptr_array_index (st.info->inputs, 0);
-  if (!input_lens_get (in, opts, input_lens, &err)) {
+  if (!input_lens_get (in, opts, input_lens, &err)
+      || !rds_infer_engine_validate_tensor_size (input_lens.data () + 1, 3, opts->batch_size, G_MAXSIZE,
+          input_dims, NULL, &input_bytes, &err)) {
     model_error (error, RDS_INFER_ENGINE_ERROR_MODEL, opts->onnx_file, err);
     return NULL;
   }
@@ -779,9 +830,10 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
   e->warnings = g_ptr_array_new_with_free_func (g_free);
   e->batch = opts->batch_size;
   e->gpu_id = opts->gpu_id;
-  e->c = (guint) input_lens[1];
-  e->h = (guint) input_lens[2];
-  e->w = (guint) input_lens[3];
+  e->c = input_dims[0];
+  e->h = input_dims[1];
+  e->w = input_dims[2];
+  e->input_bytes = input_bytes;
   e->input_name = in->name;
 
   st.sha256 = file_sha256 (st.onnx, st.onnx_len);

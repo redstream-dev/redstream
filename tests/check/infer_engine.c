@@ -221,6 +221,80 @@ has_warning (RdsInferEngine * e, const gchar * needle)
   return FALSE;
 }
 
+/* Sizing boundaries run without a GPU or allocating the requested tensors. Each failure would be missed if
+ * its corresponding narrowing/product/byte-size check were removed. */
+static void
+assert_tensor_size_rejected (const gsize * dims, guint ndims, guint batch, gsize limit)
+{
+  GError *err = NULL;
+
+  g_assert_false (rds_infer_engine_validate_tensor_size (dims, ndims, batch, limit, NULL, NULL, NULL, &err));
+  g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL);
+  g_clear_error (&err);
+}
+
+static void
+test_tensor_size_narrowing (void)
+{
+  const gsize dims[] = { (gsize) G_MAXUINT + 1 };
+
+  if (G_MAXSIZE == G_MAXUINT) {
+    g_test_skip ("gsize cannot exceed guint on this platform");
+    return;
+  }
+  assert_tensor_size_rejected (dims, G_N_ELEMENTS (dims), 1, G_MAXSIZE);
+}
+
+static void
+test_tensor_size_product_overflow (void)
+{
+  const gsize dims[] = { G_MAXUINT, G_MAXUINT, 2 };
+
+  assert_tensor_size_rejected (dims, G_N_ELEMENTS (dims), 1, G_MAXSIZE);
+}
+
+static void
+test_tensor_size_output_overflow (void)
+{
+  const gsize dims[] = { 65536, 65536 };
+
+  assert_tensor_size_rejected (dims, G_N_ELEMENTS (dims), 1, G_MAXUINT);
+}
+
+static void
+test_tensor_size_bytes_overflow (void)
+{
+  const gsize dims[] = { G_MAXUINT };
+
+  assert_tensor_size_rejected (dims, G_N_ELEMENTS (dims), G_MAXUINT, G_MAXSIZE);
+}
+
+static void
+test_tensor_size_zero (void)
+{
+  const gsize dims[] = { 3, 0, 48 };
+
+  assert_tensor_size_rejected (dims, G_N_ELEMENTS (dims), 1, G_MAXSIZE);
+}
+
+static void
+test_tensor_size_valid (void)
+{
+  const gsize dims[] = { 3, 64, 48 };
+  guint narrowed[3] = { 0 };
+  gsize elements = 0, bytes = 0;
+  GError *err = NULL;
+
+  g_assert_true (rds_infer_engine_validate_tensor_size (dims, G_N_ELEMENTS (dims), 2, G_MAXUINT, narrowed,
+          &elements, &bytes, &err));
+  g_assert_no_error (err);
+  g_assert_cmpuint (narrowed[0], ==, 3);
+  g_assert_cmpuint (narrowed[1], ==, 64);
+  g_assert_cmpuint (narrowed[2], ==, 48);
+  g_assert_cmpuint (elements, ==, 9216);
+  g_assert_cmpuint (bytes, ==, 73728);
+}
+
 /* ----- the ONNX reader ----- */
 
 static void
@@ -1322,6 +1396,12 @@ main (int argc, char **argv)
    * there by default: without its own cache directory every YOLO11n build compiles cold. */
   g_setenv ("AMD_COMGR_CACHE_DIR", RDS_TEST_BUILD_DIR "/comgr", FALSE);
   g_test_init (&argc, &argv, G_TEST_OPTION_ISOLATE_DIRS, NULL);
+  g_test_add_func ("/cpu/infer-engine/tensor-size/narrowing", test_tensor_size_narrowing);
+  g_test_add_func ("/cpu/infer-engine/tensor-size/product-overflow", test_tensor_size_product_overflow);
+  g_test_add_func ("/cpu/infer-engine/tensor-size/output-overflow", test_tensor_size_output_overflow);
+  g_test_add_func ("/cpu/infer-engine/tensor-size/bytes-overflow", test_tensor_size_bytes_overflow);
+  g_test_add_func ("/cpu/infer-engine/tensor-size/zero", test_tensor_size_zero);
+  g_test_add_func ("/cpu/infer-engine/tensor-size/valid", test_tensor_size_valid);
   g_test_add_func ("/cpu/infer-engine/onnx-reader", test_onnx_reader);
   g_test_add_func ("/cpu/infer-engine/onnx-reader-truncated", test_onnx_reader_truncated);
   g_test_add_func ("/cpu/infer-engine/onnx-reader-external", test_onnx_reader_external);

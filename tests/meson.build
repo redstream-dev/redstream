@@ -167,7 +167,8 @@ if rds_infer_enabled
       '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
       '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
     ])
-  test('infer_engine_cpu', infer_engine_exe, args : ['-p', '/cpu/infer-engine'],
+  # Include nested tensor-size boundary cases as well as direct engine tests.
+  test('infer_engine_cpu', infer_engine_exe, args : ['-r', '/cpu/infer-engine'],
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
   test('infer_engine', infer_engine_exe, args : ['-p', '/gpu/infer-engine'],
     suite : 'gpu', env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 120)

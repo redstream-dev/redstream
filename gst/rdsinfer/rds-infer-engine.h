@@ -51,6 +51,12 @@ typedef struct
 
 typedef struct _RdsInferEngine RdsInferEngine;
 
+/* Checks packed float32 tensor sizes before narrowing dimensions or allocating buffers. @dims are per image;
+ * max_elements is G_MAXSIZE for inputs, G_MAXUINT for outputs exposed through RdsInferDims. Optional outputs
+ * are written only on success; a rank-zero per-image tensor has one element. */
+G_GNUC_INTERNAL gboolean rds_infer_engine_validate_tensor_size (const gsize * dims, guint n_dims,
+    guint batch_size, gsize max_elements, guint * narrowed_dims, gsize * elements, gsize * bytes, GError ** error);
+
 /* Loads a matching cached program (engine_file first, then the cache name in the model's directory, then in
  * $XDG_CACHE_HOME/redstream/) or builds one and saves it under the cache name. With no_build, the same lookup
  * decides whether the program is up to date (rds-compile). The model's input must be a float NCHW tensor whose batch

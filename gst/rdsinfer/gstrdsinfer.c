@@ -449,8 +449,9 @@ open_engine (GstRdsInfer * self, GError ** error)
 
     rds_infer_engine_get_output (self->engine, i, &self->out_names[i], od, &nd);
     d->numDims = nd;
-    for (guint k = 0; k < nd; k++)
-      d->d[k] = od[k];
+    /* The engine validated every dimension and the per-image count against guint, and the complete
+     * batch against gsize, before exposing this output. Keep those counts for allocation and metadata. */
+    memcpy (d->d, od, nd * sizeof (guint));
     d->numElements = (guint) rds_infer_engine_get_output_elements (self->engine, i);
     self->layers[i].dataType = RDS_INFER_DATA_FLOAT;
     self->layers[i].inferDims = *d;
