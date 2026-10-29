@@ -10,7 +10,7 @@
 G_BEGIN_DECLS
 
 /* "RDSE": set by the pool on every element it allocates, checked before the flags are trusted. A meta that did
- * not come from a pool is refused. Reading the 16 bytes before such a pointer can itself be out of bounds; the
+ * not come from a pool is refused. Reading the hidden header before such a pointer can itself be out of bounds; the
  * magic only makes the common misuse (a meta allocated by the app) fail loudly. */
 #define RDS_META_ELEM_MAGIC 0x52445345u
 
