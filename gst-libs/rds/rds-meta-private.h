@@ -1,4 +1,4 @@
-/* Redstream: metadata internals shared by rds-meta.c and rds-meta-copy.c. Not installed.
+/* Redstream: metadata internals shared by the metadata library and elements. Not installed.
  * Everything here expects the batch's meta_mutex to be held unless noted.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_META_PRIVATE_H
@@ -14,22 +14,30 @@ G_BEGIN_DECLS
  * magic only makes the common misuse (a meta allocated by the app) fail loudly. */
 #define RDS_META_ELEM_MAGIC 0x52445345u
 
-/* Hidden per-element header, allocated just before every pooled meta. 16 bytes keep the meta itself aligned as
- * g_malloc would. */
+/* Hidden per-element header, allocated just before every pooled meta. A multiple of 16 bytes keeps the meta
+ * itself aligned as g_malloc would. */
 typedef union
 {
   struct
   {
+    guint64 generation;         /* acquisition identity: survives release/reset */
     guint32 magic;
     gboolean attached;          /* in a list: refuses double adds and adds to a second list */
     gboolean parented;          /* an object added with a parent: counted in n_parented */
   } f;
-  guint8 pad[16];
+  guint8 pad[32];
 } RdsMetaElemHeader;
 
 G_STATIC_ASSERT (sizeof (RdsMetaElemHeader) % 16 == 0);
 
 #define RDS_META_ELEM_HEADER(elem) (((RdsMetaElemHeader *) (elem)) - 1)
+
+/* Only for pooled metas, with the batch lock held. Header-only so plugins need no exported private symbol. */
+static inline guint64
+rds_meta_get_generation (gconstpointer meta)
+{
+  return RDS_META_ELEM_HEADER (meta)->f.generation;
+}
 
 /* Private batch: the public struct comes first, so RdsBatchMeta * casts to it. This is why an RdsBatchMeta must
  * come from rds_create_batch_meta. */

@@ -17,6 +17,7 @@
 #include <gst/video/video.h>
 #include <rds/rds.h>
 #include <rds/rds-infer-meta.h>
+#include <rds/rds-meta-private.h>
 #include <string.h>
 
 #define RDS_CAPS "video/x-raw(memory:RDS), format=NV12, width=64, height=48, framerate=30/1"
@@ -1189,6 +1190,116 @@ test_parser_failure (void)
   g_free (cfg);
 }
 
+/* A raw batch pointer remains alive in the blocked push; keeping an extra buffer reference would allow
+ * GstBaseTransform to copy it and would test a different batch. */
+typedef struct
+{
+  GstHarness *h;
+  GstBuffer *in;
+  GstFlowReturn flow;
+} ReplacementPush;
+
+static gpointer
+replacement_push (gpointer data)
+{
+  ReplacementPush *p = data;
+
+  p->flow = gst_harness_push (p->h, p->in);
+  return NULL;
+}
+
+/* Pointer-only attachment must fail this test: the replacement deliberately repeats every identity scalar.
+ * A second, untouched frame also proves that ordinary results are still attached. */
+static void
+run_frame_replacement (gboolean parser_fails)
+{
+  const gchar *func = parser_fails ? "FixtureBarrierFail" : "FixtureBarrierBoxes";
+  gchar *cfg, *texts = NULL;
+  GModule *module;
+  void (*reset) (void), (*release) (void);
+  gboolean (*wait) (void);
+  GstBus *bus;
+  GstElement *e;
+  GstBuffer *out;
+  RdsBatchMeta *bm;
+  RdsFrameMeta *original, *replacement, saved;
+  guint64 generation;
+  ReplacementPush push = { 0 };
+  GThread *thread;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  module = g_module_open (RDS_TEST_PARSER_FIXTURE, G_MODULE_BIND_LOCAL);
+  g_assert_nonnull (module);
+  g_assert_true (g_module_symbol (module, "FixtureBarrierReset", (gpointer *) &reset));
+  g_assert_true (g_module_symbol (module, "FixtureBarrierWait", (gpointer *) &wait));
+  g_assert_true (g_module_symbol (module, "FixtureBarrierRelease", (gpointer *) &release));
+  reset ();
+  cfg = detector_config (parser_fails ? "replace-fail.txt" : "replace-boxes.txt", ASPECT_OFF, func);
+  bus = gst_bus_new ();
+  e = new_infer (cfg);
+  g_object_set (e, "output-tensor-meta", TRUE, NULL);
+  push.h = harness_for (e, bus, RDS_BUF_COLOR_FORMAT_RGBA, 128, 64);
+  push.in = make_batch (RDS_BUF_COLOR_FORMAT_RGBA, 128, 64, 3, 2, 0);
+  bm = gst_buffer_get_rds_batch_meta (push.in);
+  rds_acquire_meta_lock (bm);
+  original = bm->frame_meta_list->data;
+  generation = rds_meta_get_generation (original);
+  original->source_id = 17;
+  original->frame_num = 23;
+  original->buf_pts = 42;
+  saved = *original;
+  rds_release_meta_lock (bm);
+  thread = g_thread_new ("replace-push", replacement_push, &push);
+  g_assert_true (wait ());
+  rds_acquire_meta_lock (bm);
+  rds_remove_frame_meta_from_batch (bm, original);
+  replacement = rds_acquire_frame_meta_from_pool (bm);
+  g_assert_true (replacement == original);
+  g_assert_cmpuint (rds_meta_get_generation (replacement), !=, generation);
+  *replacement = saved;
+  if (parser_fails)
+    replacement->source_id = 99;
+  rds_add_frame_meta_to_batch (bm, replacement);
+  rds_release_meta_lock (bm);
+  release ();
+  g_thread_join (thread);
+  g_assert_cmpint (push.flow, ==, GST_FLOW_OK);
+  out = gst_harness_pull (push.h);
+  g_assert_true (gst_buffer_get_rds_batch_meta (out) == bm);
+  if (parser_fails) {
+    g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 1);
+    g_assert_nonnull (strstr (texts, "source 17,"));
+    g_assert_null (strstr (texts, "source 99,"));
+  }
+  g_assert_cmpuint (replacement->num_obj_meta, ==, 0);
+  g_assert_null (replacement->obj_meta_list);
+  g_assert_null (frame_tensor_meta (replacement));
+  g_assert_false (replacement->bInferDone);
+  /* Removal/re-add appends the replacement after the untouched frame. */
+  g_assert_true (nth_frame (out, 0)->bInferDone);
+  g_assert_cmpuint (nth_frame (out, 0)->num_obj_meta, ==, parser_fails ? 0 : 2);
+  g_assert_nonnull (frame_tensor_meta (nth_frame (out, 0)));
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
+  gst_buffer_unref (out);
+  harness_teardown_with_bus (push.h, bus);
+  g_module_close (module);
+  g_free (texts);
+  g_free (cfg);
+}
+
+static void
+test_frame_replacement_failure (void)
+{
+  run_frame_replacement (TRUE);
+}
+
+static void
+test_frame_replacement (void)
+{
+  run_frame_replacement (FALSE);
+}
+
 /* ---- gpu: concurrent metadata readers ---- */
 
 #define CONCURRENCY_BATCHES 500
@@ -1389,6 +1500,8 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer/interval", test_interval);
   g_test_add_func ("/gpu/infer/detector", test_detector);
   g_test_add_func ("/gpu/infer/parser-failure", test_parser_failure);
+  g_test_add_func ("/gpu/infer/frame-replacement-failure", test_frame_replacement_failure);
+  g_test_add_func ("/gpu/infer/frame-replacement", test_frame_replacement);
   g_test_add_func ("/gpu/infer/concurrency", test_concurrency);
   ret = g_test_run ();
   if (dev_alloc)

@@ -75,6 +75,7 @@ rds_meta_pool_acquire (RdsMetaPool * pool, RdsBatchMeta * batch_meta)
     hdr = elem_new (pool->element_size);
     g_ptr_array_add (pool->all, hdr);
   }
+  hdr->f.generation++;
   base = (RdsBaseMeta *) (hdr + 1);
   base->batch_meta = batch_meta;
   base->meta_type = pool->meta_type;
@@ -86,8 +87,10 @@ static void
 pool_release (RdsMetaPool * pool, gpointer elem)
 {
   RdsMetaElemHeader *hdr = RDS_META_ELEM_HEADER (elem);
+  guint64 generation = hdr->f.generation;
 
   memset (hdr, 0, sizeof (RdsMetaElemHeader) + pool->element_size);
+  hdr->f.generation = generation;
   hdr->f.magic = RDS_META_ELEM_MAGIC;
   g_ptr_array_add (pool->free, hdr);
 }

@@ -26,6 +26,7 @@
 
 #include <rds/rds.h>
 #include <rds/rds-infer-meta.h>
+#include <rds/rds-meta-private.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <string.h>
@@ -83,8 +84,9 @@ typedef enum
 /* One frame of the batch being inferred. */
 typedef struct
 {
-  RdsFrameMeta *frame;
-  guint slot;
+  RdsFrameMeta *frame;          /* identity only outside the batch lock */
+  guint64 generation;
+  guint source_id, slot;
   RdsInferLetterbox lb;
   guint det_start, n_dets;      /* in self->dets */
 } FrameJob;
@@ -616,7 +618,9 @@ snapshot_frames (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * su
   rds_acquire_meta_lock (bm);
   for (GList * l = bm->frame_meta_list; l; l = l->next) {
     RdsFrameMeta *fm = l->data;
-    FrameJob job = {.frame = fm,.slot = fm->batch_id };
+    FrameJob job = {.frame = fm,.generation = rds_meta_get_generation (fm),
+      .source_id = fm->source_id,.slot = fm->batch_id
+    };
 
     if (fm->batch_id >= batch || fm->batch_id >= surf->batchSize) {
       ok = FALSE;
@@ -658,7 +662,7 @@ parse_frames (GstRdsInfer * self, RdsInferOutputSet * set)
     g_array_set_size (self->objects, 0);
     if (!rds_infer_parser_parse (self->parser, self->layers, self->n_outputs, &self->net, self->objects, &err)) {
       gchar *msg = g_strdup_printf ("Parser %s failed on a frame of source %u, which gets no objects: %s",
-          rds_infer_parser_get_func_name (self->parser), job->frame->source_id, err->message);
+          rds_infer_parser_get_func_name (self->parser), job->source_id, err->message);
 
       warn_once (self, WARN_PARSE, msg);
       g_free (msg);
@@ -711,16 +715,19 @@ attach_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set)
   rds_acquire_meta_lock (bm);
   for (guint f = 0; f < self->jobs->len; f++) {
     FrameJob *job = &g_array_index (self->jobs, FrameJob, f);
+    GList *live = g_list_find (bm->frame_meta_list, job->frame);
+    RdsFrameMeta *fm;
 
-    /* A frame removed while the lock was released (by an application thread) gets nothing. This assumes such a
-     * thread doesn't also add a new frame in between: one acquired from the pool could reuse the removed frame's
-     * memory and would then get its results. */
-    if (!g_list_find (bm->frame_meta_list, job->frame))
+    /* Resolve the saved identity to a live frame while locked: the pool may reuse a removed frame's address. */
+    if (!live)
+      continue;
+    fm = live->data;
+    if (rds_meta_get_generation (fm) != job->generation)
       continue;
     if (cfg->network_type == 0) {
       for (guint i = 0; i < job->n_dets; i++)
-        add_object (self, bm, job->frame, &g_array_index (self->dets, RdsInferDetection, job->det_start + i));
-      GST_DEBUG_OBJECT (self, "source %u frame %d: %u objects", job->frame->source_id, job->frame->frame_num,
+        add_object (self, bm, fm, &g_array_index (self->dets, RdsInferDetection, job->det_start + i));
+      GST_DEBUG_OBJECT (self, "source %u frame %d: %u objects", fm->source_id, fm->frame_num,
           job->n_dets);
     }
     if (tensor_meta) {
@@ -731,9 +738,9 @@ attach_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set)
       um->base_meta.meta_type = RDS_INFER_TENSOR_OUTPUT_META;
       um->base_meta.copy_func = rds_infer_tensor_meta_copy;
       um->base_meta.release_func = rds_infer_tensor_meta_release;
-      rds_add_user_meta_to_frame (job->frame, um);
+      rds_add_user_meta_to_frame (fm, um);
     }
-    job->frame->bInferDone = TRUE;
+    fm->bInferDone = TRUE;
   }
   rds_release_meta_lock (bm);
 }
