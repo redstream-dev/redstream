@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <gst/gst.h>
 #include <rds/rds-meta.h>
+#include <rds/rds-meta-private.h>
 
 static RdsObjectMeta *
 add_obj (RdsBatchMeta * b, RdsFrameMeta * f, gint class_id, RdsObjectMeta * parent)
@@ -342,10 +343,10 @@ test_non_pool_frame_and_obj_refused (void)
 {
   RdsBatchMeta *b = rds_create_batch_meta (1);
   RdsFrameMeta *f = rds_acquire_frame_meta_from_pool (b);
-  guint8 *fblk = g_malloc0 (16 + sizeof (RdsFrameMeta));
-  guint8 *oblk = g_malloc0 (16 + sizeof (RdsObjectMeta));
-  RdsFrameMeta *fake_f = (RdsFrameMeta *) (fblk + 16);
-  RdsObjectMeta *fake_o = (RdsObjectMeta *) (oblk + 16);
+  guint8 *fblk = g_malloc0 (sizeof (RdsMetaElemHeader) + sizeof (RdsFrameMeta));
+  guint8 *oblk = g_malloc0 (sizeof (RdsMetaElemHeader) + sizeof (RdsObjectMeta));
+  RdsFrameMeta *fake_f = (RdsFrameMeta *) (fblk + sizeof (RdsMetaElemHeader));
+  RdsObjectMeta *fake_o = (RdsObjectMeta *) (oblk + sizeof (RdsMetaElemHeader));
 
   fake_f->base_meta.batch_meta = b;
   fake_o->base_meta.batch_meta = b;

@@ -2,6 +2,7 @@
 #include <string.h>
 #include <gst/gst.h>
 #include <rds/rds-meta.h>
+#include <rds/rds-meta-private.h>
 
 #define MAX_VALUES 16
 
@@ -489,9 +490,9 @@ test_non_pool_meta_refused (void)
   RdsBatchMeta *b = rds_create_batch_meta (1);
   RdsFrameMeta *f = new_frame (b);
   RdsObjectMeta *o = new_obj (b, f);
-  /* A zeroed 16-byte prefix stands in for whatever precedes a meta the app allocated itself. */
-  guint8 *blk = g_malloc0 (16 + sizeof (RdsUserMeta));
-  RdsUserMeta *fake = (RdsUserMeta *) (blk + 16);
+  /* A zeroed header-sized prefix stands in for whatever precedes a meta the app allocated itself. */
+  guint8 *blk = g_malloc0 (sizeof (RdsMetaElemHeader) + sizeof (RdsUserMeta));
+  RdsUserMeta *fake = (RdsUserMeta *) (blk + sizeof (RdsMetaElemHeader));
 
   fake->base_meta.batch_meta = b;
   fake->base_meta.meta_type = RDS_USER_META;
