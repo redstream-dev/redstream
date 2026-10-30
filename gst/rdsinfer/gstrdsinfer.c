@@ -84,8 +84,7 @@ typedef enum
 /* One frame of the batch being inferred. */
 typedef struct
 {
-  RdsFrameMeta *frame;          /* identity only outside the batch lock */
-  guint64 generation;
+  RdsMetaRef frame;             /* resolved under the batch lock before use */
   guint source_id, slot;
   RdsInferLetterbox lb;
   guint det_start, n_dets;      /* in self->dets */
@@ -618,9 +617,7 @@ snapshot_frames (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * su
   rds_acquire_meta_lock (bm);
   for (GList * l = bm->frame_meta_list; l; l = l->next) {
     RdsFrameMeta *fm = l->data;
-    FrameJob job = {.frame = fm,.generation = rds_meta_get_generation (fm),
-      .source_id = fm->source_id,.slot = fm->batch_id
-    };
+    FrameJob job = {.frame = rds_meta_ref (fm),.source_id = fm->source_id,.slot = fm->batch_id };
 
     if (fm->batch_id >= batch || fm->batch_id >= surf->batchSize) {
       ok = FALSE;
@@ -715,14 +712,10 @@ attach_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set)
   rds_acquire_meta_lock (bm);
   for (guint f = 0; f < self->jobs->len; f++) {
     FrameJob *job = &g_array_index (self->jobs, FrameJob, f);
-    GList *live = g_list_find (bm->frame_meta_list, job->frame);
-    RdsFrameMeta *fm;
+    RdsFrameMeta *fm = rds_meta_ref_resolve (bm->frame_meta_list, &job->frame);
 
-    /* Resolve the saved identity to a live frame while locked: the pool may reuse a removed frame's address. */
-    if (!live)
-      continue;
-    fm = live->data;
-    if (rds_meta_get_generation (fm) != job->generation)
+    /* A frame removed while the lock was released gets nothing, even when the pool reused its address. */
+    if (!fm)
       continue;
     if (cfg->network_type == 0) {
       for (guint i = 0; i < job->n_dets; i++)

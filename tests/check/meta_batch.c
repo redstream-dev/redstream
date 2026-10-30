@@ -361,6 +361,46 @@ test_non_pool_frame_and_obj_refused (void)
   g_free (oblk);
 }
 
+/* A ref outlives a removal: the pool hands the removed meta's address to the next acquire, and only the
+ * generation tells the two apart. */
+static void
+test_ref_resolve (void)
+{
+  RdsBatchMeta *b = rds_create_batch_meta (2);
+  RdsFrameMeta *fa = rds_acquire_frame_meta_from_pool (b);
+  RdsFrameMeta *fb = rds_acquire_frame_meta_from_pool (b);
+  RdsFrameMeta *fc;
+  RdsObjectMeta *o, *again;
+  RdsMetaRef ref_a, ref_b, ref_o;
+
+  rds_add_frame_meta_to_batch (b, fa);
+  rds_add_frame_meta_to_batch (b, fb);
+  o = add_obj (b, fb, 1, NULL);
+  ref_a = rds_meta_ref (fa);
+  ref_b = rds_meta_ref (fb);
+  ref_o = rds_meta_ref (o);
+  g_assert_true (rds_meta_ref_resolve (b->frame_meta_list, &ref_a) == fa);
+  g_assert_true (rds_meta_ref_resolve (b->frame_meta_list, &ref_b) == fb);
+  g_assert_true (rds_meta_ref_resolve (fb->obj_meta_list, &ref_o) == o);
+  g_assert_null (rds_meta_ref_resolve (fa->obj_meta_list, &ref_o));
+
+  rds_remove_frame_meta_from_batch (b, fa);
+  g_assert_null (rds_meta_ref_resolve (b->frame_meta_list, &ref_a));
+  fc = rds_acquire_frame_meta_from_pool (b);
+  g_assert_true (fc == fa);                         /* the same address, so only the generation differs */
+  rds_add_frame_meta_to_batch (b, fc);
+  g_assert_null (rds_meta_ref_resolve (b->frame_meta_list, &ref_a));
+  g_assert_true (rds_meta_ref_resolve (b->frame_meta_list, &ref_b) == fb);
+
+  rds_remove_obj_meta_from_frame (fb, o);
+  again = add_obj (b, fb, 2, NULL);
+  g_assert_true (again == o);
+  g_assert_null (rds_meta_ref_resolve (fb->obj_meta_list, &ref_o));
+  ref_o = rds_meta_ref (again);
+  g_assert_true (rds_meta_ref_resolve (fb->obj_meta_list, &ref_o) == again);
+  rds_destroy_batch_meta (b);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -379,5 +419,6 @@ main (int argc, char **argv)
   g_test_add_func ("/meta/remove-during-traversal", test_remove_during_traversal);
   g_test_add_func ("/meta/parent-tracking", test_parent_tracking);
   g_test_add_func ("/meta/non-pool-refused", test_non_pool_frame_and_obj_refused);
+  g_test_add_func ("/meta/ref-resolve", test_ref_resolve);
   return g_test_run ();
 }

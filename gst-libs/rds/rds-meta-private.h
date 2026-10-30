@@ -39,6 +39,35 @@ rds_meta_get_generation (gconstpointer meta)
   return RDS_META_ELEM_HEADER (meta)->f.generation;
 }
 
+/* A pooled meta's identity, for code that keeps a frame or object across a release of the batch lock. The pool
+ * hands a removed meta's address to the next acquire, so the address alone can name a different meta later. */
+typedef struct
+{
+  gpointer meta;
+  guint64 generation;
+} RdsMetaRef;
+
+/* Only for pooled metas, with the batch lock held. */
+static inline RdsMetaRef
+rds_meta_ref (gpointer meta)
+{
+  RdsMetaRef ref = {.meta = meta,.generation = rds_meta_get_generation (meta) };
+
+  return ref;
+}
+
+/* The meta that @ref names, if it is still in @list and from the same acquisition; else NULL. With the batch lock
+ * held. Only a meta found in @list is dereferenced. */
+static inline gpointer
+rds_meta_ref_resolve (GList * list, const RdsMetaRef * ref)
+{
+  GList *live = g_list_find (list, ref->meta);
+
+  if (!live || rds_meta_get_generation (live->data) != ref->generation)
+    return NULL;
+  return live->data;
+}
+
 /* Private batch: the public struct comes first, so RdsBatchMeta * casts to it. This is why an RdsBatchMeta must
  * come from rds_create_batch_meta. */
 typedef struct

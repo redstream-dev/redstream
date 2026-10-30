@@ -398,6 +398,10 @@ meson test -C build-rel --print-errorlogs
   FLUSHING from one branch stops all of them: block or unlink a branch before setting it to NULL. To remove a source,
   wait for its `rds-stream-eos` downstream before releasing its mux pad (releasing right after sending EOS into the
   pad drops that stream-eos). A sink added while PLAYING needs `async=false`.
+- **Metas across a lock release.** An element that releases the batch lock while it holds frame or object pointers
+  keeps `RdsMetaRef`s (address + pool generation, `rds-meta-private.h`) and resolves them under the lock before using
+  them. A pointer comparison alone is not enough: the pool hands a removed meta's address to the next acquire.
+  `rdsinfer` is the example.
 - Dispatch our stream events on the cast type: `switch ((RdsEventType) GST_EVENT_TYPE (ev))`. An uncast switch
   triggers `-Wswitch`, as on DeepStream.
 - Use TDD: write the failing test first.
