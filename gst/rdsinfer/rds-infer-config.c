@@ -241,10 +241,11 @@ static const KeyInfo keys[] = {
       .def = "0.45",.field = C (nms_iou_threshold)},
   {.name = "topk",.group = CLS,.type = TYPE_INT,.status = SUP,.min = -1,.max = G_MAXINT,.def = "-1",
       .field = C (topk)},
-  {.name = "roi-top-offset",.group = CLS,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,.def = "0",
-      .field = C (roi_top_offset)},
-  {.name = "roi-bottom-offset",.group = CLS,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,.def = "0",
-      .field = C (roi_bottom_offset)},
+  /* not applied in secondary mode (ours: from a crop's edges they would be surprising) */
+  {.name = "roi-top-offset",.group = CLS,.type = TYPE_UINT,.status = SUP,.scope = SCOPE_PRIMARY,.min = 0,
+      .max = G_MAXINT,.def = "0",.field = C (roi_top_offset)},
+  {.name = "roi-bottom-offset",.group = CLS,.type = TYPE_UINT,.status = SUP,.scope = SCOPE_PRIMARY,.min = 0,
+      .max = G_MAXINT,.def = "0",.field = C (roi_bottom_offset)},
   {.name = "detected-min-w",.group = CLS,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,.def = "0",
       .field = C (detected_min_w)},
   {.name = "detected-min-h",.group = CLS,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,.def = "0",
@@ -1023,26 +1024,27 @@ rds_infer_config_free (RdsInferConfig * cfg)
   g_free (cfg);
 }
 
-/* @k's value in @cfg as text, as it would be written in the file (NULL: an unset string). */
+/* @k's value in @base (an RdsInferConfig for [property] keys, an RdsInferClassAttrs for class keys) as text, as it
+ * would be written in the file (NULL: an unset string). */
 static gchar *
-format_value (const KeyInfo * k, const RdsInferConfig * cfg)
+format_value (const KeyInfo * k, gconstpointer base)
 {
   gchar buf[G_ASCII_DTOSTR_BUF_SIZE];
 
   switch (k->type) {
     case TYPE_BOOL:
-      return g_strdup (FIELD (gboolean, cfg, k) ? "1" : "0");
+      return g_strdup (FIELD (gboolean, base, k) ? "1" : "0");
     case TYPE_INT:
-      return g_strdup_printf ("%d", FIELD (gint, cfg, k));
+      return g_strdup_printf ("%d", FIELD (gint, base, k));
     case TYPE_UINT:
-      return g_strdup_printf ("%u", FIELD (guint, cfg, k));
+      return g_strdup_printf ("%u", FIELD (guint, base, k));
     case TYPE_FLOAT:
-      return g_strdup (g_ascii_formatd (buf, sizeof (buf), "%g", FIELD (gfloat, cfg, k)));
+      return g_strdup (g_ascii_formatd (buf, sizeof (buf), "%g", FIELD (gfloat, base, k)));
     case TYPE_STRING:
     case TYPE_PATH:
-      return g_strdup (FIELD (gchar *, cfg, k));
+      return g_strdup (FIELD (gchar *, base, k));
     case TYPE_INT_LIST:{
-      GArray *ids = FIELD (GArray *, cfg, k);
+      GArray *ids = FIELD (GArray *, base, k);
       GString *str = g_string_new (NULL);
 
       for (guint i = 0; i < ids->len; i++)
@@ -1055,10 +1057,59 @@ format_value (const KeyInfo * k, const RdsInferConfig * cfg)
   return NULL;
 }
 
+/* Why @k, set to something other than its default, is ignored in the final mode or network type; NULL: it isn't. */
+static const gchar *
+mode_warning (const KeyInfo * k, gboolean secondary, gboolean classifier)
+{
+  if (k->scope & SCOPE_SECONDARY && !secondary)
+    return "ignored: used in secondary mode (process-mode=2) only";
+  if (k->scope & SCOPE_CLASSIFIER && !classifier)
+    return "ignored: used by classifiers (network-type=1) only";
+  if (k->scope & SCOPE_PRIMARY && secondary)
+    return "ignored in secondary mode (process-mode=2)";
+  if (k->group == GROUP_PROPERTY && k->field == P (classifier_async_mode))
+    return "runs synchronously (asynchronous classifier mode is not supported)";
+  return NULL;
+}
+
+/* The mode warning of the class key @k, once for all classes after the class-attrs groups were merged at load:
+ * "every class" when all classes have the same value, else "class <id>", the first class off the default. */
+static void
+class_mode_warning (RdsInferConfig * cfg, const KeyInfo * k, const RdsInferClassAttrs * defaults, const gchar * why)
+{
+  gchar *def = format_value (k, defaults), *v0 = NULL, *first = NULL, *which;
+  gint first_id = -1;
+  gboolean uniform = TRUE;
+
+  for (guint i = 0; i < cfg->num_detected_classes; i++) {
+    gchar *value = format_value (k, &cfg->class_attrs[i]);
+
+    if (first_id < 0 && g_strcmp0 (value, def) != 0) {
+      first_id = (gint) i;
+      first = g_strdup (value);
+    }
+    if (i == 0)
+      v0 = g_strdup (value);
+    else
+      uniform = uniform && g_strcmp0 (value, v0) == 0;
+    g_free (value);
+  }
+  if (first_id >= 0) {
+    which = uniform ? g_strdup ("every class") : g_strdup_printf ("class %d", first_id);
+    g_ptr_array_add (cfg->warnings, g_strdup_printf ("%s:%s: %s (%s): %s", cfg->config_path, k->name, first, which,
+            why));
+    g_free (which);
+  }
+  g_free (first);
+  g_free (v0);
+  g_free (def);
+}
+
 gboolean
 rds_infer_config_check_mode (RdsInferConfig * cfg, const gchar * const *overridden, GError ** error)
 {
   RdsInferConfig defaults;
+  RdsInferClassAttrs class_defaults;
   gboolean secondary, classifier;
 
   g_return_val_if_fail (cfg != NULL, FALSE);
@@ -1070,29 +1121,25 @@ rds_infer_config_check_mode (RdsInferConfig * cfg, const gchar * const *overridd
         "classifiers in primary mode are not supported yet; use process-mode=2");
   memset (&defaults, 0, sizeof (defaults));
   apply_defaults (GROUP_PROPERTY, &defaults);
+  memset (&class_defaults, 0, sizeof (class_defaults));
+  apply_defaults (GROUP_CLASS_ATTRS, &class_defaults);
   for (guint i = 0; i < G_N_ELEMENTS (keys); i++) {
     const KeyInfo *k = &keys[i];
+    const gchar *why = k->scope ? mode_warning (k, secondary, classifier) : NULL;
     gchar *value, *def;
-    const gchar *why = NULL;
 
-    if (k->group != GROUP_PROPERTY || k->scope == 0 || (overridden && g_strv_contains (overridden, k->name)))
+    if (!why || (overridden && g_strv_contains (overridden, k->name)))
       continue;
+    if (k->group != GROUP_PROPERTY) {
+      class_mode_warning (cfg, k, &class_defaults, why);
+      continue;
+    }
     if (k->type == TYPE_INT_LIST)
       def = g_strdup ("");      /* no default: an empty list */
     else
       def = format_value (k, &defaults);
     value = format_value (k, cfg);
-    if (g_strcmp0 (value, def) != 0) {
-      if (k->scope & SCOPE_SECONDARY && !secondary)
-        why = "ignored: used in secondary mode (process-mode=2) only";
-      else if (k->scope & SCOPE_CLASSIFIER && !classifier)
-        why = "ignored: used by classifiers (network-type=1) only";
-      else if (k->scope & SCOPE_PRIMARY && secondary)
-        why = "ignored in secondary mode (process-mode=2)";
-      else if (k->field == P (classifier_async_mode))
-        why = "runs synchronously (asynchronous classifier mode is not supported)";
-    }
-    if (why)
+    if (g_strcmp0 (value, def) != 0)
       g_ptr_array_add (cfg->warnings, g_strdup_printf ("%s:%s: %s: %s", cfg->config_path, k->name, value, why));
     g_free (value);
     g_free (def);
@@ -1194,11 +1241,11 @@ rds_infer_config_check_table (GError ** error)
       return table_error (error, k, "accepted values of no-op keys are for ints and bools only");
     if (k->n_accept > 0 && k->status == RDS_INFER_KEY_REJECTED)
       return table_error (error, k, "rejected keys have no accepted values");
-    if (k->scope != 0 && (k->status != RDS_INFER_KEY_SUPPORTED || k->group != GROUP_PROPERTY))
-      return table_error (error, k, "only supported [property] keys have a scope");
+    if (k->scope != 0 && k->status != RDS_INFER_KEY_SUPPORTED)
+      return table_error (error, k, "only supported keys have a scope");
     if (k->scope != 0 && (k->type == TYPE_OFFSETS || k->type == TYPE_DIMS || k->type == TYPE_UINT_LIST
-            || k->type == TYPE_STRING_LIST))
-      return table_error (error, k, "scoped keys are scalars or int lists (rds_infer_config_check_mode)");
+            || k->type == TYPE_STRING_LIST || (k->group != GROUP_PROPERTY && k->type == TYPE_INT_LIST)))
+      return table_error (error, k, "scoped keys are scalars or [property] int lists (rds_infer_config_check_mode)");
     if (k->def) {
       union
       {

@@ -97,9 +97,12 @@ G_GNUC_INTERNAL gboolean rds_infer_config_validate (const RdsInferConfig * cfg, 
 /* The checks of the final process-mode, once per config after the overrides and rds_infer_config_validate (the
  * element and rds-compile run it; rds_infer_config_load doesn't): a classifier (network-type=1) needs secondary
  * mode, an error as for validate. Then adds a warning for each key whose value the mode or network type doesn't use
- * (secondary-mode keys in primary mode, classifier keys outside classifiers, interval in secondary mode) and for
- * classifier-async-mode=1. A key at its default value doesn't warn, nor does one in @overridden (config key names,
- * as for validate): the element warns about its properties itself. */
+ * (secondary-mode keys in primary mode, classifier keys outside classifiers, interval and the class keys
+ * roi-top-offset and roi-bottom-offset in secondary mode) and for classifier-async-mode=1. A class key warns once,
+ * after the class-attrs groups are merged: "KEY: VALUE (every class)" when all classes have the value, else
+ * "KEY: VALUE (class <id>)" for the first class that differs from the default. A key at its default value doesn't
+ * warn, nor does one in @overridden (config key names, as for validate): the element warns about its properties
+ * itself. */
 G_GNUC_INTERNAL gboolean rds_infer_config_check_mode (RdsInferConfig * cfg, const gchar * const *overridden,
     GError ** error);
 G_GNUC_INTERNAL void rds_infer_config_free (RdsInferConfig * cfg);

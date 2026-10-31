@@ -12,9 +12,13 @@ GST_DEBUG_CATEGORY_EXTERN (gst_rds_infer_debug);
 struct _RdsInferOutputPool
 {
   gint refcount;                /* the owner's, plus one per set in use */
-  GMutex lock;                  /* free_sets, n_sets */
-  GQueue free_sets;
+  GMutex lock;                  /* free_sets .. n_freed */
+  GQueue free_sets;             /* most recently released first */
   guint n_sets;
+  /* the recent peak of sets in use (RDS_INFER_OUTPUT_PEAK_WINDOW): this window's and the last one's */
+  guint64 n_acquires;
+  guint peak, prev_peak;
+  guint64 n_allocated, n_freed;
   guint gpu_id, batch_size, n_outputs;
   RdsInferDims *dims;
   gchar **names;
@@ -88,6 +92,20 @@ rds_infer_output_pool_unref (RdsInferOutputPool * pool)
   g_free (pool);
 }
 
+/* With the lock, after an acquire: the sets in use now count towards this window's peak; every
+ * RDS_INFER_OUTPUT_PEAK_WINDOW acquires the window moves on. */
+static void
+count_acquire (RdsInferOutputPool * pool)
+{
+  guint in_use = pool->n_sets - pool->free_sets.length;
+
+  pool->peak = MAX (pool->peak, in_use);
+  if (++pool->n_acquires % RDS_INFER_OUTPUT_PEAK_WINDOW == 0) {
+    pool->prev_peak = pool->peak;
+    pool->peak = in_use;
+  }
+}
+
 RdsInferOutputSet *
 rds_infer_output_pool_acquire (RdsInferOutputPool * pool, GError ** error)
 {
@@ -96,6 +114,8 @@ rds_infer_output_pool_acquire (RdsInferOutputPool * pool, GError ** error)
 
   g_mutex_lock (&pool->lock);
   set = g_queue_pop_head (&pool->free_sets);
+  if (set)
+    count_acquire (pool);
   g_mutex_unlock (&pool->lock);
   if (!set) {
     set = g_new0 (RdsInferOutputSet, 1);
@@ -116,6 +136,8 @@ rds_infer_output_pool_acquire (RdsInferOutputPool * pool, GError ** error)
     }
     g_mutex_lock (&pool->lock);
     n_sets = ++pool->n_sets;
+    pool->n_allocated++;
+    count_acquire (pool);
     g_mutex_unlock (&pool->lock);
     GST_DEBUG ("all output sets in use: allocated set %u", n_sets);
   }
@@ -133,6 +155,15 @@ rds_infer_output_pool_get_counts (RdsInferOutputPool * pool, guint * n_sets, gui
   g_mutex_unlock (&pool->lock);
 }
 
+void
+rds_infer_output_pool_get_totals (RdsInferOutputPool * pool, guint64 * allocated, guint64 * freed)
+{
+  g_mutex_lock (&pool->lock);
+  *allocated = pool->n_allocated;
+  *freed = pool->n_freed;
+  g_mutex_unlock (&pool->lock);
+}
+
 RdsInferOutputSet *
 rds_infer_output_set_ref (RdsInferOutputSet * set)
 {
@@ -140,10 +171,17 @@ rds_infer_output_set_ref (RdsInferOutputSet * set)
   return set;
 }
 
+/* Any thread (the last tensor meta of a set can go wherever downstream drops its buffer). Free sets beyond what the
+ * pool keeps (the rule above RDS_INFER_OUTPUT_MAX_FREE in rds-infer-output.h) are taken off the free list, least
+ * recently used first, and freed outside the lock: set_free switches to the pool's GPU and restores the thread's
+ * device, and a free set has no GPU work pending (the element synchronized its stream before attaching the metas).
+ * The pool ref this set held keeps the pool alive until then. */
 void
 rds_infer_output_set_unref (RdsInferOutputSet * set)
 {
   RdsInferOutputPool *pool;
+  GSList *trimmed = NULL;
+  guint keep, n_sets;
 
   if (!set || !g_atomic_int_dec_and_test (&set->refcount))
     return;
@@ -151,7 +189,20 @@ rds_infer_output_set_unref (RdsInferOutputSet * set)
   set->pool = NULL;
   g_mutex_lock (&pool->lock);
   g_queue_push_head (&pool->free_sets, set);
+  keep = MAX (RDS_INFER_OUTPUT_MAX_FREE, MAX (pool->peak, pool->prev_peak));
+  while (pool->n_sets > keep && pool->free_sets.length > 0) {
+    trimmed = g_slist_prepend (trimmed, g_queue_pop_tail (&pool->free_sets));
+    pool->n_sets--;
+    pool->n_freed++;
+  }
+  n_sets = pool->n_sets;
   g_mutex_unlock (&pool->lock);
+  if (trimmed) {
+    GST_DEBUG ("freeing %u output sets beyond the recent peak, %u left", g_slist_length (trimmed), n_sets);
+    for (GSList * l = trimmed; l; l = l->next)
+      set_free (pool, l->data);
+    g_slist_free (trimmed);
+  }
   rds_infer_output_pool_unref (pool);
 }
 

@@ -549,15 +549,15 @@ is set.
 |---|---|---|---|---|
 | `config-file-path` | string | none | supported | required; `.yml`/`.yaml` is read as YAML, anything else as a key file |
 | `unique-id` | uint | `1` (ours) | supported | overrides `gie-unique-id`; range 0..`G_MAXUINT` as documented (the config key starts at 1) |
-| `process-mode` | uint | `1` | supported | overrides `process-mode`; `2` (secondary) is checked with the config, then fails at start (secondary inference is not implemented yet) |
+| `process-mode` | uint | `1` | supported | overrides `process-mode`; `2`: secondary mode, see "Secondary mode" (classifiers there fail at start: not implemented yet) |
 | `infer-on-gie-id` | int | `-1` | supported | -1..`G_MAXINT` (DeepStream 8.0's type and default: -1 is every GIE); overrides `operate-on-gie-id`; a warning when set in primary mode |
 | `infer-on-class-ids` | string | none | supported | colon-separated class ids (`1:2:4`; `-1` in it: every class, ours); overrides `operate-on-class-ids`; a warning when set in primary mode |
 | `filter-out-class-ids` | string | none | supported | semicolon-separated class ids (`1;2`); replaces the file's list (an empty string clears it) |
 | `model-engine-file` | string | none | supported | a compiled MIGraphX program (`.mxr`), loaded when its manifest matches the model and the device, else rebuilt into the cache name; used as given (a config-file value is relative to the config file). A TensorRT `.engine` is ignored with a warning. Changing it while PLAYING (on-the-fly model update) is not supported |
-| `batch-size` | uint | `1` (ours) | supported | 1..1024. Frames of a batch go to the network image of their slot (`batch_id`); a frame in a slot at or above `batch-size` is an error |
+| `batch-size` | uint | `1` (ours) | supported | 1..1024. Primary mode: frames of a batch go to the network image of their slot (`batch_id`); a frame in a slot at or above `batch-size` is an error. Secondary mode: objects inferred together, see "Secondary mode" |
 | `interval` | int | `0` (ours) | supported | 0..32: infer one batch, skip the next `interval` (they pass with `bInferDone` FALSE and no objects); the count restarts at start and after a flush (ours); ignored in secondary mode, with a warning (DeepStream 8.0 behaviour) |
 | `gpu-id` | uint | `0` | supported | the GPU for preprocessing and inference; the batch must be in GPU memory on it |
-| `output-tensor-meta` | boolean | `FALSE` | supported | one `RdsInferTensorMeta` per inferred frame (also always with `network-type=100`), see "Tensor output meta" |
+| `output-tensor-meta` | boolean | `FALSE` | supported | one `RdsInferTensorMeta` per inferred frame, or per object in secondary mode (also always with `network-type=100`), see "Tensor output meta" |
 | `raw-output-file-write` | boolean | `FALSE` | accepted no-op | not implemented; a warning (once per element) when set |
 | `raw-output-generated-callback` | pointer | NULL | accepted no-op | the callback's signature isn't documented; a warning (once per element) when set |
 | `raw-output-generated-userdata` | pointer | NULL | accepted no-op |  |
@@ -587,26 +587,56 @@ batch meta is an error.
   `UNTRACKED_OBJECT_ID`, `obj_label` (the label, truncated to 127 bytes), `parent` NULL. Drawing defaults (ours):
   `rect_params` border 3 px red, no background; `text_params` the label at the box's top-left, 20 px above it
   (clamped to 0), "Serif" 10, white on black.
-- Frames that were inferred get `bInferDone` TRUE. The post-processing order and NMS are under "Detection post-processing".
+- Frames that were inferred get `bInferDone` TRUE (primary mode). The post-processing order and NMS are under
+  "Detection post-processing". A secondary detector's objects are under "Secondary mode".
 - A parse function that returns `false` or throws: that frame gets no objects, and the element posts one warning
   (then logs at debug level); the stream goes on. Invalid objects from a parser (class id out of range, non-finite
   values, empty boxes) are dropped, and a non-zero `rotation_angle` is ignored: one warning each.
 
 #### Tensor output meta
 
-One `RdsUserMeta` per inferred frame on `frame_user_meta_list`, `meta_type` `RDS_INFER_TENSOR_OUTPUT_META`
-(`NVDSINFER_TENSOR_OUTPUT_META`), data `RdsInferTensorMeta`. `out_buf_ptrs_host[i]` (pinned host memory) and
-`out_buf_ptrs_dev[i]` point at the frame's slice of output layer `i`; the `buffer` pointers in
-`output_layers_info` are NULL (documented: not valid there). The buffers stay valid as long as the meta exists, in
+One `RdsUserMeta` per inferred frame on `frame_user_meta_list` (in secondary mode per inferred object, on its
+`obj_user_meta_list`), `meta_type` `RDS_INFER_TENSOR_OUTPUT_META` (`NVDSINFER_TENSOR_OUTPUT_META`), data
+`RdsInferTensorMeta`. `out_buf_ptrs_host[i]` (pinned host memory) and `out_buf_ptrs_dev[i]` point at the frame's (or
+object's) slice of output layer `i`, whose dims in `output_layers_info` are those of one image, without the batch;
+the `buffer` pointers in `output_layers_info` are NULL (documented: not valid there). The buffers stay valid as long as the meta exists, in
 copies too (`rdsstreamdemux` outputs, `rds_batch_meta_copy`), also after the element has stopped. They are
-refcounted and reused once the last meta pointing at them is gone, so `tensor-meta-pool-size` has no effect.
+refcounted and reused once the last meta pointing at them is gone, so `tensor-meta-pool-size` has no effect. The
+element keeps as many as the most it had in use lately (during the last 256 to 512 batches, or chunks of
+`batch-size` objects in secondary mode), and at least 4 (`rdsstreammux`'s default `buffer-pool-size`); the rest are
+freed (ours).
 
 #### Processing
 
 One batch at a time, synchronously (ours; nvinfer's threading isn't documented): preprocessing and inference on the
-element's own non-blocking stream, one synchronization per batch, parsing on the CPU. Slots without a frame (a
-partial batch) are zeroed, not inferred on stale pixels. The batch's metadata lock is held only to read the frame
-list and to add the results, never during GPU work.
+element's own non-blocking stream, one synchronization per batch (per chunk of `batch-size` objects in secondary
+mode), parsing on the CPU. Slots without a frame (a partial batch) and unused images of a chunk are zeroed, not
+inferred on stale pixels. The batch's metadata lock is held only to read the frame list and to add the results,
+never during GPU work; results for a frame or object removed in between are dropped, also when the metadata pool
+gave its address to a new one.
+
+#### Secondary mode
+
+`process-mode=2` infers on the objects that upstream elements added (no primary `rdsinfer` is needed). Each row is
+**DeepStream 8.0 behaviour** (observed where the docs are silent) or **ours** (where 8.0 settles nothing, crashes or
+is inconsistent).
+
+| Topic | Source | Behaviour |
+|---|---|---|
+| Which frames | DeepStream 8.0 behaviour | every frame of every batch, with `bInferDone` TRUE or FALSE; `interval` is ignored (a warning when set). `bInferDone` is never set or cleared |
+| Which objects | DeepStream 8.0 behaviour | `operate-on-gie-id` (-1: every GIE; 0 is a real id), `operate-on-class-ids` (empty: every class) and `input-object-min/max-width/height` (inclusive, 0: no limit) on `rect_params`; see the config keys |
+| Crop | DeepStream 8.0 behaviour | the object's `rect_params`, origin rounded up to even, size down to even (at least 2); overflow past the right or bottom edge is clipped |
+| Crop outside the frame | ours | a negative origin or a box wholly outside is clipped too (8.0 fails); a crop with less than 2 pixels left, or a side under 1 pixel, is skipped (logged at debug level) |
+| Crop in the network input | DeepStream 8.0 behaviour | stretched to the network, or with `maintain-aspect-ratio` scaled by min(W/w, H/h) to even sizes, at the top-left or centred with `symmetric-padding` |
+| Batching | DeepStream 8.0 behaviour | objects in frame list order, then object list order, in chunks of `batch-size` that continue across the frames of a batch but never across batches: 10 objects at `batch-size` 4 run as 4, 4, 2. The network always runs `batch-size` images; unused ones are zeroed |
+| Tensor meta | DeepStream 8.0 behaviour | one per inferred object (a detector's parents included), on the object's `obj_user_meta_list`; none on the frame or the batch |
+| Detector objects (children) | DeepStream 8.0 behaviour | per crop, with the crop's own thresholds and NMS (never across crops); `parent` is the cropped object, `unique_component_id` this element's `gie-unique-id`, `class_id`, `confidence`, `obj_label` and the text from the parser and label file, `object_id` untracked |
+| Child geometry | ours | network → crop → frame pixels with one consistent mapping; `rect_params` clipped to the frame, `detector_bbox_info` the unclipped box (8.0 can be a pixel off and doesn't clip). A child wholly outside its crop is dropped; one partly outside keeps its part inside the frame |
+| Child order | ours | appended to the frame's object list after the existing objects, crop by crop (8.0 prepends) |
+| Detector chains | DeepStream 8.0 behaviour | a second `rdsinfer` with `infer-on-gie-id` = the detector's `gie-unique-id` infers on its children |
+| `roi-top-offset`, `roi-bottom-offset` | ours | not applied (measured from a crop's edges they would be surprising), with a warning; 8.0 not observed |
+| Parser returns false | ours | one warning per element, that object gets no children but its tensor meta is still attached (as in primary mode), the other objects are unaffected (8.0 crashes) |
+| Classifiers (`network-type=1`) | ours | not implemented yet: fail at start |
 
 #### Config files
 
@@ -636,7 +666,9 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 - Keys the mode or the network type doesn't use are a warning when set to something other than their default: the
   secondary-mode keys (`operate-on-*`, `input-object-*`, `secondary-reinfer-interval`, `classifier-async-mode`) in
   primary mode, the classifier keys outside classifiers, and `interval` in secondary mode (DeepStream 8.0 behaviour:
-  it is ignored there).
+  it is ignored there). So are `roi-top-offset` and `roi-bottom-offset` in secondary mode (ours: not applied there),
+  once per key after the class-attrs groups are merged: `KEY: VALUE (every class)` when all classes have the value,
+  else `KEY: VALUE (class <id>)` for the first class that has another value than the default.
 
 #### Config keys: `[property]`
 
@@ -650,7 +682,7 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `batch-size` | uint | `1` (ours) | 1..1024 | supported | the program is compiled for this batch size; the model's batch dimension must be symbolic or equal to it |
 | `network-mode` | int | `0` (ours) | 0..3 | supported | accepted values: 0, 2 (FP32, FP16; inputs and outputs stay FP32). INT8 (1) and BEST (3) fail at start |
 | `network-type` | int | `0` (ours) | 0..100 | supported | accepted values: 0, 1, 100 (detector; classifier, in secondary mode only; no post-processing, tensor meta only). A classifier in primary mode and segmentation (2, 3) fail at start |
-| `process-mode` | int | `1` (ours) | 1..2 | supported | 1 primary, 2 secondary (the config is checked; the element doesn't run secondary inference yet and fails at start) |
+| `process-mode` | int | `1` (ours) | 1..2 | supported | 1 primary, 2 secondary (see "Secondary mode"; a secondary classifier fails at start: not implemented yet) |
 | `gie-unique-id` | uint | `1` (ours) | >= 1 | supported | the objects' `unique_component_id` and the tensor meta's `unique_id` |
 | `interval` | uint | `0` (ours) | 0..32 | supported | as the property |
 | `output-tensor-meta` | bool | `0` (ours) |  | supported | as the property |
@@ -716,7 +748,7 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `post-cluster-threshold` | float | `0.0` (ours) | >= 0 | supported | objects with a lower confidence are dropped after clustering |
 | `nms-iou-threshold` | float | `0.45` (ours) | >= 0 | supported | `cluster-mode=2`: a box is suppressed when its IoU with a kept box of its class is above it |
 | `topk` | int | `-1` (ours) | >= -1 | supported | `cluster-mode=2`: the best K per class and frame after NMS; -1 keeps all, 0 none |
-| `roi-top-offset` | uint | `0` (ours) | 0..2147483647 | supported | rows ignored at the top of the frame: objects whose centre is above are dropped (ours: the centre) |
+| `roi-top-offset` | uint | `0` (ours) | 0..2147483647 | supported | rows ignored at the top of the frame: objects whose centre is above are dropped (ours: the centre). Primary mode only: ignored in secondary mode, with a warning (ours) |
 | `roi-bottom-offset` | uint | `0` (ours) | 0..2147483647 | supported | the same from the bottom |
 | `detected-min-w` | uint | `0` (ours) | 0..2147483647 | supported | narrower objects are dropped |
 | `detected-min-h` | uint | `0` (ours) | 0..2147483647 | supported | lower objects are dropped |

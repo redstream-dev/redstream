@@ -1,7 +1,9 @@
 /* rdsinfer: registration, pad templates, properties and how they override the config file (cpu); start errors,
  * the tensor path on the scale2 test model (output = 2 x input) against the CPU preprocessing reference, a restart,
  * partial batches, tensor meta through rdsstreamdemux, interval, the detector path with the fixture parser, and
- * concurrent metadata readers (gpu, skipped without a ROCm device).
+ * concurrent metadata readers (gpu, skipped without a ROCm device); secondary mode (/gpu/infer-secondary): object
+ * crops, chunks, object selection, secondary detectors on fixeddet and their chains, objects replaced while the lock
+ * is released, parser failures and the ROI offsets.
  * The element's test hooks (gstrdsinfer.h) are looked up in the loaded plugin.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
@@ -9,6 +11,7 @@
 #include "infer-preprocess-ref.h"
 #include "infer-parser-fixture.h"
 #include "rds-infer-config.h"
+#include "rds-infer-output.h"
 
 #include <gmodule.h>
 #include <gst/app/gstappsink.h>
@@ -27,11 +30,13 @@ typedef GstStructure *(*GetConfigFunc) (GstElement * element, GError ** error);
 typedef gboolean (*GetOutputSetsFunc) (GstElement * element, guint * n_sets, guint * n_free);
 typedef gboolean (*ReadInputFunc) (GstElement * element, gfloat * dst, gsize n_floats);
 typedef guint64 (*GetUnitCountFunc) (GstElement * element);
+typedef gboolean (*GetOutputSetTotalsFunc) (GstElement * element, guint64 * allocated, guint64 * freed);
 
 static GetConfigFunc hook_get_config;
 static GetOutputSetsFunc hook_get_output_sets;
 static ReadInputFunc hook_read_input;
 static GetUnitCountFunc hook_get_unit_count;
+static GetOutputSetTotalsFunc hook_get_output_set_totals;
 
 static void
 load_hooks (void)
@@ -52,6 +57,8 @@ load_hooks (void)
   g_assert_true (g_module_symbol (module, "rds_infer_test_get_output_sets", (gpointer *) & hook_get_output_sets));
   g_assert_true (g_module_symbol (module, "rds_infer_test_read_input", (gpointer *) & hook_read_input));
   g_assert_true (g_module_symbol (module, "rds_infer_test_get_unit_count", (gpointer *) & hook_get_unit_count));
+  g_assert_true (g_module_symbol (module, "rds_infer_test_get_output_set_totals",
+          (gpointer *) & hook_get_output_set_totals));
   /* the module stays open: the plugin is never unloaded either */
   gst_object_unref (plugin);
 }
@@ -69,21 +76,29 @@ write_file (const gchar * name, const gchar * text)
   return path;
 }
 
-/* scale2.onnx copied into WORK_DIR, so its compiled programs are cached there (not in the source tree). */
+/* tests/models/@name copied into WORK_DIR, so its compiled programs are cached there (not in the source tree). */
 static void
-ensure_model (void)
+ensure_test_model (const gchar * name)
 {
-  gchar *contents = NULL, *dst = g_build_filename (WORK_DIR, "scale2.onnx", NULL);
+  gchar *contents = NULL, *src = g_build_filename (RDS_TEST_MODELS, name, NULL);
+  gchar *dst = g_build_filename (WORK_DIR, name, NULL);
   gsize len = 0;
   GError *err = NULL;
 
   if (!g_file_test (dst, G_FILE_TEST_EXISTS)) {
-    g_assert_true (g_file_get_contents (RDS_TEST_MODELS "/scale2.onnx", &contents, &len, &err));
+    g_assert_true (g_file_get_contents (src, &contents, &len, &err));
     g_assert_cmpint (g_mkdir_with_parents (WORK_DIR, 0755), ==, 0);
     g_assert_true (g_file_set_contents (dst, contents, (gssize) len, &err));
     g_free (contents);
   }
+  g_free (src);
   g_free (dst);
+}
+
+static void
+ensure_model (void)
+{
+  ensure_test_model ("scale2.onnx");
 }
 
 /* Pops every message of @type from @bus; returns how many there were and the concatenated texts in *@texts. */
@@ -415,6 +430,8 @@ test_override_secondary (void)
   g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 1);
   g_assert_cmpuint (count_substr (gst_structure_get_string (s, "warnings"), ":interval: 2: ignored in secondary mode"),
       ==, 1);
+  /* the effective config: secondary mode runs with interval 0 */
+  g_assert_true (gst_structure_get_uint (s, "interval", &u) && u == 0);
   gst_structure_free (s);
 
   /* the properties win over the file, without warnings in secondary mode; 0 is a real GIE id, -1 every class */
@@ -482,6 +499,24 @@ test_override_secondary (void)
   gst_structure_free (s);
   gst_object_unref (e);
   g_free (cfg);
+
+  /* the ROI offsets follow the final mode too: ignored in secondary mode, with a warning (ours) */
+  cfg = write_file ("roi-mode.txt", "[property]\nonnx-file=fixeddet.onnx\nnetwork-type=0\nnum-detected-classes=2\n"
+      "parse-bbox-func-name=RdsInferParseYolo\n[class-attrs-all]\nroi-top-offset=30\n");
+  e = gst_element_factory_make ("rdsinfer", NULL);
+  g_object_set (e, "config-file-path", cfg, NULL);
+  s = hook_get_config (e, &err);
+  g_assert_no_error (err);
+  g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 0);
+  gst_structure_free (s);
+  g_object_set (e, "process-mode", 2, NULL);
+  s = hook_get_config (e, &err);
+  g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 1);
+  g_assert_nonnull (strstr (gst_structure_get_string (s, "warnings"), "roi-mode.txt:roi-top-offset: 30 (every "
+          "class): ignored in secondary mode (process-mode=2)"));
+  gst_structure_free (s);
+  gst_object_unref (e);
+  g_free (cfg);
 }
 
 /* Sets @e (in a pipeline of its own) to PAUSED, which must fail, and returns the error texts. */
@@ -508,29 +543,24 @@ test_start_config_errors (void)
   gchar *cfg = write_file ("process-mode.txt", BASE_CONFIG), *missing = g_build_filename (WORK_DIR,
       "missing.txt", NULL), *bad = write_file ("bad-mode.txt", BASE_CONFIG "network-mode=1\n"), *texts;
   gchar *classifier = write_file ("start-classifier.txt", "[property]\nonnx-file=scale2.onnx\n"
-      "infer-dims=3;48;64\nnetwork-type=1\n"), *secondary = write_file ("secondary.txt", BASE_CONFIG
-      "process-mode=2\n");
+      "infer-dims=3;48;64\nnetwork-type=1\n"), *secondary = write_file ("secondary-classifier.txt",
+      "[property]\nonnx-file=scale2.onnx\ninfer-dims=3;48;64\nnetwork-type=1\nprocess-mode=2\n");
   GstElement *e;
 
-  e = gst_element_factory_make ("rdsinfer", NULL);
-  g_object_set (e, "config-file-path", cfg, "process-mode", 2, NULL);
-  texts = start_error (e);
-  g_assert_nonnull (strstr (texts, "element property process-mode: 2: secondary inference is not implemented yet"));
-  g_free (texts);
-
-  /* a classifier file made secondary by the property reaches the same refusal, not the primary-mode error */
+  /* a classifier file made secondary by the property: refused at start (classifiers aren't run yet), not with the
+   * primary-mode error */
   e = gst_element_factory_make ("rdsinfer", NULL);
   g_object_set (e, "config-file-path", classifier, "process-mode", 2, NULL);
   texts = start_error (e);
-  g_assert_nonnull (strstr (texts, "element property process-mode: 2: secondary inference is not implemented yet"));
+  g_assert_nonnull (strstr (texts, "start-classifier.txt:network-type: 1: classifiers are not implemented yet"));
   g_assert_null (strstr (texts, "classifiers in primary mode"));
   g_free (texts);
 
-  /* secondary mode from the file: named by the file */
+  /* a secondary classifier from the file */
   e = gst_element_factory_make ("rdsinfer", NULL);
   g_object_set (e, "config-file-path", secondary, NULL);
   texts = start_error (e);
-  g_assert_nonnull (strstr (texts, "secondary.txt:process-mode: 2: secondary inference is not implemented yet"));
+  g_assert_nonnull (strstr (texts, "secondary-classifier.txt:network-type: 1: classifiers are not implemented yet"));
   g_free (texts);
 
   e = gst_element_factory_make ("rdsinfer", NULL);
@@ -757,10 +787,11 @@ bilinear_delta (guint len)
 }
 
 /* Checks image @t (NCHW RGB, net_w x net_h, the model's output = 2 x the input) of the slot @src against the CPU
- * reference: the slot resized into the letterbox rect (dl, dt, dw, dh), then scale * (x - offset). */
+ * reference: the source rect (sx, sy, sw, sh) of the slot resized into the letterbox rect (dl, dt, dw, dh), then
+ * scale * (x - offset). */
 static void
-check_tensor_image (const HostImage * src, const gfloat * t, guint net_w, guint net_h, guint dl, guint dt, guint dw,
-    guint dh, gboolean bilinear, gfloat scale, const gfloat offsets[3])
+check_tensor_rect (const HostImage * src, const gfloat * t, guint net_w, guint net_h, guint sx, guint sy, guint sw,
+    guint sh, guint dl, guint dt, guint dw, guint dh, gboolean bilinear, gfloat scale, const gfloat offsets[3])
 {
   double delta = bilinear ? bilinear_delta (MAX (src->im.width, src->im.height)) : DELTA_NEAREST, worst = 0;
 
@@ -770,7 +801,7 @@ check_tensor_image (const HostImage * src, const gfloat * t, guint net_w, guint 
       double rgb[3], gray;
 
       if (inside)
-        ref_pre_sample (&src->im, x, y, dl, dt, dw, dh, bilinear, rgb, &gray);
+        ref_pre_sample_rect (&src->im, x, y, sx, sy, sw, sh, dl, dt, dw, dh, bilinear, rgb, &gray);
       for (guint c = 0; c < 3; c++) {
         float got = t[(gsize) c * net_h * net_w + (gsize) y * net_w + x] / 2.0f;
         gboolean alt;
@@ -783,6 +814,15 @@ check_tensor_image (const HostImage * src, const gfloat * t, guint net_w, guint 
       }
     }
   g_assert_cmpfloat (worst, <=, TOL);
+}
+
+/* check_tensor_rect with the whole slot as the source rect. */
+static void
+check_tensor_image (const HostImage * src, const gfloat * t, guint net_w, guint net_h, guint dl, guint dt, guint dw,
+    guint dh, gboolean bilinear, gfloat scale, const gfloat offsets[3])
+{
+  check_tensor_rect (src, t, net_w, net_h, 0, 0, src->im.width, src->im.height, dl, dt, dw, dh, bilinear, scale,
+      offsets);
 }
 
 #define TENSOR_CONFIG \
@@ -1222,8 +1262,9 @@ typedef struct
   TestBox box, rect;
 } Expected;
 
+/* An object made by the rdsinfer of @unique_id, with @parent (NULL in primary mode). */
 static void
-check_object (const RdsObjectMeta * om, const Expected * x)
+check_object_from (const RdsObjectMeta * om, const Expected * x, gint unique_id, const RdsObjectMeta * parent)
 {
   const RdsBbox_Coords *b = &om->detector_bbox_info.org_bbox_coords;
   const RdsOSD_RectParams *r = &om->rect_params;
@@ -1232,9 +1273,9 @@ check_object (const RdsObjectMeta * om, const Expected * x)
       b->width, b->height, r->left, r->top, r->width, r->height);
   g_assert_cmpint (om->class_id, ==, x->class_id);
   g_assert_cmpfloat_with_epsilon (om->confidence, x->confidence, 1e-6);
-  g_assert_cmpint (om->unique_component_id, ==, 3);
+  g_assert_cmpint (om->unique_component_id, ==, unique_id);
   g_assert_true (om->object_id == RDS_UNTRACKED_OBJECT_ID);
-  g_assert_null (om->parent);
+  g_assert_true (om->parent == parent);
   g_assert_cmpstr (om->obj_label, ==, x->label);
   g_assert_cmpfloat_with_epsilon (b->left, x->box.left, 1e-4);
   g_assert_cmpfloat_with_epsilon (b->top, x->box.top, 1e-4);
@@ -1254,6 +1295,12 @@ check_object (const RdsObjectMeta * om, const Expected * x)
   g_assert_cmpstr (om->text_params.font_params.font_name, ==, "Serif");
   g_assert_cmpuint (om->text_params.font_params.font_size, ==, 10);
   g_assert_cmpint (om->text_params.set_bg_clr, ==, 1);
+}
+
+static void
+check_object (const RdsObjectMeta * om, const Expected * x)
+{
+  check_object_from (om, x, 3, NULL);
 }
 
 /* The fixture's boxes (infer-parser-fixture.h) on 128x64 frames into a 64x64 network: box 1 is suppressed by NMS
@@ -1464,6 +1511,931 @@ test_frame_replacement (void)
   run_frame_replacement (FALSE);
 }
 
+/* ---- gpu: secondary mode ---- */
+
+/* Adds an object from GIE @gie of class @class_id with rect_params (@left, @top, @w, @h) to frame @n of @buf. */
+static RdsObjectMeta *
+add_test_object (GstBuffer * buf, guint n, gint gie, gint class_id, gfloat left, gfloat top, gfloat w, gfloat h)
+{
+  RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (buf);
+  RdsFrameMeta *fm = nth_frame (buf, n);
+  RdsObjectMeta *om;
+
+  rds_acquire_meta_lock (bm);
+  om = rds_acquire_obj_meta_from_pool (bm);
+  om->unique_component_id = gie;
+  om->class_id = class_id;
+  om->object_id = RDS_UNTRACKED_OBJECT_ID;
+  om->confidence = 1.0f;
+  om->rect_params.left = left;
+  om->rect_params.top = top;
+  om->rect_params.width = w;
+  om->rect_params.height = h;
+  rds_add_obj_meta_to_frame (fm, om, NULL);
+  rds_release_meta_lock (bm);
+  return om;
+}
+
+/* The tensor meta in @om's obj_user_meta_list (at most one), or NULL. */
+static RdsInferTensorMeta *
+obj_tensor_meta (const RdsObjectMeta * om)
+{
+  RdsInferTensorMeta *tm = NULL;
+
+  for (GList * l = om->obj_user_meta_list; l; l = l->next) {
+    RdsUserMeta *um = l->data;
+
+    if (um->base_meta.meta_type == RDS_INFER_TENSOR_OUTPUT_META) {
+      g_assert_null (tm);
+      tm = um->user_meta_data;
+    }
+  }
+  return tm;
+}
+
+/* Every object of @buf, frame by frame, in list order. Free with g_ptr_array_unref. */
+static GPtrArray *
+all_objects (GstBuffer * buf)
+{
+  GPtrArray *objs = g_ptr_array_new ();
+
+  for (GList * f = gst_buffer_get_rds_batch_meta (buf)->frame_meta_list; f; f = f->next)
+    for (GList * o = ((RdsFrameMeta *) f->data)->obj_meta_list; o; o = o->next)
+      g_ptr_array_add (objs, o->data);
+  return objs;
+}
+
+/* Neither the batch nor a frame of @buf has tensor meta (secondary mode attaches to objects), and bInferDone is still
+ * FALSE on every frame but frame @done (-1: none), which had it TRUE: secondary mode leaves it alone. */
+static void
+check_frames_untouched (GstBuffer * buf, gint done)
+{
+  RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (buf);
+  gint n = 0;
+
+  for (GList * l = bm->batch_user_meta_list; l; l = l->next)
+    g_assert_cmpint (((RdsUserMeta *) l->data)->base_meta.meta_type, !=, RDS_INFER_TENSOR_OUTPUT_META);
+  for (GList * f = bm->frame_meta_list; f; f = f->next, n++) {
+    g_assert_null (frame_tensor_meta (f->data));
+    g_assert_cmpint (((RdsFrameMeta *) f->data)->bInferDone, ==, n == done);
+  }
+}
+
+#define SECONDARY_TENSOR_CONFIG TENSOR_CONFIG "process-mode=2\n"
+
+/* An object's rect_params, its crop (rds_infer_crop_rect) and where the crop goes in the 64x48 network (aspect kept,
+ * centred: rds_infer_crop_letterbox), worked out by hand. */
+typedef struct
+{
+  gfloat left, top, w, h;
+  guint sx, sy, sw, sh;
+  guint dl, dt, dw, dh;
+} CropCase;
+
+/* Checks @om's tensor meta (SECONDARY_TENSOR_CONFIG, unique-id 7) against its crop @c of slot @slot of @s. */
+static void
+check_crop_tensor (const RdsObjectMeta * om, RdsBufSurface * s, guint slot, const CropCase * c)
+{
+  static const gfloat offsets[3] = { 10, 20, 30 };
+  RdsInferTensorMeta *tm = obj_tensor_meta (om);
+  const RdsInferLayerInfo *l;
+  gsize image = 3 * 48 * 64;
+  gfloat *dev_copy = g_new (gfloat, image);
+  HostImage src;
+
+  g_test_message ("object (%g, %g) %gx%g: crop (%u, %u) %ux%u", c->left, c->top, c->w, c->h, c->sx, c->sy, c->sw,
+      c->sh);
+  g_assert_nonnull (tm);
+  g_assert_cmpuint (tm->unique_id, ==, 7);
+  g_assert_cmpuint (tm->num_output_layers, ==, 1);
+  g_assert_cmpuint (tm->network_info.width, ==, 64);
+  g_assert_cmpuint (tm->network_info.height, ==, 48);
+  g_assert_true (tm->maintain_aspect_ratio);
+  g_assert_true (tm->symmetric_padding);
+  /* the dims of one image, without the batch */
+  l = &tm->output_layers_info[0];
+  g_assert_cmpuint (l->inferDims.numDims, ==, 3);
+  g_assert_cmpuint (l->inferDims.d[0], ==, 3);
+  g_assert_cmpuint (l->inferDims.d[1], ==, 48);
+  g_assert_cmpuint (l->inferDims.d[2], ==, 64);
+  g_assert_cmpuint (l->inferDims.numElements, ==, image);
+  snapshot (s, slot, &src);
+  check_tensor_rect (&src, tm->out_buf_ptrs_host[0], 64, 48, c->sx, c->sy, c->sw, c->sh, c->dl, c->dt, c->dw, c->dh,
+      TRUE, 0.5f, offsets);
+  host_image_clear (&src);
+  g_assert_cmpint (hipMemcpy (dev_copy, tm->out_buf_ptrs_dev[0], image * sizeof (gfloat), hipMemcpyDeviceToHost), ==,
+      hipSuccess);
+  g_assert_cmpint (memcmp (dev_copy, tm->out_buf_ptrs_host[0], image * sizeof (gfloat)), ==, 0);
+  g_free (dev_copy);
+}
+
+/* scale2 in secondary mode: each selected object gets one tensor meta in its obj_user_meta_list holding 2 x its crop
+ * through the crop letterbox (CPU reference), its own slice of its chunk's output set; nothing goes on the frames.
+ * Two batches of different slot sizes, objects at odd offsets and past the frame edges. batch-size 2: the first
+ * batch's three objects run as a chunk of 2 (frame 0) and one of 1 (frame 1). Objects whose crop is empty are
+ * skipped. */
+static void
+test_secondary_tensor_crop (void)
+{
+  /* 96x64 slots: frame 0, frame 0, frame 1 */
+  static const CropCase big[] = {
+    {11, 7, 31.6f, 21, 12, 8, 30, 20, 0, 2, 64, 42},
+    {85, 41, 20, 30, 86, 42, 10, 22, 21, 0, 20, 48},
+    {3, 5, 64, 40, 4, 6, 64, 40, 0, 4, 64, 40},
+  };
+  /* a 70x50 slot: left of the frame and past its bottom */
+  static const CropCase small = { -3, 9, 20, 45, 0, 10, 18, 40, 21, 0, 20, 48 };
+  gchar *cfg = write_file ("secondary-tensor.txt", SECONDARY_TENSOR_CONFIG "batch-size=2\n");
+  const gchar *caps = "video/x-raw(memory:RDS), format=NV12, width=70, height=50, framerate=30/1";
+  GstElement *e;
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *om[3], *skipped[2];
+  RdsInferTensorMeta *tm[3];
+  guint n_sets, n_free;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  load_hooks ();
+  e = new_infer (cfg);
+  g_object_set (e, "unique-id", 7, NULL);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 96, 64);
+  in = make_batch (RDS_BUF_COLOR_FORMAT_NV12, 96, 64, 2, 2, 11);
+  om[0] = add_test_object (in, 0, 1, 0, big[0].left, big[0].top, big[0].w, big[0].h);
+  /* under a pixel wide, and wholly right of the frame: no crop */
+  skipped[0] = add_test_object (in, 0, 1, 0, 30, 30, 0.5f, 10);
+  om[1] = add_test_object (in, 0, 1, 0, big[1].left, big[1].top, big[1].w, big[1].h);
+  skipped[1] = add_test_object (in, 0, 1, 0, 200, 10, 10, 10);
+  om[2] = add_test_object (in, 1, 1, 0, big[2].left, big[2].top, big[2].w, big[2].h);
+  /* a frame an earlier element marked inferred is inferred on all the same, and keeps its flag */
+  nth_frame (in, 1)->bInferDone = TRUE;
+  g_assert_cmpint (gst_harness_push (h, gst_buffer_ref (in)), ==, GST_FLOW_OK);
+  out = gst_harness_pull (h);
+  g_assert_true (out == in);
+  g_assert_cmpuint (hook_get_unit_count (e), ==, 3);
+  check_frames_untouched (out, 1);
+  for (guint i = 0; i < 2; i++)
+    g_assert_null (obj_tensor_meta (skipped[i]));
+  for (guint i = 0; i < 3; i++) {
+    check_crop_tensor (om[i], rds_buffer_get_surface (in), i < 2 ? 0 : 1, &big[i]);
+    tm[i] = obj_tensor_meta (om[i]);
+  }
+  /* images 0 and 1 of the first chunk's set, image 0 of the second's */
+  g_assert_true (tm[0]->priv_data == tm[1]->priv_data);
+  g_assert_true (tm[2]->priv_data != tm[0]->priv_data);
+  g_assert_true ((gfloat *) tm[1]->out_buf_ptrs_host[0] == (gfloat *) tm[0]->out_buf_ptrs_host[0] + 3 * 48 * 64);
+  g_assert_true (hook_get_output_sets (e, &n_sets, &n_free));
+  g_assert_cmpuint (n_sets, ==, 2);
+  g_assert_cmpuint (n_free, ==, 0);
+  gst_buffer_unref (out);
+  gst_buffer_unref (in);
+
+  gst_harness_set_caps_str (h, caps, caps);
+  in = make_batch (RDS_BUF_COLOR_FORMAT_NV12, 70, 50, 1, 1, 21);
+  om[0] = add_test_object (in, 0, 1, 0, small.left, small.top, small.w, small.h);
+  g_assert_cmpint (gst_harness_push (h, gst_buffer_ref (in)), ==, GST_FLOW_OK);
+  out = gst_harness_pull (h);
+  check_frames_untouched (out, -1);
+  check_crop_tensor (om[0], rds_buffer_get_surface (in), 0, &small);
+  g_assert_cmpuint (hook_get_unit_count (e), ==, 4);
+  gst_buffer_unref (out);
+  gst_buffer_unref (in);
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* @objs ran in chunks of @sizes, in this order: the objects of a chunk share its output set and are consecutive
+ * images of it in list order; consecutive chunks have distinct sets. */
+static void
+check_chunks (GPtrArray * objs, const guint * sizes, guint n_chunks, gsize image)
+{
+  gpointer prev_set = NULL;
+  guint total = 0;
+
+  for (guint c = 0; c < n_chunks; c++)
+    total += sizes[c];
+  g_assert_cmpuint (objs->len, ==, total);
+  for (guint c = 0, o = 0; c < n_chunks; o += sizes[c], c++) {
+    RdsInferTensorMeta *head = obj_tensor_meta (g_ptr_array_index (objs, o));
+
+    g_assert_nonnull (head);
+    g_assert_true (head->priv_data != prev_set);
+    for (guint i = 1; i < sizes[c]; i++) {
+      RdsInferTensorMeta *tm = obj_tensor_meta (g_ptr_array_index (objs, o + i));
+
+      g_assert_true (tm->priv_data == head->priv_data);
+      g_assert_true ((gfloat *) tm->out_buf_ptrs_host[0] == (gfloat *) head->out_buf_ptrs_host[0] + i * image);
+    }
+    prev_set = head->priv_data;
+  }
+}
+
+/* A 64x48 NV12 batch of @frames frames (one slot each) with @per_frame[f] 16x16 objects in frame f (all inside the
+ * frame, so each one is a unit). */
+static GstBuffer *
+batch_with_objects (guint frames, const guint * per_frame)
+{
+  GstBuffer *buf = make_batch (RDS_BUF_COLOR_FORMAT_NV12, 64, 48, frames, frames, 0);
+
+  for (guint f = 0; f < frames; f++)
+    for (guint i = 0; i < per_frame[f]; i++)
+      add_test_object (buf, f, 1, 0, 2 + 4 * (i % 10), 2 + 2 * (i % 10), 16, 16);
+  return buf;
+}
+
+/* Units are packed in frame list order, then object list order, in chunks of batch-size, continuing across the
+ * frames of a buffer but never across buffers (DeepStream 8.0 behaviour): 10 objects (6 in frame 0, 4 in frame 1) at
+ * batch-size 4 run as 4, 4, 2; two buffers of 5 as 4, 1 and 4, 1. interval is ignored in secondary mode: every buffer
+ * is inferred. */
+static void
+test_secondary_chunks (void)
+{
+  static const guint ten[] = { 6, 4 }, five[] = { 5 }, c442[] = { 4, 4, 2 }, c41[] = { 4, 1 };
+  gchar *cfg = write_file ("secondary-chunks.txt", "[property]\nonnx-file=scale2.onnx\ninfer-dims=3;16;16\n"
+      "network-type=100\nprocess-mode=2\nbatch-size=4\n");
+  const gsize image = 3 * 16 * 16;
+  GstElement *e;
+  GstHarness *h;
+  GstBuffer *out[2];
+  GPtrArray *objs[2];
+  guint n_sets, n_free;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  load_hooks ();
+  e = new_infer (cfg);
+  g_object_set (e, "interval", 1, NULL);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 64, 48);
+
+  g_assert_cmpint (gst_harness_push (h, batch_with_objects (2, ten)), ==, GST_FLOW_OK);
+  out[0] = gst_harness_pull (h);
+  g_assert_cmpuint (hook_get_unit_count (e), ==, 10);
+  objs[0] = all_objects (out[0]);
+  g_assert_cmpuint (objs[0]->len, ==, 10);
+  check_chunks (objs[0], c442, G_N_ELEMENTS (c442), image);
+  /* one output set per chunk, all held by the tensor metas */
+  g_assert_true (hook_get_output_sets (e, &n_sets, &n_free));
+  g_assert_cmpuint (n_sets, ==, 3);
+  g_assert_cmpuint (n_free, ==, 0);
+  g_ptr_array_unref (objs[0]);
+  gst_buffer_unref (out[0]);
+  g_assert_true (hook_get_output_sets (e, &n_sets, &n_free));
+  g_assert_cmpuint (n_free, ==, 3);
+
+  for (guint b = 0; b < 2; b++) {
+    g_assert_cmpint (gst_harness_push (h, batch_with_objects (1, five)), ==, GST_FLOW_OK);
+    out[b] = gst_harness_pull (h);
+    g_assert_cmpuint (hook_get_unit_count (e), ==, 15 + 5 * b);
+  }
+  for (guint b = 0; b < 2; b++) {
+    objs[b] = all_objects (out[b]);
+    check_chunks (objs[b], c41, G_N_ELEMENTS (c41), image);
+  }
+  /* the buffers' chunks have their own sets */
+  g_assert_true (obj_tensor_meta (objs[0]->pdata[4])->priv_data != obj_tensor_meta (objs[1]->pdata[0])->priv_data);
+  for (guint b = 0; b < 2; b++) {
+    g_ptr_array_unref (objs[b]);
+    gst_buffer_unref (out[b]);
+  }
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* Objects in a 128x64 frame for the selection test: GIE, class, size. */
+static const struct
+{
+  gint gie, class_id;
+  gfloat w, h;
+} sel_objects[] = {
+  {1, 0, 20, 20},
+  {2, 0, 20, 20},
+  {1, 1, 20, 20},
+  {1, 2, 8, 20},                /* narrower than input-object-min-width */
+  {1, 2, 10, 40},               /* at the limits: they are inclusive */
+  {1, 0, 20, 41},               /* taller than input-object-max-height */
+  {0, 0, 20, 20},               /* GIE 0 is a real id */
+};
+
+/* Runs the selection config @cfg with @gie and @classes as the infer-on-gie-id and infer-on-class-ids properties
+ * (unset if -2 or NULL); @want lists, per object of sel_objects, whether it gets tensor meta. */
+static void
+run_selection (const gchar * cfg, gint gie, const gchar * classes, const gboolean * want)
+{
+  GstElement *e = new_infer (cfg);
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *om[G_N_ELEMENTS (sel_objects)];
+  guint n = 0;
+
+  if (gie != -2)
+    g_object_set (e, "infer-on-gie-id", gie, NULL);
+  if (classes)
+    g_object_set (e, "infer-on-class-ids", classes, NULL);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 128, 64);
+  in = make_batch (RDS_BUF_COLOR_FORMAT_NV12, 128, 64, 1, 1, 0);
+  for (guint i = 0; i < G_N_ELEMENTS (sel_objects); i++)
+    om[i] = add_test_object (in, 0, sel_objects[i].gie, sel_objects[i].class_id, 2 + 16 * i, 2, sel_objects[i].w,
+        sel_objects[i].h);
+  g_assert_cmpint (gst_harness_push (h, in), ==, GST_FLOW_OK);
+  out = gst_harness_pull (h);
+  for (guint i = 0; i < G_N_ELEMENTS (sel_objects); i++) {
+    g_test_message ("object %u: tensor meta %d, want %d", i, obj_tensor_meta (om[i]) != NULL, want[i]);
+    g_assert_true ((obj_tensor_meta (om[i]) != NULL) == want[i]);
+    n += want[i];
+  }
+  g_assert_cmpuint (hook_get_unit_count (e), ==, n);
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+}
+
+/* Which objects are inferred on, end to end: the producer GIE, the class list and the size limits from the file,
+ * then the element properties over them. */
+static void
+test_secondary_selection (void)
+{
+  static const gboolean from_file[] = { TRUE, FALSE, FALSE, FALSE, TRUE, FALSE, FALSE };
+  static const gboolean gie2[] = { FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE };
+  static const gboolean every[] = { TRUE, TRUE, TRUE, FALSE, TRUE, FALSE, TRUE };
+  static const gboolean gie0[] = { FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE };
+  gchar *cfg = write_file ("secondary-select.txt", "[property]\nonnx-file=scale2.onnx\ninfer-dims=3;16;16\n"
+      "network-type=100\nprocess-mode=2\nbatch-size=4\noperate-on-gie-id=1\noperate-on-class-ids=0;2\n"
+      "input-object-min-width=10\ninput-object-max-height=40\n");
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  load_hooks ();
+  run_selection (cfg, -2, NULL, from_file);
+  run_selection (cfg, 2, "0", gie2);
+  run_selection (cfg, -1, "-1", every);
+  run_selection (cfg, 0, "-1", gie0);
+  g_free (cfg);
+}
+
+/* A secondary detector on fixeddet (README.md: six boxes in network pixels), GIE 5, on the objects of GIE 1;
+ * @extra goes at the end of the file. */
+static gchar *
+fixeddet_config (const gchar * name, const gchar * extra)
+{
+  gchar *labels = write_file ("labels.txt", "person\ncar\n"), *text, *path;
+
+  text = g_strdup_printf ("[property]\nonnx-file=fixeddet.onnx\nbatch-size=2\nnetwork-type=0\nprocess-mode=2\n"
+      "num-detected-classes=2\nparse-bbox-func-name=RdsInferParseYolo\nlabelfile-path=labels.txt\n"
+      "gie-unique-id=5\noperate-on-gie-id=1\n%s", extra ? extra : "");
+  path = write_file (name, text);
+  g_free (text);
+  g_free (labels);
+  return path;
+}
+
+/* fixeddet's children of the two parents of run_children, in frame pixels. Parent 0: rect (100, 40) 64x64, the crop
+ * is the same and the network input 1:1, so a child is its network box moved by (100, 40); boxes reaching outside
+ * the crop keep that part (inside the frame). */
+static const Expected children_p0[] = {
+  {0, 0.9f, "person", {108, 48, 16, 16}, {108, 48, 16, 16}},
+  {1, 0.8f, "car", {138, 50, 20, 12}, {138, 50, 20, 12}},
+  {0, 0.85f, "person", {152, 92, 16, 16}, {152, 92, 16, 16}},
+  {0, 0.75f, "person", {96, 78, 16, 20}, {96, 78, 16, 20}},
+  {1, 0.7f, "car", {152, 66, 12, 8}, {152, 66, 12, 8}},
+  {1, 0.6f, "car", {132, 76, 24, 16}, {132, 76, 24, 16}},
+};
+
+/* Parent 1: rect (223.4, 95.2) 40x40 at the bottom-right corner of the 256x128 frame: crop (224, 96) 32x32 (origin up
+ * to even, clipped to the frame), stretched to the network: half the network box, moved by (224, 96), the rect
+ * clipped to the frame. */
+static const Expected children_p1[] = {
+  {0, 0.9f, "person", {228, 100, 8, 8}, {228, 100, 8, 8}},
+  {1, 0.8f, "car", {243, 101, 10, 6}, {243, 101, 10, 6}},
+  {0, 0.85f, "person", {250, 122, 8, 8}, {250, 122, 6, 6}},
+  {0, 0.75f, "person", {222, 115, 8, 10}, {222, 115, 8, 10}},
+  {1, 0.7f, "car", {250, 109, 6, 4}, {250, 109, 6, 4}},
+  {1, 0.6f, "car", {240, 114, 12, 8}, {240, 114, 12, 8}},
+};
+
+/* Pushes a 256x128 RGBA batch with two GIE 1 parents (and a GIE 2 object, not inferred on) through @h; returns the
+ * output and the parents in @parents[0..2]. */
+static GstBuffer *
+run_children (GstHarness * h, RdsObjectMeta * parents[3])
+{
+  GstBuffer *in = make_batch (RDS_BUF_COLOR_FORMAT_RGBA, 256, 128, 1, 1, 0);
+
+  parents[0] = add_test_object (in, 0, 1, 0, 100, 40, 64, 64);
+  parents[1] = add_test_object (in, 0, 1, 0, 223.4f, 95.2f, 40, 40);
+  parents[2] = add_test_object (in, 0, 2, 0, 10, 10, 40, 40);
+  g_assert_cmpint (gst_harness_push (h, in), ==, GST_FLOW_OK);
+  return gst_harness_pull (h);
+}
+
+/* Checks @out's objects: the three parents, then parent 0's children and parent 1's, appended in the parser's order
+ * (ours: 8.0 prepends). */
+static void
+check_children (GstBuffer * out, RdsObjectMeta * parents[3])
+{
+  GPtrArray *objs = all_objects (out);
+
+  g_assert_cmpuint (objs->len, ==, 3 + 12);
+  g_assert_cmpuint (nth_frame (out, 0)->num_obj_meta, ==, 15);
+  for (guint i = 0; i < 3; i++)
+    g_assert_true (objs->pdata[i] == parents[i]);
+  for (guint i = 0; i < 6; i++) {
+    check_object_from (objs->pdata[3 + i], &children_p0[i], 5, parents[0]);
+    check_object_from (objs->pdata[9 + i], &children_p1[i], 5, parents[1]);
+  }
+  check_frames_untouched (out, -1);
+  g_ptr_array_unref (objs);
+}
+
+/* A secondary detector: each parent's children in frame coordinates, with the parent set and the labels of the label
+ * file; no tensor meta without output-tensor-meta. A second rdsinfer with infer-on-gie-id = the detector's id
+ * infers the children (and only them). */
+static void
+test_secondary_detector_children (void)
+{
+  gchar *cfg = fixeddet_config ("secondary-det.txt", NULL);
+  gchar *chain = write_file ("secondary-chain.txt", "[property]\nonnx-file=scale2.onnx\ninfer-dims=3;16;16\n"
+      "network-type=100\nprocess-mode=2\nbatch-size=4\n");
+  GstElement *e, *e2;
+  GstHarness *h, *h2;
+  GstBuffer *out;
+  RdsObjectMeta *parents[3];
+  GPtrArray *objs;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  ensure_test_model ("fixeddet.onnx");
+  load_hooks ();
+  e = new_infer (cfg);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_RGBA, 256, 128);
+  e2 = new_infer (chain);
+  g_object_set (e2, "infer-on-gie-id", 5, "unique-id", 9, NULL);
+  h2 = harness_for (e2, NULL, RDS_BUF_COLOR_FORMAT_RGBA, 256, 128);
+
+  out = run_children (h, parents);
+  g_assert_cmpuint (hook_get_unit_count (e), ==, 2);
+  check_children (out, parents);
+  objs = all_objects (out);
+  for (guint i = 0; i < objs->len; i++)
+    g_assert_null (obj_tensor_meta (objs->pdata[i]));
+
+  g_assert_cmpint (gst_harness_push (h2, out), ==, GST_FLOW_OK);
+  out = gst_harness_pull (h2);
+  g_assert_cmpuint (hook_get_unit_count (e2), ==, 12);
+  for (guint i = 0; i < objs->len; i++) {
+    RdsInferTensorMeta *tm = obj_tensor_meta (objs->pdata[i]);
+
+    if (i < 3) {
+      g_assert_null (tm);
+    } else {
+      g_assert_nonnull (tm);
+      g_assert_cmpuint (tm->unique_id, ==, 9);
+    }
+  }
+  g_ptr_array_unref (objs);
+  gst_buffer_unref (out);
+  gst_harness_teardown (h2);
+  gst_harness_teardown (h);
+  g_free (chain);
+  g_free (cfg);
+}
+
+/* roi-top-offset and roi-bottom-offset are not applied in secondary mode (ours): a band that would drop every child
+ * (centre y in [30, 34) of the crop) drops none, and start warns about each key. */
+static void
+test_secondary_roi_ignored (void)
+{
+  gchar *cfg = fixeddet_config ("secondary-roi.txt", "[class-attrs-all]\nroi-top-offset=30\nroi-bottom-offset=30\n");
+  GstBus *bus = gst_bus_new ();
+  GstElement *e;
+  GstHarness *h;
+  GstBuffer *out;
+  RdsObjectMeta *parents[3];
+  gchar *texts;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_test_model ("fixeddet.onnx");
+  load_hooks ();
+  e = new_infer (cfg);
+  gst_element_set_bus (e, bus);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_RGBA, 256, 128);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 2);
+  g_assert_nonnull (strstr (texts, "secondary-roi.txt:roi-top-offset: 30 (every class): ignored in secondary mode"));
+  g_assert_nonnull (strstr (texts, "secondary-roi.txt:roi-bottom-offset: 30 (every class): ignored in secondary "
+          "mode"));
+  g_free (texts);
+  out = run_children (h, parents);
+  check_children (out, parents);
+  gst_buffer_unref (out);
+  harness_teardown_with_bus (h, bus);
+  g_free (cfg);
+}
+
+/* The fixture parser @func on scale2 (64x64 network, stretched) as a secondary detector of the objects of GIE 1, GIE
+ * 3; FixtureBoxes gives two children per crop (box 1 is suppressed by NMS, box 3 is below the threshold). */
+static gchar *
+fixture_secondary_config (const gchar * name, const gchar * func, gboolean tensor_meta)
+{
+  gchar *labels = write_file ("labels.txt", "person\ncar\n"), *text, *path;
+
+  text = g_strdup_printf ("[property]\nonnx-file=scale2.onnx\ninfer-dims=3;64;64\nbatch-size=4\nnetwork-type=0\n"
+      "process-mode=2\noperate-on-gie-id=1\nnum-detected-classes=2\ncustom-lib-path=%s\nparse-bbox-func-name=%s\n"
+      "labelfile-path=labels.txt\ngie-unique-id=3\noutput-tensor-meta=%d\n"
+      "[class-attrs-all]\npre-cluster-threshold=0.2\nnms-iou-threshold=0.5\n", RDS_TEST_PARSER_FIXTURE, func,
+      tensor_meta);
+  path = write_file (name, text);
+  g_free (text);
+  g_free (labels);
+  return path;
+}
+
+/* The children of @parent in @fm. */
+static guint
+count_children (const RdsFrameMeta * fm, const RdsObjectMeta * parent)
+{
+  guint n = 0;
+
+  for (GList * o = fm->obj_meta_list; o; o = o->next)
+    n += ((RdsObjectMeta *) o->data)->parent == parent;
+  return n;
+}
+
+/* An object removed, or replaced by a new one at the same address, between the snapshot and the attachment gets
+ * nothing: no children, no tensor meta. The other object is unaffected. The replacement repeats every identity
+ * scalar, so a pointer-only check would attach to it. */
+static void
+run_object_replacement (gboolean replace)
+{
+  gchar *cfg;
+  GModule *module;
+  void (*reset) (void), (*release) (void);
+  gboolean (*wait) (void);
+  GstBus *bus;
+  GstElement *e;
+  GstBuffer *out;
+  RdsBatchMeta *bm;
+  RdsFrameMeta *fm;
+  RdsObjectMeta *original, *other, *replacement = NULL;
+  ReplacementPush push = { 0 };
+  GThread *thread;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  module = g_module_open (RDS_TEST_PARSER_FIXTURE, G_MODULE_BIND_LOCAL);
+  g_assert_nonnull (module);
+  g_assert_true (g_module_symbol (module, "FixtureBarrierReset", (gpointer *) & reset));
+  g_assert_true (g_module_symbol (module, "FixtureBarrierWait", (gpointer *) & wait));
+  g_assert_true (g_module_symbol (module, "FixtureBarrierRelease", (gpointer *) & release));
+  reset ();
+  cfg = fixture_secondary_config ("secondary-replace.txt", "FixtureBarrierBoxes", TRUE);
+  bus = gst_bus_new ();
+  e = new_infer (cfg);
+  push.h = harness_for (e, bus, RDS_BUF_COLOR_FORMAT_RGBA, 128, 64);
+  push.in = make_batch (RDS_BUF_COLOR_FORMAT_RGBA, 128, 64, 1, 1, 0);
+  original = add_test_object (push.in, 0, 1, 0, 0, 0, 64, 64);
+  other = add_test_object (push.in, 0, 1, 1, 64, 0, 64, 64);
+  bm = gst_buffer_get_rds_batch_meta (push.in);
+  fm = nth_frame (push.in, 0);
+  thread = g_thread_new ("replace-push", replacement_push, &push);
+  /* the parser of the first unit: after the snapshot and the GPU work, before the attachment */
+  g_assert_true (wait ());
+  rds_acquire_meta_lock (bm);
+  rds_remove_obj_meta_from_frame (fm, original);
+  if (replace) {
+    replacement = rds_acquire_obj_meta_from_pool (bm);
+    g_assert_true (replacement == original);
+    replacement->unique_component_id = 1;
+    replacement->class_id = 0;
+    replacement->object_id = RDS_UNTRACKED_OBJECT_ID;
+    replacement->rect_params.width = 64;
+    replacement->rect_params.height = 64;
+    rds_add_obj_meta_to_frame (fm, replacement, NULL);
+  }
+  rds_release_meta_lock (bm);
+  release ();
+  g_thread_join (thread);
+  g_assert_cmpint (push.flow, ==, GST_FLOW_OK);
+  out = gst_harness_pull (push.h);
+  g_assert_true (gst_buffer_get_rds_batch_meta (out) == bm);
+  g_assert_cmpuint (hook_get_unit_count (e), ==, 2);
+  /* the other object, its two children, and the replacement */
+  g_assert_cmpuint (fm->num_obj_meta, ==, replace ? 4 : 3);
+  g_assert_cmpuint (count_children (fm, other), ==, 2);
+  g_assert_nonnull (obj_tensor_meta (other));
+  if (replace) {
+    g_assert_cmpuint (count_children (fm, replacement), ==, 0);
+    g_assert_null (obj_tensor_meta (replacement));
+  }
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
+  gst_buffer_unref (out);
+  harness_teardown_with_bus (push.h, bus);
+  g_module_close (module);
+  g_free (cfg);
+}
+
+static void
+test_secondary_object_removed (void)
+{
+  run_object_replacement (FALSE);
+}
+
+static void
+test_secondary_object_replaced (void)
+{
+  run_object_replacement (TRUE);
+}
+
+/* Units of frames A, B and C (one chunk), and B removed between the snapshot and the attachment, then a new frame
+ * acquired at B's address with a new object at the address of B's object, repeating their identity scalars: A's
+ * and C's objects get their results, the units of B nothing, also through the per-frame resolve that attachment
+ * keeps from one unit to the next. */
+static void
+test_secondary_frame_replaced (void)
+{
+  gchar *cfg;
+  GModule *module;
+  void (*reset) (void), (*release) (void);
+  gboolean (*wait) (void);
+  GstBus *bus;
+  GstElement *e;
+  GstBuffer *out;
+  RdsBatchMeta *bm;
+  RdsFrameMeta *fb, *fb2;
+  RdsObjectMeta *om[5], *ob2;
+  ReplacementPush push = { 0 };
+  GThread *thread;
+  static const guint frame_of[] = { 0, 0, 1, 2, 2 };
+  guint source_id, batch_id;
+  gint frame_num;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  module = g_module_open (RDS_TEST_PARSER_FIXTURE, G_MODULE_BIND_LOCAL);
+  g_assert_nonnull (module);
+  g_assert_true (g_module_symbol (module, "FixtureBarrierReset", (gpointer *) & reset));
+  g_assert_true (g_module_symbol (module, "FixtureBarrierWait", (gpointer *) & wait));
+  g_assert_true (g_module_symbol (module, "FixtureBarrierRelease", (gpointer *) & release));
+  reset ();
+  cfg = fixture_secondary_config ("secondary-frame-replace.txt", "FixtureBarrierBoxes", TRUE);
+  bus = gst_bus_new ();
+  e = new_infer (cfg);
+  g_object_set (e, "batch-size", 8, NULL);
+  push.h = harness_for (e, bus, RDS_BUF_COLOR_FORMAT_RGBA, 128, 64);
+  push.in = make_batch (RDS_BUF_COLOR_FORMAT_RGBA, 128, 64, 3, 3, 0);
+  /* A: om[0], om[1]; B: om[2]; C: om[3], om[4] */
+  for (guint i = 0; i < 5; i++)
+    om[i] = add_test_object (push.in, frame_of[i], 1, 0, 64 * (i % 2), 0, 64, 64);
+  bm = gst_buffer_get_rds_batch_meta (push.in);
+  fb = nth_frame (push.in, 1);
+  source_id = fb->source_id;
+  batch_id = fb->batch_id;
+  frame_num = fb->frame_num;
+  thread = g_thread_new ("replace-push", replacement_push, &push);
+  g_assert_true (wait ());
+  rds_acquire_meta_lock (bm);
+  rds_remove_frame_meta_from_batch (bm, fb);
+  fb2 = rds_acquire_frame_meta_from_pool (bm);
+  g_assert_true (fb2 == fb);
+  fb2->source_id = source_id;
+  fb2->pad_index = source_id;
+  fb2->batch_id = batch_id;
+  fb2->frame_num = frame_num;
+  fb2->source_frame_width = fb2->pipeline_width = 128;
+  fb2->source_frame_height = fb2->pipeline_height = 64;
+  rds_add_frame_meta_to_batch (bm, fb2);
+  ob2 = rds_acquire_obj_meta_from_pool (bm);
+  g_assert_true (ob2 == om[2]);
+  ob2->unique_component_id = 1;
+  ob2->object_id = RDS_UNTRACKED_OBJECT_ID;
+  ob2->rect_params.width = 64;
+  ob2->rect_params.height = 64;
+  rds_add_obj_meta_to_frame (fb2, ob2, NULL);
+  rds_release_meta_lock (bm);
+  release ();
+  g_thread_join (thread);
+  g_assert_cmpint (push.flow, ==, GST_FLOW_OK);
+  out = gst_harness_pull (push.h);
+  g_assert_cmpuint (hook_get_unit_count (e), ==, 5);
+  /* the frame list is now A, C, B' */
+  for (guint i = 0; i < 5; i++) {
+    if (i == 2)
+      continue;
+    g_assert_cmpuint (count_children (nth_frame (out, frame_of[i] ? 1 : 0), om[i]), ==, 2);
+    g_assert_nonnull (obj_tensor_meta (om[i]));
+  }
+  g_assert_true (nth_frame (out, 2) == fb2);
+  g_assert_cmpuint (fb2->num_obj_meta, ==, 1);
+  g_assert_null (obj_tensor_meta (ob2));
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
+  gst_buffer_unref (out);
+  harness_teardown_with_bus (push.h, bus);
+  g_module_close (module);
+  g_free (cfg);
+}
+
+/* A parser that returns false on some crops (FixtureFailDark: the dark frame's): one warning, those objects get no
+ * children, the others (in the same chunk) theirs, and the stream goes on (ours: DeepStream 8.0 crashes). With
+ * tensor meta, the failed objects still get theirs, as frames do in primary mode. */
+static void
+run_parser_false (gboolean tensor_meta)
+{
+  gchar *name = g_strdup_printf ("secondary-fail-%d.txt", tensor_meta), *texts;
+  gchar *cfg = fixture_secondary_config (name, "FixtureFailDark", tensor_meta);
+  GstBus *bus = gst_bus_new ();
+  GstElement *e;
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  e = new_infer (cfg);
+  h = harness_for (e, bus, RDS_BUF_COLOR_FORMAT_RGBA, 128, 64);
+  for (guint b = 0; b < 2; b++) {
+    GstBuffer *in = make_batch (RDS_BUF_COLOR_FORMAT_RGBA, 128, 64, 2, 2, 0), *out;
+    RdsObjectMeta *om[4];
+
+    /* FixtureFailDark tells the slots apart by their pixel value: 40 (dark) and 70 */
+    for (guint slot = 0; slot < 2; slot++) {
+      HostImage img;
+
+      snapshot (rds_buffer_get_surface (in), slot, &img);
+      g_assert_cmpuint (img.im.plane[0][0], ==, slot ? 70 : 40);
+      host_image_clear (&img);
+    }
+    for (guint i = 0; i < 4; i++)
+      om[i] = add_test_object (in, i / 2, 1, 0, 64 * (i % 2), 0, 64, 64);
+    g_assert_cmpint (gst_harness_push (h, in), ==, GST_FLOW_OK);
+    out = gst_harness_pull (h);
+    for (guint i = 0; i < 4; i++) {
+      g_assert_cmpuint (count_children (nth_frame (out, i / 2), om[i]), ==, i < 2 ? 0 : 2);
+      g_assert_true ((obj_tensor_meta (om[i]) != NULL) == tensor_meta);
+    }
+    gst_buffer_unref (out);
+  }
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "FixtureFailDark"));
+  g_assert_nonnull (strstr (texts, "an object of source 0, which gets no children"));
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
+  g_free (texts);
+  harness_teardown_with_bus (h, bus);
+  g_free (cfg);
+  g_free (name);
+}
+
+static void
+test_secondary_parser_false (void)
+{
+  run_parser_false (FALSE);
+}
+
+static void
+test_secondary_parser_false_tensor (void)
+{
+  run_parser_false (TRUE);
+}
+
+/* Pushes @n buffers of one 64x48 frame with @objects objects each through @h, dropping each output at once. */
+static void
+push_object_buffers (GstHarness * h, guint n, guint objects)
+{
+  for (guint b = 0; b < n; b++) {
+    g_assert_cmpint (gst_harness_push (h, batch_with_objects (1, &objects)), ==, GST_FLOW_OK);
+    gst_buffer_unref (gst_harness_pull (h));
+  }
+}
+
+/* The element's output sets: in use and free, and allocated and freed since start. */
+static void
+get_set_counts (GstElement * e, guint * n_sets, guint * n_free, guint64 * allocated, guint64 * freed)
+{
+  g_assert_true (hook_get_output_sets (e, n_sets, n_free));
+  g_assert_true (hook_get_output_set_totals (e, allocated, freed));
+}
+
+#define POOL_CONFIG "[property]\nonnx-file=scale2.onnx\ninfer-dims=3;16;16\nnetwork-type=100\nprocess-mode=2\n" \
+  "batch-size=1\n"
+
+/* Steady load never frees and reallocates: buffers of 20 objects at batch-size 1 (20 sets in use per buffer) keep
+ * the first buffer's 20 sets, reused by every later one. */
+static void
+test_secondary_pool_steady (void)
+{
+  gchar *cfg = write_file ("secondary-steady.txt", POOL_CONFIG);
+  GstElement *e;
+  GstHarness *h;
+  guint n_sets, n_free;
+  guint64 allocated, freed;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  load_hooks ();
+  e = new_infer (cfg);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 64, 48);
+  push_object_buffers (h, 1, 20);
+  get_set_counts (e, &n_sets, &n_free, &allocated, &freed);
+  g_assert_cmpuint (n_sets, ==, 20);
+  g_assert_cmpuint (n_free, ==, 20);
+  g_assert_cmpuint (allocated, ==, 20);
+  g_assert_cmpuint (freed, ==, 0);
+  /* past several windows of the recent peak: it stays at 20 */
+  push_object_buffers (h, 3 * RDS_INFER_OUTPUT_PEAK_WINDOW / 20 + 1, 20);
+  get_set_counts (e, &n_sets, &n_free, &allocated, &freed);
+  g_assert_cmpuint (n_sets, ==, 20);
+  g_assert_cmpuint (allocated, ==, 20);
+  g_assert_cmpuint (freed, ==, 0);
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* A spike is trimmed eventually: after one buffer of 30 objects at batch-size 1 (30 sets), the sets stay while the
+ * peak is recent (the next buffer reuses them), then buffers of 4 objects bring the pool back to
+ * RDS_INFER_OUTPUT_MAX_FREE once the spike is more than two windows of acquires old. */
+static void
+test_secondary_pool_trim (void)
+{
+  gchar *cfg = write_file ("secondary-trim.txt", POOL_CONFIG);
+  GstElement *e;
+  GstHarness *h;
+  GstBuffer *out;
+  guint n_sets, n_free;
+  guint64 allocated, freed;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  load_hooks ();
+  e = new_infer (cfg);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 64, 48);
+  g_assert_cmpint (gst_harness_push (h, batch_with_objects (1, (const guint[]) { 30 })), ==, GST_FLOW_OK);
+  out = gst_harness_pull (h);
+  get_set_counts (e, &n_sets, &n_free, &allocated, &freed);
+  g_assert_cmpuint (n_sets, ==, 30);
+  g_assert_cmpuint (n_free, ==, 0);
+  gst_buffer_unref (out);
+  get_set_counts (e, &n_sets, &n_free, &allocated, &freed);
+  g_assert_cmpuint (n_sets, ==, 30);
+  g_assert_cmpuint (n_free, ==, 30);
+  /* a recent peak: kept and reused */
+  push_object_buffers (h, 1, 30);
+  get_set_counts (e, &n_sets, &n_free, &allocated, &freed);
+  g_assert_cmpuint (allocated, ==, 30);
+  g_assert_cmpuint (freed, ==, 0);
+  /* two windows of small buffers: back to the cap, and the next small buffer allocates nothing */
+  push_object_buffers (h, 2 * RDS_INFER_OUTPUT_PEAK_WINDOW / 4 + 1, 4);
+  get_set_counts (e, &n_sets, &n_free, &allocated, &freed);
+  g_assert_cmpuint (n_sets, ==, RDS_INFER_OUTPUT_MAX_FREE);
+  g_assert_cmpuint (n_free, ==, RDS_INFER_OUTPUT_MAX_FREE);
+  g_assert_cmpuint (allocated, ==, 30);
+  g_assert_cmpuint (freed, ==, 30 - RDS_INFER_OUTPUT_MAX_FREE);
+  push_object_buffers (h, 1, 4);
+  get_set_counts (e, &n_sets, &n_free, &allocated, &freed);
+  g_assert_cmpuint (allocated, ==, 30);
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* A chunk that fails after earlier chunks attached (slot 1's surface has no valid format, so its preprocessing
+ * fails): an element error, the earlier objects keep their tensor meta, and every set is back in the pool once the
+ * buffer is gone. */
+static void
+test_secondary_chunk_failure (void)
+{
+  static const guint per_frame[] = { 2, 1 };
+  gchar *cfg = write_file ("secondary-fail-chunk.txt", "[property]\nonnx-file=scale2.onnx\ninfer-dims=3;16;16\n"
+      "network-type=100\nprocess-mode=2\nbatch-size=1\n"), *texts;
+  GstBus *bus = gst_bus_new ();
+  GstElement *e;
+  GstHarness *h;
+  GstBuffer *in;
+  RdsBufSurface *s;
+  RdsBufSurfaceColorFormat fmt;
+  GPtrArray *objs;
+  guint n_sets, n_free;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  load_hooks ();
+  e = new_infer (cfg);
+  h = harness_for (e, bus, RDS_BUF_COLOR_FORMAT_NV12, 64, 48);
+  in = batch_with_objects (2, per_frame);
+  s = rds_buffer_get_surface (in);
+  fmt = s->surfaceList[1].colorFormat;
+  s->surfaceList[1].colorFormat = RDS_BUF_COLOR_FORMAT_INVALID;
+  g_assert_cmpint (gst_harness_push (h, gst_buffer_ref (in)), ==, GST_FLOW_ERROR);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "Preprocessing failed"));
+  g_free (texts);
+  s->surfaceList[1].colorFormat = fmt;
+  objs = all_objects (in);
+  g_assert_nonnull (obj_tensor_meta (objs->pdata[0]));
+  g_assert_nonnull (obj_tensor_meta (objs->pdata[1]));
+  g_assert_null (obj_tensor_meta (objs->pdata[2]));
+  g_ptr_array_unref (objs);
+  g_assert_true (hook_get_output_sets (e, &n_sets, &n_free));
+  g_assert_cmpuint (n_sets, ==, 2);
+  g_assert_cmpuint (n_free, ==, 0);
+  gst_buffer_unref (in);
+  g_assert_true (hook_get_output_sets (e, &n_sets, &n_free));
+  g_assert_cmpuint (n_free, ==, n_sets);
+  harness_teardown_with_bus (h, bus);
+  g_free (cfg);
+}
+
 /* ---- gpu: concurrent metadata readers ---- */
 
 #define CONCURRENCY_BATCHES 500
@@ -1668,6 +2640,19 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer/frame-replacement-failure", test_frame_replacement_failure);
   g_test_add_func ("/gpu/infer/frame-replacement", test_frame_replacement);
   g_test_add_func ("/gpu/infer/concurrency", test_concurrency);
+  g_test_add_func ("/gpu/infer-secondary/tensor-crop", test_secondary_tensor_crop);
+  g_test_add_func ("/gpu/infer-secondary/chunks", test_secondary_chunks);
+  g_test_add_func ("/gpu/infer-secondary/selection", test_secondary_selection);
+  g_test_add_func ("/gpu/infer-secondary/detector-children", test_secondary_detector_children);
+  g_test_add_func ("/gpu/infer-secondary/object-removed", test_secondary_object_removed);
+  g_test_add_func ("/gpu/infer-secondary/object-replaced", test_secondary_object_replaced);
+  g_test_add_func ("/gpu/infer-secondary/frame-replaced", test_secondary_frame_replaced);
+  g_test_add_func ("/gpu/infer-secondary/parser-false", test_secondary_parser_false);
+  g_test_add_func ("/gpu/infer-secondary/parser-false-tensor", test_secondary_parser_false_tensor);
+  g_test_add_func ("/gpu/infer-secondary/pool-steady", test_secondary_pool_steady);
+  g_test_add_func ("/gpu/infer-secondary/pool-trim", test_secondary_pool_trim);
+  g_test_add_func ("/gpu/infer-secondary/chunk-failure", test_secondary_chunk_failure);
+  g_test_add_func ("/gpu/infer-secondary/roi-ignored", test_secondary_roi_ignored);
   ret = g_test_run ();
   if (dev_alloc)
     gst_object_unref (dev_alloc);

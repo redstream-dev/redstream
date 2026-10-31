@@ -15,8 +15,8 @@ tiler → OSD → display, `samples/rds-test3`). The libgstrds core is in place 
 metadata, events, read-only surface views, the `rds_buf_surf_transform` GPU transform and its many-to-one composite).
 The elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
 `rdsstreammux` (the default scaling mux: batches of fixed-size slots), `rdsstreamdemux` (zero-copy per-source
-views of the batch), `rdsinfer` (MIGraphX primary detector: nvinfer configs, custom bbox parsers, object and
-tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs),
+views of the batch), `rdsinfer` (MIGraphX primary and secondary detector: nvinfer configs, custom bbox parsers,
+object and tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs),
 `rdsmultistreamtiler` (batches into one tiled frame), `rdsosd` (boxes, text, lines, arrows, circles and the clock,
 drawn on the GPU by default or on the CPU, the same pixels, Pango for text), `rdslogger` (per-stream FPS lines),
 `rdsvideosink` (display through a stock GStreamer sink) and `rdsurisrcbin` (file and RTSP sources, with RTSP

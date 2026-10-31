@@ -1,5 +1,5 @@
-/* Redstream: rdsinfer, a primary detector on MIGraphX. Property names and config files follow DeepStream's public
- * nvinfer documentation.
+/* Redstream: rdsinfer, a primary or secondary detector on MIGraphX. Property names and config files follow
+ * DeepStream's public nvinfer documentation.
  *
  * An in-place GstBaseTransform in passthrough mode on rdsstreammux batches: buffers go downstream unchanged, with
  * object meta (detectors) and tensor meta added to their RdsBatchMeta. Pixels are never written.
@@ -7,16 +7,25 @@
  *   wins over the file, also when set to its default value), and builds or loads the engine, synchronously. Any
  *   error fails the state change with a message naming the file (or the property), the key and the value.
  * - Per batch, one at a time on the element's own non-blocking stream: the frame list is read under the meta lock
- *   into inference units, each a source rect of a frame's slot (primary mode: one per frame, the whole slot, into
- *   image frame_meta->batch_id). Units run in chunks of at most batch-size: without the lock, the preprocessing
- *   kernel writes each unit's image of the network input and the chunk's unused images are zeroed, the engine runs
- *   (always batch-size images), the outputs are copied to pinned host memory of the chunk's output set and the
- *   stream is synchronized once; the parser and the post-processing run on the CPU, and the meta lock is taken again
- *   to add the chunk's objects and tensor meta. Primary mode is one chunk per batch. Inferred frames get
- *   bInferDone.
- * - interval N: one batch is inferred, the next N pass untouched (bInferDone FALSE); the count restarts at start
- *   and after a flush.
- * - Output buffers are refcounted sets (rds-infer-output.h) that tensor metas keep alive, also in demuxed copies.
+ *   into inference units, each a source rect of a frame's slot with its letterbox:
+ *   - primary mode: one per frame, the whole slot, into image frame_meta->batch_id; one chunk per batch;
+ *   - secondary mode (process-mode=2): one per selected object with a non-empty crop (rds-infer-units.h), in frame
+ *     list order, then object list order, in chunks of batch-size that continue across the frames of a batch, unit
+ *     i of a chunk into image i (DeepStream 8.0 behaviour). No hard limit: the unit array is reused and grows.
+ *   Units run in chunks of at most batch-size: without the lock, the preprocessing kernel writes each unit's image
+ *   of the network input and the chunk's unused images are zeroed, the engine runs (always batch-size images), the
+ *   outputs are copied to pinned host memory of the chunk's output set and the stream is synchronized once; the
+ *   parser and the post-processing run on the CPU, and the meta lock is taken again to add the chunk's results,
+ *   which go to frames that are still there (and in secondary mode objects: RdsMetaRef). Inferred frames get
+ *   bInferDone in primary mode; secondary mode doesn't touch it (DeepStream 8.0 behaviour), and attaches to the
+ *   object: its tensor meta, and a detector's children with the object as parent.
+ * - interval N (primary mode): one batch is inferred, the next N pass untouched (bInferDone FALSE); the count
+ *   restarts at start and after a flush. Secondary mode infers every batch (DeepStream 8.0 behaviour).
+ * - Output buffers are refcounted sets (rds-infer-output.h) that tensor metas keep alive, also in demuxed copies:
+ *   one set per chunk, so with tensor meta a secondary batch holds one set per batch-size objects while its metas
+ *   live. The pool reuses free sets and keeps as many as the recent peak in use, at least
+ *   RDS_INFER_OUTPUT_MAX_FREE (rds-infer-output.h): the rest are freed when a set is released (on whichever thread
+ *   drops the last meta).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsinfer.h"
 #include "rds-infer-config.h"
@@ -25,6 +34,7 @@
 #include "rds-infer-parse.h"
 #include "rds-infer-post.h"
 #include "rds-infer-preprocess.h"
+#include "rds-infer-units.h"
 #include "rds-object-style.h"
 
 #include <rds/rds.h>
@@ -90,10 +100,10 @@ typedef struct
   RdsMetaRef frame;             /* resolved under the batch lock before use */
   RdsMetaRef obj;               /* the object it crops; unused (zeroed) in primary mode */
   guint source_id, slot;
-  RdsBufSurfTransformRect src;  /* in slot pixels; primary mode: the whole slot */
+  RdsBufSurfTransformRect src;  /* in slot pixels; primary mode: the whole slot, secondary mode: the object's crop */
   guint image;                  /* in the chunk's network input and output set; primary mode: the slot */
-  RdsInferLetterbox lb;         /* for src's size */
-  guint det_start, n_dets;      /* in self->dets */
+  RdsInferLetterbox lb;         /* for src's size (secondary mode: rds_infer_crop_letterbox) */
+  guint det_start, n_dets;      /* in self->dets; secondary mode: in frame pixels */
 } InferUnit;
 
 struct _GstRdsInfer
@@ -126,6 +136,7 @@ struct _GstRdsInfer
   guint batch_count;            /* batches seen since start or the last flush */
   guint64 unit_count;           /* units inferred since start */
   guint warned;                 /* WarnOnce */
+  gboolean secondary;           /* process-mode=2 */
   GArray *units;                /* InferUnit, the current batch's */
   GArray *objects;              /* RdsInferObjectDetectionInfo, one frame's parser output */
   GArray *dets;                 /* RdsInferDetection, every frame's */
@@ -188,6 +199,18 @@ parse_id_list (const gchar * s, const gchar * sep, gint64 min, gint64 max, GArra
   }
   g_strfreev (items);
   return ok;
+}
+
+/* What secondary mode ignores, after the config warned about it: interval (DeepStream 8.0 behaviour) and the ROI
+ * offsets, which postprocessing would apply from a crop's top and bottom edges (ours). */
+static void
+ignore_in_secondary_mode (RdsInferConfig * cfg)
+{
+  cfg->interval = 0;
+  for (guint i = 0; i < cfg->num_detected_classes; i++) {
+    cfg->class_attrs[i].roi_top_offset = 0;
+    cfg->class_attrs[i].roi_bottom_offset = 0;
+  }
 }
 
 /* What start would run with: the config file with the explicitly set properties applied and validated. Property
@@ -316,6 +339,9 @@ configure (GstRdsInfer * self, GError ** error)
     g_ptr_array_add (cfg->warnings, g_strdup ("element properties raw-output-file-write and "
             "raw-output-generated-callback: ignored: raw output dumps are not implemented"));
   }
+  /* after the warnings about them: the config start runs with, and the test hook reports */
+  if (cfg->process_mode == 2)
+    ignore_in_secondary_mode (cfg);
   goto out;
 
 fail:
@@ -555,17 +581,11 @@ gst_rds_infer_start (GstBaseTransform * trans)
     g_error_free (err);
     return FALSE;
   }
-  /* the config accepts secondary mode; the element doesn't run it yet */
-  if (self->cfg->process_mode == 2) {
-    gchar *where;
-
-    GST_OBJECT_LOCK (self);
-    where = self->set_mask & PROP_BIT (PROP_PROCESS_MODE) ? g_strdup ("element property ")
-        : g_strconcat (self->cfg->config_path, ":", NULL);
-    GST_OBJECT_UNLOCK (self);
+  /* the config accepts classifiers (in secondary mode, which check_mode made sure of); the element doesn't run them
+   * yet. network-type comes from the file only. */
+  if (self->cfg->network_type == 1) {
     g_set_error (&err, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_UNSUPPORTED,
-        "%sprocess-mode: 2: secondary inference is not implemented yet", where);
-    g_free (where);
+        "%s:network-type: 1: classifiers are not implemented yet", self->cfg->config_path);
     post_config_error (self, err);
     g_error_free (err);
     release_resources (self);
@@ -574,6 +594,7 @@ gst_rds_infer_start (GstBaseTransform * trans)
   for (guint i = 0; i < self->cfg->warnings->len; i++)
     GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("%s", (const gchar *) g_ptr_array_index (self->cfg->warnings,
                 i)), (NULL));
+  self->secondary = self->cfg->process_mode == 2;
   GST_OBJECT_LOCK (self);
   if (self->raw_output_file_write || self->raw_output_generated_callback)
     self->warned |= WARN_RAW_OUTPUT;
@@ -658,12 +679,13 @@ warn_once (GstRdsInfer * self, WarnOnce what, const gchar * msg)
   }
 }
 
-/* Reads the frame list (under the meta lock) into self->units, one unit per frame (the whole slot, as image
- * batch_id), and self->slot_used; FALSE with an element error on a bad batch. */
+/* Primary mode: reads the frame list (under the meta lock) into self->units, one unit per frame (the whole slot, as
+ * image batch_id), and self->slot_used; FALSE with an element error on a bad batch. */
 static gboolean
 snapshot_frames (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf)
 {
-  guint batch = self->cfg->batch_size;
+  RdsInferConfig *cfg = self->cfg;
+  guint batch = cfg->batch_size;
   gboolean ok = TRUE;
 
   g_array_set_size (self->units, 0);
@@ -687,15 +709,80 @@ snapshot_frames (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * su
     self->slot_used[fm->batch_id] = TRUE;
     unit.src.width = surf->surfaceList[fm->batch_id].width;
     unit.src.height = surf->surfaceList[fm->batch_id].height;
+    rds_infer_letterbox (self->net.width, self->net.height, unit.src.width, unit.src.height,
+        cfg->maintain_aspect_ratio, cfg->symmetric_padding, &unit.lb);
     g_array_append_val (self->units, unit);
   }
   rds_release_meta_lock (bm);
   return ok;
 }
 
-/* Parser and post-processing of the units @first .. @first + @n - 1 (a chunk), on the host outputs of its @set. */
+/* Secondary mode: reads the objects of every frame (under the meta lock) into self->units, one unit per selected
+ * object (rds_infer_object_selected) whose crop isn't empty (rds_infer_crop_rect), in frame list order, then object
+ * list order (DeepStream 8.0 behaviour). Every frame is read, bInferDone or not. Unit i goes into image
+ * i % batch-size: the units run in chunks of batch-size in this order. FALSE with an element error on a bad
+ * batch. */
+static gboolean
+snapshot_objects (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf)
+{
+  RdsInferConfig *cfg = self->cfg;
+  gboolean ok = TRUE;
+
+  g_array_set_size (self->units, 0);
+  rds_acquire_meta_lock (bm);
+  for (GList * l = bm->frame_meta_list; l; l = l->next) {
+    RdsFrameMeta *fm = l->data;
+    const RdsBufSurfaceParams *sp;
+
+    if (fm->batch_id >= surf->batchSize) {
+      ok = FALSE;
+      GST_ELEMENT_ERROR (self, STREAM, FORMAT, ("Frame in batch slot %u, but the batch has %u slots", fm->batch_id,
+              surf->batchSize), (NULL));
+      break;
+    }
+    sp = &surf->surfaceList[fm->batch_id];
+    for (GList * o = fm->obj_meta_list; o; o = o->next) {
+      RdsObjectMeta *om = o->data;
+      const RdsOSD_RectParams *r = &om->rect_params;
+      InferUnit unit = {.source_id = fm->source_id,.slot = fm->batch_id };
+
+      if (!rds_infer_object_selected (cfg, om->unique_component_id, om->class_id, r->width, r->height))
+        continue;
+      if (!rds_infer_crop_rect (r->left, r->top, r->width, r->height, sp->width, sp->height, &unit.src)) {
+        GST_DEBUG_OBJECT (self, "source %u frame %d: object at (%g, %g) %gx%g has an empty crop in %ux%u, skipped",
+            fm->source_id, fm->frame_num, r->left, r->top, r->width, r->height, sp->width, sp->height);
+        continue;
+      }
+      unit.frame = rds_meta_ref (fm);
+      unit.obj = rds_meta_ref (om);
+      unit.image = self->units->len % cfg->batch_size;
+      rds_infer_crop_letterbox (self->net.width, self->net.height, unit.src.width, unit.src.height,
+          cfg->maintain_aspect_ratio, cfg->symmetric_padding, &unit.lb);
+      g_array_append_val (self->units, unit);
+    }
+  }
+  rds_release_meta_lock (bm);
+  return ok;
+}
+
+/* Secondary mode: @unit's detections (the last ones in self->dets, in crop pixels) to frame pixels in its @sp-sized
+ * slot (rds_infer_map_child), dropping those left empty. */
 static void
-parse_units (GstRdsInfer * self, RdsInferOutputSet * set, guint first, guint n)
+map_children (GstRdsInfer * self, const InferUnit * unit, const RdsBufSurfaceParams * sp)
+{
+  guint kept = unit->det_start;
+
+  for (guint i = unit->det_start; i < self->dets->len; i++)
+    if (rds_infer_map_child (&unit->src, sp->width, sp->height, &g_array_index (self->dets, RdsInferDetection, i),
+            &g_array_index (self->dets, RdsInferDetection, kept)))
+      kept++;
+  g_array_set_size (self->dets, kept);
+}
+
+/* Parser and post-processing of the units @first .. @first + @n - 1 (a chunk), on the host outputs of its @set; in
+ * secondary mode per crop (thresholds and NMS within the crop), then to frame pixels. */
+static void
+parse_units (GstRdsInfer * self, const RdsBufSurface * surf, RdsInferOutputSet * set, guint first, guint n)
 {
   RdsInferConfig *cfg = self->cfg;
 
@@ -714,9 +801,11 @@ parse_units (GstRdsInfer * self, RdsInferOutputSet * set, guint first, guint n)
       self->layers[i].deviceBuffer = set->dev[i] + offset;
     }
     g_array_set_size (self->objects, 0);
+    /* only this unit loses its objects (ours in secondary mode, where DeepStream 8.0 crashes) */
     if (!rds_infer_parser_parse (self->parser, self->layers, self->n_outputs, &self->net, self->objects, &err)) {
-      gchar *msg = g_strdup_printf ("Parser %s failed on a frame of source %u, which gets no objects: %s",
-          rds_infer_parser_get_func_name (self->parser), unit->source_id, err->message);
+      gchar *msg = g_strdup_printf ("Parser %s failed on %s of source %u, which gets no %s: %s",
+          rds_infer_parser_get_func_name (self->parser), self->secondary ? "an object" : "a frame", unit->source_id,
+          self->secondary ? "children" : "objects", err->message);
 
       warn_once (self, WARN_PARSE, msg);
       g_free (msg);
@@ -731,12 +820,17 @@ parse_units (GstRdsInfer * self, RdsInferOutputSet * set, guint first, guint n)
     if (flags & RDS_INFER_POST_ROTATED)
       warn_once (self, WARN_POST_ROTATED, "The parser returned objects with a rotation_angle; oriented boxes are "
           "not supported, the angle is ignored");
+    if (self->secondary)
+      map_children (self, unit, &surf->surfaceList[unit->slot]);
     unit->n_dets = self->dets->len - unit->det_start;
   }
 }
 
+/* @parent: the object a secondary detector cropped, NULL in primary mode. The child is appended (ours, as everywhere
+ * in our metadata library; DeepStream 8.0 prepends). */
 static void
-add_object (GstRdsInfer * self, RdsBatchMeta * bm, RdsFrameMeta * fm, const RdsInferDetection * d)
+add_object (GstRdsInfer * self, RdsBatchMeta * bm, RdsFrameMeta * fm, const RdsInferDetection * d,
+    RdsObjectMeta * parent)
 {
   RdsObjectMeta *om = rds_acquire_obj_meta_from_pool (bm);
   const gchar *label = self->cfg->labels[d->class_id];
@@ -757,13 +851,28 @@ add_object (GstRdsInfer * self, RdsBatchMeta * bm, RdsFrameMeta * fm, const RdsI
   rds_object_meta_set_drawing_defaults (om);
   g_strlcpy (om->obj_label, label, sizeof (om->obj_label));
   tp->display_text = g_strdup (label);
-  rds_add_obj_meta_to_frame (fm, om, NULL);
+  rds_add_obj_meta_to_frame (fm, om, parent);
+}
+
+/* A tensor meta for image @image of @set, in a user meta from @bm's pool. */
+static RdsUserMeta *
+new_tensor_user_meta (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set, guint image)
+{
+  RdsInferConfig *cfg = self->cfg;
+  RdsUserMeta *um = rds_acquire_user_meta_from_pool (bm);
+
+  um->user_meta_data = rds_infer_tensor_meta_new (set, image, cfg->gie_unique_id, &self->net,
+      cfg->maintain_aspect_ratio, cfg->symmetric_padding);
+  um->base_meta.meta_type = RDS_INFER_TENSOR_OUTPUT_META;
+  um->base_meta.copy_func = rds_infer_tensor_meta_copy;
+  um->base_meta.release_func = rds_infer_tensor_meta_release;
+  return um;
 }
 
 /* The results of the units @first .. @first + @n - 1 (a chunk); their tensor metas hold a ref on the chunk's @set
- * and name their image in it. In primary mode the unit is the frame: objects, tensor meta and bInferDone per frame. */
+ * and name their image in it. Primary mode: the unit is the frame: objects, tensor meta and bInferDone per frame. */
 static void
-attach_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set, guint first, guint n)
+attach_frame_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set, guint first, guint n)
 {
   RdsInferConfig *cfg = self->cfg;
   gboolean tensor_meta = cfg->output_tensor_meta || cfg->network_type == 100;
@@ -778,21 +887,49 @@ attach_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set, 
       continue;
     if (cfg->network_type == 0) {
       for (guint i = 0; i < unit->n_dets; i++)
-        add_object (self, bm, fm, &g_array_index (self->dets, RdsInferDetection, unit->det_start + i));
+        add_object (self, bm, fm, &g_array_index (self->dets, RdsInferDetection, unit->det_start + i), NULL);
       GST_DEBUG_OBJECT (self, "source %u frame %d: %u objects", fm->source_id, fm->frame_num,
           unit->n_dets);
     }
-    if (tensor_meta) {
-      RdsUserMeta *um = rds_acquire_user_meta_from_pool (bm);
-
-      um->user_meta_data = rds_infer_tensor_meta_new (set, unit->image, cfg->gie_unique_id, &self->net,
-          cfg->maintain_aspect_ratio, cfg->symmetric_padding);
-      um->base_meta.meta_type = RDS_INFER_TENSOR_OUTPUT_META;
-      um->base_meta.copy_func = rds_infer_tensor_meta_copy;
-      um->base_meta.release_func = rds_infer_tensor_meta_release;
-      rds_add_user_meta_to_frame (fm, um);
-    }
+    if (tensor_meta)
+      rds_add_user_meta_to_frame (fm, new_tensor_user_meta (self, bm, set, unit->image));
     fm->bInferDone = TRUE;
+  }
+  rds_release_meta_lock (bm);
+}
+
+/* Secondary mode: the results of a chunk go to the unit's object (DeepStream 8.0 behaviour): its tensor meta in the
+ * object's obj_user_meta_list (detectors included), a detector's children to the frame with the object as parent.
+ * bInferDone is left alone (DeepStream 8.0 behaviour). A frame or object removed while the lock was released gets
+ * nothing, even when the pool reused its address. */
+static void
+attach_object_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set, guint first, guint n)
+{
+  RdsInferConfig *cfg = self->cfg;
+  gboolean tensor_meta = cfg->output_tensor_meta || cfg->network_type == 100;
+  RdsMetaRef frame = { 0 };
+  RdsFrameMeta *fm = NULL;
+
+  rds_acquire_meta_lock (bm);
+  for (guint u = first; u < first + n; u++) {
+    InferUnit *unit = &g_array_index (self->units, InferUnit, u);
+    RdsObjectMeta *om;
+
+    /* consecutive units of a frame resolve it once: the lock is held throughout */
+    if (unit->frame.meta != frame.meta || unit->frame.generation != frame.generation) {
+      frame = unit->frame;
+      fm = rds_meta_ref_resolve (bm->frame_meta_list, &unit->frame);
+    }
+    om = fm ? rds_meta_ref_resolve (fm->obj_meta_list, &unit->obj) : NULL;
+    if (!om) {
+      GST_DEBUG_OBJECT (self, "source %u: the %s of a unit is gone, its results are dropped", unit->source_id,
+          fm ? "object" : "frame");
+      continue;
+    }
+    for (guint i = 0; i < unit->n_dets; i++)
+      add_object (self, bm, fm, &g_array_index (self->dets, RdsInferDetection, unit->det_start + i), om);
+    if (tensor_meta)
+      rds_add_user_meta_to_obj (om, new_tensor_user_meta (self, bm, set, unit->image));
   }
   rds_release_meta_lock (bm);
 }
@@ -817,8 +954,6 @@ infer_chunk (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf, 
 
     g_assert (unit->image < cfg->batch_size && !self->image_used[unit->image]);
     self->image_used[unit->image] = TRUE;
-    rds_infer_letterbox (self->net.width, self->net.height, unit->src.width, unit->src.height,
-        cfg->maintain_aspect_ratio, cfg->symmetric_padding, &unit->lb);
     (void) rds_infer_preprocess_job_set_source (&pj, sp, &unit->src, &unit->lb);
     pj.channels = self->channels;
     pj.color = cfg->model_color_format;
@@ -858,8 +993,11 @@ infer_chunk (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf, 
 
   /* 3. parsing on the CPU, then the metadata under the lock */
   if (cfg->network_type == 0)
-    parse_units (self, set, first, n);
-  attach_results (self, bm, set, first, n);
+    parse_units (self, surf, set, first, n);
+  if (self->secondary)
+    attach_object_results (self, bm, set, first, n);
+  else
+    attach_frame_results (self, bm, set, first, n);
   self->unit_count += n;
   rds_infer_output_set_unref (set);
   return TRUE;
@@ -880,6 +1018,7 @@ gst_rds_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
   RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (buf);
   RdsBufSurface *surf = rds_buffer_get_surface (buf);
   gint64 t0 = 0;
+  gboolean ok;
 
   if (!bm || !surf) {
     GST_ELEMENT_ERROR (self, STREAM, FORMAT, ("rdsinfer needs batches from rdsstreammux"),
@@ -895,10 +1034,11 @@ gst_rds_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
         ("memory type %d on GPU %u", surf->memType, surf->gpuId));
     return GST_FLOW_ERROR;
   }
-  if (!snapshot_frames (self, bm, surf))
+  ok = self->secondary ? snapshot_objects (self, bm, surf) : snapshot_frames (self, bm, surf);
+  if (!ok)
     return GST_FLOW_ERROR;
   if (self->units->len == 0) {
-    GST_LOG_OBJECT (self, "batch without frames");
+    GST_LOG_OBJECT (self, "batch without %s", self->secondary ? "objects to infer on" : "frames");
     return GST_FLOW_OK;
   }
   if (gst_debug_category_get_threshold (GST_CAT_DEFAULT) >= GST_LEVEL_DEBUG)
@@ -910,7 +1050,8 @@ gst_rds_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("GPU %u is not available", self->gpu), (NULL));
     return GST_FLOW_ERROR;
   }
-  /* primary mode has at most batch-size units (one per slot): one chunk */
+  /* primary mode has at most batch-size units (one per slot): one chunk; secondary mode never chunks across
+   * buffers (DeepStream 8.0 behaviour) */
   for (guint first = 0; first < self->units->len; first += cfg->batch_size)
     if (!infer_chunk (self, bm, surf, first, MIN (cfg->batch_size, self->units->len - first)))
       return GST_FLOW_ERROR;
@@ -929,6 +1070,17 @@ rds_infer_test_get_output_sets (GstElement * element, guint * n_sets, guint * n_
   if (!self->outputs)
     return FALSE;
   rds_infer_output_pool_get_counts (self->outputs, n_sets, n_free);
+  return TRUE;
+}
+
+gboolean
+rds_infer_test_get_output_set_totals (GstElement * element, guint64 * allocated, guint64 * freed)
+{
+  GstRdsInfer *self = GST_RDS_INFER (element);
+
+  if (!self->outputs)
+    return FALSE;
+  rds_infer_output_pool_get_totals (self->outputs, allocated, freed);
   return TRUE;
 }
 
@@ -1141,7 +1293,8 @@ gst_rds_infer_class_init (GstRdsInferClass * klass)
           DEFAULT_UNIQUE_ID, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_PROCESS_MODE,
       g_param_spec_uint ("process-mode", "Process mode",
-          "1: primary (whole frames), 2: secondary (objects; not implemented yet, fails at start)", 1, 2,
+          "1: primary (whole frames), 2: secondary (the objects upstream elements found; classifiers are not "
+          "implemented yet and fail at start)", 1, 2,
           DEFAULT_PROCESS_MODE, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_INFER_ON_GIE_ID,
       g_param_spec_int ("infer-on-gie-id", "Infer on GIE ID",
@@ -1159,7 +1312,8 @@ gst_rds_infer_class_init (GstRdsInferClass * klass)
           "Compiled MIGraphX program (.mxr) to load if it matches the model; used as given, not relative to the "
           "config file", NULL, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_BATCH_SIZE,
-      g_param_spec_uint ("batch-size", "Batch size", "Frames inferred together", 1, RDS_INFER_MAX_BATCH_SIZE,
+      g_param_spec_uint ("batch-size", "Batch size", "Frames (primary mode) or objects (secondary mode) inferred "
+          "together", 1, RDS_INFER_MAX_BATCH_SIZE,
           DEFAULT_BATCH_SIZE, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_INTERVAL,
       g_param_spec_int ("interval", "Interval", "Batches skipped after each inferred batch", 0,
@@ -1169,7 +1323,8 @@ gst_rds_infer_class_init (GstRdsInferClass * klass)
           PFLAGS));
   g_object_class_install_property (gobject_class, PROP_OUTPUT_TENSOR_META,
       g_param_spec_boolean ("output-tensor-meta", "Output tensor meta",
-          "Attach the output tensors to each frame as RdsInferTensorMeta user meta", FALSE, PFLAGS));
+          "Attach the output tensors to each frame (primary mode) or object (secondary mode) as "
+          "RdsInferTensorMeta user meta", FALSE, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_RAW_OUTPUT_FILE_WRITE,
       g_param_spec_boolean ("raw-output-file-write", "Raw output file write",
           "Not implemented: accepted with a warning", FALSE, PFLAGS));

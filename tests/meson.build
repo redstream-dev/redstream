@@ -217,9 +217,10 @@ if rds_infer_enabled
     depends : [infer_parser_fixture, infer_parser_hidden, infer_parser_noabi, infer_parser_badabi,
       infer_parser_depabi, infer_compat_only])
 
-  # The element: properties and config overrides (cpu), then the scale2 model and the fixture parser (gpu). It
-  # links rdsinfer-core only for the config key table (no GTypes in it) and finds the plugin's test hooks with
-  # GModule. Programs are compiled into the build directory (element-infer/).
+  # The element: properties and config overrides (cpu), then the scale2 model and the fixture parser (gpu), and
+  # secondary mode (gpu, its own entry; fixeddet too). It links rdsinfer-core only for the config key table (no GTypes
+  # in it) and finds the plugin's test hooks with GModule. Programs are compiled into the build directory
+  # (element-infer/).
   element_infer_exe = executable('element_infer', 'check' / 'element_infer.c',
     dependencies : test_deps + [rdsinfer_core_dep, gst_app_dep, gst_video_dep, dependency('gmodule-2.0'),
       cc.find_library('m', required : false)],
@@ -232,6 +233,9 @@ if rds_infer_enabled
   test('element_infer_cpu', element_infer_exe, args : ['-p', '/cpu/infer'],
     suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
   test('element_infer', element_infer_exe, args : ['-p', '/gpu/infer'],
+    suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300,
+    depends : rds_plugins + [infer_parser_fixture])
+  test('element_infer_secondary', element_infer_exe, args : ['-p', '/gpu/infer-secondary'],
     suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300,
     depends : rds_plugins + [infer_parser_fixture])
 

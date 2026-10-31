@@ -1,6 +1,7 @@
 /* Test parser module, written the way a DeepStream bbox parser is: only the NvDsInfer* names and
  * CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE, through rds/rds_compat_infer.h (built with -DUSE_REDSTREAM). Not installed.
- * FixtureBoxes returns the boxes in infer-parser-fixture.h, FixtureThrow throws, FixtureFail returns false.
+ * FixtureBoxes returns the boxes in infer-parser-fixture.h, FixtureThrow throws, FixtureFail returns false,
+ * FixtureFailDark returns false for dark images only.
  * FixtureVisible (in the second file) is FixtureBoxes marked with default visibility, for the build of these
  * sources with -fvisibility=hidden.
  * The box table lives in a second translation unit (infer-parser-fixture-boxes.cpp), which includes the parser
@@ -65,9 +66,25 @@ FixtureFail (std::vector<NvDsInferLayerInfo> const &outputLayersInfo, NvDsInferN
   return false;
 }
 
+/* FixtureBoxes for a bright image, false for a dark one: the first value of output layer 0 below 100 (scale2 doubles
+ * its input, so a pixel value below 50 with net-scale-factor 1 and no offsets). */
+extern "C" bool FixtureFailDark (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, NvDsInferParseDetectionParams const &detectionParams,
+    std::vector<NvDsInferParseObjectInfo> &objectList);
+
+extern "C" bool
+FixtureFailDark (std::vector<NvDsInferLayerInfo> const &outputLayersInfo, NvDsInferNetworkInfo const &networkInfo,
+    NvDsInferParseDetectionParams const &detectionParams, std::vector<NvDsInferParseObjectInfo> &objectList)
+{
+  if (outputLayersInfo.empty () || static_cast<const float *> (outputLayersInfo[0].buffer)[0] < 100.0f)
+    return false;
+  return FixtureBoxes (outputLayersInfo, networkInfo, detectionParams, objectList);
+}
+
 CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE (FixtureBoxes);
 CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE (FixtureThrow);
 CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE (FixtureFail);
+CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE (FixtureFailDark);
 
 /* A parser-side barrier makes frame replacement happen strictly after the snapshot and before attachment.
  * Controls live in this test module; no synchronization hooks are needed in the element. */
