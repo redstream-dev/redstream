@@ -549,13 +549,13 @@ is set.
 |---|---|---|---|---|
 | `config-file-path` | string | none | supported | required; `.yml`/`.yaml` is read as YAML, anything else as a key file |
 | `unique-id` | uint | `1` (ours) | supported | overrides `gie-unique-id`; range 0..`G_MAXUINT` as documented (the config key starts at 1) |
-| `process-mode` | uint | `1` | supported | `1` only; `2` (secondary) fails at start naming the property |
-| `infer-on-gie-id` | uint | `0` | accepted no-op | secondary mode only; a warning when set |
-| `infer-on-class-ids` | string | none | accepted no-op | secondary mode only: colon-separated class ids (`1:2:4`, `-1` allowed), checked at start, then ignored with a warning |
+| `process-mode` | uint | `1` | supported | overrides `process-mode`; `2` (secondary) is checked with the config, then fails at start (secondary inference is not implemented yet) |
+| `infer-on-gie-id` | int | `-1` | supported | -1..`G_MAXINT` (DeepStream 8.0's type and default: -1 is every GIE); overrides `operate-on-gie-id`; a warning when set in primary mode |
+| `infer-on-class-ids` | string | none | supported | colon-separated class ids (`1:2:4`; `-1` in it: every class, ours); overrides `operate-on-class-ids`; a warning when set in primary mode |
 | `filter-out-class-ids` | string | none | supported | semicolon-separated class ids (`1;2`); replaces the file's list (an empty string clears it) |
 | `model-engine-file` | string | none | supported | a compiled MIGraphX program (`.mxr`), loaded when its manifest matches the model and the device, else rebuilt into the cache name; used as given (a config-file value is relative to the config file). A TensorRT `.engine` is ignored with a warning. Changing it while PLAYING (on-the-fly model update) is not supported |
 | `batch-size` | uint | `1` (ours) | supported | 1..1024. Frames of a batch go to the network image of their slot (`batch_id`); a frame in a slot at or above `batch-size` is an error |
-| `interval` | int | `0` (ours) | supported | 0..32: infer one batch, skip the next `interval` (they pass with `bInferDone` FALSE and no objects); the count restarts at start and after a flush (ours) |
+| `interval` | int | `0` (ours) | supported | 0..32: infer one batch, skip the next `interval` (they pass with `bInferDone` FALSE and no objects); the count restarts at start and after a flush (ours); ignored in secondary mode, with a warning (DeepStream 8.0 behaviour) |
 | `gpu-id` | uint | `0` | supported | the GPU for preprocessing and inference; the batch must be in GPU memory on it |
 | `output-tensor-meta` | boolean | `FALSE` | supported | one `RdsInferTensorMeta` per inferred frame (also always with `network-type=100`), see "Tensor output meta" |
 | `raw-output-file-write` | boolean | `FALSE` | accepted no-op | not implemented; a warning (once per element) when set |
@@ -628,6 +628,15 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 - Label file (`labelfile-path`): one label per line, or all of them on one `;`-separated line; whitespace, CRs and
   trailing blank lines are ignored. Fewer labels than classes is a warning (the rest get empty labels), and so are
   more (the extra ones are ignored).
+- A classifier's label file (`network-type=1`) has another form (DeepStream 8.0 behaviour): line i has the labels of
+  output layer i, `;`-separated and not trimmed; one trailing `;` on a line is ignored (`a;b;` is `a`, `b`), an empty
+  label elsewhere is kept (`a;;b`), and an empty line is a layer without labels. Only the CR of a CRLF line end and
+  trailing blank lines are left out.
+  Without `labelfile-path`, a warning: the classifier output gets empty labels (ours).
+- Keys the mode or the network type doesn't use are a warning when set to something other than their default: the
+  secondary-mode keys (`operate-on-*`, `input-object-*`, `secondary-reinfer-interval`, `classifier-async-mode`) in
+  primary mode, the classifier keys outside classifiers, and `interval` in secondary mode (DeepStream 8.0 behaviour:
+  it is ignored there).
 
 #### Config keys: `[property]`
 
@@ -640,8 +649,8 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `output-blob-names` | string list | none |  | accepted no-op | all outputs are passed to the parser and to the tensor meta |
 | `batch-size` | uint | `1` (ours) | 1..1024 | supported | the program is compiled for this batch size; the model's batch dimension must be symbolic or equal to it |
 | `network-mode` | int | `0` (ours) | 0..3 | supported | accepted values: 0, 2 (FP32, FP16; inputs and outputs stay FP32). INT8 (1) and BEST (3) fail at start |
-| `network-type` | int | `0` (ours) | 0..100 | supported | accepted values: 0, 100 (detector; no post-processing, tensor meta only). Classifiers (1) and segmentation (2, 3) fail at start |
-| `process-mode` | int | `1` (ours) | 1..2 | supported | accepted values: 1 (primary); secondary mode (2) fails at start |
+| `network-type` | int | `0` (ours) | 0..100 | supported | accepted values: 0, 1, 100 (detector; classifier, in secondary mode only; no post-processing, tensor meta only). A classifier in primary mode and segmentation (2, 3) fail at start |
+| `process-mode` | int | `1` (ours) | 1..2 | supported | 1 primary, 2 secondary (the config is checked; the element doesn't run secondary inference yet and fails at start) |
 | `gie-unique-id` | uint | `1` (ours) | >= 1 | supported | the objects' `unique_component_id` and the tensor meta's `unique_id` |
 | `interval` | uint | `0` (ours) | 0..32 | supported | as the property |
 | `output-tensor-meta` | bool | `0` (ours) |  | supported | as the property |
@@ -657,6 +666,17 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `parse-bbox-func-name` | string | none |  | supported | required for detectors: `RdsInferParseYolo` (built in) or a function in `custom-lib-path` |
 | `custom-lib-path` | path | none |  | supported | a parser library, see "nvinfer custom parser ABI"; relative to the config file's directory, a bare name too |
 | `filter-out-class-ids` | uint list | none | >= 0 | supported | objects of these classes are dropped |
+| `operate-on-gie-id` | int | `-1` (ours) | >= -1 | supported | secondary mode: infer on the objects of this GIE; -1 or unset: every GIE, this element's own id included (DeepStream 8.0 behaviour); 0 is a real id |
+| `operate-on-class-ids` | int list | none | >= -1 | supported | secondary mode: infer on objects of these classes; unset: every class; a `-1` in the list: every class (ours) |
+| `input-object-min-width` | uint | none | >= 0 | supported | secondary mode: objects narrower are skipped; inclusive, 0: no limit (DeepStream 8.0 behaviour); above a set `input-object-max-width` is an error |
+| `input-object-min-height` | uint | none | >= 0 | supported | secondary mode: as `input-object-min-width`, for the height |
+| `input-object-max-width` | uint | none | >= 0 | supported | secondary mode: objects wider are skipped; inclusive, 0: no limit (DeepStream 8.0 behaviour) |
+| `input-object-max-height` | uint | none | >= 0 | supported | secondary mode: as `input-object-max-width`, for the height |
+| `secondary-reinfer-interval` | int | `-1` (ours) | >= -1 | supported | secondary mode: unset (-1) never reinfers an object, 0 every frame, N every N + 1 frames (DeepStream 8.0 behaviour) |
+| `classifier-threshold` | float | `0` (ours) | >= 0 | supported | classifiers: a label needs a probability strictly above it; unset: 0 (DeepStream 8.0 behaviour) |
+| `classifier-type` | string | none |  | supported | classifiers: the classifier meta's type name; letters, digits, `_` and `-` |
+| `parse-classifier-func-name` | string | none |  | supported | classifiers: a parse function in `custom-lib-path` (required with it) |
+| `classifier-async-mode` | bool | none |  | supported | secondary classifiers: `1` runs synchronously all the same, with a warning (ours) |
 | `gpu-id` | uint | none | >= 0 | accepted no-op | the GPU is chosen with the element's `gpu-id` property |
 | `workspace-size` | uint | none | >= 0 | accepted no-op | a TensorRT setting |
 | `force-implicit-batch-dim` | bool | none |  | accepted no-op | a TensorRT setting |
@@ -665,17 +685,11 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `tensor-meta-pool-size` | uint | none | >= 1 | accepted no-op | tensor output buffers are allocated as needed |
 | `scaling-compute-hw` | int | none | 0..2 | accepted no-op | accepted values: 0, 1 (always the GPU); VIC (2) is a Jetson unit |
 | `crop-objects-to-roi-boundary` | bool | none |  | accepted no-op | applies to preprocessed-tensor ROIs |
-| `is-classifier` | bool | none |  | accepted no-op | accepted values: 0; legacy key |
+| `is-classifier` | bool | none |  | accepted no-op | accepted values: 0; legacy key, use `network-type=1` |
 | `enable-dbscan` | bool | none |  | accepted no-op | accepted values: 0; deprecated, use `cluster-mode=2` |
 | `int8-calib-file` | string | none |  | accepted no-op | INT8 only |
 | `output-instance-mask` | bool | none |  | accepted no-op | accepted values: 0; instance segmentation |
 | `input-tensor-from-meta` | bool | none |  | accepted no-op | accepted values: 0; preprocessed tensor input |
-| `operate-on-gie-id` | int | none | >= -1 | accepted no-op | secondary mode only |
-| `operate-on-class-ids` | int list | none | >= -1 | accepted no-op | secondary mode only |
-| `input-object-min-width` | uint | none | >= 0 | accepted no-op | secondary mode only |
-| `input-object-min-height` | uint | none | >= 0 | accepted no-op | secondary mode only |
-| `input-object-max-width` | uint | none | >= 0 | accepted no-op | secondary mode only |
-| `input-object-max-height` | uint | none | >= 0 | accepted no-op | secondary mode only |
 | `model-file` | string | none |  | unsupported | Caffe; use `onnx-file` |
 | `proto-file` | string | none |  | unsupported | Caffe; use `onnx-file` |
 | `mean-file` | string | none |  | unsupported | use `offsets` |
@@ -689,11 +703,6 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `layer-device-precision` | string | none |  | unsupported | a TensorRT setting; use `network-mode` |
 | `output-io-formats` | string | none |  | unsupported | a TensorRT setting; inputs and outputs are FP32 |
 | `parse-bbox-instance-mask-func-name` | string | none |  | unsupported | instance segmentation |
-| `parse-classifier-func-name` | string | none |  | unsupported | classifiers |
-| `classifier-threshold` | string | none |  | unsupported | classifiers |
-| `classifier-type` | string | none |  | unsupported | classifiers |
-| `classifier-async-mode` | string | none |  | unsupported | classifiers |
-| `secondary-reinfer-interval` | string | none |  | unsupported | secondary mode |
 | `parse-segmentation-func-name` | string | none |  | unsupported | segmentation |
 | `segmentation-threshold` | string | none |  | unsupported | segmentation |
 | `segmentation-output-order` | string | none |  | unsupported | segmentation |

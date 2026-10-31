@@ -43,7 +43,7 @@ GST_DEBUG_CATEGORY (gst_rds_infer_debug);
 /* Property defaults: the config file's defaults (ours, see rds-infer-config.c); they apply only when set. */
 #define DEFAULT_UNIQUE_ID 1
 #define DEFAULT_PROCESS_MODE 1
-#define DEFAULT_INFER_ON_GIE_ID 0
+#define DEFAULT_INFER_ON_GIE_ID -1     /* every GIE, as DeepStream 8.0's */
 #define DEFAULT_BATCH_SIZE 1
 #define DEFAULT_INTERVAL 0
 #define DEFAULT_GPU_ID 0
@@ -102,8 +102,8 @@ struct _GstRdsInfer
 
   /* properties (object lock); set_mask has PROP_BIT of every property set explicitly */
   gchar *config_file_path, *infer_on_class_ids, *filter_out_class_ids, *model_engine_file;
-  guint unique_id, process_mode, infer_on_gie_id, batch_size, gpu_id;
-  gint interval;
+  guint unique_id, process_mode, batch_size, gpu_id;
+  gint infer_on_gie_id, interval;
   gboolean output_tensor_meta, raw_output_file_write, output_instance_mask, input_tensor_meta,
       crop_objects_to_roi_boundary, clip_object_outside_roi;
   gpointer raw_output_generated_callback, raw_output_generated_userdata;
@@ -163,10 +163,10 @@ property_error (GError ** error, gint code, const gchar * prop, const gchar * va
   return FALSE;
 }
 
-/* @s split at @sep into integers in [min, G_MAXUINT] (whitespace around them allowed, empty items skipped) appended
- * to @out (gint64); an empty or NULL string gives an empty list. */
+/* @s split at @sep into integers in [min, max] (whitespace around them allowed, empty items skipped) appended to @out
+ * (gint64); an empty or NULL string gives an empty list. */
 static gboolean
-parse_id_list (const gchar * s, const gchar * sep, gint64 min, GArray * out)
+parse_id_list (const gchar * s, const gchar * sep, gint64 min, gint64 max, GArray * out)
 {
   gchar **items;
   gboolean ok = TRUE;
@@ -182,7 +182,7 @@ parse_id_list (const gchar * s, const gchar * sep, gint64 min, GArray * out)
       continue;
     errno = 0;
     v = g_ascii_strtoll (item, &end, 10);
-    ok = errno == 0 && end && !*end && v >= min && v <= G_MAXUINT;
+    ok = errno == 0 && end && !*end && v >= min && v <= max;
     if (ok)
       g_array_append_val (out, v);
   }
@@ -191,18 +191,18 @@ parse_id_list (const gchar * s, const gchar * sep, gint64 min, GArray * out)
 }
 
 /* What start would run with: the config file with the explicitly set properties applied and validated. Property
- * warnings go into cfg->warnings. @operate_on_class_ids (gint64, may be NULL) gets infer-on-class-ids, which is only
- * checked (it applies to secondary mode). */
+ * warnings go into cfg->warnings, after the config's warnings about keys the final mode doesn't use. */
 static RdsInferConfig *
-configure (GstRdsInfer * self, GArray * operate_on_class_ids, GError ** error)
+configure (GstRdsInfer * self, GError ** error)
 {
   RdsInferConfig *cfg = NULL;
-  const gchar *overridden[16];
+  /* at most one config key per property, and the terminating NULL */
+  const gchar *overridden[N_PROPS + 1];
   guint n_over = 0;
   gchar *path, *engine_file, *on_class_ids, *filter_ids;
   guint32 set;
   guint unique_id, process_mode, batch_size, gpu_id;
-  gint interval;
+  gint on_gie_id, interval;
   gboolean tensor_meta, raw_write, instance_mask, tensor_input, crop, clip;
   gpointer raw_cb;
   GArray *ids;
@@ -215,6 +215,7 @@ configure (GstRdsInfer * self, GArray * operate_on_class_ids, GError ** error)
   set = self->set_mask;
   unique_id = self->unique_id;
   process_mode = self->process_mode;
+  on_gie_id = self->infer_on_gie_id;
   batch_size = self->batch_size;
   gpu_id = self->gpu_id;
   interval = self->interval;
@@ -235,10 +236,13 @@ configure (GstRdsInfer * self, GArray * operate_on_class_ids, GError ** error)
   if (!(cfg = rds_infer_config_load (path, error)))
     goto out;
 
+#define ADD_OVERRIDDEN(key) G_STMT_START { \
+    g_assert (n_over < G_N_ELEMENTS (overridden) - 1); overridden[n_over++] = key; } G_STMT_END
 #define OVERRIDE(prop, key, assign) G_STMT_START { \
-    if (set & PROP_BIT (prop)) { assign; overridden[n_over++] = key; } } G_STMT_END
+    if (set & PROP_BIT (prop)) { assign; ADD_OVERRIDDEN (key); } } G_STMT_END
   OVERRIDE (PROP_UNIQUE_ID, "gie-unique-id", cfg->gie_unique_id = unique_id);
   OVERRIDE (PROP_PROCESS_MODE, "process-mode", cfg->process_mode = (gint) process_mode);
+  OVERRIDE (PROP_INFER_ON_GIE_ID, "operate-on-gie-id", cfg->operate_on_gie_id = on_gie_id);
   OVERRIDE (PROP_BATCH_SIZE, "batch-size", cfg->batch_size = batch_size);
   OVERRIDE (PROP_INTERVAL, "interval", cfg->interval = (guint) interval);
   OVERRIDE (PROP_GPU_ID, "gpu-id", cfg->gpu_id = gpu_id);
@@ -248,7 +252,7 @@ configure (GstRdsInfer * self, GArray * operate_on_class_ids, GError ** error)
 #undef OVERRIDE
   if (set & PROP_BIT (PROP_FILTER_OUT_CLASS_IDS)) {
     ids = g_array_new (FALSE, FALSE, sizeof (gint64));
-    if (!parse_id_list (filter_ids, ";", 0, ids)) {
+    if (!parse_id_list (filter_ids, ";", 0, G_MAXUINT, ids)) {
       g_array_unref (ids);
       property_error (error, RDS_INFER_CONFIG_ERROR_INVALID, "filter-out-class-ids", filter_ids,
           "expected class ids separated by ';', e.g. 1;2");
@@ -261,20 +265,27 @@ configure (GstRdsInfer * self, GArray * operate_on_class_ids, GError ** error)
       g_array_append_val (cfg->filter_out_class_ids, id);
     }
     g_array_unref (ids);
-    overridden[n_over++] = "filter-out-class-ids";
+    ADD_OVERRIDDEN ("filter-out-class-ids");
   }
   if (set & PROP_BIT (PROP_INFER_ON_CLASS_IDS)) {
     ids = g_array_new (FALSE, FALSE, sizeof (gint64));
-    if (!parse_id_list (on_class_ids, ":", -1, ids)) {
+    if (!parse_id_list (on_class_ids, ":", -1, G_MAXINT, ids)) {
       g_array_unref (ids);
       property_error (error, RDS_INFER_CONFIG_ERROR_INVALID, "infer-on-class-ids", on_class_ids,
           "expected class ids separated by ':', e.g. 1:2:4");
       goto fail;
     }
-    if (operate_on_class_ids)
-      g_array_append_vals (operate_on_class_ids, ids->data, ids->len);
+    g_array_set_size (cfg->operate_on_class_ids, 0);
+    for (guint i = 0; i < ids->len; i++) {
+      gint id = (gint) g_array_index (ids, gint64, i);
+
+      g_array_append_val (cfg->operate_on_class_ids, id);
+    }
+    rds_infer_config_normalize_class_ids (cfg->operate_on_class_ids);
     g_array_unref (ids);
+    ADD_OVERRIDDEN ("operate-on-class-ids");
   }
+#undef ADD_OVERRIDDEN
   if (instance_mask) {
     property_error (error, RDS_INFER_CONFIG_ERROR_UNSUPPORTED, "output-instance-mask", "1",
         "instance segmentation is not supported yet");
@@ -285,14 +296,18 @@ configure (GstRdsInfer * self, GArray * operate_on_class_ids, GError ** error)
         "preprocessed tensor input is not supported yet");
     goto fail;
   }
-  g_assert (n_over < G_N_ELEMENTS (overridden));
   overridden[n_over] = NULL;
-  if (!rds_infer_config_validate (cfg, overridden, error))
+  if (!rds_infer_config_validate (cfg, overridden, error) || !rds_infer_config_check_mode (cfg, overridden, error))
     goto fail;
 
-  if (set & PROP_BIT (PROP_INFER_ON_GIE_ID) || set & PROP_BIT (PROP_INFER_ON_CLASS_IDS))
+  /* properties at their default value don't warn */
+  if (cfg->process_mode != 2 && ((set & PROP_BIT (PROP_INFER_ON_GIE_ID) && on_gie_id != DEFAULT_INFER_ON_GIE_ID)
+          || (set & PROP_BIT (PROP_INFER_ON_CLASS_IDS) && cfg->operate_on_class_ids->len > 0)))
     g_ptr_array_add (cfg->warnings, g_strdup ("element properties infer-on-gie-id and infer-on-class-ids: ignored: "
-            "they apply to secondary mode (process-mode=2) only, which is not supported yet"));
+            "they apply to secondary mode (process-mode=2) only"));
+  if (cfg->process_mode == 2 && set & PROP_BIT (PROP_INTERVAL) && interval != 0)
+    g_ptr_array_add (cfg->warnings, g_strdup_printf ("element property interval: %d: ignored in secondary mode "
+            "(process-mode=2)", interval));
   if (crop || clip)
     g_ptr_array_add (cfg->warnings, g_strdup ("element properties crop-objects-to-roi-boundary and "
             "clip-object-outside-roi: ignored: they apply to preprocessed-tensor ROIs, which are not supported yet"));
@@ -314,12 +329,22 @@ out:
 }
 
 static gchar *
+join_warnings (const GPtrArray * warnings)
+{
+  GString *s = g_string_new (NULL);
+
+  for (guint i = 0; i < warnings->len; i++)
+    g_string_append_printf (s, "%s%s", i ? "\n" : "", (const gchar *) g_ptr_array_index (warnings, i));
+  return g_string_free (s, FALSE);
+}
+
+static gchar *
 join_ids (const GArray * a, gboolean is_uint)
 {
   GString *s = g_string_new (NULL);
 
   for (guint i = 0; i < a->len; i++) {
-    gint64 v = is_uint ? (gint64) g_array_index (a, guint, i) : g_array_index (a, gint64, i);
+    gint64 v = is_uint ? (gint64) g_array_index (a, guint, i) : (gint64) g_array_index (a, gint, i);
 
     g_string_append_printf (s, "%s%" G_GINT64_FORMAT, i ? ";" : "", v);
   }
@@ -329,14 +354,14 @@ join_ids (const GArray * a, gboolean is_uint)
 GstStructure *
 rds_infer_test_get_config (GstElement * element, GError ** error)
 {
-  GArray *class_ids = g_array_new (FALSE, FALSE, sizeof (gint64));
-  RdsInferConfig *cfg = configure (GST_RDS_INFER (element), class_ids, error);
+  RdsInferConfig *cfg = configure (GST_RDS_INFER (element), error);
   GstStructure *s = NULL;
-  gchar *filter, *on_class;
+  gchar *filter, *on_class, *warnings;
 
   if (cfg) {
     filter = join_ids (cfg->filter_out_class_ids, TRUE);
-    on_class = join_ids (class_ids, FALSE);
+    on_class = join_ids (cfg->operate_on_class_ids, FALSE);
+    warnings = join_warnings (cfg->warnings);
     s = gst_structure_new ("rdsinfer-config",
         "batch-size", G_TYPE_UINT, cfg->batch_size,
         "interval", G_TYPE_UINT, cfg->interval,
@@ -346,13 +371,15 @@ rds_infer_test_get_config (GstElement * element, GError ** error)
         "output-tensor-meta", G_TYPE_BOOLEAN, cfg->output_tensor_meta,
         "model-engine-file", G_TYPE_STRING, cfg->model_engine_file,
         "filter-out-class-ids", G_TYPE_STRING, filter,
+        "operate-on-gie-id", G_TYPE_INT, cfg->operate_on_gie_id,
         "operate-on-class-ids", G_TYPE_STRING, on_class,
-        "n-warnings", G_TYPE_UINT, cfg->warnings->len, NULL);
+        "n-warnings", G_TYPE_UINT, cfg->warnings->len,
+        "warnings", G_TYPE_STRING, warnings, NULL);
     g_free (filter);
     g_free (on_class);
+    g_free (warnings);
     rds_infer_config_free (cfg);
   }
-  g_array_unref (class_ids);
   return s;
 }
 
@@ -523,9 +550,25 @@ gst_rds_infer_start (GstBaseTransform * trans)
 
   self->batch_count = 0;
   self->unit_count = 0;
-  if (!(self->cfg = configure (self, NULL, &err))) {
+  if (!(self->cfg = configure (self, &err))) {
     post_config_error (self, err);
     g_error_free (err);
+    return FALSE;
+  }
+  /* the config accepts secondary mode; the element doesn't run it yet */
+  if (self->cfg->process_mode == 2) {
+    gchar *where;
+
+    GST_OBJECT_LOCK (self);
+    where = self->set_mask & PROP_BIT (PROP_PROCESS_MODE) ? g_strdup ("element property ")
+        : g_strconcat (self->cfg->config_path, ":", NULL);
+    GST_OBJECT_UNLOCK (self);
+    g_set_error (&err, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_UNSUPPORTED,
+        "%sprocess-mode: 2: secondary inference is not implemented yet", where);
+    g_free (where);
+    post_config_error (self, err);
+    g_error_free (err);
+    release_resources (self);
     return FALSE;
   }
   for (guint i = 0; i < self->cfg->warnings->len; i++)
@@ -931,7 +974,7 @@ gst_rds_infer_set_property (GObject * object, guint prop_id, const GValue * valu
       self->process_mode = g_value_get_uint (value);
       break;
     case PROP_INFER_ON_GIE_ID:
-      self->infer_on_gie_id = g_value_get_uint (value);
+      self->infer_on_gie_id = g_value_get_int (value);
       break;
     case PROP_INFER_ON_CLASS_IDS:
       g_free (self->infer_on_class_ids);
@@ -1004,7 +1047,7 @@ gst_rds_infer_get_property (GObject * object, guint prop_id, GValue * value, GPa
       g_value_set_uint (value, self->process_mode);
       break;
     case PROP_INFER_ON_GIE_ID:
-      g_value_set_uint (value, self->infer_on_gie_id);
+      g_value_set_int (value, self->infer_on_gie_id);
       break;
     case PROP_INFER_ON_CLASS_IDS:
       g_value_set_string (value, self->infer_on_class_ids);
@@ -1098,16 +1141,16 @@ gst_rds_infer_class_init (GstRdsInferClass * klass)
           DEFAULT_UNIQUE_ID, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_PROCESS_MODE,
       g_param_spec_uint ("process-mode", "Process mode",
-          "1: primary (whole frames), 2: secondary (objects; not supported yet, fails at start)", 1, 2,
+          "1: primary (whole frames), 2: secondary (objects; not implemented yet, fails at start)", 1, 2,
           DEFAULT_PROCESS_MODE, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_INFER_ON_GIE_ID,
-      g_param_spec_uint ("infer-on-gie-id", "Infer on GIE ID",
-          "Secondary mode: infer on the objects of this unique-id (ignored in primary mode)", 0, G_MAXUINT,
-          DEFAULT_INFER_ON_GIE_ID, PFLAGS));
+      g_param_spec_int ("infer-on-gie-id", "Infer on GIE ID",
+          "Secondary mode: infer on the objects of this unique-id, -1 for every one (overrides operate-on-gie-id; "
+          "ignored in primary mode)", -1, G_MAXINT, DEFAULT_INFER_ON_GIE_ID, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_INFER_ON_CLASS_IDS,
       g_param_spec_string ("infer-on-class-ids", "Infer on class IDs",
-          "Secondary mode: infer on objects of these classes, separated by ':' (e.g. 1:2:4; ignored in primary "
-          "mode)", NULL, PFLAGS));
+          "Secondary mode: infer on objects of these classes, separated by ':' (e.g. 1:2:4; -1: every class; "
+          "overrides operate-on-class-ids; ignored in primary mode)", NULL, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_FILTER_OUT_CLASS_IDS,
       g_param_spec_string ("filter-out-class-ids", "Filter out class IDs",
           "Drop detections of these classes, separated by ';' (e.g. 1;2)", NULL, PFLAGS));

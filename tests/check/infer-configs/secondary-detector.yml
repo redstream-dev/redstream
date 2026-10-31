@@ -1,0 +1,10 @@
+# A secondary detector on the objects of GIE 0 (a real id), classes 1 and 3, at least 10 pixels wide.
+property:
+  onnx-file: model.onnx
+  process-mode: 2
+  num-detected-classes: 2
+  parse-bbox-func-name: RdsInferParseYolo
+  operate-on-gie-id: 0
+  operate-on-class-ids: [1, 3]
+  input-object-min-width: 10
+  secondary-reinfer-interval: 0

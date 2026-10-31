@@ -1,0 +1,19 @@
+# A secondary classifier with every secondary-mode and classifier key set; the label file has one line per output
+# layer.
+[property]
+onnx-file=model.onnx
+process-mode=2
+network-type=1
+gie-unique-id=2
+operate-on-gie-id=1
+operate-on-class-ids=0;2
+input-object-min-width=32
+input-object-min-height=16
+input-object-max-width=640
+input-object-max-height=480
+classifier-threshold=0.51
+classifier-type=vehicle-color_2
+secondary-reinfer-interval=5
+custom-lib-path=libmyclassifier.so
+parse-classifier-func-name=MyParseClassifier
+labelfile-path=classifier-labels-2.txt

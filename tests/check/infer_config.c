@@ -12,12 +12,23 @@ corpus (const gchar * name)
   return g_build_filename (RDS_INFER_CONFIGS, name, NULL);
 }
 
+/* What the element and rds-compile do without overrides: load, then the process-mode checks. */
+static RdsInferConfig *
+load_checked (const gchar * path, GError ** error)
+{
+  RdsInferConfig *cfg = rds_infer_config_load (path, error);
+
+  if (cfg && !rds_infer_config_check_mode (cfg, NULL, error))
+    g_clear_pointer (&cfg, rds_infer_config_free);
+  return cfg;
+}
+
 static RdsInferConfig *
 load_ok (const gchar * name)
 {
   gchar *path = corpus (name);
   GError *err = NULL;
-  RdsInferConfig *cfg = rds_infer_config_load (path, &err);
+  RdsInferConfig *cfg = load_checked (path, &err);
 
   g_assert_no_error (err);
   g_assert_nonnull (cfg);
@@ -32,7 +43,7 @@ assert_load_fails (const gchar * path, gint code, va_list ap)
 {
   gchar *prefix = g_strconcat (path, ":", NULL);
   GError *err = NULL;
-  RdsInferConfig *cfg = rds_infer_config_load (path, &err);
+  RdsInferConfig *cfg = load_checked (path, &err);
   const gchar *pos, *want;
 
   g_assert_null (cfg);
@@ -359,8 +370,7 @@ test_rejected (void)
   {
     const gchar *file, *key, *value;
   } cases[] = {
-    {"rejected-process-mode.txt", "process-mode", "2"},
-    {"rejected-network-type.txt", "network-type", "1"},
+    {"rejected-network-type.txt", "network-type", "2"},
     {"rejected-cluster-mode.txt", "cluster-mode", "0"},
     {"rejected-network-mode.txt", "network-mode", "1"},
     {"rejected-engine-create-func-name.txt", "engine-create-func-name", "MyEngine"},
@@ -429,6 +439,7 @@ test_wrong_types (void)
   load_fails ("bad-int.txt", RDS_INFER_CONFIG_ERROR_INVALID, "batch-size: abc: ", NULL);
   load_fails ("bad-float.txt", RDS_INFER_CONFIG_ERROR_INVALID, "net-scale-factor: -1: ", NULL);
   load_fails ("bad-bool.txt", RDS_INFER_CONFIG_ERROR_INVALID, "maintain-aspect-ratio: maybe: ", NULL);
+  load_fails ("bad-process-mode.txt", RDS_INFER_CONFIG_ERROR_INVALID, "process-mode: 3: ", "at most 2", NULL);
 }
 
 static void
@@ -437,7 +448,7 @@ test_missing (void)
   gchar *path = corpus ("no-such-config.txt");
   GError *err = NULL;
 
-  g_assert_null (rds_infer_config_load (path, &err));
+  g_assert_null (load_checked (path, &err));
   g_assert_error (err, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_FILE);
   g_assert_nonnull (strstr (err->message, path));
   g_clear_error (&err);
@@ -556,7 +567,7 @@ load_with_labels (const gchar * labels, guint num_classes)
 {
   gchar *text = labels_config_text (num_classes), *path = tmp_config ("pgie.txt", text, labels);
   GError *err = NULL;
-  RdsInferConfig *cfg = rds_infer_config_load (path, &err);
+  RdsInferConfig *cfg = load_checked (path, &err);
 
   g_assert_no_error (err);
   g_assert_nonnull (cfg);
@@ -615,6 +626,361 @@ test_labels (void)
   g_free (long_label);
 }
 
+static void
+assert_no_warnings (RdsInferConfig * cfg)
+{
+  for (guint i = 0; i < cfg->warnings->len; i++)
+    g_test_message ("warning: %s", (const gchar *) g_ptr_array_index (cfg->warnings, i));
+  g_assert_cmpuint (cfg->warnings->len, ==, 0);
+}
+
+static void
+assert_class_ids (const GArray * ids, guint n, const gint * want)
+{
+  g_assert_nonnull (ids);
+  g_assert_cmpuint (ids->len, ==, n);
+  for (guint i = 0; i < n; i++)
+    g_assert_cmpint (g_array_index (ids, gint, i), ==, want[i]);
+}
+
+/* The secondary-mode and classifier keys: values as written, defaults, no warnings when they apply. */
+static void
+test_secondary (void)
+{
+  static const gint ids_02[] = { 0, 2 }, ids_13[] = { 1, 3 };
+  RdsInferConfig *cfg = load_ok ("secondary-classifier.txt");
+  gchar *lib = g_build_filename (cfg->config_dir, "libmyclassifier.so", NULL);
+
+  assert_no_warnings (cfg);
+  g_assert_cmpint (cfg->process_mode, ==, 2);
+  g_assert_cmpint (cfg->network_type, ==, 1);
+  g_assert_cmpint (cfg->operate_on_gie_id, ==, 1);
+  assert_class_ids (cfg->operate_on_class_ids, 2, ids_02);
+  g_assert_cmpuint (cfg->input_object_min_width, ==, 32);
+  g_assert_cmpuint (cfg->input_object_min_height, ==, 16);
+  g_assert_cmpuint (cfg->input_object_max_width, ==, 640);
+  g_assert_cmpuint (cfg->input_object_max_height, ==, 480);
+  g_assert_cmpfloat (cfg->classifier_threshold, ==, 0.51f);
+  g_assert_cmpstr (cfg->classifier_type, ==, "vehicle-color_2");
+  g_assert_cmpint (cfg->secondary_reinfer_interval, ==, 5);
+  g_assert_false (cfg->classifier_async_mode);
+  g_assert_cmpstr (cfg->parse_classifier_func_name, ==, "MyParseClassifier");
+  g_assert_cmpstr (cfg->custom_lib_path, ==, lib);
+  /* a classifier needs neither classes nor a bbox parser */
+  g_assert_cmpuint (cfg->num_detected_classes, ==, 0);
+  g_assert_null (cfg->parse_bbox_func_name);
+  g_assert_nonnull (cfg->labels);
+  g_assert_null (cfg->labels[0]);
+  g_assert_cmpuint (cfg->classifier_labels->len, ==, 2);
+  rds_infer_config_free (cfg);
+  g_free (lib);
+
+  cfg = load_ok ("secondary-detector.yml");
+  assert_no_warnings (cfg);
+  g_assert_cmpint (cfg->process_mode, ==, 2);
+  g_assert_cmpint (cfg->network_type, ==, 0);
+  g_assert_cmpint (cfg->operate_on_gie_id, ==, 0);        /* 0 is a real id */
+  assert_class_ids (cfg->operate_on_class_ids, 2, ids_13);
+  g_assert_cmpuint (cfg->input_object_min_width, ==, 10);
+  g_assert_cmpuint (cfg->input_object_max_width, ==, 0);
+  g_assert_cmpint (cfg->secondary_reinfer_interval, ==, 0);       /* every frame */
+  /* a detector's labels stay in the detector form; no classifier labels */
+  g_assert_cmpuint (g_strv_length (cfg->labels), ==, 2);
+  g_assert_cmpuint (cfg->classifier_labels->len, ==, 0);
+  rds_infer_config_free (cfg);
+
+  /* the defaults: every GIE, every class, no size limit, never reinfer, threshold 0, synchronous */
+  cfg = load_ok ("secondary-tensor.txt");
+  assert_no_warnings (cfg);
+  g_assert_cmpint (cfg->process_mode, ==, 2);
+  g_assert_cmpint (cfg->operate_on_gie_id, ==, -1);
+  assert_class_ids (cfg->operate_on_class_ids, 0, NULL);
+  g_assert_cmpuint (cfg->input_object_min_width, ==, 0);
+  g_assert_cmpuint (cfg->input_object_min_height, ==, 0);
+  g_assert_cmpuint (cfg->input_object_max_width, ==, 0);
+  g_assert_cmpuint (cfg->input_object_max_height, ==, 0);
+  g_assert_cmpint (cfg->secondary_reinfer_interval, ==, -1);
+  g_assert_cmpfloat (cfg->classifier_threshold, ==, 0.0f);
+  g_assert_null (cfg->classifier_type);
+  g_assert_null (cfg->parse_classifier_func_name);
+  g_assert_false (cfg->classifier_async_mode);
+  rds_infer_config_free (cfg);
+
+  /* primary-mode defaults too */
+  cfg = load_ok ("defaults.txt");
+  g_assert_cmpint (cfg->operate_on_gie_id, ==, -1);
+  assert_class_ids (cfg->operate_on_class_ids, 0, NULL);
+  g_assert_cmpint (cfg->secondary_reinfer_interval, ==, -1);
+  g_assert_nonnull (cfg->classifier_labels);
+  g_assert_cmpuint (cfg->classifier_labels->len, ==, 0);
+  rds_infer_config_free (cfg);
+
+  /* -1 in operate-on-class-ids: every class (ours), also next to other ids */
+  cfg = load_ok ("class-ids-minus-one.txt");
+  assert_no_warnings (cfg);
+  assert_class_ids (cfg->operate_on_class_ids, 0, NULL);
+  rds_infer_config_free (cfg);
+  {
+    gchar *path = tmp_config ("sgie.txt", "[property]\nonnx-file=m.onnx\nprocess-mode=2\nnetwork-type=100\n"
+        "operate-on-class-ids=2;-1\n", NULL);
+
+    cfg = load_checked (path, NULL);
+    g_assert_nonnull (cfg);
+    assert_class_ids (cfg->operate_on_class_ids, 0, NULL);
+    rds_infer_config_free (cfg);
+    tmp_cleanup (path);
+  }
+}
+
+#define SGIE_TXT "[property]\nonnx-file=m.onnx\nprocess-mode=2\nnetwork-type=100\n"
+#define CLASSIFIER_TXT "[property]\nonnx-file=m.onnx\nprocess-mode=2\nnetwork-type=1\n"
+
+static void
+test_secondary_errors (void)
+{
+  load_fails ("rejected-classifier-primary.txt", RDS_INFER_CONFIG_ERROR_UNSUPPORTED, "network-type: 1: ",
+      "classifiers in primary mode are not supported yet", NULL);
+  load_fails ("min-gt-max.txt", RDS_INFER_CONFIG_ERROR_INVALID, "input-object-min-width: 200: ",
+      "input-object-max-width", NULL);
+  text_fails ("sgie.txt", SGIE_TXT "input-object-min-height=50\ninput-object-max-height=49\n",
+      RDS_INFER_CONFIG_ERROR_INVALID, "input-object-min-height: 50: ", "input-object-max-height", NULL);
+  load_fails ("bad-classifier-type.txt", RDS_INFER_CONFIG_ERROR_INVALID, "classifier-type: bad type!: ", NULL);
+  /* ranges and types */
+  text_fails ("sgie.txt", SGIE_TXT "operate-on-gie-id=abc\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "operate-on-gie-id: abc: ", "not an integer", NULL);
+  text_fails ("sgie.txt", SGIE_TXT "operate-on-gie-id=-2\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "operate-on-gie-id: -2: ", NULL);
+  text_fails ("sgie.txt", SGIE_TXT "operate-on-class-ids=1;-2\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "operate-on-class-ids: 1;-2: ", NULL);
+  text_fails ("sgie.txt", SGIE_TXT "input-object-min-width=-1\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "input-object-min-width: -1: ", NULL);
+  text_fails ("sgie.txt", SGIE_TXT "secondary-reinfer-interval=-2\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "secondary-reinfer-interval: -2: ", NULL);
+  text_fails ("sgie.txt", CLASSIFIER_TXT "classifier-threshold=-0.1\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "classifier-threshold: -0.1: ", NULL);
+  text_fails ("sgie.txt", CLASSIFIER_TXT "classifier-async-mode=maybe\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "classifier-async-mode: maybe: ", NULL);
+  /* the classifier parse function is looked up in custom-lib-path */
+  text_fails ("sgie.txt", CLASSIFIER_TXT "parse-classifier-func-name=MyParse\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "parse-classifier-func-name: MyParse: ", "custom-lib-path", NULL);
+  /* segmentation stays rejected, also in secondary mode */
+  text_fails ("sgie.txt", "[property]\nonnx-file=m.onnx\nprocess-mode=2\nnetwork-type=3\n",
+      RDS_INFER_CONFIG_ERROR_UNSUPPORTED, "network-type: 3: ", NULL);
+}
+
+/* Loads @text (labels.txt: @labels) and runs the process-mode checks. */
+static RdsInferConfig *
+load_warnings (const gchar * text, const gchar * labels)
+{
+  gchar *path = tmp_config ("sgie.txt", text, labels);
+  GError *err = NULL;
+  RdsInferConfig *cfg = load_checked (path, &err);
+
+  g_assert_no_error (err);
+  for (guint i = 0; i < cfg->warnings->len; i++)
+    g_test_message ("warning: %s", (const gchar *) g_ptr_array_index (cfg->warnings, i));
+  tmp_cleanup (path);
+  return cfg;
+}
+
+/* Keys the mode or the network type doesn't use: one warning each, naming the key and the value. */
+static void
+test_mode_warnings (void)
+{
+  RdsInferConfig *cfg;
+
+  /* secondary-mode keys in primary mode */
+  cfg = load_warnings (DETECTOR_TXT "operate-on-gie-id=1\noperate-on-class-ids=0;1\ninput-object-min-width=8\n"
+      "input-object-max-height=90\nsecondary-reinfer-interval=3\nclassifier-async-mode=1\n", NULL);
+  g_assert_cmpuint (cfg->warnings->len, ==, 6);
+  g_assert_cmpuint (count_warnings (cfg, ":operate-on-gie-id: 1: ignored: used in secondary mode (process-mode=2) "
+          "only"), ==, 1);
+  g_assert_cmpuint (count_warnings (cfg, ":operate-on-class-ids: 0;1: ignored: "), ==, 1);
+  g_assert_cmpuint (count_warnings (cfg, ":input-object-min-width: 8: ignored: "), ==, 1);
+  g_assert_cmpuint (count_warnings (cfg, ":input-object-max-height: 90: ignored: "), ==, 1);
+  g_assert_cmpuint (count_warnings (cfg, ":secondary-reinfer-interval: 3: ignored: "), ==, 1);
+  g_assert_cmpuint (count_warnings (cfg, ":classifier-async-mode: 1: ignored: "), ==, 1);
+  rds_infer_config_free (cfg);
+  /* their defaults written out: no warning */
+  cfg = load_warnings (DETECTOR_TXT "operate-on-gie-id=-1\ninput-object-min-width=0\nclassifier-threshold=0\n",
+      NULL);
+  g_assert_cmpuint (cfg->warnings->len, ==, 0);
+  rds_infer_config_free (cfg);
+
+  /* classifier keys on a detector */
+  cfg = load_warnings (SGIE_TXT "classifier-threshold=0.5\nclassifier-type=color\n", NULL);
+  g_assert_cmpuint (cfg->warnings->len, ==, 2);
+  g_assert_cmpuint (count_warnings (cfg, ":classifier-threshold: 0.5: ignored: used by classifiers (network-type=1) "
+          "only"), ==, 1);
+  g_assert_cmpuint (count_warnings (cfg, ":classifier-type: color: ignored: "), ==, 1);
+  rds_infer_config_free (cfg);
+
+  /* interval in secondary mode */
+  cfg = load_ok ("interval-secondary.txt");
+  g_assert_cmpuint (cfg->warnings->len, ==, 1);
+  g_assert_cmpuint (count_warnings (cfg, ":interval: 2: ignored in secondary mode"), ==, 1);
+  g_assert_cmpuint (cfg->interval, ==, 2);
+  rds_infer_config_free (cfg);
+
+  /* classifier-async-mode=1: runs synchronously */
+  cfg = load_ok ("async-mode.txt");
+  g_assert_true (cfg->classifier_async_mode);
+  g_assert_cmpuint (cfg->warnings->len, ==, 1);
+  g_assert_cmpuint (count_warnings (cfg, ":classifier-async-mode: 1: runs synchronously"), ==, 1);
+  rds_infer_config_free (cfg);
+
+  /* a classifier without a label file */
+  cfg = load_warnings (CLASSIFIER_TXT, NULL);
+  g_assert_cmpuint (cfg->warnings->len, ==, 1);
+  g_assert_cmpuint (count_warnings (cfg, ":labelfile-path: (unset): classifier output gets empty labels"), ==, 1);
+  rds_infer_config_free (cfg);
+}
+
+/* The process-mode checks are the caller's, after its overrides: loading alone doesn't run them. */
+static void
+test_check_mode (void)
+{
+  gchar *path = tmp_config ("sgie.txt", "[property]\nonnx-file=m.onnx\nnetwork-type=1\n", NULL);
+  RdsInferConfig *cfg = rds_infer_config_load (path, NULL);
+  const gchar *overridden[] = { "process-mode", NULL };
+  GError *err = NULL;
+
+  /* a classifier in primary mode loads: the element property process-mode may still make it secondary */
+  g_assert_nonnull (cfg);
+  g_assert_cmpint (cfg->process_mode, ==, 1);
+  g_assert_false (rds_infer_config_check_mode (cfg, NULL, &err));
+  g_assert_error (err, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_UNSUPPORTED);
+  g_assert_nonnull (strstr (err->message, ":network-type: 1: classifiers in primary mode are not supported yet"));
+  g_clear_error (&err);
+  cfg->process_mode = 2;
+  g_assert_true (rds_infer_config_check_mode (cfg, overridden, &err));
+  g_assert_no_error (err);
+  rds_infer_config_free (cfg);
+  tmp_cleanup (path);
+
+  /* the mode warnings follow the final mode, and keys from element properties are the element's to warn about */
+  path = tmp_config ("pgie.txt", DETECTOR_TXT "operate-on-gie-id=1\nno-such-key=1\n", NULL);
+  cfg = rds_infer_config_load (path, NULL);
+  g_assert_cmpuint (cfg->warnings->len, ==, 1);       /* the unknown key only */
+  cfg->process_mode = 2;
+  g_assert_true (rds_infer_config_check_mode (cfg, overridden, NULL));
+  g_assert_cmpuint (cfg->warnings->len, ==, 1);
+  rds_infer_config_free (cfg);
+  cfg = rds_infer_config_load (path, NULL);
+  g_assert_true (rds_infer_config_check_mode (cfg, (const gchar *[]) { "operate-on-gie-id", NULL }, NULL));
+  g_assert_cmpuint (cfg->warnings->len, ==, 1);
+  rds_infer_config_free (cfg);
+  cfg = rds_infer_config_load (path, NULL);
+  g_assert_true (rds_infer_config_check_mode (cfg, NULL, NULL));
+  g_assert_cmpuint (cfg->warnings->len, ==, 2);
+  g_assert_cmpuint (count_warnings (cfg, ":operate-on-gie-id: 1: ignored: "), ==, 1);
+  rds_infer_config_free (cfg);
+  tmp_cleanup (path);
+}
+
+static gchar *
+classifier_labels_text (void)
+{
+  return g_strdup (CLASSIFIER_TXT "labelfile-path=labels.txt\n");
+}
+
+/* @labels as a classifier's label file: its layers, each a NULL-terminated label list. */
+static RdsInferConfig *
+load_classifier_labels (const gchar * labels)
+{
+  gchar *text = classifier_labels_text (), *path = tmp_config ("sgie.txt", text, labels);
+  GError *err = NULL;
+  RdsInferConfig *cfg = load_checked (path, &err);
+
+  g_assert_no_error (err);
+  tmp_cleanup (path);
+  g_free (text);
+  return cfg;
+}
+
+static void
+assert_layer (RdsInferConfig * cfg, guint layer, const gchar * const *want)
+{
+  gchar **got = g_ptr_array_index (cfg->classifier_labels, layer);
+
+  g_assert_nonnull (got);
+  g_assert_cmpuint (g_strv_length (got), ==, g_strv_length ((gchar **) want));
+  for (guint i = 0; want[i]; i++)
+    g_assert_cmpstr (got[i], ==, want[i]);
+}
+
+/* Classifier label files (DeepStream 8.0 behaviour): line i is output layer i, its labels ';'-separated and not
+ * trimmed. */
+static void
+test_classifier_labels (void)
+{
+  const gchar *colors[] = { "red", "green", " blue", NULL }, *types[] = { "sedan", "suv", NULL };
+  const gchar *abc[] = { "a", "b", "c", NULL }, *one[] = { "car", NULL };
+  RdsInferConfig *cfg;
+  gchar *text = classifier_labels_text (), *path;
+  GError *err = NULL;
+
+  cfg = load_ok ("secondary-classifier.txt");
+  g_assert_cmpuint (cfg->classifier_labels->len, ==, 2);
+  assert_layer (cfg, 0, colors);
+  assert_layer (cfg, 1, types);
+  rds_infer_config_free (cfg);
+
+  cfg = load_ok ("async-mode.txt");            /* classifier-labels-1.txt: one line, no final newline */
+  g_assert_cmpuint (cfg->classifier_labels->len, ==, 1);
+  assert_layer (cfg, 0, abc);
+  rds_infer_config_free (cfg);
+
+  /* CRLF line ends, a byte order mark and trailing blank lines are not labels */
+  cfg = load_classifier_labels ("\xEF\xBB\xBF" "red;green; blue\r\nsedan;suv\r\n\n\n");
+  g_assert_cmpuint (cfg->classifier_labels->len, ==, 2);
+  assert_layer (cfg, 0, colors);
+  assert_layer (cfg, 1, types);
+  rds_infer_config_free (cfg);
+
+  /* one label per line: one layer each */
+  cfg = load_classifier_labels ("car\ncar\n");
+  g_assert_cmpuint (cfg->classifier_labels->len, ==, 2);
+  assert_layer (cfg, 0, one);
+  assert_layer (cfg, 1, one);
+  g_assert_cmpuint (cfg->warnings->len, ==, 0);
+  rds_infer_config_free (cfg);
+
+  /* one trailing ';' is ignored, an empty label elsewhere kept, an empty line a layer without labels */
+  cfg = load_classifier_labels ("a;b;\na;;b\n\n;\nc\n");
+  g_assert_cmpuint (cfg->classifier_labels->len, ==, 5);
+  assert_layer (cfg, 0, (const gchar *[]) { "a", "b", NULL });
+  assert_layer (cfg, 1, (const gchar *[]) { "a", "", "b", NULL });
+  assert_layer (cfg, 2, (const gchar *[]) { NULL });
+  assert_layer (cfg, 3, (const gchar *[]) { "", NULL });
+  assert_layer (cfg, 4, (const gchar *[]) { "c", NULL });
+  rds_infer_config_free (cfg);
+
+  /* not trimmed */
+  cfg = load_classifier_labels ("red ; green\n");
+  assert_layer (cfg, 0, (const gchar *[]) { "red ", " green", NULL });
+  rds_infer_config_free (cfg);
+
+  /* an empty file: no layers, no labels */
+  cfg = load_classifier_labels ("");
+  g_assert_cmpuint (cfg->classifier_labels->len, ==, 0);
+  rds_infer_config_free (cfg);
+
+  /* invalid UTF-8 names the line */
+  path = tmp_config ("sgie.txt", text, "a;b\nc;\xff\n");
+  g_assert_null (load_checked (path, &err));
+  g_assert_error (err, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_INVALID);
+  g_assert_nonnull (strstr (err->message, "labelfile-path: "));
+  g_assert_nonnull (strstr (err->message, "labels.txt:2: "));
+  g_clear_error (&err);
+  tmp_cleanup (path);
+  g_free (text);
+
+  /* a label file that can't be read is an error, as for detectors */
+  text_fails ("sgie.txt", CLASSIFIER_TXT "labelfile-path=no-such-labels.txt\n", RDS_INFER_CONFIG_ERROR_FILE,
+      "labelfile-path: ", "no-such-labels.txt", NULL);
+}
+
 /* Element properties override fields after loading; validate re-checks them. */
 static void
 test_validate (void)
@@ -622,12 +988,12 @@ test_validate (void)
   RdsInferConfig *cfg = load_ok ("defaults.txt");
   GError *err = NULL;
 
-  const gchar *overridden[] = { "process-mode", NULL };
-  gchar *prefix = g_strconcat (cfg->config_path, ":process-mode: 2: ", NULL);
+  const gchar *overridden[] = { "network-mode", NULL };
+  gchar *prefix = g_strconcat (cfg->config_path, ":network-mode: 1: ", NULL);
 
   g_assert_true (rds_infer_config_validate (cfg, NULL, &err));
   g_assert_no_error (err);
-  cfg->process_mode = 2;
+  cfg->network_mode = 1;
   /* from the file: FILE:KEY */
   g_assert_false (rds_infer_config_validate (cfg, NULL, &err));
   g_assert_error (err, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_UNSUPPORTED);
@@ -636,8 +1002,12 @@ test_validate (void)
   /* from an element property: named as such */
   g_assert_false (rds_infer_config_validate (cfg, overridden, &err));
   g_assert_error (err, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_UNSUPPORTED);
-  g_assert_true (g_str_has_prefix (err->message, "element property process-mode: 2: "));
+  g_assert_true (g_str_has_prefix (err->message, "element property network-mode: 1: "));
   g_clear_error (&err);
+  cfg->network_mode = 0;
+  /* secondary mode is valid */
+  cfg->process_mode = 2;
+  g_assert_true (rds_infer_config_validate (cfg, NULL, &err));
   cfg->process_mode = 1;
   cfg->batch_size = 4;
   cfg->interval = 3;
@@ -654,7 +1024,7 @@ test_engine_options (void)
       "batch-size=3\nnetwork-mode=2\ninfer-dims=3;48;64\nnetwork-input-order=1\n", NULL);
   gchar *dir = g_path_get_dirname (path), *onnx = g_build_filename (dir, "m.onnx", NULL);
   gchar *engine = g_build_filename (dir, "m.mxr", NULL);
-  RdsInferConfig *cfg = rds_infer_config_load (path, NULL);
+  RdsInferConfig *cfg = load_checked (path, NULL);
   RdsInferEngineOptions opts;
   guint dims[3];
   GError *err = NULL;
@@ -756,6 +1126,29 @@ collect_key (const RdsInferKeyDesc * key, gpointer user_data)
     g_assert_cmpstr (key->range, ==, ">= 0");
   } else if (!strcmp (key->name, "topk")) {
     g_assert_cmpstr (key->range, ==, ">= -1");
+  } else if (!strcmp (key->name, "process-mode")) {
+    g_assert_cmpstr (key->range, ==, "1..2");
+    g_assert_null (key->accepted);
+  } else if (!strcmp (key->name, "network-type")) {
+    g_assert_cmpstr (key->accepted, ==, "0, 1, 100");
+  } else if (!strcmp (key->name, "operate-on-gie-id") || !strcmp (key->name, "secondary-reinfer-interval")) {
+    g_assert_cmpstr (key->type, ==, "int");
+    g_assert_cmpstr (key->default_value, ==, "-1");
+    g_assert_cmpstr (key->range, ==, ">= -1");
+  } else if (!strcmp (key->name, "operate-on-class-ids")) {
+    g_assert_cmpstr (key->type, ==, "int list");
+    g_assert_cmpstr (key->range, ==, ">= -1");
+  } else if (g_str_has_prefix (key->name, "input-object-")) {
+    g_assert_cmpstr (key->type, ==, "uint");
+    g_assert_cmpstr (key->range, ==, ">= 0");
+  } else if (!strcmp (key->name, "classifier-threshold")) {
+    g_assert_cmpstr (key->type, ==, "float");
+    g_assert_cmpstr (key->default_value, ==, "0");
+    g_assert_cmpstr (key->range, ==, ">= 0");
+  } else if (!strcmp (key->name, "classifier-async-mode")) {
+    g_assert_cmpstr (key->type, ==, "bool");
+  } else if (!strcmp (key->name, "classifier-type") || !strcmp (key->name, "parse-classifier-func-name")) {
+    g_assert_cmpstr (key->type, ==, "string");
   } else if (!strcmp (key->name, "onnx-file")) {
     g_assert_cmpstr (key->type, ==, "path");
     g_assert_null (key->default_value);
@@ -781,6 +1174,21 @@ test_key_table (void)
   g_assert_cmpint (STATUS ("class-attrs/nms-iou-threshold"), ==, RDS_INFER_KEY_SUPPORTED);
   g_assert_cmpint (STATUS ("class-attrs/eps"), ==, RDS_INFER_KEY_NOOP);
   g_assert_cmpint (STATUS ("property/no-such-key"), ==, -1);
+  {
+    const gchar *secondary[] = { "process-mode", "network-type", "operate-on-gie-id", "operate-on-class-ids",
+      "input-object-min-width", "input-object-min-height", "input-object-max-width", "input-object-max-height",
+      "classifier-threshold", "classifier-type", "parse-classifier-func-name", "classifier-async-mode",
+      "secondary-reinfer-interval"
+    };
+
+    for (guint i = 0; i < G_N_ELEMENTS (secondary); i++) {
+      gchar *id = g_strconcat ("property/", secondary[i], NULL);
+
+      g_test_message ("%s", id);
+      g_assert_cmpint (STATUS (id), ==, RDS_INFER_KEY_SUPPORTED);
+      g_free (id);
+    }
+  }
 #undef STATUS
   g_hash_table_unref (keys);
 }
@@ -895,7 +1303,7 @@ test_sample_test3 (void)
     g_test_skip ("no coco-labels.txt in .cache/models (run tests/models/fetch-yolo11n.sh)");
     goto out;
   }
-  cfg = rds_infer_config_load (RDS_TEST_SAMPLE_PGIE_CONFIG, &err);
+  cfg = load_checked (RDS_TEST_SAMPLE_PGIE_CONFIG, &err);
   g_assert_no_error (err);
   for (guint i = 0; i < cfg->warnings->len; i++)
     g_test_message ("warning: %s", (const gchar *) g_ptr_array_index (cfg->warnings, i));
@@ -941,6 +1349,11 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-config/numbers", test_numbers);
   g_test_add_func ("/cpu/infer-config/keyfile-values", test_keyfile_values);
   g_test_add_func ("/cpu/infer-config/labels", test_labels);
+  g_test_add_func ("/cpu/infer-config/secondary", test_secondary);
+  g_test_add_func ("/cpu/infer-config/secondary-errors", test_secondary_errors);
+  g_test_add_func ("/cpu/infer-config/mode-warnings", test_mode_warnings);
+  g_test_add_func ("/cpu/infer-config/check-mode", test_check_mode);
+  g_test_add_func ("/cpu/infer-config/classifier-labels", test_classifier_labels);
   g_test_add_func ("/cpu/infer-config/engine-options", test_engine_options);
   g_test_add_func ("/cpu/infer-config/engine-error", test_engine_error);
   g_test_add_func ("/cpu/infer-config/validate", test_validate);

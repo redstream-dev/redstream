@@ -1,0 +1,6 @@
+# Secondary mode without post-processing: tensor meta on every object of every GIE.
+[property]
+onnx-file=model.onnx
+process-mode=2
+network-type=100
+output-tensor-meta=1

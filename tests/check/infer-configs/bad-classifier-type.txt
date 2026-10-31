@@ -1,0 +1,6 @@
+# classifier-type is a name: letters, digits, '_' and '-'.
+[property]
+onnx-file=model.onnx
+process-mode=2
+network-type=1
+classifier-type=bad type!

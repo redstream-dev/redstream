@@ -1,0 +1,7 @@
+# classifier-async-mode=1: a warning, the classifier runs synchronously.
+[property]
+onnx-file=model.onnx
+process-mode=2
+network-type=1
+labelfile-path=classifier-labels-1.txt
+classifier-async-mode=1

@@ -35,7 +35,8 @@ typedef enum
   TYPE_OFFSETS,                 /* ';' list of up to MAX_OFFSETS floats: offsets, n_offsets */
   TYPE_DIMS,                    /* C;H;W: infer_dims, has_infer_dims */
   TYPE_UINT_LIST,               /* ';' list into a GArray of guint */
-  TYPE_INT_LIST,                /* ';' list, checked only (no field) */
+  TYPE_INT_LIST,                /* ';' list of class ids into a GArray of gint; a -1 in it is every class (ours),
+                                 * stored as an empty list */
   TYPE_STRING_LIST,             /* ';' list into a gchar ** */
 } KeyType;
 
@@ -45,17 +46,27 @@ static const gchar *const type_names[] = {
   [TYPE_INT_LIST] = "int list",[TYPE_STRING_LIST] = "string list",
 };
 
+/* What a supported key is used for: other modes or network types ignore it, with a warning when it is set to
+ * something other than its default (rds_infer_config_check_mode). */
+typedef enum
+{
+  SCOPE_SECONDARY = 1 << 0,     /* process-mode=2 only */
+  SCOPE_CLASSIFIER = 1 << 1,    /* network-type=1 only */
+  SCOPE_PRIMARY = 1 << 2,       /* process-mode=1 only */
+} KeyScope;
+
 typedef struct
 {
   const gchar *name;
   KeyGroup group;
   KeyType type;
   RdsInferKeyStatus status;
+  KeyScope scope;               /* 0: every mode and network type */
   gdouble min, max;             /* numbers, and the elements of number lists */
   gboolean min_exclusive;
   const gchar *def;             /* default, parsed like a value from the file; NULL: zero / unset */
   gssize field;                 /* offset + 1 into RdsInferConfig (property) or RdsInferClassAttrs; 0: not stored */
-  gint accept[2];               /* with n_accept > 0, the only supported values; others are rejected */
+  gint accept[3];               /* with n_accept > 0, the only supported values; others are rejected */
   guint n_accept;
   const gchar *note;            /* why the key is a no-op or rejected, or why other values are rejected */
 } KeyInfo;
@@ -71,8 +82,6 @@ typedef struct
 
 #define NOTE_TRT "a TensorRT setting; MIGraphX has no equivalent"
 #define NOTE_DLA "DLA is not available on AMD GPUs"
-#define NOTE_SECONDARY "used in secondary mode (process-mode=2) only, which is not supported yet"
-#define NOTE_CLASSIFIER "classifiers are not supported yet"
 #define NOTE_SEGMENTATION "segmentation models are not supported yet"
 #define NOTE_CLUSTER "used only by GroupRectangles and DBSCAN clustering, which are not supported"
 
@@ -94,16 +103,15 @@ static const KeyInfo keys[] = {
         .field = P (network_mode),.accept = {0, 2},.n_accept = 2,
       .note = "only FP32 (0) and FP16 (2) are supported; INT8 (1) and BEST (3) are not"},
   {.name = "network-type",.group = PROP,.type = TYPE_INT,.status = SUP,.min = 0,.max = 100,.def = "0",
-        .field = P (network_type),.accept = {0, 100},.n_accept = 2,
-      .note = "only detectors (0) and no post-processing (100) are supported; "
-        "classifiers and segmentation models are not supported yet"},
+        .field = P (network_type),.accept = {0, 1, 100},.n_accept = 3,
+      .note = "only detectors (0), classifiers (1, in secondary mode) and no post-processing (100) are supported; "
+        "segmentation models are not supported yet"},
   {.name = "process-mode",.group = PROP,.type = TYPE_INT,.status = SUP,.min = 1,.max = 2,.def = "1",
-        .field = P (process_mode),.accept = {1},.n_accept = 1,
-      .note = "only primary mode (1) is supported; secondary mode (2) is not supported yet"},
+      .field = P (process_mode)},
   {.name = "gie-unique-id",.group = PROP,.type = TYPE_UINT,.status = SUP,.min = 1,.max = G_MAXUINT,.def = "1",
       .field = P (gie_unique_id)},
-  {.name = "interval",.group = PROP,.type = TYPE_UINT,.status = SUP,.min = 0,.max = RDS_INFER_MAX_INTERVAL,
-      .def = "0",.field = P (interval)},
+  {.name = "interval",.group = PROP,.type = TYPE_UINT,.status = SUP,.scope = SCOPE_PRIMARY,.min = 0,
+      .max = RDS_INFER_MAX_INTERVAL,.def = "0",.field = P (interval)},
   {.name = "output-tensor-meta",.group = PROP,.type = TYPE_BOOL,.status = SUP,.def = "0",
       .field = P (output_tensor_meta)},
   /* preprocessing */
@@ -132,6 +140,32 @@ static const KeyInfo keys[] = {
   {.name = "custom-lib-path",.group = PROP,.type = TYPE_PATH,.status = SUP,.field = P (custom_lib_path)},
   {.name = "filter-out-class-ids",.group = PROP,.type = TYPE_UINT_LIST,.status = SUP,.min = 0,.max = G_MAXUINT,
       .field = P (filter_out_class_ids)},
+  /* secondary mode: the objects inferred on (DeepStream 8.0 behaviour: -1 or unset is every GIE, also this element;
+   * the size limits are inclusive, 0 is no limit) */
+  {.name = "operate-on-gie-id",.group = PROP,.type = TYPE_INT,.status = SUP,.scope = SCOPE_SECONDARY,.min = -1,
+      .max = G_MAXINT,.def = "-1",.field = P (operate_on_gie_id)},
+  {.name = "operate-on-class-ids",.group = PROP,.type = TYPE_INT_LIST,.status = SUP,.scope = SCOPE_SECONDARY,
+      .min = -1,.max = G_MAXINT,.field = P (operate_on_class_ids)},
+  {.name = "input-object-min-width",.group = PROP,.type = TYPE_UINT,.status = SUP,.scope = SCOPE_SECONDARY,
+      .min = 0,.max = G_MAXUINT,.field = P (input_object_min_width)},
+  {.name = "input-object-min-height",.group = PROP,.type = TYPE_UINT,.status = SUP,.scope = SCOPE_SECONDARY,
+      .min = 0,.max = G_MAXUINT,.field = P (input_object_min_height)},
+  {.name = "input-object-max-width",.group = PROP,.type = TYPE_UINT,.status = SUP,.scope = SCOPE_SECONDARY,
+      .min = 0,.max = G_MAXUINT,.field = P (input_object_max_width)},
+  {.name = "input-object-max-height",.group = PROP,.type = TYPE_UINT,.status = SUP,.scope = SCOPE_SECONDARY,
+      .min = 0,.max = G_MAXUINT,.field = P (input_object_max_height)},
+  /* DeepStream 8.0 behaviour: unset never reinfers an object, 0 every frame, N every N + 1 frames */
+  {.name = "secondary-reinfer-interval",.group = PROP,.type = TYPE_INT,.status = SUP,.scope = SCOPE_SECONDARY,
+      .min = -1,.max = G_MAXINT,.def = "-1",.field = P (secondary_reinfer_interval)},
+  /* classifiers (DeepStream 8.0 behaviour: a label needs a probability strictly above classifier-threshold) */
+  {.name = "classifier-threshold",.group = PROP,.type = TYPE_FLOAT,.status = SUP,.scope = SCOPE_CLASSIFIER,
+      .min = 0,.max = G_MAXFLOAT,.def = "0",.field = P (classifier_threshold)},
+  {.name = "classifier-type",.group = PROP,.type = TYPE_STRING,.status = SUP,.scope = SCOPE_CLASSIFIER,
+      .field = P (classifier_type)},
+  {.name = "parse-classifier-func-name",.group = PROP,.type = TYPE_STRING,.status = SUP,.scope = SCOPE_CLASSIFIER,
+      .field = P (parse_classifier_func_name)},
+  {.name = "classifier-async-mode",.group = PROP,.type = TYPE_BOOL,.status = SUP,
+      .scope = SCOPE_SECONDARY | SCOPE_CLASSIFIER,.field = P (classifier_async_mode)},
 
   /* [property]: accepted, without effect */
   {.name = "gpu-id",.group = PROP,.type = TYPE_UINT,.status = NOOP,.min = 0,.max = G_MAXUINT,
@@ -152,7 +186,7 @@ static const KeyInfo keys[] = {
   {.name = "crop-objects-to-roi-boundary",.group = PROP,.type = TYPE_BOOL,.status = NOOP,
       .note = "it applies to preprocessed-tensor ROIs, which are not supported yet"},
   {.name = "is-classifier",.group = PROP,.type = TYPE_BOOL,.status = NOOP,.accept = {0},
-      .n_accept = 1,.note = "legacy key; " NOTE_CLASSIFIER},
+      .n_accept = 1,.note = "legacy key; use network-type=1 for a classifier"},
   {.name = "enable-dbscan",.group = PROP,.type = TYPE_BOOL,.status = NOOP,.accept = {0},
       .n_accept = 1,.note = "deprecated; DBSCAN clustering is not supported, use cluster-mode=2 (NMS)"},
   {.name = "int8-calib-file",.group = PROP,.type = TYPE_STRING,.status = NOOP,
@@ -161,18 +195,6 @@ static const KeyInfo keys[] = {
       .n_accept = 1,.note = "instance segmentation is not supported yet"},
   {.name = "input-tensor-from-meta",.group = PROP,.type = TYPE_BOOL,.status = NOOP,
       .accept = {0},.n_accept = 1,.note = "preprocessed tensor input is not supported yet"},
-  {.name = "operate-on-gie-id",.group = PROP,.type = TYPE_INT,.status = NOOP,.min = -1,.max = G_MAXINT,
-      .note = NOTE_SECONDARY},
-  {.name = "operate-on-class-ids",.group = PROP,.type = TYPE_INT_LIST,.status = NOOP,.min = -1,.max = G_MAXINT,
-      .note = NOTE_SECONDARY},
-  {.name = "input-object-min-width",.group = PROP,.type = TYPE_UINT,.status = NOOP,.min = 0,.max = G_MAXUINT,
-      .note = NOTE_SECONDARY},
-  {.name = "input-object-min-height",.group = PROP,.type = TYPE_UINT,.status = NOOP,.min = 0,.max = G_MAXUINT,
-      .note = NOTE_SECONDARY},
-  {.name = "input-object-max-width",.group = PROP,.type = TYPE_UINT,.status = NOOP,.min = 0,.max = G_MAXUINT,
-      .note = NOTE_SECONDARY},
-  {.name = "input-object-max-height",.group = PROP,.type = TYPE_UINT,.status = NOOP,.min = 0,.max = G_MAXUINT,
-      .note = NOTE_SECONDARY},
 
   /* [property]: rejected */
   {.name = "model-file",.group = PROP,.type = TYPE_STRING,.status = REJ,
@@ -201,16 +223,6 @@ static const KeyInfo keys[] = {
       .note = "I/O formats are a TensorRT setting; inputs and outputs are always FP32"},
   {.name = "parse-bbox-instance-mask-func-name",.group = PROP,.type = TYPE_STRING,.status = REJ,
       .note = "instance segmentation is not supported yet"},
-  {.name = "parse-classifier-func-name",.group = PROP,.type = TYPE_STRING,.status = REJ,
-      .note = NOTE_CLASSIFIER},
-  {.name = "classifier-threshold",.group = PROP,.type = TYPE_STRING,.status = REJ,
-      .note = NOTE_CLASSIFIER},
-  {.name = "classifier-type",.group = PROP,.type = TYPE_STRING,.status = REJ,
-      .note = NOTE_CLASSIFIER},
-  {.name = "classifier-async-mode",.group = PROP,.type = TYPE_STRING,.status = REJ,
-      .note = NOTE_CLASSIFIER},
-  {.name = "secondary-reinfer-interval",.group = PROP,.type = TYPE_STRING,.status = REJ,
-      .note = NOTE_SECONDARY},
   {.name = "parse-segmentation-func-name",.group = PROP,.type = TYPE_STRING,.status = REJ,
       .note = NOTE_SEGMENTATION},
   {.name = "segmentation-threshold",.group = PROP,.type = TYPE_STRING,.status = REJ,
@@ -343,6 +355,17 @@ split_list (const gchar * s, gchar ** reason)
   return items;
 }
 
+void
+rds_infer_config_normalize_class_ids (GArray * ids)
+{
+  for (guint i = 0; i < ids->len; i++) {
+    if (g_array_index (ids, gint, i) == -1) {
+      g_array_set_size (ids, 0);
+      return;
+    }
+  }
+}
+
 /* Parses @raw as @k's type. With @base, stores it into k's field (paths resolved against
  * @config_dir); without, only checks it. @num receives the value of a scalar bool or number (for the accepted-value
  * checks). On failure @reason says why. */
@@ -414,10 +437,16 @@ parse_value (const KeyInfo * k, const gchar * raw, gpointer base, const gchar * 
       }
       if (k->type == TYPE_UINT_LIST)
         ids = g_array_new (FALSE, FALSE, sizeof (guint));
+      else if (k->type == TYPE_INT_LIST)
+        ids = g_array_new (FALSE, FALSE, sizeof (gint));
       for (guint i = 0; ok && i < n; i++) {
         ok = parse_number (k, items[i], &v, reason);
-        if (ok && ids) {
+        if (ok && k->type == TYPE_UINT_LIST) {
           guint id = (guint) v;
+
+          g_array_append_val (ids, id);
+        } else if (ok && k->type == TYPE_INT_LIST) {
+          gint id = (gint) v;
 
           g_array_append_val (ids, id);
         } else if (ok && i < MAX_OFFSETS) {
@@ -440,6 +469,8 @@ parse_value (const KeyInfo * k, const gchar * raw, gpointer base, const gchar * 
       } else if (ok && base && ids) {
         GArray **field = &FIELD (GArray *, base, k);
 
+        if (k->type == TYPE_INT_LIST)
+          rds_infer_config_normalize_class_ids (ids);
         g_array_unref (*field);
         *field = g_steal_pointer (&ids);
       }
@@ -583,6 +614,26 @@ validate_error (GError ** error, gint code, const RdsInferConfig * cfg, const gc
   return FALSE;
 }
 
+#define CLASSIFIER_TYPE_CHARS "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+
+/* input-object-min-@dim must not be above input-object-max-@dim when both are set (0: no limit). */
+static gboolean
+check_size_limit (const RdsInferConfig * cfg, const gchar * const *overridden, const gchar * dim, guint min,
+    guint max, GError ** error)
+{
+  gchar *key, *value;
+
+  if (min == 0 || max == 0 || min <= max)
+    return TRUE;
+  key = g_strconcat ("input-object-min-", dim, NULL);
+  value = g_strdup_printf ("%u", min);
+  validate_error (error, RDS_INFER_CONFIG_ERROR_INVALID, cfg, overridden, key, value,
+      "larger than input-object-max-%s (%u): no object would be inferred on", dim, max);
+  g_free (value);
+  g_free (key);
+  return FALSE;
+}
+
 gboolean
 rds_infer_config_validate (const RdsInferConfig * cfg, const gchar * const *overridden, GError ** error)
 {
@@ -617,6 +668,16 @@ rds_infer_config_validate (const RdsInferConfig * cfg, const gchar * const *over
         "(unset)",
         "nvinfer's internal resnet parser is not available; set it to RdsInferParseYolo (the built-in YOLO "
         "parser) or to a parser in custom-lib-path");
+  if (!check_size_limit (cfg, overridden, "width", cfg->input_object_min_width, cfg->input_object_max_width, error)
+      || !check_size_limit (cfg, overridden, "height", cfg->input_object_min_height, cfg->input_object_max_height,
+          error))
+    return FALSE;
+  if (cfg->classifier_type && strspn (cfg->classifier_type, CLASSIFIER_TYPE_CHARS) != strlen (cfg->classifier_type))
+    return validate_error (error, RDS_INFER_CONFIG_ERROR_INVALID, cfg, overridden, "classifier-type",
+        cfg->classifier_type, "only letters, digits, '_' and '-'");
+  if (cfg->network_type == 1 && cfg->parse_classifier_func_name && !cfg->custom_lib_path)
+    return validate_error (error, RDS_INFER_CONFIG_ERROR_INVALID, cfg, overridden, "parse-classifier-func-name",
+        cfg->parse_classifier_func_name, "the function is looked up in custom-lib-path, which is unset");
   if (cfg->n_offsets > 0 && cfg->n_offsets != input_channels (cfg)) {
     GString *value = g_string_new (NULL);
 
@@ -677,33 +738,25 @@ rds_infer_config_format_engine_error (const RdsInferConfig * cfg, const GError *
   return g_strdup_printf ("%s:onnx-file: %s", cfg->config_path, err->message);
 }
 
-/* Label file: one label per line, or all of them on one ';'-separated line. Whitespace around labels, a CR before
- * the newline and trailing blank lines are ignored. */
-static gboolean
-load_labels (LoadCtx * ctx, GError ** error)
+/* The label file's lines, the UTF-8 byte order mark left out; each must be valid UTF-8 (labels end up in metadata,
+ * messages and JSON). NULL on error. */
+static gchar **
+read_label_lines (LoadCtx * ctx, GError ** error)
 {
   RdsInferConfig *cfg = ctx->cfg;
-  guint n = cfg->num_detected_classes, n_labels;
-  gchar *text = NULL, *start, **lines, **labels;
+  gchar *text = NULL, *start, **lines;
   GError *err = NULL;
 
-  cfg->labels = g_new0 (gchar *, n + 1);
-  if (!cfg->labelfile_path || n == 0) {
-    for (guint i = 0; i < n; i++)
-      cfg->labels[i] = g_strdup ("");
-    return TRUE;
-  }
   if (!g_file_get_contents (cfg->labelfile_path, &text, NULL, &err)) {
     key_error (error, RDS_INFER_CONFIG_ERROR_FILE, ctx->path, NULL, "labelfile-path", cfg->labelfile_path, "%s",
         err->message);
     g_error_free (err);
-    return FALSE;
+    return NULL;
   }
-  start = g_str_has_prefix (text, "\xEF\xBB\xBF") ? text + 3 : text;        /* UTF-8 byte order mark */
+  start = g_str_has_prefix (text, "\xEF\xBB\xBF") ? text + 3 : text;
   lines = g_strsplit (start, "\n", -1);
-  n_labels = g_strv_length (lines);
-  /* labels end up in metadata, messages and JSON */
-  for (guint i = 0; i < n_labels; i++) {
+  g_free (text);
+  for (guint i = 0; lines[i]; i++) {
     if (!g_utf8_validate (lines[i], -1, NULL)) {
       gchar *where = g_strdup_printf ("%s:%u", cfg->labelfile_path, i + 1);
 
@@ -711,22 +764,95 @@ load_labels (LoadCtx * ctx, GError ** error)
           "not valid UTF-8");
       g_free (where);
       g_strfreev (lines);
-      g_free (text);
-      return FALSE;
+      return NULL;
     }
   }
-  for (guint i = 0; i < n_labels; i++)
-    g_strstrip (lines[i]);
-  while (n_labels > 0 && !*lines[n_labels - 1]) {
-    g_free (lines[n_labels - 1]);
-    lines[--n_labels] = NULL;
+  return lines;
+}
+
+/* Drops the empty strings at the end of @v (trailing blank lines, a trailing ';'); returns the new length. */
+static guint
+drop_trailing_empty (gchar ** v)
+{
+  guint n = g_strv_length (v);
+
+  while (n > 0 && !*v[n - 1]) {
+    g_free (v[n - 1]);
+    v[--n] = NULL;
   }
+  return n;
+}
+
+/* Classifier label file (DeepStream 8.0 behaviour): line i has the labels of output layer i, ';'-separated and not
+ * trimmed; one trailing ';' on a line is ignored ("a;b;" is a, b), an empty label elsewhere is kept ("a;;b"), and an
+ * empty line is a layer without labels. Only the line ends (a CR before the newline) and trailing blank lines are
+ * left out. No file: a warning, and the classifier output gets empty labels (ours). */
+static gboolean
+load_classifier_labels (LoadCtx * ctx, GError ** error)
+{
+  RdsInferConfig *cfg = ctx->cfg;
+  gchar **lines;
+  guint n;
+
+  if (!cfg->labelfile_path) {
+    warn_once (ctx, NULL, "labelfile-path", "(unset): classifier output gets empty labels");
+    return TRUE;
+  }
+  if (!(lines = read_label_lines (ctx, error)))
+    return FALSE;
+  for (guint i = 0; lines[i]; i++) {
+    gsize len = strlen (lines[i]);
+
+    if (len > 0 && lines[i][len - 1] == '\r')
+      lines[i][len - 1] = '\0';
+  }
+  n = drop_trailing_empty (lines);
+  for (guint i = 0; i < n; i++) {
+    gchar **labels = g_strsplit (lines[i], ";", -1);
+    guint n_labels = g_strv_length (labels);
+
+    if (n_labels > 0 && !*labels[n_labels - 1]) {
+      g_free (labels[n_labels - 1]);
+      labels[n_labels - 1] = NULL;
+    }
+    g_ptr_array_add (cfg->classifier_labels, labels);
+  }
+  g_strfreev (lines);
+  return TRUE;
+}
+
+/* Detector label file: one label per line, or all of them on one ';'-separated line. Whitespace around labels, a CR
+ * before the newline and trailing blank lines are ignored. A classifier's labels are in classifier_labels instead
+ * (its file has another form), and its labels[] are empty. */
+static gboolean
+load_labels (LoadCtx * ctx, GError ** error)
+{
+  RdsInferConfig *cfg = ctx->cfg;
+  guint n = cfg->num_detected_classes, n_labels;
+  gchar **lines, **labels;
+
+  cfg->labels = g_new0 (gchar *, n + 1);
+  if (cfg->network_type == 1) {
+    for (guint i = 0; i < n; i++)
+      cfg->labels[i] = g_strdup ("");
+    return load_classifier_labels (ctx, error);
+  }
+  if (!cfg->labelfile_path || n == 0) {
+    for (guint i = 0; i < n; i++)
+      cfg->labels[i] = g_strdup ("");
+    return TRUE;
+  }
+  if (!(lines = read_label_lines (ctx, error)))
+    return FALSE;
+  for (guint i = 0; lines[i]; i++)
+    g_strstrip (lines[i]);
+  n_labels = drop_trailing_empty (lines);
   if (n_labels == 1 && strchr (lines[0], ';')) {
     labels = g_strsplit (lines[0], ";", -1);
     g_strfreev (lines);
-    n_labels = g_strv_length (labels);
-    for (guint i = 0; i < n_labels; i++)
+    for (guint i = 0; labels[i]; i++)
       g_strstrip (labels[i]);
+    n_labels = g_strv_length (labels);
     if (n_labels > 0 && !*labels[n_labels - 1]) {
       g_free (labels[n_labels - 1]);
       labels[--n_labels] = NULL;
@@ -744,7 +870,6 @@ load_labels (LoadCtx * ctx, GError ** error)
     warn_once (ctx, NULL, "labelfile-path", "%s: %u labels for %u classes, the extra labels are ignored",
         cfg->labelfile_path, n_labels, n);
   g_strfreev (labels);
-  g_free (text);
   return TRUE;
 }
 
@@ -846,6 +971,8 @@ rds_infer_config_load (const gchar * path, GError ** error)
   cfg->config_dir = g_path_get_dirname (abs_path);
   g_free (abs_path);
   cfg->filter_out_class_ids = g_array_new (FALSE, FALSE, sizeof (guint));
+  cfg->operate_on_class_ids = g_array_new (FALSE, FALSE, sizeof (gint));
+  cfg->classifier_labels = g_ptr_array_new_with_free_func ((GDestroyNotify) g_strfreev);
   cfg->warnings = g_ptr_array_new_with_free_func (g_free);
   apply_defaults (GROUP_PROPERTY, cfg);
   ctx.path = path;
@@ -883,11 +1010,94 @@ rds_infer_config_free (RdsInferConfig * cfg)
   g_free (cfg->parse_bbox_func_name);
   if (cfg->filter_out_class_ids)
     g_array_unref (cfg->filter_out_class_ids);
+  if (cfg->operate_on_class_ids)
+    g_array_unref (cfg->operate_on_class_ids);
+  g_free (cfg->classifier_type);
+  g_free (cfg->parse_classifier_func_name);
   g_free (cfg->class_attrs);
   g_strfreev (cfg->labels);
+  if (cfg->classifier_labels)
+    g_ptr_array_unref (cfg->classifier_labels);
   if (cfg->warnings)
     g_ptr_array_unref (cfg->warnings);
   g_free (cfg);
+}
+
+/* @k's value in @cfg as text, as it would be written in the file (NULL: an unset string). */
+static gchar *
+format_value (const KeyInfo * k, const RdsInferConfig * cfg)
+{
+  gchar buf[G_ASCII_DTOSTR_BUF_SIZE];
+
+  switch (k->type) {
+    case TYPE_BOOL:
+      return g_strdup (FIELD (gboolean, cfg, k) ? "1" : "0");
+    case TYPE_INT:
+      return g_strdup_printf ("%d", FIELD (gint, cfg, k));
+    case TYPE_UINT:
+      return g_strdup_printf ("%u", FIELD (guint, cfg, k));
+    case TYPE_FLOAT:
+      return g_strdup (g_ascii_formatd (buf, sizeof (buf), "%g", FIELD (gfloat, cfg, k)));
+    case TYPE_STRING:
+    case TYPE_PATH:
+      return g_strdup (FIELD (gchar *, cfg, k));
+    case TYPE_INT_LIST:{
+      GArray *ids = FIELD (GArray *, cfg, k);
+      GString *str = g_string_new (NULL);
+
+      for (guint i = 0; i < ids->len; i++)
+        g_string_append_printf (str, "%s%d", i ? ";" : "", g_array_index (ids, gint, i));
+      return g_string_free (str, FALSE);
+    }
+    default:
+      g_assert_not_reached ();
+  }
+  return NULL;
+}
+
+gboolean
+rds_infer_config_check_mode (RdsInferConfig * cfg, const gchar * const *overridden, GError ** error)
+{
+  RdsInferConfig defaults;
+  gboolean secondary, classifier;
+
+  g_return_val_if_fail (cfg != NULL, FALSE);
+
+  secondary = cfg->process_mode == 2;
+  classifier = cfg->network_type == 1;
+  if (classifier && !secondary)
+    return validate_error (error, RDS_INFER_CONFIG_ERROR_UNSUPPORTED, cfg, overridden, "network-type", "1",
+        "classifiers in primary mode are not supported yet; use process-mode=2");
+  memset (&defaults, 0, sizeof (defaults));
+  apply_defaults (GROUP_PROPERTY, &defaults);
+  for (guint i = 0; i < G_N_ELEMENTS (keys); i++) {
+    const KeyInfo *k = &keys[i];
+    gchar *value, *def;
+    const gchar *why = NULL;
+
+    if (k->group != GROUP_PROPERTY || k->scope == 0 || (overridden && g_strv_contains (overridden, k->name)))
+      continue;
+    if (k->type == TYPE_INT_LIST)
+      def = g_strdup ("");      /* no default: an empty list */
+    else
+      def = format_value (k, &defaults);
+    value = format_value (k, cfg);
+    if (g_strcmp0 (value, def) != 0) {
+      if (k->scope & SCOPE_SECONDARY && !secondary)
+        why = "ignored: used in secondary mode (process-mode=2) only";
+      else if (k->scope & SCOPE_CLASSIFIER && !classifier)
+        why = "ignored: used by classifiers (network-type=1) only";
+      else if (k->scope & SCOPE_PRIMARY && secondary)
+        why = "ignored in secondary mode (process-mode=2)";
+      else if (k->field == P (classifier_async_mode))
+        why = "runs synchronously (asynchronous classifier mode is not supported)";
+    }
+    if (why)
+      g_ptr_array_add (cfg->warnings, g_strdup_printf ("%s:%s: %s: %s", cfg->config_path, k->name, value, why));
+    g_free (value);
+    g_free (def);
+  }
+  return TRUE;
 }
 
 static gboolean
@@ -984,6 +1194,11 @@ rds_infer_config_check_table (GError ** error)
       return table_error (error, k, "accepted values of no-op keys are for ints and bools only");
     if (k->n_accept > 0 && k->status == RDS_INFER_KEY_REJECTED)
       return table_error (error, k, "rejected keys have no accepted values");
+    if (k->scope != 0 && (k->status != RDS_INFER_KEY_SUPPORTED || k->group != GROUP_PROPERTY))
+      return table_error (error, k, "only supported [property] keys have a scope");
+    if (k->scope != 0 && (k->type == TYPE_OFFSETS || k->type == TYPE_DIMS || k->type == TYPE_UINT_LIST
+            || k->type == TYPE_STRING_LIST))
+      return table_error (error, k, "scoped keys are scalars or int lists (rds_infer_config_check_mode)");
     if (k->def) {
       union
       {
@@ -995,8 +1210,8 @@ rds_infer_config_check_table (GError ** error)
       gboolean ok;
 
       memset (&scratch, 0, sizeof (scratch));
-      if (k->type == TYPE_UINT_LIST || k->type == TYPE_STRING_LIST || k->type == TYPE_STRING
-          || k->type == TYPE_PATH)
+      if (k->type == TYPE_UINT_LIST || k->type == TYPE_INT_LIST || k->type == TYPE_STRING_LIST
+          || k->type == TYPE_STRING || k->type == TYPE_PATH)
         return table_error (error, k, "defaults are for scalars and number lists only");
       ok = parse_value (k, k->def, k->field > 0 ? &scratch : NULL, NULL, &v, &reason);
       if (!ok || !accepted (k, v)) {

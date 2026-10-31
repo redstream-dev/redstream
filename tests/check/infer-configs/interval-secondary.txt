@@ -1,0 +1,6 @@
+# interval applies to primary mode: in secondary mode a warning, then ignored.
+[property]
+onnx-file=model.onnx
+process-mode=2
+network-type=100
+interval=2

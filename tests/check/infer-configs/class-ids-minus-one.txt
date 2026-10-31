@@ -1,0 +1,6 @@
+# operate-on-class-ids=-1: every class (ours).
+[property]
+onnx-file=model.onnx
+process-mode=2
+network-type=100
+operate-on-class-ids=-1

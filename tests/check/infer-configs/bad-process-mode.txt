@@ -1,6 +1,6 @@
-# Secondary mode is not supported: an error.
+# process-mode is 1 (primary) or 2 (secondary): 3 is out of range.
 [property]
 onnx-file=model.onnx
 num-detected-classes=2
 parse-bbox-func-name=RdsInferParseYolo
-process-mode=2
+process-mode=3

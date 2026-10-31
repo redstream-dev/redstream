@@ -1,0 +1,7 @@
+# input-object-min-width larger than input-object-max-width: no object could match.
+[property]
+onnx-file=model.onnx
+process-mode=2
+network-type=100
+input-object-min-width=200
+input-object-max-width=100

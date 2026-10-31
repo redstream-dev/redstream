@@ -54,20 +54,39 @@ typedef struct
   gboolean maintain_aspect_ratio, symmetric_padding, output_tensor_meta;
   GArray *filter_out_class_ids;                 /* guint, never NULL */
   RdsInferClassAttrs *class_attrs;              /* num_detected_classes entries, after inheritance */
-  gchar **labels;                               /* NULL-terminated, num_detected_classes entries ("" if none) */
-  /* Warnings found while loading (no-op and unknown keys, label count), one string each and at most one per key.
-   * The element posts them, rds-compile prints them. */
+  /* Detectors: NULL-terminated, num_detected_classes entries ("" if none; all "" for a classifier). */
+  gchar **labels;
+  /* Secondary mode (process-mode=2): the objects inferred on. */
+  gint operate_on_gie_id;                       /* -1: every GIE, also this element's own id */
+  GArray *operate_on_class_ids;                 /* gint, never NULL; empty: every class (a -1 in the file too) */
+  /* Object size limits in pixels, inclusive; 0: no limit. A min above its max (both set) is an error. */
+  guint input_object_min_width, input_object_min_height, input_object_max_width, input_object_max_height;
+  gint secondary_reinfer_interval;              /* -1: never reinfer, 0: every frame, N: every N + 1 frames */
+  /* Classifiers (network-type=1, secondary mode only). */
+  gfloat classifier_threshold;                  /* a label needs a probability > this */
+  gchar *classifier_type, *parse_classifier_func_name;  /* the function is in custom_lib_path */
+  gboolean classifier_async_mode;               /* runs synchronously all the same, with a warning */
+  /* Classifiers: one gchar ** (NULL-terminated) per label file line, i.e. per output layer: its ';'-separated
+   * labels, not trimmed, one trailing ';' ignored (an empty line: no labels). Never NULL; empty for other network
+   * types and without a label file. */
+  GPtrArray *classifier_labels;
+  /* Warnings found while loading (no-op and unknown keys, label count) and by rds_infer_config_check_mode (keys the
+   * mode or network type doesn't use), one string each and at most one per key. The element posts them, rds-compile
+   * prints them. */
   GPtrArray *warnings;
 } RdsInferConfig;
 
-/* Loads @path (YAML if it ends in .yml or .yaml, a key file otherwise), validates it and loads the labels. */
+/* Loads @path (YAML if it ends in .yml or .yaml, a key file otherwise), validates it and loads the labels. The
+ * checks that depend on process-mode are left to rds_infer_config_check_mode, which the caller runs after its
+ * overrides (the element property process-mode can change the mode). */
 G_GNUC_INTERNAL RdsInferConfig *rds_infer_config_load (const gchar * path, GError ** error);
 
 /* The supported-value and cross-key checks of rds_infer_config_load, for re-running after element properties
  * override fields. Overrides follow these rules:
  * - strings: g_free the old value, store a g_strdup'ed new one (NULL for unset). Paths from properties are used as
  *   given, not resolved against config_dir.
- * - filter_out_class_ids: replace its contents; it stays non-NULL.
+ * - filter_out_class_ids and operate_on_class_ids: replace their contents; they stay non-NULL (an empty
+ *   operate_on_class_ids is every class).
  * - num_detected_classes, class_attrs and labels must not change (they were sized and loaded together).
  * - Ranges are checked only while parsing the file, not here: the element's GParamSpecs must carry the same bounds
  *   (batch-size 1..1024, interval 0..32, ...).
@@ -75,7 +94,18 @@ G_GNUC_INTERNAL RdsInferConfig *rds_infer_config_load (const gchar * path, GErro
  * for none. Errors about those keys read "element property KEY: VALUE: reason" instead of "FILE:KEY: ...". */
 G_GNUC_INTERNAL gboolean rds_infer_config_validate (const RdsInferConfig * cfg, const gchar * const *overridden,
     GError ** error);
+/* The checks of the final process-mode, once per config after the overrides and rds_infer_config_validate (the
+ * element and rds-compile run it; rds_infer_config_load doesn't): a classifier (network-type=1) needs secondary
+ * mode, an error as for validate. Then adds a warning for each key whose value the mode or network type doesn't use
+ * (secondary-mode keys in primary mode, classifier keys outside classifiers, interval in secondary mode) and for
+ * classifier-async-mode=1. A key at its default value doesn't warn, nor does one in @overridden (config key names,
+ * as for validate): the element warns about its properties itself. */
+G_GNUC_INTERNAL gboolean rds_infer_config_check_mode (RdsInferConfig * cfg, const gchar * const *overridden,
+    GError ** error);
 G_GNUC_INTERNAL void rds_infer_config_free (RdsInferConfig * cfg);
+/* operate-on-class-ids from the file or the element property (gint): a -1 anywhere is every class (ours), which is
+ * the empty list, so it empties @ids. */
+G_GNUC_INTERNAL void rds_infer_config_normalize_class_ids (GArray * ids);
 
 /* The engine options rdsinfer (and rds-compile) open the engine with: onnx-file, model-engine-file, batch-size,
  * gpu-id, network-mode, and infer-dims in the model's input order (stored in @dims, which opts->infer_dims then

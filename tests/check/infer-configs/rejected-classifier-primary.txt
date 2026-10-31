@@ -1,0 +1,4 @@
+# Classifiers run in secondary mode only: in primary mode an error.
+[property]
+onnx-file=model.onnx
+network-type=1

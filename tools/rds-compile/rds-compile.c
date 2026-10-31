@@ -117,7 +117,7 @@ main (int argc, char **argv)
   if (output && !g_str_has_suffix (output, ".mxr"))
     g_printerr (PROG ": warning: -o %s: not a .mxr name; the program is written there anyway\n", output);
 
-  /* The element's steps: load, apply the overrides, validate. */
+  /* The element's steps: load, apply the overrides, validate, check the mode. */
   if (!(cfg = rds_infer_config_load (config, &err))) {
     g_printerr (PROG ": %s\n", err->message);
     goto out;
@@ -135,7 +135,7 @@ main (int argc, char **argv)
     overridden[n_over++] = "gpu-id";
   }
   overridden[n_over] = NULL;
-  if (!rds_infer_config_validate (cfg, overridden, &err)) {
+  if (!rds_infer_config_validate (cfg, overridden, &err) || !rds_infer_config_check_mode (cfg, overridden, &err)) {
     g_printerr (PROG ": %s\n", err->message);
     goto out;
   }

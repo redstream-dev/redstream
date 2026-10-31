@@ -180,7 +180,7 @@ test_properties (void)
     {"config-file-path", G_TYPE_STRING},
     {"unique-id", G_TYPE_UINT},
     {"process-mode", G_TYPE_UINT},
-    {"infer-on-gie-id", G_TYPE_UINT},
+    {"infer-on-gie-id", G_TYPE_INT},
     {"infer-on-class-ids", G_TYPE_STRING},
     {"filter-out-class-ids", G_TYPE_STRING},
     {"model-engine-file", G_TYPE_STRING},
@@ -207,6 +207,21 @@ test_properties (void)
     g_assert_true (G_PARAM_SPEC_VALUE_TYPE (pspec) == props[i].type);
     g_assert_true ((pspec->flags & G_PARAM_READWRITE) == G_PARAM_READWRITE);
   }
+  /* infer-on-gie-id: -1 (every GIE) by default, as DeepStream 8.0's */
+  {
+    GParamSpecInt *gie = G_PARAM_SPEC_INT (g_object_class_find_property (G_OBJECT_GET_CLASS (e),
+            "infer-on-gie-id"));
+    gint v = 0;
+
+    g_assert_cmpint (gie->default_value, ==, -1);
+    g_assert_cmpint (gie->minimum, ==, -1);
+    g_assert_cmpint (gie->maximum, ==, G_MAXINT);
+    g_object_get (e, "infer-on-gie-id", &v, NULL);
+    g_assert_cmpint (v, ==, -1);
+    g_object_set (e, "infer-on-gie-id", 0, NULL);
+    g_object_get (e, "infer-on-gie-id", &v, NULL);
+    g_assert_cmpint (v, ==, 0);
+  }
   g_object_get (e, "config-file-path", &path, NULL);
   g_assert_null (path);
   g_object_set (e, "config-file-path", "/tmp/pgie.yml", NULL);
@@ -220,7 +235,7 @@ test_properties (void)
 static gchar *
 pspec_range (GParamSpec * pspec)
 {
-  guint64 min, max, type_max;
+  gint64 min, max, type_max;
 
   if (G_IS_PARAM_SPEC_UINT (pspec)) {
     min = G_PARAM_SPEC_UINT (pspec)->minimum;
@@ -228,13 +243,12 @@ pspec_range (GParamSpec * pspec)
     type_max = G_MAXUINT;
   } else {
     g_assert_true (G_IS_PARAM_SPEC_INT (pspec));
-    g_assert_cmpint (G_PARAM_SPEC_INT (pspec)->minimum, >=, 0);
-    min = (guint64) G_PARAM_SPEC_INT (pspec)->minimum;
-    max = (guint64) G_PARAM_SPEC_INT (pspec)->maximum;
+    min = G_PARAM_SPEC_INT (pspec)->minimum;
+    max = G_PARAM_SPEC_INT (pspec)->maximum;
     type_max = G_MAXINT;
   }
-  return max == type_max ? g_strdup_printf (">= %" G_GUINT64_FORMAT, min)
-      : g_strdup_printf ("%" G_GUINT64_FORMAT "..%" G_GUINT64_FORMAT, min, max);
+  return max == type_max ? g_strdup_printf (">= %" G_GINT64_FORMAT, min)
+      : g_strdup_printf ("%" G_GINT64_FORMAT "..%" G_GINT64_FORMAT, min, max);
 }
 
 typedef struct
@@ -264,6 +278,7 @@ test_property_ranges (void)
     {"batch-size", "batch-size"},
     {"interval", "interval"},
     {"process-mode", "process-mode"},
+    {"infer-on-gie-id", "operate-on-gie-id"},
     {"gpu-id", "gpu-id"},
   };
   GstElement *e = gst_element_factory_make ("rdsinfer", NULL);
@@ -328,8 +343,10 @@ test_override (void)
   g_assert_cmpstr (gst_structure_get_string (s, "filter-out-class-ids"), ==, "1;2");
   g_assert_cmpstr (gst_structure_get_string (s, "operate-on-class-ids"), ==, "1;2;4");
   g_assert_cmpstr (gst_structure_get_string (s, "model-engine-file"), ==, "/x/y.mxr");
-  /* infer-on-class-ids is accepted with a warning (secondary mode only) */
+  /* infer-on-class-ids in primary mode: a warning (secondary mode only) */
   g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 1);
+  g_assert_cmpstr (gst_structure_get_string (s, "warnings"), ==, "element properties infer-on-gie-id and "
+      "infer-on-class-ids: ignored: they apply to secondary mode (process-mode=2) only");
   gst_structure_free (s);
 
   /* an empty list clears the file's */
@@ -351,6 +368,118 @@ test_override (void)
   g_assert_nonnull (strstr (err->message, "element property infer-on-class-ids: 1;x"));
   g_clear_error (&err);
 
+  gst_object_unref (e);
+  g_free (cfg);
+}
+
+/* How often @needle is in @haystack. */
+static guint
+count_substr (const gchar * haystack, const gchar * needle)
+{
+  guint n = 0;
+
+  for (const gchar * p = haystack; (p = strstr (p, needle)); p += strlen (needle))
+    n++;
+  return n;
+}
+
+/* The secondary-mode properties: process-mode, infer-on-gie-id and infer-on-class-ids override the file, and the
+ * warnings follow the final mode. */
+static void
+test_override_secondary (void)
+{
+  gchar *cfg = write_file ("override-secondary.txt", BASE_CONFIG "operate-on-gie-id=4\noperate-on-class-ids=1;2\n"
+      "interval=2\n");
+  GstElement *e = gst_element_factory_make ("rdsinfer", NULL);
+  GstStructure *s;
+  GError *err = NULL;
+  gint i;
+  guint u;
+
+  load_hooks ();
+  /* primary mode: the file's secondary keys warn */
+  g_object_set (e, "config-file-path", cfg, NULL);
+  s = hook_get_config (e, &err);
+  g_assert_no_error (err);
+  g_assert_true (gst_structure_get_int (s, "process-mode", &i) && i == 1);
+  g_assert_true (gst_structure_get_int (s, "operate-on-gie-id", &i) && i == 4);
+  g_assert_cmpstr (gst_structure_get_string (s, "operate-on-class-ids"), ==, "1;2");
+  g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 2);
+  gst_structure_free (s);
+
+  /* process-mode=2 from the property: those warnings go, the file's interval warns instead */
+  g_object_set (e, "process-mode", 2, NULL);
+  s = hook_get_config (e, &err);
+  g_assert_no_error (err);
+  g_assert_true (gst_structure_get_int (s, "process-mode", &i) && i == 2);
+  g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 1);
+  g_assert_cmpuint (count_substr (gst_structure_get_string (s, "warnings"), ":interval: 2: ignored in secondary mode"),
+      ==, 1);
+  gst_structure_free (s);
+
+  /* the properties win over the file, without warnings in secondary mode; 0 is a real GIE id, -1 every class */
+  g_object_set (e, "infer-on-gie-id", 0, "infer-on-class-ids", "-1", "interval", 0, NULL);
+  s = hook_get_config (e, &err);
+  g_assert_no_error (err);
+  g_assert_true (gst_structure_get_int (s, "operate-on-gie-id", &i) && i == 0);
+  g_assert_cmpstr (gst_structure_get_string (s, "operate-on-class-ids"), ==, "");
+  g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 0);
+  gst_structure_free (s);
+
+  /* infer-on-gie-id=-1 explicitly: every GIE again; class ids from the property */
+  g_object_set (e, "infer-on-gie-id", -1, "infer-on-class-ids", "3:5", NULL);
+  s = hook_get_config (e, &err);
+  g_assert_true (gst_structure_get_int (s, "operate-on-gie-id", &i) && i == -1);
+  g_assert_cmpstr (gst_structure_get_string (s, "operate-on-class-ids"), ==, "3;5");
+  gst_structure_free (s);
+
+  /* the interval property in secondary mode: a warning naming the property */
+  g_object_set (e, "interval", 3, NULL);
+  s = hook_get_config (e, &err);
+  g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 1);
+  g_assert_cmpstr (gst_structure_get_string (s, "warnings"), ==,
+      "element property interval: 3: ignored in secondary mode (process-mode=2)");
+  gst_structure_free (s);
+
+  /* primary mode: the properties at their defaults don't warn */
+  g_object_set (e, "process-mode", 1, "infer-on-gie-id", -1, "infer-on-class-ids", "", "interval", 0, NULL);
+  s = hook_get_config (e, &err);
+  g_assert_no_error (err);
+  g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 0);
+  gst_structure_free (s);
+  g_object_set (e, "infer-on-gie-id", 2, NULL);
+  s = hook_get_config (e, &err);
+  g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 1);
+  g_assert_cmpuint (count_substr (gst_structure_get_string (s, "warnings"), "element properties infer-on-gie-id "
+          "and infer-on-class-ids: ignored: "), ==, 1);
+  gst_structure_free (s);
+  g_object_set (e, "infer-on-gie-id", -1, NULL);
+
+  /* a malformed list names the property; ids are ints */
+  g_object_set (e, "infer-on-class-ids", "1:-2", NULL);
+  g_assert_null (hook_get_config (e, &err));
+  g_assert_nonnull (strstr (err->message, "element property infer-on-class-ids: 1:-2"));
+  g_clear_error (&err);
+  g_object_set (e, "infer-on-class-ids", "2147483648", NULL);
+  g_assert_null (hook_get_config (e, &err));
+  g_clear_error (&err);
+
+  gst_object_unref (e);
+  g_free (cfg);
+
+  /* a classifier file without process-mode, made secondary by the property: valid (the mode is checked after the
+   * overrides) */
+  cfg = write_file ("classifier.txt", "[property]\nonnx-file=scale2.onnx\ninfer-dims=3;48;64\nnetwork-type=1\n");
+  e = gst_element_factory_make ("rdsinfer", NULL);
+  g_object_set (e, "config-file-path", cfg, NULL);
+  g_assert_null (hook_get_config (e, &err));
+  g_assert_nonnull (strstr (err->message, "classifier.txt:network-type: 1: classifiers in primary mode"));
+  g_clear_error (&err);
+  g_object_set (e, "process-mode", 2, NULL);
+  s = hook_get_config (e, &err);
+  g_assert_no_error (err);
+  g_assert_true (gst_structure_get_int (s, "process-mode", &i) && i == 2);
+  gst_structure_free (s);
   gst_object_unref (e);
   g_free (cfg);
 }
@@ -378,12 +507,30 @@ test_start_config_errors (void)
 {
   gchar *cfg = write_file ("process-mode.txt", BASE_CONFIG), *missing = g_build_filename (WORK_DIR,
       "missing.txt", NULL), *bad = write_file ("bad-mode.txt", BASE_CONFIG "network-mode=1\n"), *texts;
+  gchar *classifier = write_file ("start-classifier.txt", "[property]\nonnx-file=scale2.onnx\n"
+      "infer-dims=3;48;64\nnetwork-type=1\n"), *secondary = write_file ("secondary.txt", BASE_CONFIG
+      "process-mode=2\n");
   GstElement *e;
 
   e = gst_element_factory_make ("rdsinfer", NULL);
   g_object_set (e, "config-file-path", cfg, "process-mode", 2, NULL);
   texts = start_error (e);
-  g_assert_nonnull (strstr (texts, "element property process-mode: 2:"));
+  g_assert_nonnull (strstr (texts, "element property process-mode: 2: secondary inference is not implemented yet"));
+  g_free (texts);
+
+  /* a classifier file made secondary by the property reaches the same refusal, not the primary-mode error */
+  e = gst_element_factory_make ("rdsinfer", NULL);
+  g_object_set (e, "config-file-path", classifier, "process-mode", 2, NULL);
+  texts = start_error (e);
+  g_assert_nonnull (strstr (texts, "element property process-mode: 2: secondary inference is not implemented yet"));
+  g_assert_null (strstr (texts, "classifiers in primary mode"));
+  g_free (texts);
+
+  /* secondary mode from the file: named by the file */
+  e = gst_element_factory_make ("rdsinfer", NULL);
+  g_object_set (e, "config-file-path", secondary, NULL);
+  texts = start_error (e);
+  g_assert_nonnull (strstr (texts, "secondary.txt:process-mode: 2: secondary inference is not implemented yet"));
   g_free (texts);
 
   e = gst_element_factory_make ("rdsinfer", NULL);
@@ -412,6 +559,8 @@ test_start_config_errors (void)
   g_free (cfg);
   g_free (missing);
   g_free (bad);
+  g_free (classifier);
+  g_free (secondary);
 }
 
 /* ---- gpu: helpers ---- */
@@ -1506,6 +1655,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer/properties", test_properties);
   g_test_add_func ("/cpu/infer/property-ranges", test_property_ranges);
   g_test_add_func ("/cpu/infer/override", test_override);
+  g_test_add_func ("/cpu/infer/override-secondary", test_override_secondary);
   g_test_add_func ("/cpu/infer/start-config-errors", test_start_config_errors);
   g_test_add_func ("/gpu/infer/start-errors", test_start_errors);
   g_test_add_func ("/gpu/infer/no-batch-meta", test_no_batch_meta);
