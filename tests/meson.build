@@ -153,6 +153,11 @@ if rds_infer_enabled
       dependencies : [rdsinfer_core_dep],
       link_language : 'cpp'),
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
+  # The secondary-mode per-object cache: when tracked objects are due, eviction, stale completions, a second thread.
+  test('infer_cache', executable('infer_cache', 'check' / 'infer_cache.c',
+      dependencies : [rdsinfer_core_dep],
+      link_language : 'cpp'),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap')
   # The preprocessing kernel against its CPU reference (check/infer-preprocess-ref.h) and against
   # rds_buf_surf_transform; prints the max differences and the batch timing. Internal: the static libgstrds only.
   test('infer_preprocess', executable('infer_preprocess', 'check' / 'infer_preprocess.c',

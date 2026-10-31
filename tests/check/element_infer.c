@@ -4,7 +4,8 @@
  * concurrent metadata readers (gpu, skipped without a ROCm device); secondary mode (/gpu/infer-secondary): object
  * crops, chunks, object selection, secondary detectors on fixeddet and their chains, objects replaced while the lock
  * is released, parser failures and the ROI offsets; classifiers on meancls and meancls2 (built-in and custom
- * parsers, thresholds, labels, display text, chains).
+ * parsers, thresholds, labels, display text, chains) and their per-object cache (tracked ids, growth, the reinfer
+ * interval, stream events, eviction; a detector with the interval).
  * The element's test hooks (gstrdsinfer.h) are looked up in the loaded plugin.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
@@ -2873,7 +2874,7 @@ test_classifier_custom (void)
 }
 
 /* A custom parser that returns false (FixtureClassifyFailDark, on red below 64): one warning per element, that object
- * gets no classifier meta, the others theirs (ours: DeepStream 8.0 crashes). */
+ * (untracked) gets no classifier meta, the others theirs (ours: DeepStream 8.0 crashes). */
 static void
 test_classifier_custom_false (void)
 {
@@ -2900,7 +2901,8 @@ test_classifier_custom_false (void)
   }
   g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 1);
   g_assert_nonnull (strstr (texts, "FixtureClassifyFailDark"));
-  g_assert_nonnull (strstr (texts, "an object of source 0, which gets no classifier meta"));
+  g_assert_nonnull (strstr (texts, "an object of source 0, which gets no new classifier meta "
+          "(a tracked object keeps its stored result, if any)"));
   g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
   g_free (texts);
   harness_teardown_with_bus (h, bus);
@@ -2962,7 +2964,7 @@ test_classifier_custom_throw (void)
   g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 1);
   g_assert_nonnull (strstr (texts, "FixtureClassifyThrow"));
   g_assert_nonnull (strstr (texts, "threw an exception"));
-  g_assert_nonnull (strstr (texts, "which gets no classifier meta"));
+  g_assert_nonnull (strstr (texts, "which gets no new classifier meta"));
   g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
   g_free (texts);
   harness_teardown_with_bus (h, bus);
@@ -3016,6 +3018,377 @@ test_classifier_tensor_meta (void)
   g_assert_cmpfloat (means[2], ==, 0.0f);
   gst_buffer_unref (out);
   gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* ---- gpu: the per-object cache ---- */
+
+/* An object of GIE 1 with tracked id @id, @size x @size at (@left, @top) of frame @frame, painted (@r, @g, @b),
+ * obj_label "car" and the display text @text, as add_colour_object. */
+static RdsObjectMeta *
+add_tracked (GstBuffer * buf, guint frame, guint64 id, guint left, guint top, guint size, guint8 r, guint8 g,
+    guint8 b, const gchar * text)
+{
+  RdsObjectMeta *om = add_colour_object (buf, frame, left, top, r, g, b, text);
+
+  om->object_id = id;
+  om->rect_params.width = om->rect_params.height = (gfloat) size;
+  paint_rect (buf, frame, left, top, size, size, r, g, b);
+  return om;
+}
+
+/* Pushes a one-frame batch with tracked object @id (32x32 at the origin, painted (@r, @g, 0)) through @h; checks
+ * the unit count afterwards and that the object got @want. */
+static void
+push_tracked (GstHarness * h, guint64 id, guint8 r, guint8 g, guint64 units, const WantLabel * want)
+{
+  GstBuffer *in = colour_batch (1), *out;
+  RdsObjectMeta *om = add_tracked (in, 0, id, 0, 0, 32, r, g, 0, "T");
+
+  out = push_pull (h, in);
+  g_assert_cmpuint (hook_get_unit_count (h->element), ==, units);
+  check_classifier (om, 0, 1, 4, NULL, want, 1);
+  gst_buffer_unref (out);
+}
+
+static const WantLabel cache_red = { 0, 0, 3, 0.78125f, "red" }, cache_green = { 0, 1, 3, 0.625f, "green" };
+
+/* Tracked objects are inferred once; later frames get an identical copy of the stored result (classifier meta,
+ * labels, the display text append) and no tensor meta, also when their pixels changed. An empty result (below the
+ * threshold) is cached too and not retried. Untracked objects are inferred every frame (DeepStream 8.0
+ * behaviour). */
+static void
+test_cache_hits (void)
+{
+  static const WantLabel blue = { 0, 2, 3, 0.99609375f, "blue" };
+  gchar *cfg = classifier_config ("cache-hits.txt", "meancls.onnx", 4, RGB_LABELS,
+      "classifier-type=colour\noutput-tensor-meta=1\nclassifier-threshold=0.1\n");
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  for (guint b = 0; b < 3; b++) {
+    GstBuffer *in = colour_batch (1), *out;
+    /* from the second batch on id 1 is blue and id 3 bright red: the cache still serves red and nothing */
+    RdsObjectMeta *t1 = add_tracked (in, 0, 1, 0, 0, 32, b ? 0 : 200, 0, b ? 255 : 0, "T");
+    RdsObjectMeta *t2 = add_tracked (in, 0, 2, 32, 0, 32, 0, 160, 0, NULL);
+    RdsObjectMeta *t3 = add_tracked (in, 0, 3, 64, 0, 32, b ? 200 : 10, 0, 0, "D");
+    RdsObjectMeta *u = add_colour_object (in, 0, 96, 0, b ? 0 : 200, 0, b ? 255 : 0, "U");
+
+    out = push_pull (h, in);
+    g_assert_cmpuint (hook_get_unit_count (h->element), ==, 4 + b);
+    check_classifier (t1, 0, 1, 4, "colour", &cache_red, 1);
+    check_object_kept (t1, "T red ");
+    check_classifier (t2, 0, 1, 4, "colour", &cache_green, 1);
+    check_object_kept (t2, " green ");
+    g_assert_null (t3->classifier_meta_list);
+    check_object_kept (t3, "D");
+    check_classifier (u, 0, 1, 4, "colour", b ? &blue : &cache_red, 1);
+    check_object_kept (u, b ? "U blue " : "U red ");
+    g_assert_nonnull (obj_tensor_meta (u));
+    g_assert_true ((obj_tensor_meta (t1) != NULL) == (b == 0));
+    g_assert_true ((obj_tensor_meta (t2) != NULL) == (b == 0));
+    g_assert_true ((obj_tensor_meta (t3) != NULL) == (b == 0));
+    gst_buffer_unref (out);
+  }
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* Growth above 1.2 x the area at the last inference infers again (DeepStream 8.0 behaviour): 32x32 -> 34x34 (1.13)
+ * is served from the cache, 36x36 (1.27) is inferred, and its result is served afterwards. */
+static void
+test_cache_growth (void)
+{
+  static const struct
+  {
+    guint size;
+    guint8 r, g;
+    guint64 units;
+    const WantLabel *want;
+  } steps[] = {
+    {32, 200, 0, 1, &cache_red}, {34, 0, 160, 1, &cache_red}, {36, 0, 160, 2, &cache_green},
+    {36, 200, 0, 2, &cache_green},
+  };
+  gchar *cfg = classifier_config ("cache-growth.txt", "meancls.onnx", 4, RGB_LABELS, NULL);
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  for (guint i = 0; i < G_N_ELEMENTS (steps); i++) {
+    GstBuffer *in = colour_batch (1), *out;
+    RdsObjectMeta *om = add_tracked (in, 0, 7, 0, 0, steps[i].size, steps[i].r, steps[i].g, 0, "T");
+
+    out = push_pull (h, in);
+    g_assert_cmpuint (hook_get_unit_count (h->element), ==, steps[i].units);
+    check_classifier (om, 0, 1, 4, NULL, steps[i].want, 1);
+    gst_buffer_unref (out);
+  }
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* secondary-reinfer-interval=1: a tracked object is inferred every second frame (DeepStream 8.0 behaviour) and served
+ * from the cache in between: painted red on the inferred frames and green on the others, it is always red. */
+static void
+test_cache_interval (void)
+{
+  gchar *cfg = classifier_config ("cache-interval.txt", "meancls.onnx", 4, RGB_LABELS,
+      "secondary-reinfer-interval=1\n");
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  for (guint f = 0; f < 6; f++)
+    push_tracked (h, 1, f % 2 ? 0 : 200, f % 2 ? 160 : 0, f / 2 + 1, &cache_red);
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* A secondary detector with secondary-reinfer-interval=1: a tracked parent is inferred only on its due frames and
+ * gets no children on the others, an untracked parent every frame (DeepStream 8.0 behaviour). */
+static void
+test_cache_detector_interval (void)
+{
+  static const guint64 units[] = { 2, 3, 5, 6 };
+  gchar *cfg = fixeddet_config ("cache-det.txt", "secondary-reinfer-interval=1\n");
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_test_model ("fixeddet.onnx");
+  load_hooks ();
+  h = harness_for (new_infer (cfg), NULL, RDS_BUF_COLOR_FORMAT_RGBA, 256, 128);
+  for (guint f = 0; f < G_N_ELEMENTS (units); f++) {
+    GstBuffer *in = make_batch (RDS_BUF_COLOR_FORMAT_RGBA, 256, 128, 1, 1, 0), *out;
+    RdsObjectMeta *parents[3];
+
+    parents[0] = add_test_object (in, 0, 1, 0, 100, 40, 64, 64);
+    parents[0]->object_id = 1;
+    parents[1] = add_test_object (in, 0, 1, 0, 223.4f, 95.2f, 40, 40);
+    parents[2] = add_test_object (in, 0, 2, 0, 10, 10, 40, 40);
+    out = push_pull (h, in);
+    g_assert_cmpuint (hook_get_unit_count (h->element), ==, units[f]);
+    if (f % 2 == 0) {
+      check_children (out, parents);
+    } else {
+      g_assert_cmpuint (count_children (nth_frame (out, 0), parents[0]), ==, 0);
+      g_assert_cmpuint (count_children (nth_frame (out, 0), parents[1]), ==, 6);
+    }
+    gst_buffer_unref (out);
+  }
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* classifier-async-mode=1 warns at start and runs synchronously: the results are in the same buffer, for tracked and
+ * untracked objects (ours: DeepStream 8.0 attaches them one frame late, and never to untracked objects). */
+static void
+test_cache_async_mode (void)
+{
+  gchar *cfg = classifier_config ("cache-async.txt", "meancls.onnx", 4, RGB_LABELS, "classifier-async-mode=1\n"),
+      *texts;
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *t, *u;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, bus);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "cache-async.txt:classifier-async-mode: 1"));
+  g_assert_nonnull (strstr (texts, "runs synchronously"));
+  g_free (texts);
+  in = colour_batch (1);
+  t = add_tracked (in, 0, 1, 0, 0, 32, 200, 0, 0, "T");
+  u = add_colour_object (in, 0, 32, 0, 0, 160, 0, "U");
+  out = push_pull (h, in);
+  check_classifier (t, 0, 1, 4, NULL, &cache_red, 1);
+  check_classifier (u, 0, 1, 4, NULL, &cache_green, 1);
+  gst_buffer_unref (out);
+  push_tracked (h, 1, 0, 160, 2, &cache_red);
+  harness_teardown_with_bus (h, bus);
+  g_free (cfg);
+}
+
+/* The source's stream-reset or stream-eos clears its entries, another source's doesn't; a flush clears every one
+ * (ours): the next frame infers the id again. */
+static void
+test_cache_events (void)
+{
+  gchar *cfg = classifier_config ("cache-events.txt", "meancls.onnx", 4, RGB_LABELS, NULL);
+  GstHarness *h;
+  GstSegment seg;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  push_tracked (h, 1, 200, 0, 1, &cache_red);
+  g_assert_true (gst_harness_push_event (h, rds_event_new_stream_reset (0)));
+  push_tracked (h, 1, 0, 160, 2, &cache_green);
+  g_assert_true (gst_harness_push_event (h, rds_event_new_stream_eos (1)));
+  g_assert_true (gst_harness_push_event (h, rds_event_new_stream_reset (1)));
+  push_tracked (h, 1, 200, 0, 2, &cache_green);
+  g_assert_true (gst_harness_push_event (h, rds_event_new_stream_eos (0)));
+  push_tracked (h, 1, 200, 0, 3, &cache_red);
+  g_assert_true (gst_harness_push_event (h, gst_event_new_flush_start ()));
+  g_assert_true (gst_harness_push_event (h, gst_event_new_flush_stop (TRUE)));
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  g_assert_true (gst_harness_push_event (h, gst_event_new_segment (&seg)));
+  push_tracked (h, 1, 0, 160, 4, &cache_green);
+  push_tracked (h, 1, 200, 0, 4, &cache_green);
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* Pushes @n one-frame batches without objects through @h. */
+static void
+push_empty (GstHarness * h, guint n)
+{
+  for (guint i = 0; i < n; i++)
+    gst_buffer_unref (push_pull (h, colour_batch (1)));
+}
+
+/* An id absent for 29 batches is still served; absent for 30 it is evicted and inferred again (ours: DeepStream 8.0
+ * never evicts). Batches without objects count. */
+static void
+test_cache_eviction (void)
+{
+  gchar *cfg = classifier_config ("cache-evict.txt", "meancls.onnx", 4, RGB_LABELS, NULL);
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  push_tracked (h, 1, 200, 0, 1, &cache_red);
+  push_empty (h, 29);
+  push_tracked (h, 1, 0, 160, 1, &cache_red);
+  push_empty (h, 30);
+  push_tracked (h, 1, 0, 160, 2, &cache_green);
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* An object that stays in its source's frames but is filtered out (here by class) is still seen: after 35 such frames
+ * it is selected again and served from the cache, while an id absent for those frames was evicted and is inferred
+ * again (ours). */
+static void
+test_cache_filtered_kept (void)
+{
+  gchar *cfg = classifier_config ("cache-filtered.txt", "meancls.onnx", 4, RGB_LABELS, "operate-on-class-ids=0\n");
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *kept, *back;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  in = colour_batch (1);
+  kept = add_tracked (in, 0, 1, 0, 0, 32, 200, 0, 0, "T");
+  back = add_tracked (in, 0, 2, 32, 0, 32, 200, 0, 0, "T");
+  out = push_pull (h, in);
+  g_assert_cmpuint (hook_get_unit_count (h->element), ==, 2);
+  gst_buffer_unref (out);
+  for (guint f = 0; f < 35; f++) {
+    in = colour_batch (1);
+    kept = add_tracked (in, 0, 1, 0, 0, 32, 200, 0, 0, "T");
+    kept->class_id = 1;
+    out = push_pull (h, in);
+    g_assert_null (kept->classifier_meta_list);
+    gst_buffer_unref (out);
+  }
+  g_assert_cmpuint (hook_get_unit_count (h->element), ==, 2);
+  in = colour_batch (1);
+  kept = add_tracked (in, 0, 1, 0, 0, 32, 0, 160, 0, "T");
+  back = add_tracked (in, 0, 2, 32, 0, 32, 0, 160, 0, "T");
+  out = push_pull (h, in);
+  g_assert_cmpuint (hook_get_unit_count (h->element), ==, 3);
+  check_classifier (kept, 0, 1, 4, NULL, &cache_red, 1);
+  check_classifier (back, 0, 1, 4, NULL, &cache_green, 1);
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* A re-inference whose parser fails (FixtureClassifyFailDark, on red below 64) attaches the stored result on that
+ * frame and leaves the entry as it was, so the object stays due and the next good inference replaces it (ours). */
+static void
+test_cache_parser_failure (void)
+{
+  gchar *extra = g_strdup_printf ("custom-lib-path=%s\nparse-classifier-func-name=FixtureClassifyFailDark\n",
+      RDS_TEST_PARSER_FIXTURE), *texts;
+  gchar *cfg = classifier_config ("cache-parser-fail.txt", "meancls.onnx", 4, RGB_LABELS, extra);
+  static const struct
+  {
+    guint size;
+    guint8 r;
+    guint64 units;
+    guint class_id;
+  } steps[] = {
+    /* inferred: red 200; grown and dark: inferred, fails, red 200 kept; grown and bright: inferred, red 120 */
+    {32, 200, 1, 200}, {40, 40, 2, 200}, {40, 120, 3, 120}, {40, 40, 3, 120},
+  };
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, bus);
+  for (guint i = 0; i < G_N_ELEMENTS (steps); i++) {
+    GstBuffer *in = colour_batch (1), *out;
+    RdsObjectMeta *om = add_tracked (in, 0, 1, 0, 0, steps[i].size, steps[i].r, 200, 0, "T");
+    const RdsLabelInfo *li;
+
+    out = push_pull (h, in);
+    g_assert_cmpuint (hook_get_unit_count (h->element), ==, steps[i].units);
+    g_assert_cmpuint (g_list_length (om->classifier_meta_list), ==, 1);
+    li = ((RdsClassifierMeta *) om->classifier_meta_list->data)->label_info_list->data;
+    g_assert_cmpuint (li->result_class_id, ==, steps[i].class_id);
+    check_object_kept (om, "T desc1");
+    gst_buffer_unref (out);
+  }
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "FixtureClassifyFailDark"));
+  g_free (texts);
+  harness_teardown_with_bus (h, bus);
+  g_free (cfg);
+  g_free (extra);
+}
+
+/* A chunk that fails (the slot's surface has no valid format, so its preprocessing fails) cancels the cache requests
+ * of its units: the tracked object is due again on the next batch, not stuck waiting for a result (ours). */
+static void
+test_cache_chunk_failure (void)
+{
+  gchar *cfg = classifier_config ("cache-chunk-fail.txt", "meancls.onnx", 4, RGB_LABELS, NULL), *texts;
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h;
+  GstBuffer *in;
+  RdsBufSurface *s;
+  RdsBufSurfaceColorFormat fmt;
+  RdsObjectMeta *om;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, bus);
+  in = colour_batch (1);
+  om = add_tracked (in, 0, 1, 0, 0, 32, 200, 0, 0, "T");
+  s = rds_buffer_get_surface (in);
+  fmt = s->surfaceList[0].colorFormat;
+  s->surfaceList[0].colorFormat = RDS_BUF_COLOR_FORMAT_INVALID;
+  g_assert_cmpint (gst_harness_push (h, gst_buffer_ref (in)), ==, GST_FLOW_ERROR);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "Preprocessing failed"));
+  g_free (texts);
+  s->surfaceList[0].colorFormat = fmt;
+  g_assert_null (om->classifier_meta_list);
+  g_assert_cmpuint (hook_get_unit_count (h->element), ==, 0);
+  gst_buffer_unref (in);
+  push_tracked (h, 1, 200, 0, 1, &cache_red);
+  harness_teardown_with_bus (h, bus);
   g_free (cfg);
 }
 
@@ -3249,6 +3622,16 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-secondary/classifier-custom-throw", test_classifier_custom_throw);
   g_test_add_func ("/gpu/infer-secondary/classifier-unknown-symbol", test_classifier_unknown_symbol);
   g_test_add_func ("/gpu/infer-secondary/classifier-tensor-meta", test_classifier_tensor_meta);
+  g_test_add_func ("/gpu/infer-secondary/cache-hits", test_cache_hits);
+  g_test_add_func ("/gpu/infer-secondary/cache-growth", test_cache_growth);
+  g_test_add_func ("/gpu/infer-secondary/cache-interval", test_cache_interval);
+  g_test_add_func ("/gpu/infer-secondary/cache-detector-interval", test_cache_detector_interval);
+  g_test_add_func ("/gpu/infer-secondary/cache-async-mode", test_cache_async_mode);
+  g_test_add_func ("/gpu/infer-secondary/cache-events", test_cache_events);
+  g_test_add_func ("/gpu/infer-secondary/cache-eviction", test_cache_eviction);
+  g_test_add_func ("/gpu/infer-secondary/cache-filtered-kept", test_cache_filtered_kept);
+  g_test_add_func ("/gpu/infer-secondary/cache-parser-failure", test_cache_parser_failure);
+  g_test_add_func ("/gpu/infer-secondary/cache-chunk-failure", test_cache_chunk_failure);
   ret = g_test_run ();
   if (dev_alloc)
     gst_object_unref (dev_alloc);

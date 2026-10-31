@@ -636,7 +636,7 @@ is inconsistent).
 | Detector chains | DeepStream 8.0 behaviour | a second `rdsinfer` with `infer-on-gie-id` = the detector's `gie-unique-id` infers on its children |
 | `roi-top-offset`, `roi-bottom-offset` | ours | not applied (measured from a crop's edges they would be surprising), with a warning; 8.0 not observed |
 | Parser returns false | ours | one warning per element, that object gets no children but its tensor meta is still attached (as in primary mode), the other objects are unaffected (8.0 crashes) |
-| Classifiers (`network-type=1`) | DeepStream 8.0 behaviour | secondary mode only (primary mode fails at start); see "Classifier output (classifier meta)" |
+| Classifiers (`network-type=1`) | DeepStream 8.0 behaviour | secondary mode only (primary mode fails at start); see "Classifier output (classifier meta)" and "Per-object cache" |
 
 #### Classifier output (classifier meta)
 
@@ -659,9 +659,32 @@ A classifier (`network-type=1`, `process-mode=2`) attaches what it finds to each
 | Custom parser | DeepStream 8.0 behaviour | `parse-classifier-func-name` in `custom-lib-path`, called once per object with that object's output layers (dims without the batch), the network info and `classifier-threshold`; each attribute becomes a label (`attributeLabel` → `result_label`, `attributeValue` → `result_class_id`, `attributeIndex` → `label_id`, `attributeConfidence` → `result_prob`), not thresholded again. rdsinfer frees the `attributeLabel`s |
 | Custom parser label | ours | a NULL `attributeLabel` is an empty label |
 | Unknown parse function | DeepStream 8.0 behaviour, ours | a `parse-classifier-func-name` the library doesn't have fails start (DeepStream 8.0 behaviour); the error names the key (ours) |
-| Parser returns false or throws | ours | one warning per element; that object gets no classifier meta, the others are unaffected (8.0 crashes) |
+| Parser returns false or throws | ours | one warning per element; that object gets no new classifier meta (a tracked object keeps its stored result, if any, see "Per-object cache"), the others are unaffected (8.0 crashes) |
 | Tensor meta | DeepStream 8.0 behaviour | with `output-tensor-meta=1` a classified object gets its tensor meta too; it doesn't change the classification |
 | Chained classifiers | DeepStream 8.0 behaviour | a second classifier on the same objects attaches its own meta to each |
+
+#### Per-object cache
+
+In secondary mode a classifier keeps each tracked object's last result, keyed by `source_id` and `object_id`, and
+infers the object again only when it is due. Each row is **DeepStream 8.0 behaviour** (observed) or **ours**.
+
+| Topic | Source | Behaviour |
+|---|---|---|
+| What is cached | DeepStream 8.0 behaviour | classifiers (`network-type=1`) on tracked objects only. Untracked objects (`RDS_UNTRACKED_OBJECT_ID`) are inferred every frame; tensor-only networks (`network-type=100`) infer every object every time |
+| Keys | DeepStream 8.0 behaviour | `(source_id, object_id)`: the same id in two streams has two entries |
+| New id | DeepStream 8.0 behaviour | inferred on its first frame; an id seen before gets its stored result back (until it is evicted) |
+| Growth | DeepStream 8.0 behaviour | inferred again when the `rect_params` area is above 1.2 × the area at its last inference, strictly (1.2 × no, 1.2001 × yes); shrinking or moving never re-infers and keeps the reference area. A class change keeps the result |
+| Growth comparison | ours | exact (5 × area > 6 × last area in double precision); 8.0 compares in float, which may round the other way in rare cases |
+| `secondary-reinfer-interval` | DeepStream 8.0 behaviour | unset (-1): never on time; 0: every frame; N: every N + 1 frames, counted from the object's own last inference (growth restarts the count) |
+| Interval count | ours | counted in the frames in which the object was selected (8.0 runs had one source and the object in every frame) |
+| Cached frames | DeepStream 8.0 behaviour | the stored result is attached again: identical classifier meta and label infos, the same `display_text` append; no tensor meta, even with `output-tensor-meta=1` |
+| Empty result | DeepStream 8.0 behaviour | a result below `classifier-threshold` (no labels) is cached like any other: the object gets nothing until growth or the interval infers it again |
+| Parser failure | ours | the object's entry is left as it was before the inference, and on that frame the object gets the stored result (classifier meta and display text) instead of nothing, plus its tensor meta from the failed inference; a new id has no stored result, gets no classifier meta and is tried again on its next frame; an object with a stored result keeps it and stays due until an inference succeeds |
+| Same id twice in a batch | ours | inferred once; the other object gets the result stored before this batch, if any (none for a new id) |
+| Eviction | ours | an entry not seen for 30 frames of its own source is dropped (8.0 keeps every entry: results came back after 1000 absent frames). Each source counts its own frames, one per frame of it in a batch, so a source that sends no frames keeps its entries; seen means present in the source's frame, selected or not (an object filtered out by class, size or an empty crop is kept) |
+| Stream events | ours | a source's `rds-stream-eos` or `rds-stream-reset` drops that source's entries and restarts its frame count; FLUSH_STOP and stopping the element drop every entry. A result whose request is stale (`seq` and epoch per request) is neither stored nor attached: what an object gets is always what its entry holds |
+| Secondary detectors | DeepStream 8.0 behaviour | no cache of detections; with `secondary-reinfer-interval` set, a tracked parent is inferred only when due by the same rules (new id, growth, interval) and gets no children (and no tensor meta) on the other frames. Unset: every frame |
+| `classifier-async-mode=1` | ours | warns at start and runs synchronously: results are in the same buffer, also for untracked objects (8.0 attaches them from the next frame on and never to untracked objects) |
 
 #### Config files
 

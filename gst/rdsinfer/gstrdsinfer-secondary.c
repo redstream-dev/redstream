@@ -1,6 +1,6 @@
 /* Redstream: rdsinfer's secondary mode (process-mode=2): the objects of a batch read into inference units, a
- * detector's children mapped back to the frame, a classifier's results, and a chunk's results attached to its
- * objects. The per-batch flow that calls these is in gstrdsinfer.c.
+ * detector's children mapped back to the frame, a classifier's results, the per-object cache's requests, and a
+ * chunk's results attached to its objects. The per-batch flow that calls these is in gstrdsinfer.c.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsinfer-private.h"
 #include "rds-infer-units.h"
@@ -12,8 +12,13 @@
 /* Secondary mode: reads the objects of every frame (under the meta lock) into self->units, one unit per selected
  * object (rds_infer_object_selected) whose crop isn't empty (rds_infer_crop_rect), in frame list order, then object
  * list order (DeepStream 8.0 behaviour). Every frame is read, bInferDone or not. Unit i goes into image
- * i % batch-size: the units run in chunks of batch-size in this order. FALSE with an element error on a bad
- * batch. */
+ * i % batch-size: the units run in chunks of batch-size in this order. With a cache, each frame begins a frame of
+ * its source (rds_infer_cache_begin_frame), and a tracked object gets a unit only when it is due
+ * (rds_infer_cache_lookup_or_add; the unit keeps the request); otherwise a classifier attaches the stored result
+ * right here, without tensor meta, and a detector skips the object, which gets no children on this frame
+ * (DeepStream 8.0 behaviour). A tracked object that is not selected (or has an empty crop) is still marked seen
+ * (rds_infer_cache_touch; ours), so it is not evicted while it stays in the frame. Untracked objects always get a
+ * unit (DeepStream 8.0 behaviour). FALSE with an element error on a bad batch. */
 gboolean
 gst_rds_infer_snapshot_objects (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf)
 {
@@ -33,17 +38,37 @@ gst_rds_infer_snapshot_objects (GstRdsInfer * self, RdsBatchMeta * bm, const Rds
       break;
     }
     sp = &surf->surfaceList[fm->batch_id];
+    /* lock order: the batch meta lock, then the cache's */
+    if (self->cache)
+      rds_infer_cache_begin_frame (self->cache, fm->source_id);
     for (GList * o = fm->obj_meta_list; o; o = o->next) {
       RdsObjectMeta *om = o->data;
       const RdsOSD_RectParams *r = &om->rect_params;
       InferUnit unit = {.source_id = fm->source_id,.slot = fm->batch_id };
+      gboolean tracked = self->cache && om->object_id != RDS_UNTRACKED_OBJECT_ID;
 
-      if (!rds_infer_object_selected (cfg, om->unique_component_id, om->class_id, r->width, r->height))
+      if (!rds_infer_object_selected (cfg, om->unique_component_id, om->class_id, r->width, r->height)) {
+        if (tracked)
+          rds_infer_cache_touch (self->cache, fm->source_id, om->object_id);
         continue;
+      }
       if (!rds_infer_crop_rect (r->left, r->top, r->width, r->height, sp->width, sp->height, &unit.src)) {
         GST_DEBUG_OBJECT (self, "source %u frame %d: object at (%g, %g) %gx%g has an empty crop in %ux%u, skipped",
             fm->source_id, fm->frame_num, r->left, r->top, r->width, r->height, sp->width, sp->height);
+        if (tracked)
+          rds_infer_cache_touch (self->cache, fm->source_id, om->object_id);
         continue;
+      }
+      if (tracked) {
+        RdsInferClassifierResult *stored = NULL;
+
+        unit.has_request = rds_infer_cache_lookup_or_add (self->cache, fm->source_id, om->object_id,
+            (gdouble) r->width * (gdouble) r->height, &unit.req, &stored);
+        if (!unit.has_request && stored)
+          gst_rds_infer_attach_classifier_result (bm, om, stored, (gint) cfg->gie_unique_id, self->classifier_type);
+        rds_infer_classifier_result_free (stored);
+        if (!unit.has_request)
+          continue;
       }
       unit.frame = rds_meta_ref (fm);
       unit.obj = rds_meta_ref (om);
@@ -73,8 +98,8 @@ gst_rds_infer_map_children (GstRdsInfer * self, const InferUnit * unit, const Rd
 
 /* Classifiers: the classifier parser on each unit of @first .. @first + @n - 1 (a chunk), on the host outputs of its
  * @set, once per object (DeepStream 8.0 behaviour), into self->cls_results (entry u - first). A parser that returns
- * false or throws costs only that object its classifier meta (ours: DeepStream 8.0 crashes): NULL there, and one
- * warning per element. */
+ * false or throws costs only that object its new classifier meta (ours: DeepStream 8.0 crashes): NULL there (a
+ * tracked object then gets its stored result: gst_rds_infer_complete_requests), and one warning per element. */
 void
 gst_rds_infer_classify_units (GstRdsInfer * self, RdsInferOutputSet * set, guint first, guint n)
 {
@@ -86,7 +111,8 @@ gst_rds_infer_classify_units (GstRdsInfer * self, RdsInferOutputSet * set, guint
 
     gst_rds_infer_point_layers (self, set, unit->image);
     if (!rds_infer_parser_classify (self->parser, self->layers, self->n_outputs, &self->net, result, &err)) {
-      gchar *msg = g_strdup_printf ("Parser %s failed on an object of source %u, which gets no classifier meta: %s",
+      gchar *msg = g_strdup_printf ("Parser %s failed on an object of source %u, which gets no new classifier meta "
+          "(a tracked object keeps its stored result, if any): %s",
           rds_infer_parser_get_func_name (self->parser), unit->source_id, err->message);
 
       gst_rds_infer_warn_once (self, WARN_PARSE, msg);
@@ -94,7 +120,57 @@ gst_rds_infer_classify_units (GstRdsInfer * self, RdsInferOutputSet * set, guint
       g_error_free (err);
       g_clear_pointer (&result, rds_infer_classifier_result_free);
     }
+    unit->failed = !result;
     g_ptr_array_add (self->cls_results, result);
+  }
+}
+
+/* With a cache: the results of the units @first .. @first + @n - 1 (a chunk, parsed) go to their objects' entries,
+ * before they are attached: a classifier's result (an empty one too), or for a detector the inference alone. What
+ * is then attached is the value stored in the entry (the entry holds a copy of it). A unit whose parser failed
+ * leaves its entry as it was, and a classifier attaches the entry's stored result instead, so the object keeps its
+ * classification (ours). A stale request (none in sync mode: flushes and stream events come between batches)
+ * attaches nothing. No batch meta lock needed. */
+void
+gst_rds_infer_complete_requests (GstRdsInfer * self, guint first, guint n)
+{
+  for (guint u = first; u < first + n; u++) {
+    InferUnit *unit = &g_array_index (self->units, InferUnit, u);
+    gboolean ok;
+
+    unit->stale = FALSE;
+    if (!unit->has_request)
+      continue;
+    if (self->cfg->network_type == 1) {
+      RdsInferClassifierResult **result = (RdsInferClassifierResult **) & g_ptr_array_index (self->cls_results,
+          u - first);
+
+      /* on a failure *result is NULL: it gets a copy of the stored result, if any */
+      ok = unit->failed ? rds_infer_cache_cancel (self->cache, &unit->req, result) :
+          rds_infer_cache_complete (self->cache, &unit->req, *result);
+    } else {
+      ok = unit->failed ? rds_infer_cache_cancel (self->cache, &unit->req, NULL) :
+          rds_infer_cache_complete (self->cache, &unit->req, NULL);
+    }
+    if (!ok) {
+      GST_DEBUG_OBJECT (self, "source %u object %" G_GUINT64_FORMAT ": stale cache request dropped",
+          unit->source_id, unit->req.object_id);
+      unit->stale = TRUE;
+    }
+    unit->has_request = FALSE;
+  }
+}
+
+/* The cache requests of the units from @first on, which won't be inferred (an element error), are cancelled. */
+void
+gst_rds_infer_cancel_requests (GstRdsInfer * self, guint first)
+{
+  for (guint u = first; u < self->units->len; u++) {
+    InferUnit *unit = &g_array_index (self->units, InferUnit, u);
+
+    if (unit->has_request)
+      (void) rds_infer_cache_cancel (self->cache, &unit->req, NULL);
+    unit->has_request = FALSE;
   }
 }
 
@@ -150,7 +226,7 @@ gst_rds_infer_attach_classifier_result (RdsBatchMeta * bm, RdsObjectMeta * om, c
  * object's obj_user_meta_list (detectors and classifiers included), a detector's children to the frame with the
  * object as parent, a classifier's result as its classifier meta (gst_rds_infer_attach_classifier_result).
  * bInferDone is left alone (DeepStream 8.0 behaviour). A frame or object removed while the lock was released gets
- * nothing, even when the pool reused its address. */
+ * nothing, even when the pool reused its address, and so does a unit whose cache completion was stale. */
 void
 gst_rds_infer_attach_object_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set, guint first,
     guint n)
@@ -165,6 +241,8 @@ gst_rds_infer_attach_object_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsI
     InferUnit *unit = &g_array_index (self->units, InferUnit, u);
     RdsObjectMeta *om;
 
+    if (unit->stale)
+      continue;
     /* consecutive units of a frame resolve it once: the lock is held throughout */
     if (unit->frame.meta != frame.meta || unit->frame.generation != frame.generation) {
       frame = unit->frame;

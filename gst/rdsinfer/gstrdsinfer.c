@@ -21,6 +21,14 @@
  *   bInferDone in primary mode; secondary mode doesn't touch it (DeepStream 8.0 behaviour), and attaches to the
  *   object: its tensor meta, a detector's children with the object as parent, a classifier's classifier meta
  *   (gstrdsinfer-secondary.c).
+ * - The per-object cache (secondary mode, rds-infer-cache.h; DeepStream 8.0 behaviour except where it says ours): a
+ *   classifier infers a tracked object only when it is due (a new id, growth above 1.2 x the area at its last
+ *   inference, secondary-reinfer-interval) and attaches the stored result on the other frames, without tensor meta;
+ *   a detector with secondary-reinfer-interval set infers a tracked object only when it is due, and gives it no
+ *   children on the other frames. Untracked objects are inferred every time. The cache drops entries absent for
+ *   RDS_INFER_CACHE_MAX_ABSENT frames of their source, a source's entries on its stream-eos or stream-reset, and
+ *   every entry on FLUSH_STOP and stop (ours). classifier-async-mode=1 runs synchronously, with a warning at start
+ *   (ours).
  * - interval N (primary mode): one batch is inferred, the next N pass untouched (bInferDone FALSE); the count
  *   restarts at start and after a flush. Secondary mode infers every batch (DeepStream 8.0 behaviour).
  * - Output buffers are refcounted sets (rds-infer-output.h) that tensor metas keep alive, also in demuxed copies:
@@ -369,6 +377,8 @@ release_resources (GstRdsInfer * self)
   if (switched)
     rds_infer_device_restore (prev);
   g_clear_pointer (&self->cfg, rds_infer_config_free);
+  /* stop clears the cache with everything else (a new one at start) */
+  g_clear_pointer (&self->cache, rds_infer_cache_free);
   g_clear_pointer (&self->out_dims, g_free);
   g_clear_pointer (&self->out_names, g_free);
   g_clear_pointer (&self->layers, g_free);
@@ -551,6 +561,11 @@ gst_rds_infer_start (GstBaseTransform * trans)
                 i)), (NULL));
   self->secondary = self->cfg->process_mode == 2;
   self->classifier_type = g_intern_string (self->cfg->classifier_type);
+  /* DeepStream 8.0 behaviour: classifiers cache per tracked object; detectors only track when an object is due,
+   * and only with secondary-reinfer-interval set; tensor-only networks infer every object every time */
+  if (self->secondary && (self->cfg->network_type == 1 || (self->cfg->network_type == 0
+              && self->cfg->secondary_reinfer_interval >= 0)))
+    self->cache = rds_infer_cache_new (self->cfg->secondary_reinfer_interval);
   GST_OBJECT_LOCK (self);
   if (self->raw_output_file_write || self->raw_output_generated_callback)
     self->warned |= WARN_RAW_OUTPUT;
@@ -607,11 +622,24 @@ gst_rds_infer_stop (GstBaseTransform * trans)
   return TRUE;
 }
 
+/* FLUSH_STOP restarts the interval count and clears the cache (and bumps its epoch); a source's stream-eos or
+ * stream-reset clears that source's cache entries (ours: DeepStream 8.0 keeps them). Every event goes on. */
 static gboolean
 gst_rds_infer_sink_event (GstBaseTransform * trans, GstEvent * event)
 {
-  if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP)
-    GST_RDS_INFER (trans)->batch_count = 0;
+  GstRdsInfer *self = GST_RDS_INFER (trans);
+  guint source_id;
+
+  if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP) {
+    self->batch_count = 0;
+    if (self->cache)
+      rds_infer_cache_flush (self->cache);
+  } else if (self->cache && (rds_event_parse_stream_eos (event, &source_id)
+          || rds_event_parse_stream_reset (event, &source_id))) {
+    guint n = rds_infer_cache_clear_source (self->cache, source_id);
+
+    GST_DEBUG_OBJECT (self, "source %u: %u cache entries cleared", source_id, n);
+  }
   return GST_BASE_TRANSFORM_CLASS (gst_rds_infer_parent_class)->sink_event (trans, event);
 }
 
@@ -701,6 +729,7 @@ parse_units (GstRdsInfer * self, const RdsBufSurface * surf, RdsInferOutputSet *
 
     unit->det_start = self->dets->len;
     unit->n_dets = 0;
+    unit->failed = FALSE;
     gst_rds_infer_point_layers (self, set, unit->image);
     g_array_set_size (self->objects, 0);
     /* only this unit loses its objects (ours in secondary mode, where DeepStream 8.0 crashes) */
@@ -712,6 +741,7 @@ parse_units (GstRdsInfer * self, const RdsBufSurface * surf, RdsInferOutputSet *
       gst_rds_infer_warn_once (self, WARN_PARSE, msg);
       g_free (msg);
       g_error_free (err);
+      unit->failed = TRUE;
       continue;
     }
     flags = rds_infer_postprocess (cfg, &unit->lb, (const RdsInferObjectDetectionInfo *) self->objects->data,
@@ -863,6 +893,8 @@ infer_chunk (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf, 
     parse_units (self, surf, set, first, n);
   else if (cfg->network_type == 1)
     gst_rds_infer_classify_units (self, set, first, n);
+  if (self->cache)
+    gst_rds_infer_complete_requests (self, first, n);
   if (self->secondary)
     gst_rds_infer_attach_object_results (self, bm, set, first, n);
   else
@@ -904,8 +936,18 @@ gst_rds_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     return GST_FLOW_ERROR;
   }
   ok = self->secondary ? gst_rds_infer_snapshot_objects (self, bm, surf) : snapshot_frames (self, bm, surf);
-  if (!ok)
+  if (self->cache) {
+    /* once per batch, after its lookups, batches without objects included */
+    guint evicted = rds_infer_cache_evict_absent (self->cache, RDS_INFER_CACHE_MAX_ABSENT);
+
+    if (evicted)
+      GST_LOG_OBJECT (self, "%u cache entries evicted", evicted);
+  }
+  if (!ok) {
+    if (self->cache)
+      gst_rds_infer_cancel_requests (self, 0);
     return GST_FLOW_ERROR;
+  }
   if (self->units->len == 0) {
     GST_LOG_OBJECT (self, "batch without %s", self->secondary ? "objects to infer on" : "frames");
     return GST_FLOW_OK;
@@ -917,13 +959,18 @@ gst_rds_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
    * whatever ran on it before may have left another device current. */
   if (hipSetDevice ((int) self->gpu) != hipSuccess) {
     GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("GPU %u is not available", self->gpu), (NULL));
+    if (self->cache)
+      gst_rds_infer_cancel_requests (self, 0);
     return GST_FLOW_ERROR;
   }
   /* primary mode has at most batch-size units (one per slot): one chunk; secondary mode never chunks across
    * buffers (DeepStream 8.0 behaviour) */
   for (guint first = 0; first < self->units->len; first += cfg->batch_size)
-    if (!infer_chunk (self, bm, surf, first, MIN (cfg->batch_size, self->units->len - first)))
+    if (!infer_chunk (self, bm, surf, first, MIN (cfg->batch_size, self->units->len - first))) {
+      if (self->cache)
+        gst_rds_infer_cancel_requests (self, first);
       return GST_FLOW_ERROR;
+    }
   if (t0)
     GST_DEBUG_OBJECT (self, "batch of %u units: %.3f ms", self->units->len, (g_get_monotonic_time () - t0) / 1000.0);
   return GST_FLOW_OK;

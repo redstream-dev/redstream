@@ -202,6 +202,8 @@ gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; secondary mod
                    (dlopen, ABI version check) and has the built-in YOLO and classifier parsers; rds-infer-post does the detection
                    post-processing (letterbox geometry, NMS, ROI/size filters); rds-infer-units the secondary-mode
                    geometry (object selection, aligned crops, crop letterbox, children back to the frame);
+                   rds-infer-cache the per-object cache (which tracked objects are due, classifier results as values,
+                   its own mutex taken after the batch meta lock, stale completions dropped by seq and epoch);
                    rds-infer-engine compiles ONNX with MIGraphX and caches the program (.mxr + .mxr.json manifest),
                    reading the model's declared input dims with the small protobuf reader rds-infer-onnx. These are
                    in the static rdsinfer-core library (C and C++: link it with link_language 'cpp'), shared with the

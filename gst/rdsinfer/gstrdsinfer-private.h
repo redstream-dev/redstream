@@ -6,6 +6,7 @@
 #define GST_RDS_INFER_PRIVATE_H
 
 #include "gstrdsinfer.h"
+#include "rds-infer-cache.h"
 #include "rds-infer-config.h"
 #include "rds-infer-engine.h"
 #include "rds-infer-output.h"
@@ -40,6 +41,10 @@ typedef struct
   guint image;                  /* in the chunk's network input and output set; primary mode: the slot */
   RdsInferLetterbox lb;         /* for src's size (secondary mode: rds_infer_crop_letterbox) */
   guint det_start, n_dets;      /* in self->dets; secondary mode: in frame pixels */
+  gboolean failed;              /* the parser (detector or classifier) failed on it */
+  gboolean has_request;         /* secondary mode: the cache's request for its tracked object is in req */
+  gboolean stale;               /* the cache dropped its completion: nothing is attached */
+  RdsInferCacheRequest req;
 } InferUnit;
 
 struct _GstRdsInfer
@@ -74,6 +79,9 @@ struct _GstRdsInfer
   guint warned;                 /* WarnOnce */
   gboolean secondary;           /* process-mode=2 */
   const gchar *classifier_type; /* classifier-type, interned (the classifier metas point at it); NULL if unset */
+  /* secondary mode, classifiers and detectors with secondary-reinfer-interval set: when tracked objects are due, and
+   * a classifier's stored results (rds-infer-cache.h); NULL otherwise */
+  RdsInferCache *cache;
   GArray *units;                /* InferUnit, the current batch's */
   GArray *objects;              /* RdsInferObjectDetectionInfo, one frame's parser output */
   GArray *dets;                 /* RdsInferDetection, every frame's */
@@ -106,6 +114,8 @@ G_GNUC_INTERNAL void gst_rds_infer_map_children (GstRdsInfer * self, const Infer
     const RdsBufSurfaceParams * sp);
 G_GNUC_INTERNAL void gst_rds_infer_classify_units (GstRdsInfer * self, RdsInferOutputSet * set, guint first,
     guint n);
+G_GNUC_INTERNAL void gst_rds_infer_complete_requests (GstRdsInfer * self, guint first, guint n);
+G_GNUC_INTERNAL void gst_rds_infer_cancel_requests (GstRdsInfer * self, guint first);
 G_GNUC_INTERNAL void gst_rds_infer_attach_classifier_result (RdsBatchMeta * bm, RdsObjectMeta * om,
     const RdsInferClassifierResult * result, gint unique_id, const gchar * classifier_type);
 G_GNUC_INTERNAL void gst_rds_infer_attach_object_results (GstRdsInfer * self, RdsBatchMeta * bm,
