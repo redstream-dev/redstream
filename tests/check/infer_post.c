@@ -989,6 +989,42 @@ test_clip (void)
   rds_infer_config_free (cfg);
 }
 
+/* The clip on its own: in place too, and an empty result leaves the output untouched. */
+static void
+test_box_clip (void)
+{
+  static const struct
+  {
+    RdsInferBox in;
+    gboolean ok;
+    RdsInferBox out;
+  } cases[] = {
+    {{100, 100, 10, 10}, TRUE, {100, 100, 10, 10}},
+    {{-10, 400, 50, 100}, TRUE, {0, 400, 40, 80}},
+    {{-5, -5, 700, 700}, TRUE, {0, 0, 640, 480}},
+    {{630.5f, 470.25f, 20, 20}, TRUE, {630.5f, 470.25f, 9.5f, 9.75f}},
+    {{640, 0, 10, 10}, FALSE, {0, 0, 0, 0}},
+    {{0, -10, 10, 10}, FALSE, {0, 0, 0, 0}},
+    {{650, 0, 10, 10}, FALSE, {0, 0, 0, 0}},
+    {{0, 0, 0, 10}, FALSE, {0, 0, 0, 0}},
+    {{0, 0, 10, NAN}, FALSE, {0, 0, 0, 0}},
+  };
+
+  for (guint i = 0; i < G_N_ELEMENTS (cases); i++) {
+    RdsInferBox out = { 1, 2, 3, 4 }, same = cases[i].in;
+
+    g_test_message ("case %u", i);
+    g_assert_cmpint (rds_infer_box_clip (&cases[i].in, 640, 480, &out), ==, cases[i].ok);
+    g_assert_cmpint (rds_infer_box_clip (&same, 640, 480, &same), ==, cases[i].ok);
+    if (cases[i].ok) {
+      assert_box (&out, cases[i].out.left, cases[i].out.top, cases[i].out.width, cases[i].out.height);
+      assert_box (&same, cases[i].out.left, cases[i].out.top, cases[i].out.width, cases[i].out.height);
+    } else {
+      assert_box (&out, 1, 2, 3, 4);
+    }
+  }
+}
+
 /* cluster-mode=4: no NMS and no topk; the thresholds still apply. */
 static void
 test_cluster_none (void)
@@ -1290,6 +1326,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-post/roi", test_roi);
   g_test_add_func ("/cpu/infer-post/min-max", test_min_max);
   g_test_add_func ("/cpu/infer-post/clip", test_clip);
+  g_test_add_func ("/cpu/infer-post/box-clip", test_box_clip);
   g_test_add_func ("/cpu/infer-post/cluster-none", test_cluster_none);
   g_test_add_func ("/cpu/infer-post/combined", test_combined);
   g_test_add_func ("/cpu/infer-post/random", test_random);

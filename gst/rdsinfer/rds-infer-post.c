@@ -53,6 +53,22 @@ rds_infer_letterbox_map (const RdsInferLetterbox * lb, gfloat left, gfloat top, 
   out[3] = (gfloat) ((gdouble) height * lb->frame_h / lb->scaled_h);
 }
 
+gboolean
+rds_infer_box_clip (const RdsInferBox * box, guint frame_w, guint frame_h, RdsInferBox * out)
+{
+  gfloat left = MAX (box->left, 0), top = MAX (box->top, 0);
+  gfloat right = MIN (box->left + box->width, (gfloat) frame_w);
+  gfloat bottom = MIN (box->top + box->height, (gfloat) frame_h);
+
+  if (!(box->width > 0 && box->height > 0 && right - left > 0 && bottom - top > 0))
+    return FALSE;
+  out->left = left;
+  out->top = top;
+  out->width = right - left;
+  out->height = bottom - top;
+  return TRUE;
+}
+
 /* An object that passed step 1. */
 typedef struct
 {
@@ -190,7 +206,7 @@ rds_infer_postprocess (const RdsInferConfig * cfg, const RdsInferLetterbox * lb,
     const RdsInferObjectDetectionInfo *o = &in[c[i].index];
     const RdsInferClassAttrs *attrs = &cfg->class_attrs[o->classId];
     RdsInferDetection d;
-    gfloat m[4], right, bottom, cy;
+    gfloat m[4], cy;
     gboolean filtered = FALSE;
 
     /* 4. Post-cluster threshold. */
@@ -232,13 +248,7 @@ rds_infer_postprocess (const RdsInferConfig * cfg, const RdsInferLetterbox * lb,
       continue;
 
     /* 9. Clip to the frame. */
-    d.rect.left = MAX (d.box.left, 0);
-    d.rect.top = MAX (d.box.top, 0);
-    right = MIN (d.box.left + d.box.width, (gfloat) lb->frame_w);
-    bottom = MIN (d.box.top + d.box.height, (gfloat) lb->frame_h);
-    d.rect.width = right - d.rect.left;
-    d.rect.height = bottom - d.rect.top;
-    if (d.rect.width <= 0 || d.rect.height <= 0)
+    if (!rds_infer_box_clip (&d.box, lb->frame_w, lb->frame_h, &d.rect))
       continue;
     g_array_append_val (out, d);
   }

@@ -148,6 +148,11 @@ if rds_infer_enabled
       dependencies : [rdsinfer_core_dep],
       link_language : 'cpp'),
     suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 120)
+  # The secondary-mode geometry: object selection, crop rects, the crop letterbox and the mapping back to the frame.
+  test('infer_units', executable('infer_units', 'check' / 'infer_units.c',
+      dependencies : [rdsinfer_core_dep],
+      link_language : 'cpp'),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap')
   # The preprocessing kernel against its CPU reference (check/infer-preprocess-ref.h) and against
   # rds_buf_surf_transform; prints the max differences and the batch timing. Internal: the static libgstrds only.
   test('infer_preprocess', executable('infer_preprocess', 'check' / 'infer_preprocess.c',

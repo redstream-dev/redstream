@@ -199,14 +199,15 @@ gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; refcounted ou
                    rds-infer-output; test hooks exported for element_infer). rds-infer-config parses
                    nvinfer key-file/YAML configs from one key table; rds-infer-parse loads custom parser libraries
                    (dlopen, ABI version check) and has the built-in YOLO parser; rds-infer-post does the detection
-                   post-processing (letterbox geometry, NMS, ROI/size filters); rds-infer-engine compiles ONNX with
-                   MIGraphX and caches the program (.mxr + .mxr.json manifest), reading the model's declared input
-                   dims with the small protobuf reader rds-infer-onnx. These are in the static rdsinfer-core library
-                   (C and C++: link it with link_language 'cpp'), shared with the tests; the letterbox +
-                   normalisation kernel (rds-infer-preprocess.hip) is the static rdsinfer-preprocess; config corpus
-                   in tests/check/infer-configs, test parser modules built from tests/check/infer-parser-*. Optional
-                   (-Dinfer, default auto): needs MIGraphX (-Dmigraphx_path, default <rocm_path>/extras-10), libyaml
-                   and json-glib
+                   post-processing (letterbox geometry, NMS, ROI/size filters); rds-infer-units the secondary-mode
+                   geometry (object selection, aligned crops, crop letterbox, children back to the frame);
+                   rds-infer-engine compiles ONNX with MIGraphX and caches the program (.mxr + .mxr.json manifest),
+                   reading the model's declared input dims with the small protobuf reader rds-infer-onnx. These are
+                   in the static rdsinfer-core library (C and C++: link it with link_language 'cpp'), shared with the
+                   tests; the letterbox + normalisation kernel (rds-infer-preprocess.hip) is the static
+                   rdsinfer-preprocess; config corpus in tests/check/infer-configs, test parser modules built from
+                   tests/check/infer-parser-*. Optional (-Dinfer, default auto): needs MIGraphX (-Dmigraphx_path,
+                   default <rocm_path>/extras-10), libyaml and json-glib
 gst/rdstiler/      libgstrdstiler plugin: rdsmultistreamtiler (gstrdsmultistreamtiler.c: a canvas of the last tiled
                    grid, per-pad cached meta, composite with rds_buf_surf_transform_composite). rds-tiler-layout is the
                    layout core (grid, cells, meta scaling; GLib only), the static rdstiler-core the tests link. Always

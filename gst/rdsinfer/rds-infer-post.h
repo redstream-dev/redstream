@@ -44,6 +44,11 @@ typedef struct
   gfloat left, top, width, height;
 } RdsInferBox;
 
+/* @box clipped to [0, frame_w] x [0, frame_h] (right = left + width, bottom = top + height) into @out. FALSE, @out
+ * untouched, when nothing is left or @box's width or height is not > 0 (NaN included). @out may be @box. */
+G_GNUC_INTERNAL gboolean rds_infer_box_clip (const RdsInferBox * box, guint frame_w, guint frame_h,
+    RdsInferBox * out);
+
 /* One object after post-processing, in frame pixels. */
 typedef struct
 {
