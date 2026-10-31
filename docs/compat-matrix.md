@@ -549,7 +549,7 @@ is set.
 |---|---|---|---|---|
 | `config-file-path` | string | none | supported | required; `.yml`/`.yaml` is read as YAML, anything else as a key file |
 | `unique-id` | uint | `1` (ours) | supported | overrides `gie-unique-id`; range 0..`G_MAXUINT` as documented (the config key starts at 1) |
-| `process-mode` | uint | `1` | supported | overrides `process-mode`; `2`: secondary mode, see "Secondary mode" (classifiers there fail at start: not implemented yet) |
+| `process-mode` | uint | `1` | supported | overrides `process-mode`; `2`: secondary mode, see "Secondary mode" (classifiers run only there) |
 | `infer-on-gie-id` | int | `-1` | supported | -1..`G_MAXINT` (DeepStream 8.0's type and default: -1 is every GIE); overrides `operate-on-gie-id`; a warning when set in primary mode |
 | `infer-on-class-ids` | string | none | supported | colon-separated class ids (`1:2:4`; `-1` in it: every class, ours); overrides `operate-on-class-ids`; a warning when set in primary mode |
 | `filter-out-class-ids` | string | none | supported | semicolon-separated class ids (`1;2`); replaces the file's list (an empty string clears it) |
@@ -636,7 +636,32 @@ is inconsistent).
 | Detector chains | DeepStream 8.0 behaviour | a second `rdsinfer` with `infer-on-gie-id` = the detector's `gie-unique-id` infers on its children |
 | `roi-top-offset`, `roi-bottom-offset` | ours | not applied (measured from a crop's edges they would be surprising), with a warning; 8.0 not observed |
 | Parser returns false | ours | one warning per element, that object gets no children but its tensor meta is still attached (as in primary mode), the other objects are unaffected (8.0 crashes) |
-| Classifiers (`network-type=1`) | ours | not implemented yet: fail at start |
+| Classifiers (`network-type=1`) | DeepStream 8.0 behaviour | secondary mode only (primary mode fails at start); see "Classifier output (classifier meta)" |
+
+#### Classifier output (classifier meta)
+
+A classifier (`network-type=1`, `process-mode=2`) attaches what it finds to each object it infers on. Each row is
+**DeepStream 8.0 behaviour** (observed where the docs are silent) or **ours**.
+
+| Topic | Source | Behaviour |
+|---|---|---|
+| Built-in parser | DeepStream 8.0 behaviour | without `parse-classifier-func-name`: per output layer the argmax of its values, ties to the lowest class index; no softmax (the value is the probability as it is: 200/256 gives 0.78125, an already softmaxed model's values pass through) |
+| `classifier-threshold` | DeepStream 8.0 behaviour | strictly above: 0.5 rejects 0.5 and keeps 0.50390625; the default 0 gives nothing for an all-zero output. A layer below it is left out; with none left, the object gets no classifier meta at all (not an empty one) |
+| Classifier meta | DeepStream 8.0 behaviour | one `RdsClassifierMeta` per object and classifier: `num_labels` the labels attached, `unique_component_id` the `gie-unique-id`, `classifier_type` the `classifier-type` (NULL if unset; interned, not owned) |
+| Meta order | ours | appended to the object's `classifier_meta_list`, after the metas of earlier classifiers (8.0 prepends) |
+| Labels | DeepStream 8.0 behaviour | one `RdsLabelInfo` per output layer kept: `result_label` the label, `result_class_id` the argmax, `label_id` the output layer, `result_prob` the raw value |
+| Label order | ours | in output-layer order (8.0 prepends) |
+| `num_classes` | ours | the layer's class count (8.0 sets 0); 0 for a custom parser's attribute whose `attributeIndex` is not an output layer |
+| Long labels | ours | a label longer than `result_label` (127 bytes) is truncated there and kept whole in `pResult_label`; otherwise `pResult_label` is NULL (8.0 never sets it) |
+| Label file gaps | ours | an argmax past the layer's labels, a layer without a line and no label file all attach the meta with an empty label (8.0 attaches nothing for the first and the last, an empty label for the second); start warns when there is no label file |
+| Display text | DeepStream 8.0 behaviour | `text_params.display_text` gets `" "` and then `"<label> "` per label attached (`"T"` becomes `"T red "`, NULL becomes `" blue "`, a second classifier makes it `"T red  x "`); with a custom parser `" "` and its description (`"T desc"`); unchanged when nothing is attached. `obj_label` is never changed |
+| Empty description | ours | a custom parser that leaves `descString` empty gets the labels in the display text, as the built-in parser does (8.0 not observed) |
+| Custom parser | DeepStream 8.0 behaviour | `parse-classifier-func-name` in `custom-lib-path`, called once per object with that object's output layers (dims without the batch), the network info and `classifier-threshold`; each attribute becomes a label (`attributeLabel` → `result_label`, `attributeValue` → `result_class_id`, `attributeIndex` → `label_id`, `attributeConfidence` → `result_prob`), not thresholded again. rdsinfer frees the `attributeLabel`s |
+| Custom parser label | ours | a NULL `attributeLabel` is an empty label |
+| Unknown parse function | DeepStream 8.0 behaviour, ours | a `parse-classifier-func-name` the library doesn't have fails start (DeepStream 8.0 behaviour); the error names the key (ours) |
+| Parser returns false or throws | ours | one warning per element; that object gets no classifier meta, the others are unaffected (8.0 crashes) |
+| Tensor meta | DeepStream 8.0 behaviour | with `output-tensor-meta=1` a classified object gets its tensor meta too; it doesn't change the classification |
+| Chained classifiers | DeepStream 8.0 behaviour | a second classifier on the same objects attaches its own meta to each |
 
 #### Config files
 
@@ -682,7 +707,7 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `batch-size` | uint | `1` (ours) | 1..1024 | supported | the program is compiled for this batch size; the model's batch dimension must be symbolic or equal to it |
 | `network-mode` | int | `0` (ours) | 0..3 | supported | accepted values: 0, 2 (FP32, FP16; inputs and outputs stay FP32). INT8 (1) and BEST (3) fail at start |
 | `network-type` | int | `0` (ours) | 0..100 | supported | accepted values: 0, 1, 100 (detector; classifier, in secondary mode only; no post-processing, tensor meta only). A classifier in primary mode and segmentation (2, 3) fail at start |
-| `process-mode` | int | `1` (ours) | 1..2 | supported | 1 primary, 2 secondary (see "Secondary mode"; a secondary classifier fails at start: not implemented yet) |
+| `process-mode` | int | `1` (ours) | 1..2 | supported | 1 primary, 2 secondary (see "Secondary mode"; classifiers run only there) |
 | `gie-unique-id` | uint | `1` (ours) | >= 1 | supported | the objects' `unique_component_id` and the tensor meta's `unique_id` |
 | `interval` | uint | `0` (ours) | 0..32 | supported | as the property |
 | `output-tensor-meta` | bool | `0` (ours) |  | supported | as the property |
@@ -707,7 +732,7 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `secondary-reinfer-interval` | int | `-1` (ours) | >= -1 | supported | secondary mode: unset (-1) never reinfers an object, 0 every frame, N every N + 1 frames (DeepStream 8.0 behaviour) |
 | `classifier-threshold` | float | `0` (ours) | >= 0 | supported | classifiers: a label needs a probability strictly above it; unset: 0 (DeepStream 8.0 behaviour) |
 | `classifier-type` | string | none |  | supported | classifiers: the classifier meta's type name; letters, digits, `_` and `-` |
-| `parse-classifier-func-name` | string | none |  | supported | classifiers: a parse function in `custom-lib-path` (required with it) |
+| `parse-classifier-func-name` | string | none |  | supported | classifiers: a parse function in `custom-lib-path` (required with it); unset: the built-in argmax parser (see "Classifier output (classifier meta)") |
 | `classifier-async-mode` | bool | none |  | supported | secondary classifiers: `1` runs synchronously all the same, with a warning (ours) |
 | `gpu-id` | uint | none | >= 0 | accepted no-op | the GPU is chosen with the element's `gpu-id` property |
 | `workspace-size` | uint | none | >= 0 | accepted no-op | a TensorRT setting |
@@ -1497,8 +1522,9 @@ Not aliased: `GST_NVEVENT_UPDATE_CAPS` and `gst_nvevent_new_update_caps` (no Red
 ## nvinfer custom parser ABI (nvdsinfer.h, nvdsinfer_custom_impl.h)
 
 `rds/rds-infer.h` has the layer, network and object types (C and C++); `rds/rds-infer-custom-impl.h` has the parser
-ABI (C++). Their fields keep NVIDIA's documented names and order, so a DeepStream bbox parser recompiles unchanged.
-`rdsinfer` loads the parser named by `custom-lib-path` and `parse-bbox-func-name` and calls it on every inferred frame.
+ABI (C++). Their fields keep NVIDIA's documented names and order, so a DeepStream bbox or classifier parser
+recompiles unchanged. `rdsinfer` loads the parser named by `custom-lib-path` and `parse-bbox-func-name` (or
+`parse-classifier-func-name` for a classifier) and calls it on every inferred frame (object, in secondary mode).
 
 `rds/rds_compat.h` (C and C++) aliases only the C-compatible `NvDsInfer*` types below. The parser ABI names are in
 `rds/rds_compat_infer.h` (C++), the replacement for `nvdsinfer_custom_impl.h`, which also includes `rds_compat.h`:
@@ -1543,13 +1569,16 @@ ABI (C++). Their fields keep NVIDIA's documented names and order, so a DeepStrea
 | `NvDsInferParseObjectInfo` | `RdsInferParseObjectInfo` | supported | the same type as `RdsInferObjectDetectionInfo` | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer_8h.html) |
 | `NvDsInferParseCustomFunc` | `RdsInferParseCustomFunc` | supported | C++ only, `rds_compat_infer.h` | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
 | `CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | `RDS_CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | supported | C++ only, `rds_compat_infer.h`; a mismatched signature fails to compile | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
+| `NvDsInferAttribute` | `RdsInferAttribute` | supported | C++ only, `rds_compat_infer.h`; the parser `strdup`s `attributeLabel` and rdsinfer frees it (also after a false return or an exception); NULL is an empty label (ours) | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferAttribute.html) |
+| `NvDsInferClassiferParseCustomFunc` | `RdsInferClassifierParseCustomFunc` | supported | C++ only, `rds_compat_infer.h`; NVIDIA's spelling for the alias, ours spelled out; see "Classifier output (classifier meta)" | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
+| `CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE` | `RDS_CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE` | supported | C++ only, `rds_compat_infer.h`; a mismatched signature fails to compile | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
 
 Not aliased (no Redstream counterpart yet, or none on ROCm):
 - the deprecated `dims` member of `NvDsInferLayerInfo`'s union (not in the public docs), `getDimsCHWFromDims`,
   `getDimsHWCFromDims`;
-- `NvDsInferInstanceMaskInfo`, `NvDsInferAttribute`, and the instance-mask, classifier, semantic-segmentation and
-  engine-create parser types (`NvDsInferInstanceMaskParseCustomFunc`, `NvDsInferClassiferParseCustomFunc`,
-  `NvDsInferSemSegmentationParseCustomFunc`, `NvDsInferEngineCreateCustomFunc`) with their check macros;
+- `NvDsInferInstanceMaskInfo`, and the instance-mask, semantic-segmentation and engine-create parser types
+  (`NvDsInferInstanceMaskParseCustomFunc`, `NvDsInferSemSegmentationParseCustomFunc`,
+  `NvDsInferEngineCreateCustomFunc`) with their check macros;
   `NvDsInferInitializeInputLayers`; the TensorRT-specific functions (`NvDsInferCreateModelParser`,
   `NvDsInferPluginFactoryRuntimeGet` / `Destroy`, `NvDsInferCudaEngineGet`);
 - `NvDsInferStatus` and its `NVDSINFER_*` values, `NvDsInferStatus2Str`, `NvDsInferLogLevel`;

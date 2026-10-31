@@ -1,9 +1,12 @@
-/* Redstream: the custom bbox parser ABI of rdsinfer (counterpart of DeepStream's nvdsinfer_custom_impl.h). C++.
+/* Redstream: the custom bbox and classifier parser ABI of rdsinfer (counterpart of DeepStream's
+ * nvdsinfer_custom_impl.h). C++.
  *
- * A parser library is a shared object with one or more functions of type RdsInferParseCustomFunc, with C linkage.
- * rdsinfer loads the library named by custom-lib-path and calls the function named by parse-bbox-func-name once
- * per inferred image. Names and field order follow NVIDIA's public API reference, so a DeepStream parser builds
- * unchanged against rds/rds_compat_infer.h (which adds the NvDsInfer* names).
+ * A parser library is a shared object with one or more functions of type RdsInferParseCustomFunc (detectors) or
+ * RdsInferClassifierParseCustomFunc (classifiers), with C linkage. rdsinfer loads the library named by
+ * custom-lib-path and calls the function named by parse-bbox-func-name (a detector) or parse-classifier-func-name (a
+ * classifier) once per inferred image (once per object in secondary mode). Names and field order follow NVIDIA's
+ * public API reference, so a DeepStream parser builds unchanged against rds/rds_compat_infer.h (which adds the
+ * NvDsInfer* names).
  *
  * Building a parser:
  * - Use the toolchain and C++ standard library ABI Redstream was built with (libstdc++,
@@ -18,8 +21,8 @@
  *   objects, GTypes and threads in it stay valid.
  *
  * Writing the parse function:
- * - Never let an exception escape: rdsinfer catches it, drops that image's detections and posts a warning, as it
- *   does for a false return. Never call exit() or abort().
+ * - Never let an exception escape: rdsinfer catches it, drops that image's detections (a classifier's attributes)
+ *   and posts a warning, as it does for a false return. Never call exit() or abort().
  * - It is called from one thread at a time for each loaded parser (it may be a different thread from call to call).
  * - outputLayersInfo and the buffers it points to are valid only during the call: don't keep the pointers.
  *   buffer is the layer's data in host memory; deviceBuffer (ours) is the same layer's data on the element's GPU
@@ -32,6 +35,7 @@
 #error "rds/rds-infer-custom-impl.h is C++ (the parser ABI uses std::vector)"
 #endif
 
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -83,6 +87,36 @@ typedef bool (*RdsInferParseCustomFunc) (std::vector<RdsInferLayerInfo> const &o
       std::vector<RdsInferObjectDetectionInfo> &objectList); \
   static_assert (std::is_same<decltype (&customParseFunc), RdsInferParseCustomFunc>::value, \
       #customParseFunc " is not an RdsInferParseCustomFunc");
+
+/* One attribute a classifier parser found: becomes one label of the object's classifier meta (an RdsLabelInfo). */
+struct RdsInferAttribute
+{
+  /* The attribute, e.g. the output layer it comes from: the label's label_id. */
+  unsigned int attributeIndex;
+  /* Its value, e.g. the class index: the label's result_class_id. */
+  unsigned int attributeValue;
+  /* The label's result_prob. */
+  float attributeConfidence;
+  /* The label's text: allocated by the parser with strdup () or malloc (), freed by rdsinfer (never free it in the
+   * parser), also when the parser returns false or throws. NULL: an empty label (ours). */
+  char *attributeLabel;
+};
+
+/* Parses one image's (one object's) output layers into attrList, and a description for the object's display text
+ * into descString. classifierThreshold is classifier-threshold: the parser applies it, rdsinfer doesn't. Return
+ * false on failure: the object then gets no classifier meta. */
+typedef bool (*RdsInferClassifierParseCustomFunc) (std::vector<RdsInferLayerInfo> const &outputLayersInfo,
+    RdsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<RdsInferAttribute> &attrList,
+    std::string &descString);
+
+/* Use after defining a classifier parse function: fails to compile unless the function has the
+ * RdsInferClassifierParseCustomFunc signature, and declares it extern "C". */
+#define RDS_CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE(customClassifierParseFunc) \
+  extern "C" bool customClassifierParseFunc (std::vector<RdsInferLayerInfo> const &outputLayersInfo, \
+      RdsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<RdsInferAttribute> &attrList, \
+      std::string &descString); \
+  static_assert (std::is_same<decltype (&customClassifierParseFunc), RdsInferClassifierParseCustomFunc>::value, \
+      #customClassifierParseFunc " is not an RdsInferClassifierParseCustomFunc");
 
 /* rdsinfer itself defines RDS_INFER_NO_PARSER_ABI_SYMBOL: it loads parsers and is not one. */
 #ifndef RDS_INFER_NO_PARSER_ABI_SYMBOL

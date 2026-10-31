@@ -27,7 +27,18 @@ static const RdsTestFixtureBox rds_test_fixture_boxes[RDS_TEST_FIXTURE_N_BOXES] 
   { 1, 20.0f, 40.0f, 10.0f, 10.0f, 0.1f },
 };
 
-/* What FixtureThrow throws: a std::runtime_error with this what(). */
+/* FixtureClassify's attributes, one per output layer i:
+ *   attributeIndex i, attributeValue round (RDS_TEST_FIXTURE_ATTR_SCALE x the layer's first value),
+ *   attributeConfidence classifierThreshold / 2 (below the threshold: rdsinfer applies none to a custom parser),
+ *   attributeLabel "attr<i>-<network width>x<network height>", strdup'ed, except layer 1's: NULL;
+ * descString "desc<number of layers>"; FixtureClassifyNoDesc leaves descString empty. FixtureClassifyPastLayers
+ * returns one attribute: index = the number of layers (past them), value 5, confidence 0.5, label and descString
+ * "past". FixtureClassifyFailDark returns false when output layer 0's first value is
+ * below RDS_TEST_FIXTURE_DARK_BELOW. */
+#define RDS_TEST_FIXTURE_ATTR_SCALE 256.0f
+#define RDS_TEST_FIXTURE_DARK_BELOW 0.25f
+
+/* What FixtureThrow and FixtureClassifyThrow throw: a std::runtime_error with this what(). */
 #define RDS_TEST_FIXTURE_THROW_WHAT "fixture parser exception"
 
 #endif /* RDS_TEST_INFER_PARSER_FIXTURE_H */

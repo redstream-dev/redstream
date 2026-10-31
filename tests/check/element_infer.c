@@ -3,7 +3,8 @@
  * partial batches, tensor meta through rdsstreamdemux, interval, the detector path with the fixture parser, and
  * concurrent metadata readers (gpu, skipped without a ROCm device); secondary mode (/gpu/infer-secondary): object
  * crops, chunks, object selection, secondary detectors on fixeddet and their chains, objects replaced while the lock
- * is released, parser failures and the ROI offsets.
+ * is released, parser failures and the ROI offsets; classifiers on meancls and meancls2 (built-in and custom
+ * parsers, thresholds, labels, display text, chains).
  * The element's test hooks (gstrdsinfer.h) are looked up in the loaded plugin.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
@@ -12,6 +13,7 @@
 #include "infer-parser-fixture.h"
 #include "rds-infer-config.h"
 #include "rds-infer-output.h"
+#include "rds-infer-parse.h"
 
 #include <gmodule.h>
 #include <gst/app/gstappsink.h>
@@ -31,12 +33,15 @@ typedef gboolean (*GetOutputSetsFunc) (GstElement * element, guint * n_sets, gui
 typedef gboolean (*ReadInputFunc) (GstElement * element, gfloat * dst, gsize n_floats);
 typedef guint64 (*GetUnitCountFunc) (GstElement * element);
 typedef gboolean (*GetOutputSetTotalsFunc) (GstElement * element, guint64 * allocated, guint64 * freed);
+typedef void (*AttachClassifierResultFunc) (gpointer batch_meta, gpointer obj_meta, gconstpointer result,
+    gint unique_id, const gchar * classifier_type);
 
 static GetConfigFunc hook_get_config;
 static GetOutputSetsFunc hook_get_output_sets;
 static ReadInputFunc hook_read_input;
 static GetUnitCountFunc hook_get_unit_count;
 static GetOutputSetTotalsFunc hook_get_output_set_totals;
+static AttachClassifierResultFunc hook_attach_classifier_result;
 
 static void
 load_hooks (void)
@@ -59,6 +64,8 @@ load_hooks (void)
   g_assert_true (g_module_symbol (module, "rds_infer_test_get_unit_count", (gpointer *) & hook_get_unit_count));
   g_assert_true (g_module_symbol (module, "rds_infer_test_get_output_set_totals",
           (gpointer *) & hook_get_output_set_totals));
+  g_assert_true (g_module_symbol (module, "rds_infer_test_attach_classifier_result",
+          (gpointer *) & hook_attach_classifier_result));
   /* the module stays open: the plugin is never unloaded either */
   gst_object_unref (plugin);
 }
@@ -543,24 +550,14 @@ test_start_config_errors (void)
   gchar *cfg = write_file ("process-mode.txt", BASE_CONFIG), *missing = g_build_filename (WORK_DIR,
       "missing.txt", NULL), *bad = write_file ("bad-mode.txt", BASE_CONFIG "network-mode=1\n"), *texts;
   gchar *classifier = write_file ("start-classifier.txt", "[property]\nonnx-file=scale2.onnx\n"
-      "infer-dims=3;48;64\nnetwork-type=1\n"), *secondary = write_file ("secondary-classifier.txt",
-      "[property]\nonnx-file=scale2.onnx\ninfer-dims=3;48;64\nnetwork-type=1\nprocess-mode=2\n");
+      "infer-dims=3;48;64\nnetwork-type=1\n");
   GstElement *e;
 
-  /* a classifier file made secondary by the property: refused at start (classifiers aren't run yet), not with the
-   * primary-mode error */
+  /* a classifier in primary mode: refused before any GPU work (classifiers run in secondary mode) */
   e = gst_element_factory_make ("rdsinfer", NULL);
-  g_object_set (e, "config-file-path", classifier, "process-mode", 2, NULL);
+  g_object_set (e, "config-file-path", classifier, NULL);
   texts = start_error (e);
-  g_assert_nonnull (strstr (texts, "start-classifier.txt:network-type: 1: classifiers are not implemented yet"));
-  g_assert_null (strstr (texts, "classifiers in primary mode"));
-  g_free (texts);
-
-  /* a secondary classifier from the file */
-  e = gst_element_factory_make ("rdsinfer", NULL);
-  g_object_set (e, "config-file-path", secondary, NULL);
-  texts = start_error (e);
-  g_assert_nonnull (strstr (texts, "secondary-classifier.txt:network-type: 1: classifiers are not implemented yet"));
+  g_assert_nonnull (strstr (texts, "start-classifier.txt:network-type: 1: classifiers in primary mode"));
   g_free (texts);
 
   e = gst_element_factory_make ("rdsinfer", NULL);
@@ -590,7 +587,65 @@ test_start_config_errors (void)
   g_free (missing);
   g_free (bad);
   g_free (classifier);
-  g_free (secondary);
+}
+
+/* One classifier result attached to two objects, and twice to one of them: each attach makes its own metas from the
+ * values (the result is only read), the display text grows each time, classifier_type is stored as given; a result
+ * with a description but no labels attaches nothing. ASan checks the ownership. */
+static void
+test_classifier_attach (void)
+{
+  RdsBatchMeta *bm = rds_create_batch_meta (1);
+  RdsFrameMeta *fm = rds_acquire_frame_meta_from_pool (bm);
+  RdsObjectMeta *om[2];
+  RdsInferClassifierResult *r = rds_infer_classifier_result_new (), *empty = rds_infer_classifier_result_new ();
+  const gchar *type = g_intern_string ("attach-test");
+
+  load_hooks ();
+  rds_add_frame_meta_to_batch (bm, fm);
+  for (guint i = 0; i < 2; i++) {
+    om[i] = rds_acquire_obj_meta_from_pool (bm);
+    om[i]->text_params.display_text = i ? NULL : g_strdup ("T");
+    rds_add_obj_meta_to_frame (fm, om[i], NULL);
+  }
+  rds_infer_classifier_result_add (r, 0, 1, 3, 0.5f, "b");
+  rds_infer_classifier_result_add (r, 1, 0, 2, 0.25f, "x");
+  empty->desc = g_strdup ("d");
+
+  hook_attach_classifier_result (bm, om[0], r, 4, type);
+  hook_attach_classifier_result (bm, om[1], r, 4, type);
+  hook_attach_classifier_result (bm, om[0], r, 5, NULL);
+  hook_attach_classifier_result (bm, om[1], empty, 4, type);
+  rds_infer_classifier_result_free (r);
+  rds_infer_classifier_result_free (empty);
+
+  g_assert_cmpstr (om[0]->text_params.display_text, ==, "T b x  b x ");
+  g_assert_cmpstr (om[1]->text_params.display_text, ==, " b x ");
+  g_assert_cmpuint (g_list_length (om[0]->classifier_meta_list), ==, 2);
+  g_assert_cmpuint (g_list_length (om[1]->classifier_meta_list), ==, 1);
+  for (guint i = 0; i < 3; i++) {
+    RdsClassifierMeta *c = g_list_nth_data (i < 2 ? om[0]->classifier_meta_list : om[1]->classifier_meta_list,
+        i < 2 ? i : 0);
+    const RdsLabelInfo *b, *x;
+
+    g_assert_cmpint (c->unique_component_id, ==, i == 1 ? 5 : 4);
+    g_assert_true (c->classifier_type == (i == 1 ? NULL : type));
+    g_assert_cmpuint (c->num_labels, ==, 2);
+    b = c->label_info_list->data;
+    x = c->label_info_list->next->data;
+    g_assert_cmpuint (b->label_id, ==, 0);
+    g_assert_cmpuint (b->result_class_id, ==, 1);
+    g_assert_cmpuint (b->num_classes, ==, 3);
+    g_assert_cmpfloat (b->result_prob, ==, 0.5f);
+    g_assert_cmpstr (b->result_label, ==, "b");
+    g_assert_cmpuint (x->label_id, ==, 1);
+    g_assert_cmpstr (x->result_label, ==, "x");
+    g_assert_null (x->pResult_label);
+  }
+  /* every attach has its own metas */
+  g_assert_true (om[0]->classifier_meta_list->data != om[0]->classifier_meta_list->next->data);
+  g_assert_true (om[0]->classifier_meta_list->data != om[1]->classifier_meta_list->data);
+  rds_destroy_batch_meta (bm);
 }
 
 /* ---- gpu: helpers ---- */
@@ -2436,6 +2491,534 @@ test_secondary_chunk_failure (void)
   g_free (cfg);
 }
 
+/* ---- gpu: secondary classifiers ---- */
+
+/* Paints the @w x @h rect at (@x, @y) of RGBA slot @slot of @buf with (@r, @g, @b), alpha 255. */
+static void
+paint_rect (GstBuffer * buf, guint slot, guint x, guint y, guint w, guint h, guint8 r, guint8 g, guint8 b)
+{
+  RdsBufSurface *s = rds_buffer_get_surface (buf);
+  RdsBufSurfaceParams *p = &s->surfaceList[slot];
+
+  g_assert_cmpint (p->colorFormat, ==, RDS_BUF_COLOR_FORMAT_RGBA);
+  g_assert_cmpint (rds_buf_surface_map (s, slot, 0, RDS_BUF_MAP_READ_WRITE), ==, 0);
+  g_assert_cmpint (rds_buf_surface_sync_for_cpu (s, slot, 0), ==, 0);
+  for (guint row = y; row < y + h; row++) {
+    guint8 *px = (guint8 *) p->mappedAddr.addr[0] + (gsize) row * p->planeParams.pitch[0] + (gsize) x * 4;
+
+    for (guint col = 0; col < w; col++, px += 4) {
+      px[0] = r;
+      px[1] = g;
+      px[2] = b;
+      px[3] = 255;
+    }
+  }
+  g_assert_cmpint (rds_buf_surface_sync_for_device (s, slot, 0), ==, 0);
+  g_assert_cmpint (rds_buf_surface_unmap (s, slot, 0), ==, 0);
+}
+
+/* A classifier on @model, GIE @gie, on the objects of GIE 1 (batch-size 4), with the label file @labels (NULL: no
+ * labelfile-path) and @extra at the end of [property]. meancls gives the channel means of its 32x32 input, and with
+ * net-scale-factor 1/256 a 32x32 crop of pixel value v gives exactly v / 256 (the crop is the network input, 1:1);
+ * meancls2 also gives 1 - the means as a second output layer. */
+static gchar *
+classifier_config (const gchar * name, const gchar * model, guint gie, const gchar * labels, const gchar * extra)
+{
+  gchar *label_name = g_strdup_printf ("%s.labels", name), *label_path = NULL, *text, *path;
+
+  ensure_test_model (model);
+  if (labels)
+    label_path = write_file (label_name, labels);
+  text = g_strdup_printf ("[property]\nonnx-file=%s\nnetwork-type=1\nprocess-mode=2\nbatch-size=4\n"
+      "net-scale-factor=0.00390625\ngie-unique-id=%u\noperate-on-gie-id=1\n%s%s%s%s", model, gie,
+      labels ? "labelfile-path=" : "", labels ? label_name : "", labels ? "\n" : "", extra ? extra : "");
+  path = write_file (name, text);
+  g_free (text);
+  g_free (label_path);
+  g_free (label_name);
+  return path;
+}
+
+/* A 32x32 object of GIE 1 at (@left, @top) of frame @frame, painted (@r, @g, @b), with obj_label "car" and the
+ * display text @text (NULL: none). */
+static RdsObjectMeta *
+add_colour_object (GstBuffer * buf, guint frame, guint left, guint top, guint8 r, guint8 g, guint8 b,
+    const gchar * text)
+{
+  RdsObjectMeta *om = add_test_object (buf, frame, 1, 0, left, top, 32, 32);
+
+  paint_rect (buf, frame, left, top, 32, 32, r, g, b);
+  g_strlcpy (om->obj_label, "car", sizeof (om->obj_label));
+  om->text_params.display_text = g_strdup (text);
+  return om;
+}
+
+/* A 128x64 RGBA batch of @frames frames (grey 40, then 70, as make_batch), for objects from add_colour_object. */
+static GstBuffer *
+colour_batch (guint frames)
+{
+  return make_batch (RDS_BUF_COLOR_FORMAT_RGBA, 128, 64, frames, frames, 0);
+}
+
+static GstHarness *
+classifier_harness (const gchar * cfg, GstBus * bus)
+{
+  GstElement *e = new_infer (cfg);
+
+  if (bus)
+    gst_element_set_bus (e, bus);
+  return harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_RGBA, 128, 64);
+}
+
+static GstBuffer *
+push_pull (GstHarness * h, GstBuffer * in)
+{
+  g_assert_cmpint (gst_harness_push (h, in), ==, GST_FLOW_OK);
+  return gst_harness_pull (h);
+}
+
+typedef struct
+{
+  guint label_id, class_id, num_classes;
+  gfloat prob;
+  const gchar *label;
+} WantLabel;
+
+/* @om has @n_cls classifier metas, and meta @i comes from GIE @gie with type @type (NULL: none) and has the labels
+ * @want, in order, each within the fixed-size result_label. */
+static void
+check_classifier (const RdsObjectMeta * om, guint i, guint n_cls, gint gie, const gchar * type,
+    const WantLabel * want, guint n_want)
+{
+  RdsClassifierMeta *c;
+
+  g_assert_cmpuint (g_list_length (om->classifier_meta_list), ==, n_cls);
+  c = g_list_nth_data (om->classifier_meta_list, i);
+  g_assert_cmpuint (c->num_labels, ==, n_want);
+  g_assert_cmpuint (g_list_length (c->label_info_list), ==, n_want);
+  g_assert_cmpint (c->unique_component_id, ==, gie);
+  /* not owned: interned */
+  if (type)
+    g_assert_true (c->classifier_type == g_intern_string (type));
+  else
+    g_assert_null (c->classifier_type);
+  for (guint l = 0; l < n_want; l++) {
+    const RdsLabelInfo *li = g_list_nth_data (c->label_info_list, l);
+
+    g_test_message ("label %u: layer %u class %u prob %g \"%s\"", l, li->label_id, li->result_class_id,
+        li->result_prob, li->result_label);
+    g_assert_cmpuint (li->label_id, ==, want[l].label_id);
+    g_assert_cmpuint (li->result_class_id, ==, want[l].class_id);
+    g_assert_cmpuint (li->num_classes, ==, want[l].num_classes);
+    g_assert_cmpfloat (li->result_prob, ==, want[l].prob);
+    g_assert_cmpstr (li->result_label, ==, want[l].label);
+    g_assert_null (li->pResult_label);
+  }
+}
+
+/* The parent object as it came in: a classifier never changes obj_label, the class or the producer. */
+static void
+check_object_kept (const RdsObjectMeta * om, const gchar * text)
+{
+  g_assert_cmpstr (om->obj_label, ==, "car");
+  g_assert_cmpint (om->class_id, ==, 0);
+  g_assert_cmpint (om->unique_component_id, ==, 1);
+  g_assert_null (om->parent);
+  g_assert_cmpstr (om->text_params.display_text, ==, text);
+}
+
+#define RGB_LABELS "red;green;blue\n"
+
+/* meancls: per object the raw argmax of the channel means (no softmax: 200 / 256 gives 0.78125), ties to the lowest
+ * class, kept above the default threshold 0 (an all-zero output gives nothing); one classifier meta of this GIE and
+ * classifier-type, with one label (DeepStream 8.0 behaviour; num_classes is ours), " label " appended to the
+ * display text (DeepStream 8.0 behaviour), nothing else of the object changed, no tensor meta. */
+static void
+test_classifier_classes (void)
+{
+  static const WantLabel red = { 0, 0, 3, 0.78125f, "red" }, green = { 0, 1, 3, 0.625f, "green" };
+  static const WantLabel blue = { 0, 2, 3, 0.99609375f, "blue" }, grey = { 0, 0, 3, 0.5f, "red" };
+  gchar *cfg = classifier_config ("cls-classes.txt", "meancls.onnx", 4, RGB_LABELS, "classifier-type=colour\n");
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *om[6];
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  in = colour_batch (2);
+  om[0] = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
+  om[1] = add_colour_object (in, 0, 32, 0, 0, 160, 0, NULL);
+  om[2] = add_colour_object (in, 0, 64, 0, 0, 0, 0, "B");
+  om[3] = add_colour_object (in, 0, 96, 0, 128, 128, 128, "G");
+  om[4] = add_colour_object (in, 1, 0, 32, 0, 0, 255, "T");
+  /* another GIE's object is not inferred on */
+  om[5] = add_test_object (in, 1, 2, 0, 32, 32, 32, 32);
+  out = push_pull (h, in);
+  g_assert_cmpuint (hook_get_unit_count (h->element), ==, 5);
+  check_classifier (om[0], 0, 1, 4, "colour", &red, 1);
+  check_object_kept (om[0], "T red ");
+  check_classifier (om[1], 0, 1, 4, "colour", &green, 1);
+  check_object_kept (om[1], " green ");
+  g_assert_null (om[2]->classifier_meta_list);
+  check_object_kept (om[2], "B");
+  check_classifier (om[3], 0, 1, 4, "colour", &grey, 1);
+  check_object_kept (om[3], "G red ");
+  check_classifier (om[4], 0, 1, 4, "colour", &blue, 1);
+  check_object_kept (om[4], "T blue ");
+  g_assert_null (om[5]->classifier_meta_list);
+  for (guint i = 0; i < 6; i++)
+    g_assert_null (obj_tensor_meta (om[i]));
+  g_assert_cmpuint (nth_frame (out, 0)->num_obj_meta, ==, 4);
+  check_frames_untouched (out, -1);
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* classifier-threshold is strict (DeepStream 8.0 behaviour): 0.5 rejects 0.5 (no classifier meta at all, the text
+ * unchanged) and keeps 0.50390625; without classifier-type the meta has none. */
+static void
+test_classifier_threshold (void)
+{
+  static const WantLabel above = { 0, 0, 3, 0.50390625f, "red" };
+  gchar *cfg = classifier_config ("cls-threshold.txt", "meancls.onnx", 4, RGB_LABELS, "classifier-threshold=0.5\n");
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *at, *over;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  in = colour_batch (1);
+  at = add_colour_object (in, 0, 0, 0, 128, 128, 128, "T");
+  over = add_colour_object (in, 0, 32, 0, 129, 129, 129, "T");
+  out = push_pull (h, in);
+  g_assert_null (at->classifier_meta_list);
+  check_object_kept (at, "T");
+  check_classifier (over, 0, 1, 4, NULL, &above, 1);
+  check_object_kept (over, "T red ");
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* meancls2: one label per output layer, in layer order (ours: 8.0 prepends), each kept or left out by the threshold
+ * on its own; the display text gets every attached label. */
+static void
+test_classifier_two_layers (void)
+{
+  static const WantLabel both[] = { {0, 0, 3, 0.78125f, "r"}, {1, 1, 3, 1.0f, "G"} };
+  static const WantLabel second = { 1, 0, 3, 1.0f, "R" };
+  gchar *cfg = classifier_config ("cls-two.txt", "meancls2.onnx", 4, "r;g;b\nR;G;B\n", "classifier-threshold=0.7\n");
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *om[3];
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  in = colour_batch (1);
+  /* means (0.78125, 0, 0), output1 (0.21875, 1, 1): both layers */
+  om[0] = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
+  /* 0.5 everywhere: neither */
+  om[1] = add_colour_object (in, 0, 32, 0, 128, 128, 128, "T");
+  /* means (0, 0.25, 0): below; output1 (1, 0.75, 1): class 0 */
+  om[2] = add_colour_object (in, 0, 64, 0, 0, 64, 0, "T");
+  out = push_pull (h, in);
+  check_classifier (om[0], 0, 1, 4, NULL, both, 2);
+  check_object_kept (om[0], "T r G ");
+  g_assert_null (om[1]->classifier_meta_list);
+  check_object_kept (om[1], "T");
+  check_classifier (om[2], 0, 1, 4, NULL, &second, 1);
+  check_object_kept (om[2], "T R ");
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
+/* No label file: start warns, and the classifier meta is still attached, with an empty label (ours: 8.0 attaches
+ * none). */
+static void
+test_classifier_no_labels (void)
+{
+  static const WantLabel red = { 0, 0, 3, 0.78125f, "" };
+  gchar *cfg = classifier_config ("cls-nolabels.txt", "meancls.onnx", 4, NULL, NULL), *texts;
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *om;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, bus);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "cls-nolabels.txt:labelfile-path: (unset): classifier output gets empty labels"));
+  g_free (texts);
+  in = colour_batch (1);
+  om = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
+  out = push_pull (h, in);
+  check_classifier (om, 0, 1, 4, NULL, &red, 1);
+  check_object_kept (om, "T  ");
+  gst_buffer_unref (out);
+  harness_teardown_with_bus (h, bus);
+  g_free (cfg);
+}
+
+/* An argmax past its line's labels and a layer without a line give an empty label (ours: 8.0 attaches nothing for
+ * the first). A label longer than result_label is truncated there and kept whole in pResult_label (ours), and the
+ * display text has it whole. */
+static void
+test_classifier_label_gaps (void)
+{
+  static const WantLabel blue[] = { {0, 2, 3, 0.99609375f, ""}, {1, 0, 3, 1.0f, ""} };
+  gchar *long_label = g_strnfill (200, 'g'), *labels = g_strdup_printf ("red;%s\n", long_label);
+  gchar *cfg = classifier_config ("cls-gaps.txt", "meancls2.onnx", 4, labels, NULL), *text;
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *om[2];
+  RdsClassifierMeta *c;
+  const RdsLabelInfo *li;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  in = colour_batch (1);
+  om[0] = add_colour_object (in, 0, 0, 0, 0, 0, 255, "T");
+  om[1] = add_colour_object (in, 0, 32, 0, 0, 160, 0, "T");
+  out = push_pull (h, in);
+  check_classifier (om[0], 0, 1, 4, NULL, blue, 2);
+  check_object_kept (om[0], "T   ");
+
+  /* green: layer 0 class 1, the long label; layer 1 (1, 0.375, 1): class 0, no line */
+  c = om[1]->classifier_meta_list->data;
+  g_assert_cmpuint (c->num_labels, ==, 2);
+  li = c->label_info_list->data;
+  g_assert_cmpuint (li->result_class_id, ==, 1);
+  g_assert_cmpuint (strlen (li->result_label), ==, RDS_MAX_LABEL_SIZE - 1);
+  g_assert_true (strncmp (li->result_label, long_label, RDS_MAX_LABEL_SIZE - 1) == 0);
+  g_assert_cmpstr (li->pResult_label, ==, long_label);
+  li = c->label_info_list->next->data;
+  g_assert_cmpuint (li->label_id, ==, 1);
+  g_assert_cmpstr (li->result_label, ==, "");
+  g_assert_null (li->pResult_label);
+  text = g_strdup_printf ("T %s  ", long_label);
+  check_object_kept (om[1], text);
+  g_free (text);
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+  g_free (cfg);
+  g_free (labels);
+  g_free (long_label);
+}
+
+/* Two classifiers in a row both attach to the object: the second's meta after the first's (ours: 8.0 prepends), and
+ * the display text grows by each one's labels (DeepStream 8.0 behaviour). */
+static void
+test_classifier_chained (void)
+{
+  static const WantLabel red = { 0, 0, 3, 0.78125f, "red" }, x = { 0, 0, 3, 0.78125f, "x" };
+  gchar *cfg1 = classifier_config ("cls-chain1.txt", "meancls.onnx", 4, RGB_LABELS, NULL);
+  gchar *cfg2 = classifier_config ("cls-chain2.txt", "meancls.onnx", 6, "x;y;z\n", "classifier-type=second\n");
+  GstHarness *h1, *h2;
+  GstBuffer *in, *out;
+  RdsObjectMeta *om;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h1 = classifier_harness (cfg1, NULL);
+  h2 = classifier_harness (cfg2, NULL);
+  in = colour_batch (1);
+  om = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
+  out = push_pull (h2, push_pull (h1, in));
+  check_classifier (om, 0, 2, 4, NULL, &red, 1);
+  check_classifier (om, 1, 2, 6, "second", &x, 1);
+  check_object_kept (om, "T red  x ");
+  gst_buffer_unref (out);
+  gst_harness_teardown (h2);
+  gst_harness_teardown (h1);
+  g_free (cfg2);
+  g_free (cfg1);
+}
+
+/* parse-classifier-func-name: called once per object with that object's layers, the network and the threshold; its
+ * attributes are the labels as they are (no threshold of ours: FixtureClassify returns half of it), and the display
+ * text gets " " and its description (DeepStream 8.0 behaviour). */
+static void
+test_classifier_custom (void)
+{
+  static const WantLabel red = { 0, 200, 3, 0.3f, "attr0-32x32" }, green = { 0, 0, 3, 0.3f, "attr0-32x32" };
+  gchar *extra = g_strdup_printf ("custom-lib-path=%s\nparse-classifier-func-name=FixtureClassify\n"
+      "classifier-threshold=0.6\n", RDS_TEST_PARSER_FIXTURE);
+  gchar *cfg = classifier_config ("cls-custom.txt", "meancls.onnx", 4, RGB_LABELS, extra);
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *om[2];
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  in = colour_batch (2);
+  om[0] = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
+  om[1] = add_colour_object (in, 1, 32, 0, 0, 160, 0, NULL);
+  out = push_pull (h, in);
+  check_classifier (om[0], 0, 1, 4, NULL, &red, 1);
+  check_object_kept (om[0], "T desc1");
+  check_classifier (om[1], 0, 1, 4, NULL, &green, 1);
+  check_object_kept (om[1], " desc1");
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+  g_free (cfg);
+  g_free (extra);
+}
+
+/* A custom parser that returns false (FixtureClassifyFailDark, on red below 64): one warning per element, that object
+ * gets no classifier meta, the others theirs (ours: DeepStream 8.0 crashes). */
+static void
+test_classifier_custom_false (void)
+{
+  gchar *extra = g_strdup_printf ("custom-lib-path=%s\nparse-classifier-func-name=FixtureClassifyFailDark\n",
+      RDS_TEST_PARSER_FIXTURE), *texts;
+  gchar *cfg = classifier_config ("cls-false.txt", "meancls.onnx", 4, RGB_LABELS, extra);
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, bus);
+  for (guint b = 0; b < 2; b++) {
+    GstBuffer *in = colour_batch (1), *out;
+    RdsObjectMeta *dark = add_colour_object (in, 0, 0, 0, 40, 200, 0, "T");
+    RdsObjectMeta *bright = add_colour_object (in, 0, 32, 0, 200, 0, 0, "T");
+
+    out = push_pull (h, in);
+    g_assert_null (dark->classifier_meta_list);
+    check_object_kept (dark, "T");
+    g_assert_cmpuint (g_list_length (bright->classifier_meta_list), ==, 1);
+    check_object_kept (bright, "T desc1");
+    gst_buffer_unref (out);
+  }
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "FixtureClassifyFailDark"));
+  g_assert_nonnull (strstr (texts, "an object of source 0, which gets no classifier meta"));
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
+  g_free (texts);
+  harness_teardown_with_bus (h, bus);
+  g_free (cfg);
+  g_free (extra);
+}
+
+/* A custom parser that leaves descString empty: the display text gets its labels, as for the built-in parser (ours:
+ * 8.0 not observed). */
+static void
+test_classifier_custom_no_desc (void)
+{
+  static const WantLabel red = { 0, 200, 3, 0.0f, "attr0-32x32" };
+  gchar *extra = g_strdup_printf ("custom-lib-path=%s\nparse-classifier-func-name=FixtureClassifyNoDesc\n",
+      RDS_TEST_PARSER_FIXTURE);
+  gchar *cfg = classifier_config ("cls-nodesc.txt", "meancls.onnx", 4, RGB_LABELS, extra);
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *om;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  in = colour_batch (1);
+  om = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
+  out = push_pull (h, in);
+  check_classifier (om, 0, 1, 4, NULL, &red, 1);
+  check_object_kept (om, "T attr0-32x32 ");
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+  g_free (cfg);
+  g_free (extra);
+}
+
+/* A custom parser that throws (FixtureClassifyThrow, on every object): one warning per element, no classifier meta,
+ * the labels it allocated freed (ASan), and the stream goes on (ours). */
+static void
+test_classifier_custom_throw (void)
+{
+  gchar *extra = g_strdup_printf ("custom-lib-path=%s\nparse-classifier-func-name=FixtureClassifyThrow\n",
+      RDS_TEST_PARSER_FIXTURE), *texts;
+  gchar *cfg = classifier_config ("cls-throw.txt", "meancls.onnx", 4, RGB_LABELS, extra);
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, bus);
+  for (guint b = 0; b < 2; b++) {
+    GstBuffer *in = colour_batch (1), *out;
+    RdsObjectMeta *om = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
+
+    out = push_pull (h, in);
+    g_assert_null (om->classifier_meta_list);
+    check_object_kept (om, "T");
+    gst_buffer_unref (out);
+  }
+  g_assert_cmpuint (hook_get_unit_count (h->element), ==, 2);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "FixtureClassifyThrow"));
+  g_assert_nonnull (strstr (texts, "threw an exception"));
+  g_assert_nonnull (strstr (texts, "which gets no classifier meta"));
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
+  g_free (texts);
+  harness_teardown_with_bus (h, bus);
+  g_free (cfg);
+  g_free (extra);
+}
+
+/* A parse-classifier-func-name the library doesn't have fails start, naming the key. */
+static void
+test_classifier_unknown_symbol (void)
+{
+  gchar *extra = g_strdup_printf ("custom-lib-path=%s\nparse-classifier-func-name=NoSuchClassifier\n",
+      RDS_TEST_PARSER_FIXTURE), *texts;
+  gchar *cfg = classifier_config ("cls-nosym.txt", "meancls.onnx", 4, RGB_LABELS, extra);
+
+  RDS_TEST_REQUIRE_GPU ();
+  texts = start_error (new_infer (cfg));
+  g_assert_nonnull (strstr (texts, "cls-nosym.txt:parse-classifier-func-name: NoSuchClassifier: "));
+  g_free (texts);
+  g_free (cfg);
+  g_free (extra);
+}
+
+/* With output-tensor-meta a classified object gets both metas; the tensor holds the raw means. */
+static void
+test_classifier_tensor_meta (void)
+{
+  static const WantLabel red = { 0, 0, 3, 0.78125f, "red" };
+  gchar *cfg = classifier_config ("cls-tensor.txt", "meancls.onnx", 4, RGB_LABELS, "output-tensor-meta=1\n");
+  GstHarness *h;
+  GstBuffer *in, *out;
+  RdsObjectMeta *om;
+  RdsInferTensorMeta *tm;
+  const gfloat *means;
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  h = classifier_harness (cfg, NULL);
+  in = colour_batch (1);
+  om = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
+  out = push_pull (h, in);
+  check_classifier (om, 0, 1, 4, NULL, &red, 1);
+  check_object_kept (om, "T red ");
+  tm = obj_tensor_meta (om);
+  g_assert_nonnull (tm);
+  g_assert_cmpuint (tm->unique_id, ==, 4);
+  g_assert_cmpuint (tm->num_output_layers, ==, 1);
+  means = tm->out_buf_ptrs_host[0];
+  g_assert_cmpfloat (means[0], ==, 0.78125f);
+  g_assert_cmpfloat (means[1], ==, 0.0f);
+  g_assert_cmpfloat (means[2], ==, 0.0f);
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+  g_free (cfg);
+}
+
 /* ---- gpu: concurrent metadata readers ---- */
 
 #define CONCURRENCY_BATCHES 500
@@ -2629,6 +3212,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer/override", test_override);
   g_test_add_func ("/cpu/infer/override-secondary", test_override_secondary);
   g_test_add_func ("/cpu/infer/start-config-errors", test_start_config_errors);
+  g_test_add_func ("/cpu/infer/classifier-attach", test_classifier_attach);
   g_test_add_func ("/gpu/infer/start-errors", test_start_errors);
   g_test_add_func ("/gpu/infer/no-batch-meta", test_no_batch_meta);
   g_test_add_func ("/gpu/infer/tensor-meta", test_tensor_meta);
@@ -2653,6 +3237,18 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-secondary/pool-trim", test_secondary_pool_trim);
   g_test_add_func ("/gpu/infer-secondary/chunk-failure", test_secondary_chunk_failure);
   g_test_add_func ("/gpu/infer-secondary/roi-ignored", test_secondary_roi_ignored);
+  g_test_add_func ("/gpu/infer-secondary/classifier-classes", test_classifier_classes);
+  g_test_add_func ("/gpu/infer-secondary/classifier-threshold", test_classifier_threshold);
+  g_test_add_func ("/gpu/infer-secondary/classifier-two-layers", test_classifier_two_layers);
+  g_test_add_func ("/gpu/infer-secondary/classifier-no-labels", test_classifier_no_labels);
+  g_test_add_func ("/gpu/infer-secondary/classifier-label-gaps", test_classifier_label_gaps);
+  g_test_add_func ("/gpu/infer-secondary/classifier-chained", test_classifier_chained);
+  g_test_add_func ("/gpu/infer-secondary/classifier-custom", test_classifier_custom);
+  g_test_add_func ("/gpu/infer-secondary/classifier-custom-false", test_classifier_custom_false);
+  g_test_add_func ("/gpu/infer-secondary/classifier-custom-no-desc", test_classifier_custom_no_desc);
+  g_test_add_func ("/gpu/infer-secondary/classifier-custom-throw", test_classifier_custom_throw);
+  g_test_add_func ("/gpu/infer-secondary/classifier-unknown-symbol", test_classifier_unknown_symbol);
+  g_test_add_func ("/gpu/infer-secondary/classifier-tensor-meta", test_classifier_tensor_meta);
   ret = g_test_run ();
   if (dev_alloc)
     gst_object_unref (dev_alloc);

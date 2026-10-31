@@ -1,7 +1,11 @@
 /* Test parser module, written the way a DeepStream bbox parser is: only the NvDsInfer* names and
  * CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE, through rds/rds_compat_infer.h (built with -DUSE_REDSTREAM). Not installed.
  * FixtureBoxes returns the boxes in infer-parser-fixture.h, FixtureThrow throws, FixtureFail returns false,
- * FixtureFailDark returns false for dark images only.
+ * FixtureFailDark returns false for dark images only. The classifier parsers
+ * (CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE): FixtureClassify returns the attributes in
+ * infer-parser-fixture.h, FixtureClassifyNoDesc the same without a descString, FixtureClassifyPastLayers one attribute
+ * whose index is past the layers, FixtureClassifyFail and FixtureClassifyThrow allocate a label, then return false or
+ * throw, FixtureClassifyFailDark returns false for dark images only.
  * FixtureVisible (in the second file) is FixtureBoxes marked with default visibility, for the build of these
  * sources with -fvisibility=hidden.
  * The box table lives in a second translation unit (infer-parser-fixture-boxes.cpp), which includes the parser
@@ -15,6 +19,9 @@
 
 #include <stdexcept>
 #include <chrono>
+#include <cmath>
+#include <cstring>
+#include <string>
 #include <condition_variable>
 #include <mutex>
 
@@ -85,6 +92,113 @@ CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE (FixtureBoxes);
 CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE (FixtureThrow);
 CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE (FixtureFail);
 CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE (FixtureFailDark);
+
+/* Classifier parsers, defined first and checked by the macro after (as the macro's documentation asks). */
+extern "C" bool FixtureClassify (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString);
+extern "C" bool FixtureClassifyNoDesc (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString);
+extern "C" bool FixtureClassifyPastLayers (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString);
+extern "C" bool FixtureClassifyFail (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString);
+extern "C" bool FixtureClassifyThrow (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString);
+extern "C" bool FixtureClassifyFailDark (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString);
+
+/* The attributes as in infer-parser-fixture.h: one per output layer, from its first value and the call's
+ * arguments. */
+extern "C" bool
+FixtureClassify (std::vector<NvDsInferLayerInfo> const &outputLayersInfo, NvDsInferNetworkInfo const &networkInfo,
+    float classifierThreshold, std::vector<NvDsInferAttribute> &attrList, std::string &descString)
+{
+  for (unsigned int i = 0; i < outputLayersInfo.size (); i++) {
+    const float first = static_cast<const float *> (outputLayersInfo[i].buffer)[0];
+    std::string label = "attr" + std::to_string (i) + "-" + std::to_string (networkInfo.width) + "x"
+        + std::to_string (networkInfo.height);
+    NvDsInferAttribute attr = {};
+
+    attr.attributeIndex = i;
+    attr.attributeValue = static_cast<unsigned int> (std::lround (first * RDS_TEST_FIXTURE_ATTR_SCALE));
+    attr.attributeConfidence = classifierThreshold / 2;
+    attr.attributeLabel = i == 1 ? nullptr : strdup (label.c_str ());
+    attrList.push_back (attr);
+  }
+  descString = "desc" + std::to_string (outputLayersInfo.size ());
+  return true;
+}
+
+extern "C" bool
+FixtureClassifyNoDesc (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString)
+{
+  bool ok = FixtureClassify (outputLayersInfo, networkInfo, classifierThreshold, attrList, descString);
+
+  descString.clear ();
+  return ok;
+}
+
+extern "C" bool
+FixtureClassifyPastLayers (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString)
+{
+  NvDsInferAttribute attr = {};
+
+  (void) networkInfo;
+  (void) classifierThreshold;
+  attr.attributeIndex = static_cast<unsigned int> (outputLayersInfo.size ());
+  attr.attributeValue = 5;
+  attr.attributeConfidence = 0.5f;
+  attr.attributeLabel = strdup ("past");
+  attrList.push_back (attr);
+  descString = "past";
+  return true;
+}
+
+extern "C" bool
+FixtureClassifyFail (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString)
+{
+  FixtureClassify (outputLayersInfo, networkInfo, classifierThreshold, attrList, descString);
+  return false;
+}
+
+extern "C" bool
+FixtureClassifyThrow (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString)
+{
+  FixtureClassify (outputLayersInfo, networkInfo, classifierThreshold, attrList, descString);
+  throw std::runtime_error (RDS_TEST_FIXTURE_THROW_WHAT);
+}
+
+extern "C" bool
+FixtureClassifyFailDark (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString)
+{
+  if (outputLayersInfo.empty ()
+      || static_cast<const float *> (outputLayersInfo[0].buffer)[0] < RDS_TEST_FIXTURE_DARK_BELOW)
+    return false;
+  return FixtureClassify (outputLayersInfo, networkInfo, classifierThreshold, attrList, descString);
+}
+
+CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassify);
+CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassifyNoDesc);
+CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassifyPastLayers);
+CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassifyFail);
+CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassifyThrow);
+CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassifyFailDark);
 
 /* A parser-side barrier makes frame replacement happen strictly after the snapshot and before attachment.
  * Controls live in this test module; no synchronization hooks are needed in the element. */

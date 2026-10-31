@@ -23,7 +23,9 @@ GST_ELEMENT_REGISTER_DECLARE (rdsinfer);
  * - read_input: copies the first @n_floats of the network input tensor (batch-size images) to @dst; FALSE when
  *   not started or @n_floats is too large.
  * - get_unit_count: the inference units inferred since start (primary mode: one per frame, secondary mode: one per
- *   object inferred on). */
+ *   object inferred on).
+ * - attach_classifier_result: gst_rds_infer_attach_classifier_result (gstrdsinfer-private.h), for a test that builds
+ *   the batch meta and the RdsInferClassifierResult (rds-infer-parse.h) itself; no element needed. */
 __attribute__ ((visibility ("default"))) GstStructure *rds_infer_test_get_config (GstElement * element,
     GError ** error);
 __attribute__ ((visibility ("default"))) gboolean rds_infer_test_get_output_sets (GstElement * element,
@@ -33,6 +35,8 @@ __attribute__ ((visibility ("default"))) gboolean rds_infer_test_read_input (Gst
 __attribute__ ((visibility ("default"))) guint64 rds_infer_test_get_unit_count (GstElement * element);
 __attribute__ ((visibility ("default"))) gboolean rds_infer_test_get_output_set_totals (GstElement * element,
     guint64 * allocated, guint64 * freed);
+__attribute__ ((visibility ("default"))) void rds_infer_test_attach_classifier_result (gpointer batch_meta,
+    gpointer obj_meta, gconstpointer result, gint unique_id, const gchar * classifier_type);
 
 G_END_DECLS
 

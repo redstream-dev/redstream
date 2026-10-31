@@ -1,8 +1,9 @@
-/* Redstream: rdsinfer, a primary or secondary detector on MIGraphX. Property names and config files follow
- * DeepStream's public nvinfer documentation.
+/* Redstream: rdsinfer, a primary or secondary detector, or a secondary classifier, on MIGraphX. Property names and
+ * config files follow DeepStream's public nvinfer documentation.
  *
  * An in-place GstBaseTransform in passthrough mode on rdsstreammux batches: buffers go downstream unchanged, with
- * object meta (detectors) and tensor meta added to their RdsBatchMeta. Pixels are never written.
+ * object meta (detectors), classifier meta (classifiers) and tensor meta added to their RdsBatchMeta. Pixels are
+ * never written.
  * - start (READY -> PAUSED) loads the config file, applies the properties that were set (a property set explicitly
  *   wins over the file, also when set to its default value), and builds or loads the engine, synchronously. Any
  *   error fails the state change with a message naming the file (or the property), the key and the value.
@@ -18,7 +19,8 @@
  *   parser and the post-processing run on the CPU, and the meta lock is taken again to add the chunk's results,
  *   which go to frames that are still there (and in secondary mode objects: RdsMetaRef). Inferred frames get
  *   bInferDone in primary mode; secondary mode doesn't touch it (DeepStream 8.0 behaviour), and attaches to the
- *   object: its tensor meta, and a detector's children with the object as parent.
+ *   object: its tensor meta, a detector's children with the object as parent, a classifier's classifier meta
+ *   (gstrdsinfer-secondary.c).
  * - interval N (primary mode): one batch is inferred, the next N pass untouched (bInferDone FALSE); the count
  *   restarts at start and after a flush. Secondary mode infers every batch (DeepStream 8.0 behaviour).
  * - Output buffers are refcounted sets (rds-infer-output.h) that tensor metas keep alive, also in demuxed copies:
@@ -372,6 +374,7 @@ release_resources (GstRdsInfer * self)
   g_clear_pointer (&self->layers, g_free);
   g_clear_pointer (&self->slot_used, g_free);
   g_clear_pointer (&self->image_used, g_free);
+  g_ptr_array_set_size (self->cls_results, 0);
   self->n_outputs = 0;
 }
 
@@ -495,6 +498,38 @@ open_parser (GstRdsInfer * self, GError ** error)
   return ok;
 }
 
+/* The classifier parser: parse-classifier-func-name in custom-lib-path, else the built-in one; errors name the key. */
+static gboolean
+open_classifier_parser (GstRdsInfer * self, GError ** error)
+{
+  RdsInferConfig *cfg = self->cfg;
+  GError *err = NULL;
+
+  if (cfg->parse_classifier_func_name)
+    self->parser = rds_infer_parser_open_classifier (cfg->custom_lib_path, cfg->parse_classifier_func_name, &err);
+  else
+    self->parser = rds_infer_parser_open_builtin_classifier ();
+  if (!self->parser) {
+    /* a function the library doesn't have names its key; the library's own failures name custom-lib-path */
+    if (err->domain == RDS_INFER_PARSER_ERROR && err->code == RDS_INFER_PARSER_ERROR_SYMBOL)
+      g_set_error (error, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_INVALID,
+          "%s:parse-classifier-func-name: %s: %s", cfg->config_path, cfg->parse_classifier_func_name, err->message);
+    else
+      g_set_error (error, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_INVALID, "%s:custom-lib-path: %s",
+          cfg->config_path, err->message);
+    g_error_free (err);
+    return FALSE;
+  }
+  rds_infer_parser_set_classifier_params (self->parser, cfg->classifier_threshold, cfg->classifier_labels);
+  if (!rds_infer_parser_check_layers (self->parser, self->layers, self->n_outputs, &err)) {
+    g_set_error (error, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_INVALID, "%s:network-type: 1: %s",
+        cfg->config_path, err->message);
+    g_error_free (err);
+    return FALSE;
+  }
+  return TRUE;
+}
+
 static gboolean
 gst_rds_infer_start (GstBaseTransform * trans)
 {
@@ -511,20 +546,11 @@ gst_rds_infer_start (GstBaseTransform * trans)
     g_error_free (err);
     return FALSE;
   }
-  /* the config accepts classifiers (in secondary mode, which check_mode made sure of); the element doesn't run them
-   * yet. network-type comes from the file only. */
-  if (self->cfg->network_type == 1) {
-    g_set_error (&err, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_UNSUPPORTED,
-        "%s:network-type: 1: classifiers are not implemented yet", self->cfg->config_path);
-    post_config_error (self, err);
-    g_error_free (err);
-    release_resources (self);
-    return FALSE;
-  }
   for (guint i = 0; i < self->cfg->warnings->len; i++)
     GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("%s", (const gchar *) g_ptr_array_index (self->cfg->warnings,
                 i)), (NULL));
   self->secondary = self->cfg->process_mode == 2;
+  self->classifier_type = g_intern_string (self->cfg->classifier_type);
   GST_OBJECT_LOCK (self);
   if (self->raw_output_file_write || self->raw_output_generated_callback)
     self->warned |= WARN_RAW_OUTPUT;
@@ -545,7 +571,9 @@ gst_rds_infer_start (GstBaseTransform * trans)
     release_resources (self);
     return FALSE;
   }
-  ok = open_engine (self, &err) && (self->cfg->network_type != 0 || open_parser (self, &err));
+  /* a classifier is in secondary mode (rds_infer_config_check_mode made sure of it) */
+  ok = open_engine (self, &err) && (self->cfg->network_type == 100 || (self->cfg->network_type == 1
+          ? open_classifier_parser (self, &err) : open_parser (self, &err)));
   if (ok) {
     herr = hipMalloc ((void **) &self->input, self->cfg->batch_size * self->image_floats * sizeof (gfloat));
     if (herr != hipSuccess) {
@@ -647,6 +675,17 @@ snapshot_frames (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * su
   return ok;
 }
 
+void
+gst_rds_infer_point_layers (GstRdsInfer * self, RdsInferOutputSet * set, guint image)
+{
+  for (guint i = 0; i < self->n_outputs; i++) {
+    gsize offset = (gsize) image * self->out_dims[i].numElements;
+
+    self->layers[i].buffer = set->host[i] + offset;
+    self->layers[i].deviceBuffer = set->dev[i] + offset;
+  }
+}
+
 /* Parser and post-processing of the units @first .. @first + @n - 1 (a chunk), on the host outputs of its @set; in
  * secondary mode per crop (thresholds and NMS within the crop), then to frame pixels. */
 static void
@@ -662,12 +701,7 @@ parse_units (GstRdsInfer * self, const RdsBufSurface * surf, RdsInferOutputSet *
 
     unit->det_start = self->dets->len;
     unit->n_dets = 0;
-    for (guint i = 0; i < self->n_outputs; i++) {
-      gsize offset = (gsize) unit->image * self->out_dims[i].numElements;
-
-      self->layers[i].buffer = set->host[i] + offset;
-      self->layers[i].deviceBuffer = set->dev[i] + offset;
-    }
+    gst_rds_infer_point_layers (self, set, unit->image);
     g_array_set_size (self->objects, 0);
     /* only this unit loses its objects (ours in secondary mode, where DeepStream 8.0 crashes) */
     if (!rds_infer_parser_parse (self->parser, self->layers, self->n_outputs, &self->net, self->objects, &err)) {
@@ -827,6 +861,8 @@ infer_chunk (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf, 
   /* 3. parsing on the CPU, then the metadata under the lock */
   if (cfg->network_type == 0)
     parse_units (self, surf, set, first, n);
+  else if (cfg->network_type == 1)
+    gst_rds_infer_classify_units (self, set, first, n);
   if (self->secondary)
     gst_rds_infer_attach_object_results (self, bm, set, first, n);
   else
@@ -937,6 +973,15 @@ rds_infer_test_read_input (GstElement * element, gfloat * dst, gsize n_floats)
   ok = hipMemcpy (dst, self->input, n_floats * sizeof (gfloat), hipMemcpyDeviceToHost) == hipSuccess;
   rds_infer_device_restore (prev);
   return ok;
+}
+
+void
+rds_infer_test_attach_classifier_result (gpointer batch_meta, gpointer obj_meta, gconstpointer result, gint unique_id,
+    const gchar * classifier_type)
+{
+  rds_acquire_meta_lock (batch_meta);
+  gst_rds_infer_attach_classifier_result (batch_meta, obj_meta, result, unique_id, classifier_type);
+  rds_release_meta_lock (batch_meta);
 }
 
 /* ---- properties ---- */
@@ -1097,6 +1142,7 @@ gst_rds_infer_finalize (GObject * object)
   g_array_unref (self->objects);
   g_array_unref (self->dets);
   g_byte_array_unref (self->scratch);
+  g_ptr_array_unref (self->cls_results);
   G_OBJECT_CLASS (gst_rds_infer_parent_class)->finalize (object);
 }
 
@@ -1126,8 +1172,7 @@ gst_rds_infer_class_init (GstRdsInferClass * klass)
           DEFAULT_UNIQUE_ID, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_PROCESS_MODE,
       g_param_spec_uint ("process-mode", "Process mode",
-          "1: primary (whole frames), 2: secondary (the objects upstream elements found; classifiers are not "
-          "implemented yet and fail at start)", 1, 2,
+          "1: primary (whole frames), 2: secondary (the objects upstream elements found)", 1, 2,
           DEFAULT_PROCESS_MODE, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_INFER_ON_GIE_ID,
       g_param_spec_int ("infer-on-gie-id", "Infer on GIE ID",
@@ -1206,4 +1251,5 @@ gst_rds_infer_init (GstRdsInfer * self)
   self->objects = g_array_new (FALSE, FALSE, sizeof (RdsInferObjectDetectionInfo));
   self->dets = g_array_new (FALSE, FALSE, sizeof (RdsInferDetection));
   self->scratch = g_byte_array_new ();
+  self->cls_results = g_ptr_array_new_with_free_func ((GDestroyNotify) rds_infer_classifier_result_free);
 }

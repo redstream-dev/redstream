@@ -1,7 +1,8 @@
-/* Redstream source-compatibility header for DeepStream custom bbox parsers: the replacement for
+/* Redstream source-compatibility header for DeepStream custom bbox and classifier parsers: the replacement for
  * nvdsinfer_custom_impl.h. C++. Adds the parser ABI's DeepStream names (NvDsInferParseDetectionParams,
- * NvDsInferParseCustomFunc, CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE, and the unprefixed data-type names FLOAT, HALF,
- * INT8, INT32, INT64) to everything in rds/rds_compat.h; see docs/compat-matrix.md.
+ * NvDsInferParseCustomFunc, CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE, NvDsInferAttribute,
+ * NvDsInferClassiferParseCustomFunc, CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE, and the unprefixed data-type
+ * names FLOAT, HALF, INT8, INT32, INT64) to everything in rds/rds_compat.h; see docs/compat-matrix.md.
  *
  *   #ifdef USE_REDSTREAM
  *   #include <rds/rds_compat_infer.h>
@@ -33,5 +34,9 @@ constexpr RdsInferDataType INT64 = RDS_INFER_DATA_INT64;
 typedef RdsInferParseDetectionParams NvDsInferParseDetectionParams;
 typedef RdsInferParseCustomFunc NvDsInferParseCustomFunc;
 #define CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE RDS_CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE
+typedef RdsInferAttribute NvDsInferAttribute;
+/* NVIDIA's spelling ("Classifer"). */
+typedef RdsInferClassifierParseCustomFunc NvDsInferClassiferParseCustomFunc;
+#define CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE RDS_CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE
 
 #endif /* RDS_COMPAT_INFER_H */

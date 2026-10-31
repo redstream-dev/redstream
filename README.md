@@ -65,11 +65,12 @@ Jetson-specific hardware blocks.
 - **`rdsstreamdemux`** (`nvstreamdemux`): splits a batch back into per-source streams without copying: each output
   buffer is a read-only view of its slot (a writer gets its own copy), with the source's own timestamps, segment and
   stream events.
-- **`rdsinfer`** (`nvinfer`): a primary or secondary detector on MIGraphX. It reads nvinfer config files (key file
-  or YAML), runs ONNX models (YOLO11n tested) on whole batches on the GPU, and attaches object meta and, optionally,
-  tensor output meta. Bounding boxes come from the built-in YOLO parser or from a DeepStream custom bbox parser
-  library, recompiled against `rds/rds_compat_infer.h`. Secondary mode (`process-mode=2`) runs detectors and
-  tensor-output models on the crops of objects that upstream elements found; classifiers are not implemented yet.
+- **`rdsinfer`** (`nvinfer`): a primary or secondary detector, or a secondary classifier, on MIGraphX. It reads
+  nvinfer config files (key file or YAML), runs ONNX models (YOLO11n tested) on whole batches on the GPU, and
+  attaches object meta and, optionally, tensor output meta. Bounding boxes come from the built-in YOLO parser or from
+  a DeepStream custom bbox parser library, recompiled against `rds/rds_compat_infer.h`. Secondary mode
+  (`process-mode=2`) runs detectors, classifiers (classifier meta, with the built-in argmax parser or a DeepStream
+  custom classifier parser) and tensor-output models on the crops of objects that upstream elements found.
 - **`rdstracker`** (`nvtracker`): gives detected objects persistent IDs with the IOU and NvSORT trackers of
   NvMultiObjectTracker, on the CPU, reading the same YAML low-level config files (NvDCF and NvDeepSORT configs run
   as NvSORT). Where NVIDIA's docs leave behaviour open, it follows observed DeepStream 8.0 behaviour, and the compat

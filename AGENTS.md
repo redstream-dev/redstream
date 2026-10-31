@@ -15,8 +15,8 @@ tiler → OSD → display, `samples/rds-test3`). The libgstrds core is in place 
 metadata, events, read-only surface views, the `rds_buf_surf_transform` GPU transform and its many-to-one composite).
 The elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
 `rdsstreammux` (the default scaling mux: batches of fixed-size slots), `rdsstreamdemux` (zero-copy per-source
-views of the batch), `rdsinfer` (MIGraphX primary and secondary detector: nvinfer configs, custom bbox parsers,
-object and tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs),
+views of the batch), `rdsinfer` (MIGraphX primary and secondary detector, secondary classifier: nvinfer configs,
+custom bbox and classifier parsers, object, classifier and tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs),
 `rdsmultistreamtiler` (batches into one tiled frame), `rdsosd` (boxes, text, lines, arrows, circles and the clock,
 drawn on the GPU by default or on the CPU, the same pixels, Pango for text), `rdslogger` (per-stream FPS lines),
 `rdsvideosink` (display through a stock GStreamer sink) and `rdsurisrcbin` (file and RTSP sources, with RTSP
@@ -199,7 +199,7 @@ gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; secondary mod
                    element struct they share in gstrdsinfer-private.h; refcounted output sets and tensor meta in
                    rds-infer-output; test hooks exported for element_infer). rds-infer-config parses
                    nvinfer key-file/YAML configs from one key table; rds-infer-parse loads custom parser libraries
-                   (dlopen, ABI version check) and has the built-in YOLO parser; rds-infer-post does the detection
+                   (dlopen, ABI version check) and has the built-in YOLO and classifier parsers; rds-infer-post does the detection
                    post-processing (letterbox geometry, NMS, ROI/size filters); rds-infer-units the secondary-mode
                    geometry (object selection, aligned crops, crop letterbox, children back to the frame);
                    rds-infer-engine compiles ONNX with MIGraphX and caches the program (.mxr + .mxr.json manifest),

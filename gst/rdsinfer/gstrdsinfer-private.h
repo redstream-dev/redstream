@@ -73,10 +73,14 @@ struct _GstRdsInfer
   guint64 unit_count;           /* units inferred since start */
   guint warned;                 /* WarnOnce */
   gboolean secondary;           /* process-mode=2 */
+  const gchar *classifier_type; /* classifier-type, interned (the classifier metas point at it); NULL if unset */
   GArray *units;                /* InferUnit, the current batch's */
   GArray *objects;              /* RdsInferObjectDetectionInfo, one frame's parser output */
   GArray *dets;                 /* RdsInferDetection, every frame's */
   GByteArray *scratch;
+  /* classifiers: RdsInferClassifierResult, the current chunk's, entry u - first for unit u; NULL where the parser
+   * failed */
+  GPtrArray *cls_results;
   RdsInferLayerInfo *layers;    /* one frame's output layers, for the parser */
   gboolean *slot_used;          /* batch_size entries: the current batch has a frame in that slot */
   gboolean *image_used;         /* batch_size entries: the current chunk has a unit in that image */
@@ -91,6 +95,8 @@ G_GNUC_INTERNAL void gst_rds_infer_add_object (GstRdsInfer * self, RdsBatchMeta 
 /* A tensor meta for image @image of @set, in a user meta from @bm's pool. Under the batch lock. */
 G_GNUC_INTERNAL RdsUserMeta *gst_rds_infer_new_tensor_user_meta (GstRdsInfer * self, RdsBatchMeta * bm,
     RdsInferOutputSet * set, guint image);
+/* Points self->layers at image @image of @set (host and device), for a parser call. */
+G_GNUC_INTERNAL void gst_rds_infer_point_layers (GstRdsInfer * self, RdsInferOutputSet * set, guint image);
 
 /* gstrdsinfer-secondary.c */
 
@@ -98,6 +104,10 @@ G_GNUC_INTERNAL gboolean gst_rds_infer_snapshot_objects (GstRdsInfer * self, Rds
     const RdsBufSurface * surf);
 G_GNUC_INTERNAL void gst_rds_infer_map_children (GstRdsInfer * self, const InferUnit * unit,
     const RdsBufSurfaceParams * sp);
+G_GNUC_INTERNAL void gst_rds_infer_classify_units (GstRdsInfer * self, RdsInferOutputSet * set, guint first,
+    guint n);
+G_GNUC_INTERNAL void gst_rds_infer_attach_classifier_result (RdsBatchMeta * bm, RdsObjectMeta * om,
+    const RdsInferClassifierResult * result, gint unique_id, const gchar * classifier_type);
 G_GNUC_INTERNAL void gst_rds_infer_attach_object_results (GstRdsInfer * self, RdsBatchMeta * bm,
     RdsInferOutputSet * set, guint first, guint n);
 

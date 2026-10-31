@@ -1,13 +1,17 @@
-/* The custom bbox parser ABI (rds/rds-infer-custom-impl.h and its NvDsInfer* aliases) and rdsinfer's parser
- * loader, against the test modules in infer-parser-fixture.cpp and infer-parser-noabi.c.
+/* The custom bbox and classifier parser ABI (rds/rds-infer-custom-impl.h and its NvDsInfer* aliases), rdsinfer's
+ * parser loader, against the test modules in infer-parser-fixture.cpp and infer-parser-noabi.c, and the built-in
+ * classifier parser on fixed layer data.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <rds/rds_compat_infer.h>
 
 #include "rds-infer-parse.h"
 #include "infer-parser-fixture.h"
 
+#include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <initializer_list>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <dlfcn.h>
@@ -107,6 +111,39 @@ AbiTestParse (std::vector<NvDsInferLayerInfo> const &outputLayersInfo, NvDsInfer
 
 CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE (AbiTestParse);
 RDS_CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE (AbiTestParse);
+
+/* The classifier ABI: NvDsInferAttribute in its documented order, NVIDIA's spelling of the function type. */
+static_assert (offsetof (RdsInferAttribute, attributeIndex) == 0, "");
+static_assert (offsetof (RdsInferAttribute, attributeValue) == 4, "");
+static_assert (offsetof (RdsInferAttribute, attributeConfidence) == 8, "");
+static_assert (offsetof (RdsInferAttribute, attributeConfidence) < offsetof (RdsInferAttribute, attributeLabel), "");
+static_assert (offsetof (RdsInferAttribute, attributeLabel) + sizeof (char *) == sizeof (RdsInferAttribute), "");
+static_assert (std::is_same<decltype (RdsInferAttribute::attributeIndex), unsigned int>::value, "");
+static_assert (std::is_same<decltype (RdsInferAttribute::attributeValue), unsigned int>::value, "");
+static_assert (std::is_same<decltype (RdsInferAttribute::attributeConfidence), float>::value, "");
+static_assert (std::is_same<decltype (RdsInferAttribute::attributeLabel), char *>::value, "");
+static_assert (std::is_same<NvDsInferAttribute, RdsInferAttribute>::value, "");
+static_assert (std::is_same<NvDsInferClassiferParseCustomFunc, RdsInferClassifierParseCustomFunc>::value, "");
+static_assert (std::is_same<RdsInferClassifierParseCustomFunc, bool (*) (std::vector<RdsInferLayerInfo> const &,
+        RdsInferNetworkInfo const &, float, std::vector<RdsInferAttribute> &, std::string &)>::value, "");
+
+extern "C" bool AbiTestClassify (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString);
+
+extern "C" bool
+AbiTestClassify (std::vector<NvDsInferLayerInfo> const &outputLayersInfo, NvDsInferNetworkInfo const &networkInfo,
+    float classifierThreshold, std::vector<NvDsInferAttribute> &attrList, std::string &descString)
+{
+  (void) networkInfo;
+  (void) classifierThreshold;
+  attrList.resize (outputLayersInfo.size ());
+  descString.clear ();
+  return true;
+}
+
+CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (AbiTestClassify);
+RDS_CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (AbiTestClassify);
 
 static void
 test_detection_params (void)
@@ -440,6 +477,360 @@ test_free_and_reopen (void)
   rds_infer_parser_free (NULL);
 }
 
+/* ---- Classifier parsers ---- */
+
+/* FP32 output layers over @data, one after the other: layer i has @sizes[i] values (dims [n], as the engine gives a
+ * classifier's [batch, n] output per image). */
+static std::vector<RdsInferLayerInfo>
+cls_layers (float *data, std::initializer_list<unsigned int> sizes)
+{
+  std::vector<RdsInferLayerInfo> layers;
+  unsigned int i = 0;
+
+  for (unsigned int n : sizes) {
+    RdsInferLayerInfo l = {};
+
+    l.dataType = RDS_INFER_DATA_FLOAT;
+    l.inferDims.numDims = 1;
+    l.inferDims.d[0] = n;
+    l.inferDims.numElements = n;
+    l.bindingIndex = (int) i++;
+    l.layerName = "output";
+    l.buffer = data;
+    data += n;
+    layers.push_back (l);
+  }
+  return layers;
+}
+
+/* The label file's lines as the config holds them: one NULL-terminated vector per line, split at ';'. */
+static GPtrArray *
+label_lines (std::initializer_list<const char *> lines)
+{
+  GPtrArray *a = g_ptr_array_new_with_free_func ((GDestroyNotify) g_strfreev);
+
+  for (const char *line : lines)
+    g_ptr_array_add (a, g_strsplit (line, ";", -1));
+  return a;
+}
+
+static RdsInferParser *
+builtin_classifier (gfloat threshold, std::initializer_list<const char *> lines)
+{
+  RdsInferParser *parser = rds_infer_parser_open_builtin_classifier ();
+  GPtrArray *labels = label_lines (lines);
+
+  g_assert_nonnull (parser);
+  g_assert_cmpstr (rds_infer_parser_get_func_name (parser), ==, RDS_INFER_PARSER_CLASSIFIER);
+  /* the parser keeps its own copy of the labels */
+  rds_infer_parser_set_classifier_params (parser, threshold, labels);
+  g_ptr_array_unref (labels);
+  return parser;
+}
+
+/* Runs @parser on @layers (a 32x32 network); FALSE with @err as rds_infer_parser_classify. */
+static gboolean
+classify (RdsInferParser * parser, const std::vector<RdsInferLayerInfo> &layers, RdsInferClassifierResult * result,
+    GError ** err)
+{
+  RdsInferNetworkInfo net = { 32, 32, 3 };
+
+  return rds_infer_parser_classify (parser, layers.data (), layers.size (), &net, result, err);
+}
+
+static void
+check_label (const RdsInferClassifierResult * r, guint i, guint label_id, guint class_id, guint num_classes,
+    gfloat prob, const char *label)
+{
+  const RdsInferClassifierLabel *l;
+
+  g_assert_cmpuint (r->labels->len, >, i);
+  l = &g_array_index (r->labels, RdsInferClassifierLabel, i);
+  g_assert_cmpuint (l->label_id, ==, label_id);
+  g_assert_cmpuint (l->class_id, ==, class_id);
+  g_assert_cmpuint (l->num_classes, ==, num_classes);
+  g_assert_cmpfloat (l->prob, ==, prob);
+  g_assert_cmpstr (l->label, ==, label);
+}
+
+/* The built-in parser: per output layer the raw argmax (no softmax), its value the probability, its label from that
+ * layer's line of the label file; NaN never wins. */
+static void
+test_classifier_argmax (void)
+{
+  float data[] = { 0.1f, 0.7f, 0.2f, /**/ -3.0f, -1.0f, -2.0f, 5.0f, /**/ NAN, 0.25f };
+  std::vector<RdsInferLayerInfo> layers = cls_layers (data, { 3, 4, 2 });
+  RdsInferParser *parser = builtin_classifier (-10.0f, { "a;b;c", "w;x;y;z", "n;m" });
+  RdsInferClassifierResult *r = rds_infer_classifier_result_new ();
+  GError *err = NULL;
+
+  g_assert_true (rds_infer_parser_check_layers (parser, layers.data (), layers.size (), &err));
+  g_assert_no_error (err);
+  g_assert_true (classify (parser, layers, r, &err));
+  g_assert_no_error (err);
+  g_assert_cmpuint (r->labels->len, ==, 3);
+  check_label (r, 0, 0, 1, 3, 0.7f, "b");
+  check_label (r, 1, 1, 3, 4, 5.0f, "z");
+  check_label (r, 2, 2, 1, 2, 0.25f, "m");
+  /* the built-in parser has no description: the display text comes from the labels */
+  g_assert_null (r->desc);
+  rds_infer_classifier_result_free (r);
+  rds_infer_parser_free (parser);
+}
+
+/* Equal values: the lowest class index wins. */
+static void
+test_classifier_ties (void)
+{
+  float data[] = { 0.5f, 0.5f, 0.5f, /**/ 0.1f, 0.4f, 0.4f, 0.2f };
+  std::vector<RdsInferLayerInfo> layers = cls_layers (data, { 3, 4 });
+  RdsInferParser *parser = builtin_classifier (0.0f, { "a;b;c", "w;x;y;z" });
+  RdsInferClassifierResult *r = rds_infer_classifier_result_new ();
+
+  g_assert_true (classify (parser, layers, r, NULL));
+  g_assert_cmpuint (r->labels->len, ==, 2);
+  check_label (r, 0, 0, 0, 3, 0.5f, "a");
+  check_label (r, 1, 1, 1, 4, 0.4f, "x");
+  rds_infer_classifier_result_free (r);
+  rds_infer_parser_free (parser);
+}
+
+/* A layer's best value must be strictly above classifier-threshold (DeepStream 8.0 behaviour); a layer below it is
+ * left out, and with the default 0 an all-zero (or all-negative) layer gives nothing. */
+static void
+test_classifier_threshold (void)
+{
+  float data[] = { 0.5f, 0.1f, /**/ 0.1f, 0.50390625f, /**/ 0.0f, 0.0f };
+  float zero[] = { 0.0f, 0.0f, 0.0f, /**/ -0.5f, -0.25f };
+  std::vector<RdsInferLayerInfo> layers = cls_layers (data, { 2, 2, 2 }), zeros = cls_layers (zero, { 3, 2 });
+  RdsInferParser *parser = builtin_classifier (0.5f, { "a;b", "c;d", "e;f" });
+  RdsInferClassifierResult *r = rds_infer_classifier_result_new ();
+
+  g_assert_true (classify (parser, layers, r, NULL));
+  g_assert_cmpuint (r->labels->len, ==, 1);
+  check_label (r, 0, 1, 1, 2, 0.50390625f, "d");
+  rds_infer_classifier_result_free (r);
+  rds_infer_parser_free (parser);
+
+  parser = builtin_classifier (0.0f, { "a;b;c", "d;e" });
+  r = rds_infer_classifier_result_new ();
+  g_assert_true (classify (parser, zeros, r, NULL));
+  g_assert_cmpuint (r->labels->len, ==, 0);
+  rds_infer_classifier_result_free (r);
+  rds_infer_parser_free (parser);
+}
+
+/* An index past its line's labels (layers 0 and 1), a layer without a line (layer 2) and no label file at all give
+ * an empty label (ours: DeepStream 8.0 drops the first and the last). */
+static void
+test_classifier_labels (void)
+{
+  float data[] = { 0.1f, 0.2f, 0.9f, /**/ 0.3f, 0.6f, /**/ 0.8f, 0.1f };
+  std::vector<RdsInferLayerInfo> layers = cls_layers (data, { 3, 2, 2 });
+  RdsInferParser *parser = builtin_classifier (0.0f, { "a;b", " x " });
+  RdsInferClassifierResult *r = rds_infer_classifier_result_new ();
+
+  g_assert_true (classify (parser, layers, r, NULL));
+  g_assert_cmpuint (r->labels->len, ==, 3);
+  check_label (r, 0, 0, 2, 3, 0.9f, "");
+  check_label (r, 1, 1, 1, 2, 0.6f, "");
+  check_label (r, 2, 2, 0, 2, 0.8f, "");
+  rds_infer_classifier_result_free (r);
+  rds_infer_parser_free (parser);
+
+  parser = builtin_classifier (0.0f, { "a;b;c", " x ;y" });
+  r = rds_infer_classifier_result_new ();
+  g_assert_true (classify (parser, layers, r, NULL));
+  check_label (r, 0, 0, 2, 3, 0.9f, "c");
+  check_label (r, 1, 1, 1, 2, 0.6f, "y");
+  check_label (r, 2, 2, 0, 2, 0.8f, "");
+  rds_infer_classifier_result_free (r);
+  rds_infer_parser_free (parser);
+
+  parser = builtin_classifier (0.0f, { });
+  r = rds_infer_classifier_result_new ();
+  g_assert_true (classify (parser, layers, r, NULL));
+  g_assert_cmpuint (r->labels->len, ==, 3);
+  check_label (r, 1, 1, 1, 2, 0.6f, "");
+  rds_infer_classifier_result_free (r);
+  rds_infer_parser_free (parser);
+}
+
+/* The built-in parser needs at least one FP32 output layer with at least one value. */
+static void
+test_classifier_layers (void)
+{
+  float data[] = { 0.5f };
+  std::vector<RdsInferLayerInfo> layers = cls_layers (data, { 1 }), empty = cls_layers (data, { 0 });
+  RdsInferParser *parser = builtin_classifier (0.0f, { "a" });
+  RdsInferClassifierResult *r = rds_infer_classifier_result_new ();
+  GError *err = NULL;
+
+  g_assert_false (rds_infer_parser_check_layers (parser, NULL, 0, &err));
+  g_assert_error (err, RDS_INFER_PARSER_ERROR, RDS_INFER_PARSER_ERROR_LAYERS);
+  g_test_message ("%s", err->message);
+  g_clear_error (&err);
+  g_assert_false (rds_infer_parser_check_layers (parser, empty.data (), empty.size (), &err));
+  g_assert_error (err, RDS_INFER_PARSER_ERROR, RDS_INFER_PARSER_ERROR_LAYERS);
+  g_assert_nonnull (strstr (err->message, "no values"));
+  g_clear_error (&err);
+  layers[0].dataType = RDS_INFER_DATA_INT32;
+  g_assert_false (rds_infer_parser_check_layers (parser, layers.data (), layers.size (), &err));
+  g_assert_error (err, RDS_INFER_PARSER_ERROR, RDS_INFER_PARSER_ERROR_LAYERS);
+  g_assert_nonnull (strstr (err->message, "INT32"));
+  g_clear_error (&err);
+  /* the same check on every call */
+  g_assert_false (classify (parser, layers, r, &err));
+  g_assert_error (err, RDS_INFER_PARSER_ERROR, RDS_INFER_PARSER_ERROR_LAYERS);
+  g_clear_error (&err);
+  g_assert_cmpuint (r->labels->len, ==, 0);
+  rds_infer_classifier_result_free (r);
+  rds_infer_parser_free (parser);
+}
+
+static RdsInferParser *
+open_classifier_ok (const char *func, gfloat threshold)
+{
+  GError *err = NULL;
+  RdsInferParser *parser = rds_infer_parser_open_classifier (RDS_TEST_PARSER_FIXTURE, func, &err);
+
+  g_assert_no_error (err);
+  g_assert_nonnull (parser);
+  g_assert_cmpstr (rds_infer_parser_get_func_name (parser), ==, func);
+  rds_infer_parser_set_classifier_params (parser, threshold, NULL);
+  return parser;
+}
+
+/* A custom classifier parser, called with the layers, the network and the threshold: its attributes become labels
+ * as they are (no threshold of ours), with its strdup'ed labels (freed by the loader: ASan checks) and its
+ * description; a NULL label is an empty one. Any layer checks are the parser's own. */
+static void
+test_classifier_custom (void)
+{
+  float data[] = { 0.5f, 0.1f, 0.2f, /**/ 0.25f, 0.0f };
+  std::vector<RdsInferLayerInfo> layers = cls_layers (data, { 3, 2 });
+  RdsInferParser *parser = open_classifier_ok ("FixtureClassify", 0.6f);
+  RdsInferClassifierResult *r = rds_infer_classifier_result_new (), *copy;
+  GError *err = NULL;
+
+  g_assert_true (rds_infer_parser_check_layers (parser, NULL, 0, &err));
+  g_assert_true (classify (parser, layers, r, &err));
+  g_assert_no_error (err);
+  g_assert_cmpuint (r->labels->len, ==, 2);
+  check_label (r, 0, 0, 128, 3, 0.3f, "attr0-32x32");
+  check_label (r, 1, 1, 64, 2, 0.3f, "");
+  g_assert_cmpstr (r->desc, ==, "desc2");
+
+  /* a copy owns its strings */
+  copy = rds_infer_classifier_result_copy (r);
+  rds_infer_classifier_result_free (r);
+  g_assert_cmpuint (copy->labels->len, ==, 2);
+  check_label (copy, 0, 0, 128, 3, 0.3f, "attr0-32x32");
+  check_label (copy, 1, 1, 64, 2, 0.3f, "");
+  g_assert_cmpstr (copy->desc, ==, "desc2");
+  rds_infer_classifier_result_free (copy);
+  rds_infer_parser_free (parser);
+}
+
+/* A custom parser's empty descString is no description (ours): desc stays NULL, the labels make the display text. An
+ * attribute whose index is past the layers has no class count (0). */
+static void
+test_classifier_custom_no_desc (void)
+{
+  float data[] = { 0.5f, 0.1f, 0.2f };
+  std::vector<RdsInferLayerInfo> layers = cls_layers (data, { 3 });
+  RdsInferParser *parser = open_classifier_ok ("FixtureClassifyNoDesc", 0.6f);
+  RdsInferClassifierResult *r = rds_infer_classifier_result_new ();
+
+  g_assert_true (classify (parser, layers, r, NULL));
+  g_assert_cmpuint (r->labels->len, ==, 1);
+  check_label (r, 0, 0, 128, 3, 0.3f, "attr0-32x32");
+  g_assert_null (r->desc);
+  rds_infer_classifier_result_free (r);
+  rds_infer_parser_free (parser);
+
+  parser = open_classifier_ok ("FixtureClassifyPastLayers", 0.0f);
+  r = rds_infer_classifier_result_new ();
+  g_assert_true (classify (parser, layers, r, NULL));
+  g_assert_cmpuint (r->labels->len, ==, 1);
+  check_label (r, 0, 1, 5, 0, 0.5f, "past");
+  g_assert_cmpstr (r->desc, ==, "past");
+  rds_infer_classifier_result_free (r);
+  rds_infer_parser_free (parser);
+}
+
+/* The value type on its own: a NULL label is an empty one, a copy is deep. */
+static void
+test_classifier_result (void)
+{
+  RdsInferClassifierResult *r = rds_infer_classifier_result_new (), *copy;
+
+  g_assert_cmpuint (r->labels->len, ==, 0);
+  g_assert_null (r->desc);
+  rds_infer_classifier_result_add (r, 3, 7, 0, 0.25f, NULL);
+  rds_infer_classifier_result_add (r, 0, 1, 2, 0.75f, "two");
+  copy = rds_infer_classifier_result_copy (r);
+  rds_infer_classifier_result_free (r);
+  check_label (copy, 0, 3, 7, 0, 0.25f, "");
+  check_label (copy, 1, 0, 1, 2, 0.75f, "two");
+  g_assert_null (copy->desc);
+  rds_infer_classifier_result_free (copy);
+}
+
+static void
+assert_classify_fails (const char *func, const char *const *substrings)
+{
+  float data[] = { 0.5f, 0.1f, /**/ 0.25f };
+  std::vector<RdsInferLayerInfo> layers = cls_layers (data, { 2, 1 });
+  RdsInferParser *parser = open_classifier_ok (func, 0.5f);
+  RdsInferClassifierResult *r = rds_infer_classifier_result_new ();
+  GError *err = NULL;
+
+  g_assert_false (classify (parser, layers, r, &err));
+  g_assert_error (err, RDS_INFER_PARSER_ERROR, RDS_INFER_PARSER_ERROR_PARSE);
+  g_test_message ("%s", err->message);
+  for (; *substrings; substrings++)
+    g_assert_nonnull (strstr (err->message, *substrings));
+  g_clear_error (&err);
+  /* nothing of the failed call is kept, and the labels it allocated are freed (ASan) */
+  g_assert_cmpuint (r->labels->len, ==, 0);
+  g_assert_null (r->desc);
+  g_assert_false (classify (parser, layers, r, &err));
+  g_clear_error (&err);
+  rds_infer_classifier_result_free (r);
+  rds_infer_parser_free (parser);
+}
+
+static void
+test_classifier_fail (void)
+{
+  const char *want[] = { RDS_TEST_PARSER_FIXTURE, "FixtureClassifyFail", "returned false", NULL };
+
+  assert_classify_fails ("FixtureClassifyFail", want);
+}
+
+static void
+test_classifier_throw (void)
+{
+  const char *want[] = { RDS_TEST_PARSER_FIXTURE, "FixtureClassifyThrow", RDS_TEST_FIXTURE_THROW_WHAT, NULL };
+
+  assert_classify_fails ("FixtureClassifyThrow", want);
+}
+
+static void
+test_classifier_wrong_symbol (void)
+{
+  GError *err = NULL;
+
+  g_assert_null (rds_infer_parser_open_classifier (RDS_TEST_PARSER_FIXTURE, "NoSuchClassifier", &err));
+  g_assert_error (err, RDS_INFER_PARSER_ERROR, RDS_INFER_PARSER_ERROR_SYMBOL);
+  g_assert_nonnull (strstr (err->message, "NoSuchClassifier"));
+  g_clear_error (&err);
+  g_assert_null (rds_infer_parser_open_classifier (RDS_TEST_PARSER_NOABI, "NoAbiParse", &err));
+  g_assert_error (err, RDS_INFER_PARSER_ERROR, RDS_INFER_PARSER_ERROR_ABI);
+  g_clear_error (&err);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -457,5 +848,16 @@ main (int argc, char **argv)
   g_test_add_func ("/infer-parser/abi-from-dependency", test_abi_from_dependency);
   g_test_add_func ("/infer-parser/compat-only", test_compat_only);
   g_test_add_func ("/infer-parser/free-and-reopen", test_free_and_reopen);
+  g_test_add_func ("/infer-parser/classifier-argmax", test_classifier_argmax);
+  g_test_add_func ("/infer-parser/classifier-ties", test_classifier_ties);
+  g_test_add_func ("/infer-parser/classifier-threshold", test_classifier_threshold);
+  g_test_add_func ("/infer-parser/classifier-labels", test_classifier_labels);
+  g_test_add_func ("/infer-parser/classifier-layers", test_classifier_layers);
+  g_test_add_func ("/infer-parser/classifier-custom", test_classifier_custom);
+  g_test_add_func ("/infer-parser/classifier-custom-no-desc", test_classifier_custom_no_desc);
+  g_test_add_func ("/infer-parser/classifier-result", test_classifier_result);
+  g_test_add_func ("/infer-parser/classifier-fail", test_classifier_fail);
+  g_test_add_func ("/infer-parser/classifier-throw", test_classifier_throw);
+  g_test_add_func ("/infer-parser/classifier-wrong-symbol", test_classifier_wrong_symbol);
   return g_test_run ();
 }
