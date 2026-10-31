@@ -195,7 +195,8 @@ gst/rdsvideo/      libgstrdsvideo plugin: rdsvideodec (rocDecode, gstrdsvideodec
                    (gstrdsvideoconvert.c), shared helpers in rds-video-util
 gst/rdsmux/        libgstrdsmux plugin: rdsstreammux (GstAggregator, gstrdsstreammux.c) and rdsstreamdemux
                    (gstrdsstreamdemux.c)
-gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; refcounted output sets and tensor meta in
+gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; secondary mode in gstrdsinfer-secondary.c, the
+                   element struct they share in gstrdsinfer-private.h; refcounted output sets and tensor meta in
                    rds-infer-output; test hooks exported for element_infer). rds-infer-config parses
                    nvinfer key-file/YAML configs from one key table; rds-infer-parse loads custom parser libraries
                    (dlopen, ABI version check) and has the built-in YOLO parser; rds-infer-post does the detection
