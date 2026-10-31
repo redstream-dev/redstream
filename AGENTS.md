@@ -254,6 +254,9 @@ docs/              compat-matrix.md: what the compat header and the elements map
                    and rdstracker config-key tables must match the key tables: the infer_config and tracker_config
                    tests check every row; element_compat_matrix checks the tiler, OSD, logger, sink and URI source
                    bin property tables against the elements' properties)
+samples/rds-test2/ clean-room sample with a secondary classifier: YOLO11n, NvSORT, YOLO11n-cls on the vehicles
+                   (per-frame object, vehicle and labelled counts, label totals; --dry-run, --no-display,
+                   --pgie-config, --sgie-config, --tracker-config)
 samples/rds-test3/ clean-room test3-style multi-stream sample (end to end: nvurisrcbin sources, per-frame counts, tiler,
                    OSD, display; --dry-run, --no-display, --pgie-config, --tracker-config, the RTSP options; Ctrl-C
                    stops with an EOS)
@@ -271,8 +274,10 @@ tests/tools/       tool tests (shell scripts)
 tests/media/       make-test-media.sh: generated H.264 clips (into git-ignored .cache/)
 tests/models/      committed tiny ONNX test models (make-test-models.py); fetch-yolo11n.sh exports YOLO11n and its
                    test reference data (street photo, Ultralytics detections, parity tensors) into .cache/models
-                   (host, Docker; AGPL, never committed); fetch-tracker-clip.sh transcodes a CC0 street clip for
-                   the tracker tests into .cache/media (host, Docker, GPU)
+                   (host, Docker; AGPL, never committed), fetch-yolo11n-cls.sh the same for YOLO11n-cls (a Softmax
+                   appended; ImageNet labels, Ultralytics' top-1 on the photo's vehicle crops);
+                   fetch-tracker-clip.sh transcodes a CC0 street clip for the tracker tests into .cache/media (host,
+                   Docker, GPU)
 spikes/            design spikes (rocdec-hip, migraphx-devptr); reference code, not built by meson
 .agents/skills/    agent skills for this repo (.claude/skills is a symlink)
 ```
@@ -292,6 +297,7 @@ tests/media/make-test-media.sh   # generates .cache/media/*.h264 for manual runs
                                  # (the tests encode their own clips)
 tests/models/fetch-yolo11n.sh    # ON THE HOST (Docker + network): exports YOLO11n and its reference data into
                                  # .cache/models; without it the YOLO11n tests skip
+tests/models/fetch-yolo11n-cls.sh  # ON THE HOST too: YOLO11n-cls for rds-test2 and the classifier tests
 tests/models/fetch-tracker-clip.sh  # ON THE HOST (Docker + network + GPU): the street clip for pipeline_tracker
 # run our elements from the build tree
 GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/ball-720p.h264 ! h264parse \
@@ -333,15 +339,16 @@ meson test -C build-rel --print-errorlogs
   registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
   `gst-plugin-scanner` can't load sanitized plugins. ASan runs with `use_sigaltstack=0` (Mesa's LLVM, loaded by the
   VA driver, installs its own alternate signal stack). The soak tests (`pipeline_soak`, `pipeline_mux_soak`,
-  `pipeline_infer_soak`, `pipeline_tracker_soak`, `pipeline_osd_soak`) check host memory growth on VmRSS, or under
-  ASan on ASan's live heap (`__sanitizer_get_current_allocated_bytes`, which leaves out the quarantine, so ASan keeps
-  its default options); the normal build's VmRSS check covers memory that bypasses malloc (HIP pinned memory). They
-  are also in the `soak` suite; `pipeline_infer_soak` takes about 4 min with YOLO11n (3000 batches of 4 at ~50 fps on
-  a small iGPU, also under ASan), `pipeline_tracker_soak` about 6 min with the street clip (4068 batches of 4) and
-  `pipeline_osd_soak` (the same through the tiler and rdsosd) about 6.5 min, so
-  `meson test --no-suite soak` leaves the soaks out. Their memory probes live in `tests/check/rds-test-soak.h`: host
-  memory, and GPU memory from this process's DRM fdinfo (`drm-total-vram` + `drm-total-gtt` of its render-node fds,
-  where HIP allocations are accounted), so other processes on the GPU don't skew it; `hipMemGetInfo` is device-wide.
+  `pipeline_infer_soak`, `pipeline_tracker_soak`, `pipeline_osd_soak`, `rds_test2_soak`) check host memory growth on
+  VmRSS, or under ASan on ASan's live heap (`__sanitizer_get_current_allocated_bytes`, which leaves out the
+  quarantine, so ASan keeps its default options); the normal build's VmRSS check covers memory that bypasses malloc
+  (HIP pinned memory). They are also in the `soak` suite; `pipeline_infer_soak` takes about 4 min with YOLO11n (3000
+  batches of 4 at ~50 fps on a small iGPU, also under ASan), `pipeline_tracker_soak` about 6 min with the street clip
+  (4068 batches of 4), `pipeline_osd_soak` (the same through the tiler and rdsosd) about 6.5 min and `rds_test2_soak`
+  (rds-test2's pipeline, YOLO11n-cls on the vehicles too) about 7 min, so `meson test --no-suite soak` leaves the soaks
+  out. Their memory probes live in `tests/check/rds-test-soak.h`: host memory, and GPU memory from this process's DRM
+  fdinfo (`drm-total-vram` + `drm-total-gtt` of its render-node fds, where HIP allocations are accounted), so other
+  processes on the GPU don't skew it; `hipMemGetInfo` is device-wide.
 - Element and pipeline test `main()`s end with `gst_deinit ()` after `g_test_run ()`. Without it, a test process can
   crash at exit in libamdhip64's thread-local destructors on a GStreamer task-pool thread (seen under parallel ASan
   load).

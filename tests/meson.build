@@ -166,7 +166,8 @@ if rds_infer_enabled
       link_language : 'cpp'),
     suite : 'gpu', env : internal_test_env, protocol : 'tap', is_parallel : false, timeout : 300)
   # The MIGraphX engine and its program cache on the committed scale2 models (gpu), and its ONNX reader (cpu). The
-  # YOLO11n cases (their own entry) run only once tests/models/fetch-yolo11n.sh has fetched the model; they cache
+  # YOLO11n and YOLO11n-cls cases (their own entry) run only once tests/models/fetch-yolo11n.sh (and
+  # fetch-yolo11n-cls.sh) have fetched the models; they cache
   # its programs in the build directory. A first YOLO11n compile takes about 70 s on a small GPU with cold kernel
   # caches, about 30 s warm (the test keeps the MIOpen and comgr caches in the build directory).
   infer_engine_exe = executable('infer_engine', 'check' / 'infer_engine.c',
@@ -244,8 +245,9 @@ if rds_infer_enabled
     suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300,
     depends : rds_plugins + [infer_parser_fixture])
 
-  # rdsinfer end to end with YOLO11n: detections on a street photo against Ultralytics, batch 4 against batch 1
-  # (pipeline_infer; skipped until tests/models/fetch-yolo11n.sh has run), and the four-source soak (its own entry,
+  # rdsinfer end to end with YOLO11n: detections on a street photo against Ultralytics, batch 4 against batch 1, and
+  # YOLO11n-cls in secondary mode (rds-test2's classifier config) on the photo's vehicles (pipeline_infer; skipped
+  # until tests/models/fetch-yolo11n.sh and fetch-yolo11n-cls.sh have run), and the four-source soak (its own entry,
   # pipeline_infer_soak, about 4 min, also in the soak suite: `--no-suite soak` leaves it out; with scale2 when
   # YOLO11n isn't fetched, so the leak check always runs). The
   # YOLO11n programs are cached in the build directory next to infer_engine's; a first compile takes about a minute at
@@ -254,6 +256,7 @@ if rds_infer_enabled
     dependencies : pipeline_deps + [json_glib_dep],
     c_args : [
       '-DRDS_TEST_MODELS="@0@"'.format(meson.current_source_dir() / 'models'),
+      '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
       '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
       '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
     ])
@@ -390,6 +393,19 @@ if rds_osd_enabled and rds_tracker_enabled and rds_infer_enabled
     depends : rds_plugins)
 endif
 
+if rds_osd_enabled and rds_tracker_enabled and rds_infer_enabled
+  # The rds-test2 pipeline soak with the sample's configs: four looped copies of the street clip, YOLO11n, NvSORT,
+  # YOLO11n-cls on the vehicles, the tiler and rdsosd (3 loops, 4068 batches of 4, also under ASan). GPU memory may not
+  # move by 1 MiB after the warm-up nor host memory grow by 3 MiB (rdsosd's text caches fill up over the run: the test's
+  # comment has the numbers), and the classifier's per-object cache stays bounded
+  # (the rds_infer_test_get_cache_size hook). In the soak suite only; skips without the clip, YOLO11n or YOLO11n-cls.
+  # The programs are shared with the other YOLO11n tests (a first batch-16 classifier compile takes minutes).
+  test('rds_test2_soak', executable('pipeline_test2_soak', 'check' / 'pipeline_test2_soak.c',
+      dependencies : pipeline_deps + [dependency('gmodule-2.0')], c_args : osd_pipeline_args),
+    suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,
+    depends : rds_plugins)
+endif
+
 # rdsmultistreamtiler: properties and pads (cpu); tiling device batches with scripted meta (gpu).
 element_tiler_exe = executable('element_tiler', 'check' / 'element_tiler.c', dependencies : test_deps)
 test('element_tiler_cpu', element_tiler_exe, args : ['-p', '/cpu/tiler'],
@@ -522,6 +538,24 @@ test('rds_test3_run',
   args : [rds_test3_exe, meson.project_source_root(), meson.current_build_dir(),
     rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
   suite : ['gpu', 'yolo'], env : test_env, is_parallel : false, timeout : 900, depends : rds_plugins)
+
+# rds-test2's dry run: the compat mapping (the two nvinfer, the tracker), the default configs and their options;
+# gst-inspect-1.0 as for rds-test3.
+test('rds_test2_dry_run',
+  find_program('samples/rds_test2_dry_run.sh'),
+  args : [rds_test2_exe, gst_inspect.found() and not asan ? gst_inspect.full_path() : '',
+    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
+  suite : 'cpu', env : test_env, depends : rds_plugins)
+
+# rds-test2 end to end with its default configs on four copies of the street clip: YOLO11n, NvSORT, YOLO11n-cls on the
+# vehicles, --no-display (gpu; skips without a device, rdsinfer, rdstracker, rdsosd, either model or the clip). The
+# programs are cached next to the models, as the sample does; the first run compiles the classifier's batch-16
+# program. Never in parallel with the other YOLO11n tests.
+test('rds_test2_yolo',
+  find_program('samples/rds_test2_run.sh'),
+  args : [rds_test2_exe, meson.project_source_root(), meson.current_build_dir(),
+    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
+  suite : ['gpu', 'yolo'], env : test_env, is_parallel : false, timeout : 1200, depends : rds_plugins)
 
 # rds-test3 on RTSP sources from rds-rtsp-serve: a cut and a reconnection, a source that never connects, and a clean
 # EOS on SIGINT, with the committed scale2 model as the detector (gpu; skips without a device, rdsinfer, rdsosd,

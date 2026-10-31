@@ -160,7 +160,7 @@ stretching and on 2 when letterboxing, and the same transforms on the CPU in ONN
 rdsinfer. So the test checks:
 - correctness, against `stretch_top1` (the sample config's transform, reproduced on the CPU): every crop has the same
   top-1 with a probability within 0.05, except where ONNX Runtime's top two are within 0.05 of each other (a near tie
-  that resampling differences can flip);
+  that resampling differences can flip) and ours is its second class;
 - sanity, against Ultralytics: at least 80 % of our top-1 are in Ultralytics' top 5. The top-1 agreement is only
   printed.
 

@@ -1006,6 +1006,14 @@ rds_infer_test_get_unit_count (GstElement * element)
   return GST_RDS_INFER (element)->unit_count;
 }
 
+guint
+rds_infer_test_get_cache_size (GstElement * element)
+{
+  GstRdsInfer *self = GST_RDS_INFER (element);
+
+  return self->cache ? rds_infer_cache_get_size (self->cache) : 0;
+}
+
 gboolean
 rds_infer_test_read_input (GstElement * element, gfloat * dst, gsize n_floats)
 {

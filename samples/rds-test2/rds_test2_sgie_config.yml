@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT
+# Secondary classifier for rds-test2: Ultralytics YOLO11n-cls (1000 ImageNet classes) on the vehicles the primary
+# detector (gie-unique-id 1, rds_test2_pgie_config.yml) found, with rdsinfer's built-in classifier parser (the argmax
+# of the output). Each tracked vehicle is classified once and keeps its result while it is tracked (inferred again
+# only when its box grows by more than 1.2 times); the label is appended to the object's display text.
+#
+# The model is not in the repository (AGPL-3.0): tests/models/fetch-yolo11n-cls.sh exports it into .cache/models,
+# with a Softmax appended so that its output is probabilities, and writes the label file (the 1000 names on one
+# ';'-separated line: a classifier's label file has one line per output layer). Relative paths in this file are
+# resolved against the directory of this file. rds-test2 uses this file unless --sgie-config is given. The compiled
+# program is cached next to the model (yolo11n-cls_b16_3x224x224_<gfx>_fp32.mxr).
+property:
+  onnx-file: ../../.cache/models/yolo11n-cls.onnx
+  labelfile-path: ../../.cache/models/imagenet-labels.txt
+  # The export has a symbolic height and width: the network input size must be given.
+  infer-dims: [3, 224, 224]
+  # up to 16 objects per inference run
+  batch-size: 16
+  gie-unique-id: 2
+  # secondary mode, on the primary detector's car (2), motorcycle (3), bus (5) and truck (7)
+  process-mode: 2
+  operate-on-gie-id: 1
+  operate-on-class-ids: [2, 3, 5, 7]
+  # crops smaller than this say little at 224x224
+  input-object-min-width: 64
+  input-object-min-height: 64
+  network-type: 1
+  network-mode: 0
+  # RGB scaled to [0, 1], as Ultralytics preprocesses. Ultralytics resizes the shorter side to 224 and takes the
+  # centre square, which nvinfer-style preprocessing can't do; the whole crop stretched to 224x224 comes closer to
+  # its predictions than the crop letterboxed (maintain-aspect-ratio: 1) on vehicle crops.
+  model-color-format: 0
+  net-scale-factor: 0.00392156862745098
+  maintain-aspect-ratio: 0
+  # a label only above this probability
+  classifier-threshold: 0.2
+  classifier-type: imagenet

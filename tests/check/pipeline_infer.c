@@ -1,10 +1,12 @@
 /* rdsinfer end to end with YOLO11n (gpu): detections on a public street photo against Ultralytics' own prediction
- * (through RGBA and through NV12 batches), the same frame on four sources at batch 4 against batch 1, and a long
+ * (through RGBA and through NV12 batches), the same frame on four sources at batch 4 against batch 1, YOLO11n-cls in
+ * secondary mode (the rds-test2 sample's classifier config) on crops of the photo's vehicles (the top-1 against ONNX
+ * Runtime's on the same stretched crop; at least 80 % in Ultralytics' top 5, its top-1 rate printed only), and a long
  * four-source run through the decoder and the mux (the soak, its own test entry) that neither leaks host nor GPU
  * memory.
- * The YOLO11n model and the reference data come from tests/models/fetch-yolo11n.sh (.cache/models, never
- * committed); the tests that need them skip without them. Without them the soak runs the committed scale2 model, so
- * the leak check always runs.
+ * The YOLO11n and YOLO11n-cls models and the reference data come from tests/models/fetch-yolo11n.sh and
+ * fetch-yolo11n-cls.sh (.cache/models, never committed); the tests that need them skip without them. Without them the
+ * soak runs the committed scale2 model, so the leak check always runs.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-media.h"
@@ -22,6 +24,11 @@
 #define STREET RDS_TEST_CACHE_MODELS "/street-1280x720.rgba"
 #define STREET_REF RDS_TEST_CACHE_MODELS "/street-ref.json"
 #define FETCH_HINT "run tests/models/fetch-yolo11n.sh"
+#define YOLO_CLS RDS_TEST_CACHE_MODELS "/yolo11n-cls.onnx"
+#define IMAGENET_LABELS RDS_TEST_CACHE_MODELS "/imagenet-labels.txt"
+#define STREET_CLS_REF RDS_TEST_CACHE_MODELS "/street-cls-ref.json"
+#define CLS_FETCH_HINT "run tests/models/fetch-yolo11n-cls.sh"
+#define SGIE_CONFIG RDS_TEST_SAMPLES "/rds-test2/rds_test2_sgie_config.yml"
 /* The same directory as infer_engine's YOLO11n cases, so both use one cached batch-1 program. */
 #define YOLO_DIR RDS_TEST_BUILD_DIR "/infer-engine-yolo"
 #define WORK_DIR RDS_TEST_BUILD_DIR "/pipeline-infer"
@@ -470,6 +477,311 @@ test_batch4 (void)
   collected_clear (&four);
 }
 
+/* ---- the secondary classifier ---- */
+
+#define SGIE_ID 2
+#define CLS_PROB_TOL 0.05f
+/* 13 of the 15 crops are in Ultralytics' top 5, against a floor of 12. Deterministic with the pinned reference data
+ * and engine: should an engine change lose one more crop, that is a real change in the outputs, not a flake. */
+#define CLS_MIN_TOP5 0.8
+
+/* The rds-test2 sample's SGIE config with its model and labels pointed at YOLO11n-cls behind a symlink in YOLO_DIR,
+ * so the programs are cached there and not next to the model, and classifier-threshold 0. Written into WORK_DIR;
+ * returns its path. */
+static gchar *
+sgie_config (void)
+{
+  gchar *link = g_build_filename (YOLO_DIR, "yolo11n-cls.onnx", NULL);
+  gchar *path = g_build_filename (WORK_DIR, "sgie.yml", NULL);
+  gchar *text = NULL, **lines;
+  GString *out = g_string_new (NULL);
+  guint replaced = 0, stretch = 0;
+  GError *err = NULL;
+
+  g_assert_cmpint (g_mkdir_with_parents (YOLO_DIR, 0755), ==, 0);
+  g_assert_cmpint (g_mkdir_with_parents (WORK_DIR, 0755), ==, 0);
+  if (!g_file_test (link, G_FILE_TEST_IS_SYMLINK))
+    g_assert_cmpint (symlink (YOLO_CLS, link), ==, 0);
+  g_assert_true (g_file_get_contents (SGIE_CONFIG, &text, NULL, &err));
+  g_assert_no_error (err);
+  lines = g_strsplit (text, "\n", -1);
+  for (guint i = 0; lines[i]; i++) {
+    if (g_str_has_prefix (lines[i], "  onnx-file:")) {
+      g_string_append_printf (out, "  onnx-file: %s\n", link);
+      replaced++;
+    } else if (g_str_has_prefix (lines[i], "  labelfile-path:")) {
+      g_string_append (out, "  labelfile-path: " IMAGENET_LABELS "\n");
+      replaced++;
+    } else if (g_str_has_prefix (lines[i], "  classifier-threshold:")) {
+      /* every object gets its top-1, however unsure */
+      g_string_append (out, "  classifier-threshold: 0\n");
+      replaced++;
+    } else if (lines[i + 1] || *lines[i]) {
+      g_string_append_printf (out, "%s\n", lines[i]);
+      if (strcmp (lines[i], "  maintain-aspect-ratio: 0") == 0)
+        stretch++;
+    }
+  }
+  g_assert_cmpuint (replaced, ==, 3);
+  /* street-cls-ref.json's stretch_top1 is for this preprocessing */
+  g_assert_cmpuint (stretch, ==, 1);
+  g_assert_true (g_file_set_contents (path, out->str, (gssize) out->len, &err));
+  g_assert_no_error (err);
+  g_string_free (out, TRUE);
+  g_strfreev (lines);
+  g_free (text);
+  g_free (link);
+  return path;
+}
+
+/* A street-ref.json object as the classifier sees it, and what came back. */
+typedef struct
+{
+  Det det;
+  JsonObject *ref;              /* its street-cls-ref.json entry; NULL for a non-vehicle */
+  gint result_class_id;         /* -1: no classifier meta */
+  gfloat result_prob;
+  gchar *result_label;
+} ClsObject;
+
+/* On rdsinfer's sink pad: the reference objects (GArray of ClsObject) as objects of GIE 1 on the one frame, tracked
+ * with their index as object_id. */
+static GstPadProbeReturn
+add_objects_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GArray *objects = user_data;
+  RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (GST_PAD_PROBE_INFO_BUFFER (info));
+  RdsFrameMeta *fm;
+
+  g_assert_nonnull (bm);
+  rds_acquire_meta_lock (bm);
+  g_assert_cmpuint (g_list_length (bm->frame_meta_list), ==, 1);
+  fm = bm->frame_meta_list->data;
+  for (guint i = 0; i < objects->len; i++) {
+    const Det *d = &g_array_index (objects, ClsObject, i).det;
+    RdsObjectMeta *om = rds_acquire_obj_meta_from_pool (bm);
+
+    om->unique_component_id = 1;
+    om->class_id = d->class_id;
+    om->object_id = i;
+    om->confidence = d->confidence;
+    om->rect_params.left = d->left;
+    om->rect_params.top = d->top;
+    om->rect_params.width = d->width;
+    om->rect_params.height = d->height;
+    rds_add_obj_meta_to_frame (fm, om, NULL);
+  }
+  rds_release_meta_lock (bm);
+  return GST_PAD_PROBE_OK;
+}
+
+/* On the sink: each object's classifier meta of SGIE_ID (at most one, with one label). */
+static GstPadProbeReturn
+collect_classes_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GArray *objects = user_data;
+  RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (GST_PAD_PROBE_INFO_BUFFER (info));
+  RdsFrameMeta *fm;
+
+  g_assert_nonnull (bm);
+  rds_acquire_meta_lock (bm);
+  fm = bm->frame_meta_list->data;
+  g_assert_cmpuint (g_list_length (fm->obj_meta_list), ==, objects->len);
+  for (GList * o = fm->obj_meta_list; o; o = o->next) {
+    RdsObjectMeta *om = o->data;
+    ClsObject *c;
+
+    g_assert_cmpuint (om->object_id, <, objects->len);
+    c = &g_array_index (objects, ClsObject, om->object_id);
+    for (GList * l = om->classifier_meta_list; l; l = l->next) {
+      RdsClassifierMeta *cm = l->data;
+      RdsLabelInfo *li;
+
+      if (cm->unique_component_id != SGIE_ID)
+        continue;
+      g_assert_cmpint (c->result_class_id, ==, -1);
+      g_assert_cmpuint (cm->num_labels, ==, 1);
+      li = cm->label_info_list->data;
+      c->result_class_id = (gint) li->result_class_id;
+      c->result_prob = li->result_prob;
+      c->result_label = g_strdup (li->result_label);
+    }
+  }
+  rds_release_meta_lock (bm);
+  return GST_PAD_PROBE_OK;
+}
+
+static gboolean
+is_vehicle (gint class_id)
+{
+  return class_id == 2 || class_id == 3 || class_id == 5 || class_id == 7;
+}
+
+static JsonObject *
+member_object (JsonObject * o, const gchar * name)
+{
+  return json_object_get_object_member (o, name);
+}
+
+/* The street photo -> rdsstreammux (RGBA, 1280x720) -> rdsinfer with the rds-test2 sample's classifier config
+ * (YOLO11n-cls, process-mode 2 on GIE 1's car, motorcycle, bus and truck; classifier-threshold 0 here, so every
+ * object gets its top-1) -> fakesink. The objects, all of GIE 1: street-ref.json's non-vehicles, which must get no
+ * classifier meta, and street-cls-ref.json's vehicle boxes (each of the photo's 5 vehicles as detected and grown by
+ * 1.15 and 1.3 about its centre, 15 crops), compared with the reference made on the same aligned crops:
+ * - ONNX Runtime's output on the crop stretched to 224x224 on the CPU (OpenCV bilinear, RGB / 255), the sample
+ *   config's preprocessing (maintain-aspect-ratio=0): the correctness check. Every crop has the same top-1 with a
+ *   probability within CLS_PROB_TOL, except where ONNX Runtime's top two are within CLS_PROB_TOL of each other
+ *   (a near tie that resampling differences may flip) and ours is its second class.
+ * - Ultralytics' prediction (its own export through ONNX Runtime): a sanity check. Ultralytics resizes the crop's
+ *   shorter side to 224 and takes the centre square, which nvinfer-style preprocessing can't do (it stretches or
+ *   letterboxes the whole crop). YOLO11n-cls is unsure on these crops (Ultralytics' top-1 mostly at 0.2 to 0.5), so
+ *   the two transforms often pick different, related classes (minivan, beach_wagon, police_van): the top-1 agreement
+ *   is only printed, and at least CLS_MIN_TOP5 of our top-1 must be in Ultralytics' top 5.
+ * Prints every crop's labels and the rates. */
+static void
+test_cls_crops (void)
+{
+  const gchar *need[] = { STREET, STREET_REF, NULL };
+  GArray *ref, *objects = g_array_new (FALSE, TRUE, sizeof (ClsObject));
+  JsonParser *parser;
+  JsonArray *cls_ref;
+  GError *err = NULL;
+  gchar *cfg, *desc;
+  GstElement *pipe, *el;
+  GstPad *pad;
+  guint n_vehicles = 0, n_agree = 0, n_top5 = 0, n_stretch = 0, n_ties = 0;
+  gfloat max_prob_diff = 0.0f;
+  gboolean ok = TRUE;
+
+  RDS_TEST_REQUIRE_GPU ();
+  if (!have_yolo (need))
+    return;
+  if (!g_file_test (YOLO_CLS, G_FILE_TEST_IS_REGULAR) || !g_file_test (IMAGENET_LABELS, G_FILE_TEST_IS_REGULAR)
+      || !g_file_test (STREET_CLS_REF, G_FILE_TEST_IS_REGULAR)) {
+    g_test_skip ("no " YOLO_CLS ", " IMAGENET_LABELS " or " STREET_CLS_REF " (" CLS_FETCH_HINT ")");
+    return;
+  }
+  ref = load_reference ();
+  for (guint i = 0; i < ref->len; i++) {
+    ClsObject c = { g_array_index (ref, Det, i), NULL, -1, 0.0f, NULL };
+
+    if (!is_vehicle (c.det.class_id))
+      g_array_append_val (objects, c);
+  }
+  parser = json_parser_new ();
+  g_assert_true (json_parser_load_from_file (parser, STREET_CLS_REF, &err));
+  g_assert_no_error (err);
+  cls_ref = json_object_get_array_member (json_node_get_object (json_parser_get_root (parser)), "objects");
+  g_assert_cmpuint (json_array_get_length (cls_ref), >, 0);
+  for (guint i = 0; i < json_array_get_length (cls_ref); i++) {
+    JsonObject *o = json_array_get_object_element (cls_ref, i);
+    ClsObject c = { {
+            .class_id = (gint) json_object_get_int_member (o, "class_id"),
+            .confidence = (gfloat) json_object_get_double_member (o, "confidence"),
+            .left = (gfloat) json_object_get_double_member (o, "left"),
+            .top = (gfloat) json_object_get_double_member (o, "top"),
+            .width = (gfloat) json_object_get_double_member (o, "width"),
+            .height = (gfloat) json_object_get_double_member (o, "height"),
+        }, o, -1, 0.0f, NULL
+    };
+
+    g_assert_true (is_vehicle (c.det.class_id));
+    g_array_append_val (objects, c);
+  }
+
+  cfg = sgie_config ();
+  desc = g_strdup_printf ("filesrc location=" STREET " blocksize=%u ! rawvideoparse format=rgba width=%u height=%u "
+      "framerate=30/1 ! m.sink_0 rdsstreammux name=m width=%u height=%u batch-size=1 "
+      "! video/x-raw(memory:RDS),format=RGBA ! rdsinfer name=sgie config-file-path=%s ! fakesink name=k sync=false",
+      STREET_W * STREET_H * 4, STREET_W, STREET_H, STREET_W, STREET_H, cfg);
+  pipe = gst_parse_launch (desc, &err);
+  g_assert_no_error (err);
+  g_free (desc);
+  el = gst_bin_get_by_name (GST_BIN (pipe), "sgie");
+  pad = gst_element_get_static_pad (el, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, add_objects_probe, objects, NULL);
+  gst_object_unref (pad);
+  gst_object_unref (el);
+  el = gst_bin_get_by_name (GST_BIN (pipe), "k");
+  pad = gst_element_get_static_pad (el, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, collect_classes_probe, objects, NULL);
+  gst_object_unref (pad);
+  gst_object_unref (el);
+  g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  /* a first compile of the batch-16 program */
+  wait_eos (pipe, 600 * GST_SECOND);
+  gst_element_set_state (pipe, GST_STATE_NULL);
+  gst_object_unref (pipe);
+  g_free (cfg);
+
+  for (guint i = 0; i < objects->len; i++) {
+    const ClsObject *c = &g_array_index (objects, ClsObject, i);
+    JsonObject *r = c->ref, *ultra, *stretch;
+    gboolean in_top5 = FALSE, tie, match;
+    gfloat stretch_prob, second_prob;
+    JsonArray *top5;
+    const gchar *note;
+
+    if (!r) {
+      /* not a vehicle: the sample config's operate-on-class-ids leaves it out */
+      g_assert_cmpint (c->result_class_id, ==, -1);
+      continue;
+    }
+    n_vehicles++;
+    ultra = member_object (r, "top1");
+    stretch = member_object (r, "stretch_top1");
+    stretch_prob = (gfloat) json_object_get_double_member (stretch, "prob");
+    second_prob = (gfloat) json_object_get_double_member (stretch, "second_prob");
+    /* a near tie excuses ONNX Runtime's second class, nothing else */
+    tie = stretch_prob - second_prob < CLS_PROB_TOL
+        && c->result_class_id == json_object_get_int_member (stretch, "second_class_id");
+    top5 = json_object_get_array_member (r, "top5");
+    for (guint k = 0; k < json_array_get_length (top5); k++)
+      if (c->result_class_id == json_object_get_int_member (json_array_get_object_element (top5, k), "class_id"))
+        in_top5 = TRUE;
+    if (c->result_class_id == json_object_get_int_member (ultra, "class_id"))
+      n_agree++;
+    if (in_top5)
+      n_top5++;
+    match = c->result_class_id == json_object_get_int_member (stretch, "class_id");
+    note = "";
+    if (match) {
+      n_stretch++;
+      max_prob_diff = MAX (max_prob_diff, fabsf (c->result_prob - stretch_prob));
+      if (fabsf (c->result_prob - stretch_prob) > CLS_PROB_TOL) {
+        note = "  FAIL: probability";
+        ok = FALSE;
+      }
+    } else if (tie) {
+      n_ties++;
+      note = "  (a near tie in ONNX Runtime's top two)";
+    } else {
+      note = "  FAIL: top-1";
+      ok = FALSE;
+    }
+    g_test_message ("%-10s x%.2f (%6.1f, %5.1f, %5.1f, %5.1f): ours %-14s %.4f | ONNX Runtime stretched %-14s %.4f "
+        "(2nd %.4f) | Ultralytics %-14s %.4f%s%s", json_object_get_string_member (r, "label"),
+        json_object_get_double_member (r, "scale"), c->det.left, c->det.top, c->det.width, c->det.height,
+        c->result_label ? c->result_label : "(none)", c->result_prob,
+        json_object_get_string_member (stretch, "label"), stretch_prob, second_prob,
+        json_object_get_string_member (ultra, "label"), json_object_get_double_member (ultra, "prob"),
+        in_top5 ? "" : " (ours not in its top 5)", note);
+  }
+  g_test_message ("%u vehicle crops: top-1 as ONNX Runtime's on the stretched crop on %u (%u near ties excused; max "
+      "|probability diff| %.4f); as Ultralytics' top-1 on %u (%.0f %%), in Ultralytics' top 5 on %u (%.0f %%)",
+      n_vehicles, n_stretch, n_ties, max_prob_diff, n_agree, n_vehicles ? 100.0 * n_agree / n_vehicles : 0.0, n_top5,
+      n_vehicles ? 100.0 * n_top5 / n_vehicles : 0.0);
+  g_assert_cmpuint (n_vehicles, ==, json_array_get_length (cls_ref));
+  g_assert_true (ok);
+  g_assert_cmpfloat ((gdouble) n_top5, >=, CLS_MIN_TOP5 * n_vehicles);
+
+  for (guint i = 0; i < objects->len; i++)
+    g_free (g_array_index (objects, ClsObject, i).result_label);
+  g_array_unref (objects);
+  g_array_unref (ref);
+  g_object_unref (parser);
+}
+
 /* ---- soak ---- */
 
 #define SOAK_SOURCES 4
@@ -610,6 +922,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-yolo/detect", test_detect);
   g_test_add_func ("/gpu/infer-yolo/detect-nv12", test_detect_nv12);
   g_test_add_func ("/gpu/infer-yolo/batch4", test_batch4);
+  g_test_add_func ("/gpu/infer-yolo/cls-crops", test_cls_crops);
   g_test_add_func ("/gpu/infer-soak/yolo", test_infer_soak);
   ret = g_test_run ();
   /* gst_deinit stops GStreamer's task-pool threads before exit: their HIP thread-local destructors crash at process

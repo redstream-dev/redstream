@@ -24,6 +24,8 @@ GST_ELEMENT_REGISTER_DECLARE (rdsinfer);
  *   not started or @n_floats is too large.
  * - get_unit_count: the inference units inferred since start (primary mode: one per frame, secondary mode: one per
  *   object inferred on).
+ * - get_cache_size: the entries in the per-object cache (secondary-mode classifiers; 0 without a cache). Takes only
+ *   the cache's own lock, so it may also be called from a pad probe while the stream runs.
  * - attach_classifier_result: gst_rds_infer_attach_classifier_result (gstrdsinfer-private.h), for a test that builds
  *   the batch meta and the RdsInferClassifierResult (rds-infer-parse.h) itself; no element needed. */
 __attribute__ ((visibility ("default"))) GstStructure *rds_infer_test_get_config (GstElement * element,
@@ -33,6 +35,7 @@ __attribute__ ((visibility ("default"))) gboolean rds_infer_test_get_output_sets
 __attribute__ ((visibility ("default"))) gboolean rds_infer_test_read_input (GstElement * element, gfloat * dst,
     gsize n_floats);
 __attribute__ ((visibility ("default"))) guint64 rds_infer_test_get_unit_count (GstElement * element);
+__attribute__ ((visibility ("default"))) guint rds_infer_test_get_cache_size (GstElement * element);
 __attribute__ ((visibility ("default"))) gboolean rds_infer_test_get_output_set_totals (GstElement * element,
     guint64 * allocated, guint64 * freed);
 __attribute__ ((visibility ("default"))) void rds_infer_test_attach_classifier_result (gpointer batch_meta,
