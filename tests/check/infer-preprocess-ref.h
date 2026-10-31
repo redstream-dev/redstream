@@ -1,5 +1,5 @@
 /* CPU reference for rdsinfer's preprocessing (rds-infer-preprocess.h), built on transform-ref.h's sampling: the
- * source resized into the scaled rect as rds_buf_surf_transform resizes it, then normalised. Test-only.
+ * source rect resized into the scaled rect as rds_buf_surf_transform resizes it, then normalised. Test-only.
  *
  * The reference keeps the sampled values unrounded (double), so a test can tell which output bytes the GPU may
  * legitimately round either way: the kernel computes in float (bilinear positions and weights included), so a
@@ -11,15 +11,17 @@
 #include "transform-ref.h"
 
 /* Unrounded R, G, B and gray (GRAY8 output: luma for YUV and GRAY8 sources, BT.601 intensity for RGB ones) of
- * pixel (x, y) of the rect (dl, dt, dw, dh), the whole source resized into it. */
+ * pixel (x, y) of the rect (dl, dt, dw, dh), the source rect (sx, sy, sw, sh) resized into it as
+ * rds_buf_surf_transform resizes its src_rect: positions xs = sx + (x - dl + 0.5) * sw / dw, taps clamped to the
+ * source rect, chroma to the halved rect. */
 static inline void
-ref_pre_sample (const RefImage * src, guint x, guint y, guint dl, guint dt, guint dw, guint dh, gboolean bilinear,
-    double rgb[3], double *gray)
+ref_pre_sample_rect (const RefImage * src, guint x, guint y, guint sx, guint sy, guint sw, guint sh, guint dl,
+    guint dt, guint dw, guint dh, gboolean bilinear, double rgb[3], double *gray)
 {
-  gint64 nx = (2 * ((gint64) x - dl) + 1) * (gint64) src->width;
-  gint64 ny = (2 * ((gint64) y - dt) + 1) * (gint64) src->height;
-  RefTap tx = ref_tap (nx, 2 * (gint64) dw, 0, (gint64) src->width - 1, bilinear);
-  RefTap ty = ref_tap (ny, 2 * (gint64) dh, 0, (gint64) src->height - 1, bilinear);
+  gint64 nx = 2 * (gint64) sx * dw + (2 * ((gint64) x - dl) + 1) * (gint64) sw;
+  gint64 ny = 2 * (gint64) sy * dh + (2 * ((gint64) y - dt) + 1) * (gint64) sh;
+  RefTap tx = ref_tap (nx, 2 * (gint64) dw, sx, (gint64) sx + sw - 1, bilinear);
+  RefTap ty = ref_tap (ny, 2 * (gint64) dh, sy, (gint64) sy + sh - 1, bilinear);
   RefKind k = ref_kind (src->format);
 
   if (k == REF_KIND_RGB) {
@@ -34,11 +36,19 @@ ref_pre_sample (const RefImage * src, guint x, guint y, guint dl, guint dt, guin
   if (k == REF_KIND_GRAY) {
     rgb[0] = rgb[1] = rgb[2] = *gray;
   } else {
-    RefTap cx = ref_tap_chroma_of (nx, 2 * (gint64) dw, 0, src->width, bilinear);
-    RefTap cy = ref_tap_chroma_of (ny, 2 * (gint64) dh, 0, src->height, bilinear);
+    RefTap cx = ref_tap_chroma_of (nx, 2 * (gint64) dw, sx, sw, bilinear);
+    RefTap cy = ref_tap_chroma_of (ny, 2 * (gint64) dh, sy, sh, bilinear);
 
     ref_yuv_to_rgb (*gray, ref_sample_uv (src, 0, cx, cy), ref_sample_uv (src, 1, cx, cy), rgb);
   }
+}
+
+/* The same with the whole source resized into the rect. */
+static inline void
+ref_pre_sample (const RefImage * src, guint x, guint y, guint dl, guint dt, guint dw, guint dh, gboolean bilinear,
+    double rgb[3], double *gray)
+{
+  ref_pre_sample_rect (src, x, y, 0, 0, src->width, src->height, dl, dt, dw, dh, bilinear, rgb, gray);
 }
 
 /* Distance of the GPU's normalised value @got from the closest value the reference allows for an unrounded sample

@@ -1,13 +1,14 @@
-/* Redstream: rdsinfer's preprocessing kernel (rds-infer-preprocess.hip), plugin-internal, not installed: one batch
- * slot into one image of the network's float input tensor, letterboxed and normalised. The shared part is plain C
- * with no GLib and no HIP types (streams are void *), so both compilers include it; the C-only helpers at the end
- * are hidden from the HIP compiler.
+/* Redstream: rdsinfer's preprocessing kernel (rds-infer-preprocess.hip), plugin-internal, not installed: a source
+ * rect of one batch slot (the whole slot, or an object's crop) into one image of the network's float input tensor,
+ * letterboxed and normalised. The shared part is plain C with no GLib and no HIP types (streams are void *), so
+ * both compilers include it; the C-only helpers at the end are hidden from the HIP compiler.
  *
  * Output pixel (x, y) of image `index`, channel c:
- * - inside the scaled rect (dl, dt, dw, dh): the source surface resized to dw x dh exactly as rds_buf_surf_transform
- *   resizes the whole surface into that rect (same sampling positions, filters, chroma siting, BT.601 conversion
- *   and rounding to 0..255, through the helpers in rds-kernel-common.h): the RGBA value for RGB and BGR, the GRAY8
- *   value for GRAY (the luma for YUV and GRAY8 sources, the BT.601 intensity of RGB for RGB-family sources);
+ * - inside the scaled rect (dl, dt, dw, dh): the source rect (sx, sy, sw, sh) resized to dw x dh exactly as
+ *   rds_buf_surf_transform with that src_rect (RDS_BUFSURF_TRANSFORM_CROP_SRC) resizes it into that rect (same
+ *   sampling positions, clamping to the source rect, filters, chroma siting, BT.601 conversion and rounding to
+ *   0..255, through the helpers in rds-kernel-common.h): the RGBA value for RGB and BGR, the GRAY8 value for GRAY
+ *   (the luma for YUV and GRAY8 sources, the BT.601 intensity of RGB for RGB-family sources);
  * - outside it (the letterbox padding): 0;
  * then y = scale * (x - offsets[c]), so padding pixels are scale * (0 - offsets[c]) in the tensor, not 0. The
  * caller guarantees finite scale and offsets (the config parser rejects non-finite ones); the kernel doesn't check.
@@ -32,7 +33,8 @@ enum
 
 typedef struct
 {
-  RdsKernelSurface src;         /* one slot, the whole surface is the source */
+  RdsKernelSurface src;         /* one slot */
+  unsigned sx, sy, sw, sh;      /* the source rect in slot pixels; sw == 0 (and sx, sy, sh 0): the whole slot */
   unsigned out_w, out_h, channels;      /* network input; channels is 3 for RGB and BGR, 1 for GRAY */
   int color;                    /* RDS_PREPROCESS_* */
   int nhwc, bilinear;           /* bilinear: after the filter mapping (rds_transform_filter_is_bilinear) */
@@ -43,8 +45,8 @@ typedef struct
 /* Writes image @index of the float tensor at @dst (out_w * out_h * channels floats per image) and nothing else,
  * asynchronously on @stream (a hipStream_t, NULL for the null stream) on the current device. Returns 0, or -1 if
  * the job is invalid (no source or destination, an unknown source format, a source plane the format reads with a
- * pitch shorter than its row (0 included), an empty or out-of-range rect, channels not matching color) or the
- * launch failed. */
+ * pitch shorter than its row (0 included), an empty or out-of-range scaled or source rect, channels not matching
+ * color) or the launch failed. */
 __attribute__ ((visibility ("hidden"))) int rds_infer_preprocess_launch (const RdsPreprocessJob * job, float *dst,
     unsigned index, void *stream);
 
@@ -55,16 +57,21 @@ __attribute__ ((visibility ("hidden"))) int rds_infer_preprocess_launch (const R
 #ifndef __HIP__
 #include "rds-infer-post.h"
 
-/* Sets the source (the whole slot @slot) and the geometry (network size, scaled rect) of @job from @lb, which must
- * have been computed for this slot's size: returns FALSE, leaving @job untouched, when lb's frame size isn't the
- * slot's. The other fields are left for the caller. */
+/* Sets the source (@rect of the slot @slot, NULL for the whole slot) and the geometry (network size, scaled rect)
+ * of @job from @lb, which must have been computed for the source's size: returns FALSE, leaving @job untouched,
+ * when lb's frame size isn't the rect's (the slot's). The launcher checks that the rect lies inside the slot. The
+ * other fields are left for the caller. */
 static inline gboolean
 rds_infer_preprocess_job_set_source (RdsPreprocessJob * job, const RdsBufSurfaceParams * slot,
-    const RdsInferLetterbox * lb)
+    const RdsBufSurfTransformRect * rect, const RdsInferLetterbox * lb)
 {
-  if (lb->frame_w != slot->width || lb->frame_h != slot->height)
+  if (lb->frame_w != (rect ? rect->width : slot->width) || lb->frame_h != (rect ? rect->height : slot->height))
     return FALSE;
   rds_kernel_surface_init (&job->src, slot);
+  job->sx = rect ? rect->left : 0;
+  job->sy = rect ? rect->top : 0;
+  job->sw = rect ? rect->width : 0;
+  job->sh = rect ? rect->height : 0;
   job->out_w = lb->net_w;
   job->out_h = lb->net_h;
   job->dl = lb->pad_left;

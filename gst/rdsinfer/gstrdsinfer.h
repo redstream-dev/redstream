@@ -20,13 +20,15 @@ GST_ELEMENT_REGISTER_DECLARE (rdsinfer);
  *   structure named "rdsinfer-config" whose fields are config key names; NULL with @error as start would fail.
  * - get_output_sets: the output sets allocated and the ones in the free list; FALSE when not started.
  * - read_input: copies the first @n_floats of the network input tensor (batch-size images) to @dst; FALSE when
- *   not started or @n_floats is too large. */
+ *   not started or @n_floats is too large.
+ * - get_unit_count: the inference units inferred since start (primary mode: one per frame). */
 __attribute__ ((visibility ("default"))) GstStructure *rds_infer_test_get_config (GstElement * element,
     GError ** error);
 __attribute__ ((visibility ("default"))) gboolean rds_infer_test_get_output_sets (GstElement * element,
     guint * n_sets, guint * n_free);
 __attribute__ ((visibility ("default"))) gboolean rds_infer_test_read_input (GstElement * element, gfloat * dst,
     gsize n_floats);
+__attribute__ ((visibility ("default"))) guint64 rds_infer_test_get_unit_count (GstElement * element);
 
 G_END_DECLS
 

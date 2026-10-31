@@ -26,10 +26,12 @@
 typedef GstStructure *(*GetConfigFunc) (GstElement * element, GError ** error);
 typedef gboolean (*GetOutputSetsFunc) (GstElement * element, guint * n_sets, guint * n_free);
 typedef gboolean (*ReadInputFunc) (GstElement * element, gfloat * dst, gsize n_floats);
+typedef guint64 (*GetUnitCountFunc) (GstElement * element);
 
 static GetConfigFunc hook_get_config;
 static GetOutputSetsFunc hook_get_output_sets;
 static ReadInputFunc hook_read_input;
+static GetUnitCountFunc hook_get_unit_count;
 
 static void
 load_hooks (void)
@@ -49,6 +51,7 @@ load_hooks (void)
   g_assert_true (g_module_symbol (module, "rds_infer_test_get_config", (gpointer *) & hook_get_config));
   g_assert_true (g_module_symbol (module, "rds_infer_test_get_output_sets", (gpointer *) & hook_get_output_sets));
   g_assert_true (g_module_symbol (module, "rds_infer_test_read_input", (gpointer *) & hook_read_input));
+  g_assert_true (g_module_symbol (module, "rds_infer_test_get_unit_count", (gpointer *) & hook_get_unit_count));
   /* the module stays open: the plugin is never unloaded either */
   gst_object_unref (plugin);
 }
@@ -774,6 +777,8 @@ test_restart (void)
   g_free (texts);
   for (guint b = 0; b < 2; b++)
     push_check_tensor (h, 11 + b, 7);
+  /* one unit per frame */
+  g_assert_cmpuint (hook_get_unit_count (e), ==, 4);
 
   g_assert_cmpint (gst_element_set_state (e, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
   g_assert_false (hook_get_output_sets (e, &n_sets, &n_free));
@@ -786,8 +791,10 @@ test_restart (void)
   g_free (texts);
   g_assert_true (hook_get_output_sets (e, &n_sets, &n_free));
   g_assert_cmpuint (n_sets, ==, 0);
+  g_assert_cmpuint (hook_get_unit_count (e), ==, 0);
   for (guint b = 0; b < 3; b++)
     push_check_tensor (h, 21 + b, 8);
+  g_assert_cmpuint (hook_get_unit_count (e), ==, 6);
   /* a new pool: one set, reused for each batch */
   g_assert_true (hook_get_output_sets (e, &n_sets, &n_free));
   g_assert_cmpuint (n_sets, ==, 1);
@@ -935,6 +942,8 @@ test_demux (void)
   for (gsize k = 2 * image; k < 4 * image; k++)
     g_assert_cmpfloat (input[k], ==, 0.0f);
   g_assert_cmpfloat (input[image / 2], !=, 0.0f);
+  /* one unit per frame: two in a batch of four slots */
+  g_assert_cmpuint (hook_get_unit_count (mp.infer), ==, 2);
 
   g_assert_true (hook_get_output_sets (mp.infer, &n_sets, &n_free));
   g_assert_cmpuint (n_sets, ==, 1);
@@ -978,9 +987,12 @@ test_demux (void)
 
 /* ---- gpu: interval ---- */
 
+/* Also checks that the inferred batches (one frame each) count one unit each, the skipped ones none. */
 static void
 push_batches_check_infer (GstHarness * h, const gboolean * want, guint n)
 {
+  guint64 units = hook_get_unit_count (h->element);
+
   for (guint i = 0; i < n; i++) {
     GstBuffer *out;
 
@@ -990,6 +1002,8 @@ push_batches_check_infer (GstHarness * h, const gboolean * want, guint n)
     g_test_message ("batch %u: inferred %d", i, nth_frame (out, 0)->bInferDone);
     g_assert_cmpint (nth_frame (out, 0)->bInferDone, ==, want[i]);
     g_assert_true ((frame_tensor_meta (nth_frame (out, 0)) != NULL) == want[i]);
+    units += want[i];
+    g_assert_cmpuint (hook_get_unit_count (h->element), ==, units);
     gst_buffer_unref (out);
   }
 }
@@ -1007,6 +1021,7 @@ test_interval (void)
 
   RDS_TEST_REQUIRE_GPU ();
   ensure_model ();
+  load_hooks ();
   e = new_infer (cfg);
   g_object_set (e, "interval", 2, NULL);
   h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 64, 48);

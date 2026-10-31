@@ -1,6 +1,7 @@
-/* rdsinfer's preprocessing kernel on the GPU, compared with the CPU reference in infer-preprocess-ref.h and with
- * rds_buf_surf_transform followed by normalisation. Skips without a ROCm device. Links the static internal
- * libgstrds (surfaces, the transform) and the plugin's kernel object; no plugin is loaded.
+/* rdsinfer's preprocessing kernel on the GPU, whole slots and source rects, compared with the CPU reference in
+ * infer-preprocess-ref.h and with rds_buf_surf_transform (src_rect for the rects) followed by normalisation. Skips
+ * without a ROCm device. Links the static internal libgstrds (surfaces, the transform) and the plugin's kernel
+ * object; no plugin is loaded.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-surface.h"
@@ -94,18 +95,20 @@ create_surf (RdsBufSurfaceColorFormat fmt, guint w, guint h, guint batch)
   return s;
 }
 
-/* A job for slot @slot of @surf into a net_w x net_h input, with the geometry from rds_infer_letterbox. */
+/* A job for @rect (NULL: all) of slot @slot of @surf into a net_w x net_h input, with the geometry from
+ * rds_infer_letterbox. */
 static RdsPreprocessJob
-make_job (RdsBufSurface * surf, guint slot, guint net_w, guint net_h, Aspect aspect, gboolean bilinear,
-    const Combo * cb)
+make_job_rect (RdsBufSurface * surf, guint slot, const RdsBufSurfTransformRect * rect, guint net_w, guint net_h,
+    Aspect aspect, gboolean bilinear, const Combo * cb)
 {
   RdsPreprocessJob job;
   RdsInferLetterbox lb;
   const RdsBufSurfaceParams *p = &surf->surfaceList[slot];
 
   memset (&job, 0, sizeof (job));
-  rds_infer_letterbox (net_w, net_h, p->width, p->height, aspect != ASPECT_OFF, aspect == ASPECT_SYMMETRIC, &lb);
-  g_assert_true (rds_infer_preprocess_job_set_source (&job, p, &lb));
+  rds_infer_letterbox (net_w, net_h, rect ? rect->width : p->width, rect ? rect->height : p->height,
+      aspect != ASPECT_OFF, aspect == ASPECT_SYMMETRIC, &lb);
+  g_assert_true (rds_infer_preprocess_job_set_source (&job, p, rect, &lb));
   job.channels = cb->color == RDS_PREPROCESS_GRAY ? 1 : 3;
   job.color = cb->color;
   job.nhwc = cb->nhwc;
@@ -117,6 +120,13 @@ make_job (RdsBufSurface * surf, guint slot, guint net_w, guint net_h, Aspect asp
     job.offsets[2] = 103.53f;
   }
   return job;
+}
+
+static RdsPreprocessJob
+make_job (RdsBufSurface * surf, guint slot, guint net_w, guint net_h, Aspect aspect, gboolean bilinear,
+    const Combo * cb)
+{
+  return make_job_rect (surf, slot, NULL, net_w, net_h, aspect, bilinear, cb);
 }
 
 static gsize
@@ -162,6 +172,7 @@ static void
 ref_samples_compute (const RefImage * src, const RdsPreprocessJob * job, RefSamples * rs)
 {
   gsize n = (gsize) job->dw * job->dh;
+  gboolean whole = job->sw == 0;
 
   rs->rgb = g_new (double, 3 * n);
   rs->gray = g_new (double, n);
@@ -169,8 +180,9 @@ ref_samples_compute (const RefImage * src, const RdsPreprocessJob * job, RefSamp
     for (guint x = 0; x < job->dw; x++) {
       gsize i = (gsize) y * job->dw + x;
 
-      ref_pre_sample (src, job->dl + x, job->dt + y, job->dl, job->dt, job->dw, job->dh, job->bilinear,
-          &rs->rgb[3 * i], &rs->gray[i]);
+      ref_pre_sample_rect (src, job->dl + x, job->dt + y, job->sx, job->sy, whole ? src->width : job->sw,
+          whole ? src->height : job->sh, job->dl, job->dt, job->dw, job->dh, job->bilinear, &rs->rgb[3 * i],
+          &rs->gray[i]);
     }
 }
 
@@ -234,15 +246,17 @@ check_image (const RdsPreprocessJob * job, const float *out, const RefSamples * 
   }
 }
 
-/* One source format and size into one network, aspect mode and filter, for the given output combos. */
+/* One source format and size (@rect of it, NULL: all) into one network, aspect mode and filter, for the given
+ * output combos. */
 static void
-check_case (RdsBufSurfaceColorFormat fmt, guint sw, guint sh, guint net_w, guint net_h, Aspect aspect,
-    gboolean bilinear, const Combo * const *cbs, guint n_cbs, hipStream_t stream, Stats * total)
+check_case (RdsBufSurfaceColorFormat fmt, guint sw, guint sh, const RdsBufSurfTransformRect * rect, guint net_w,
+    guint net_h, Aspect aspect, gboolean bilinear, const Combo * const *cbs, guint n_cbs, hipStream_t stream,
+    Stats * total)
 {
   RdsBufSurface *src = create_surf (fmt, sw, sh, 1);
   HostImage hsrc;
   RefSamples rs;
-  RdsPreprocessJob job0 = make_job (src, 0, net_w, net_h, aspect, bilinear, cbs[0]);
+  RdsPreprocessJob job0 = make_job_rect (src, 0, rect, net_w, net_h, aspect, bilinear, cbs[0]);
   Stats st = { 0 };
 
   fill_random (src, 0, 3 + fmt * 7 + sw + sh * 3);
@@ -250,16 +264,16 @@ check_case (RdsBufSurfaceColorFormat fmt, guint sw, guint sh, guint net_w, guint
   ref_samples_compute (&hsrc.im, &job0, &rs);
 
   for (guint i = 0; i < n_cbs; i++) {
-    RdsPreprocessJob job = make_job (src, 0, net_w, net_h, aspect, bilinear, cbs[i]);
+    RdsPreprocessJob job = make_job_rect (src, 0, rect, net_w, net_h, aspect, bilinear, cbs[i]);
     /* image 1 of 2, so the image offset is exercised */
     float *t = run_job (&job, 2, 1, NAN, stream);
 
     check_image (&job, t + image_floats (&job), &rs, &st);
     g_free (t);
     if (st.max_diff > TOL)
-      g_test_message ("%s %ux%u -> %ux%u %s %s %s %s scale %s: max diff %g", fmt_name (fmt), sw, sh, net_w, net_h,
-          aspect_names[aspect], bilinear ? "bilinear" : "nearest", color_names[cbs[i]->color],
-          cbs[i]->nhwc ? "NHWC" : "NCHW", cbs[i]->norm ? "1/255" : "1", st.max_diff);
+      g_test_message ("%s %ux%u (rect %u,%u %ux%u) -> %ux%u %s %s %s %s scale %s: max diff %g", fmt_name (fmt), sw,
+          sh, job.sx, job.sy, job.sw, job.sh, net_w, net_h, aspect_names[aspect], bilinear ? "bilinear" : "nearest",
+          color_names[cbs[i]->color], cbs[i]->nhwc ? "NHWC" : "NCHW", cbs[i]->norm ? "1/255" : "1", st.max_diff);
     g_assert_cmpfloat (st.max_diff, <=, TOL);
   }
   total->max_diff = MAX (total->max_diff, st.max_diff);
@@ -307,7 +321,7 @@ test_matrix_full (void)
     for (guint n = 0; n < G_N_ELEMENTS (nets); n++)
       for (int a = ASPECT_OFF; a <= ASPECT_SYMMETRIC; a++)
         for (int bl = 0; bl <= 1; bl++, cases++)
-          check_case (formats[f], 1280, 720, nets[n][0], nets[n][1], (Aspect) a, bl, cbs, 12, stream, &st);
+          check_case (formats[f], 1280, 720, NULL, nets[n][0], nets[n][1], (Aspect) a, bl, cbs, 12, stream, &st);
   report ("1280x720, all combos", cases * 12, &st);
   g_assert_cmpint (hipStreamDestroy (stream), ==, hipSuccess);
 }
@@ -333,16 +347,80 @@ test_matrix_sizes (void)
             const Combo *cbs[2] = { &combos[rot % 12], &combos[(rot + 7) % 12] };
 
             rot++;
-            check_case (formats[f], sizes[s][0], sizes[s][1], nets[n][0], nets[n][1], (Aspect) a, bl, cbs, 2,
+            check_case (formats[f], sizes[s][0], sizes[s][1], NULL, nets[n][0], nets[n][1], (Aspect) a, bl, cbs, 2,
                 stream, &st);
           }
   report ("640x360 and 333x187", cases * 2, &st);
   g_assert_cmpint (hipStreamDestroy (stream), ==, hipSuccess);
 }
 
+/* Source rects, as an object's crop: of a 640x360 slot, odd offsets and sizes, 2x2 at an odd offset, a rect on the
+ * right and bottom edges, a tall one on the left edge; of an odd 333x187 slot, a rect on its right and bottom edges
+ * (the last, half chroma sample of a 4:2:0 source). */
+static const struct
+{
+  guint sw, sh;
+  RdsBufSurfTransformRect rect;
+} crops[] = {
+  {640, 360, {.left = 37,.top = 23,.width = 101,.height = 67}},
+  {640, 360, {.left = 5,.top = 7,.width = 2,.height = 2}},
+  {640, 360, {.left = 579,.top = 327,.width = 61,.height = 33}},
+  {640, 360, {.left = 0,.top = 1,.width = 31,.height = 359}},
+  {333, 187, {.left = 300,.top = 150,.width = 33,.height = 37}},
+};
+
+/* Max |diff| of the job for @rect (NULL: all) of a random @fmt sw x sh slot against rds_buf_surf_transform of that
+ * rect (CROP_SRC) into a dw x dh RGBA (or GRAY8) surface, normalised; the padding is scale * (0 - offset). */
+static double
+diff_from_transform (RdsBufSurfaceColorFormat fmt, guint sw, guint sh, const RdsBufSurfTransformRect * rect,
+    guint net_w, guint net_h, Aspect aspect, gboolean bilinear, const Combo * cb, guint32 seed, hipStream_t stream)
+{
+  RdsBufSurface *src = create_surf (fmt, sw, sh, 1), *conv;
+  RdsPreprocessJob job = make_job_rect (src, 0, rect, net_w, net_h, aspect, bilinear, cb);
+  gboolean gray = cb->color == RDS_PREPROCESS_GRAY;
+  RdsBufSurfTransformRect src_rect = rect ? *rect : (RdsBufSurfTransformRect) { 0 };
+  RdsBufSurfTransformParams tp = {
+    .transform_flag = RDS_BUFSURF_TRANSFORM_FILTER | (rect ? RDS_BUFSURF_TRANSFORM_CROP_SRC : 0),
+    .transform_filter = bilinear ? RdsBufSurfTransformInter_Bilinear : RdsBufSurfTransformInter_Nearest,
+    .src_rect = rect ? &src_rect : NULL,
+  };
+  HostImage hc;
+  double max_d = 0.0;
+  float *t;
+
+  fill_random (src, 0, seed);
+  src->numFilled = 1;
+  conv = create_surf (gray ? RDS_BUF_COLOR_FORMAT_GRAY8 : RDS_BUF_COLOR_FORMAT_RGBA, job.dw, job.dh, 1);
+  g_assert_cmpint (rds_buf_surf_transform (src, conv, &tp), ==, RdsBufSurfTransformError_Success);
+  snapshot (conv, 0, &hc);
+  t = run_job (&job, 1, 0, NAN, stream);
+
+  for (guint y = 0; y < job.out_h; y++)
+    for (guint x = 0; x < job.out_w; x++)
+      for (guint c = 0; c < job.channels; c++) {
+        gboolean inside = x >= job.dl && x < job.dl + job.dw && y >= job.dt && y < job.dt + job.dh;
+        double b = 0.0, d;
+
+        if (inside) {
+          const guint8 *px = hc.im.plane[0] + (gsize) (y - job.dt) * hc.im.pitch[0]
+              + (gsize) (x - job.dl) * (gray ? 1 : 4);
+          b = gray ? px[0] : px[cb->color == RDS_PREPROCESS_BGR ? 2 - c : c];
+        }
+        d = fabs ((double) t[tensor_index (&job, x, y, c)] - (double) job.scale * (b - (double) job.offsets[c]));
+        if (isnan (d))
+          d = G_MAXDOUBLE;
+        max_d = MAX (max_d, d);
+      }
+
+  g_free (t);
+  host_image_clear (&hc);
+  g_assert_cmpint (rds_buf_surface_destroy (conv), ==, 0);
+  g_assert_cmpint (rds_buf_surface_destroy (src), ==, 0);
+  return max_d;
+}
+
 /* The property behind the reference: the scaled rect equals rds_buf_surf_transform of the slot into a dw x dh
- * RGBA (or GRAY8) surface, normalised; the padding is scale * (0 - offset). Same device code, so no rounding
- * slack. */
+ * RGBA (or GRAY8) surface, normalised. Same device code, so no rounding slack. */
 static void
 test_matches_transform (void)
 {
@@ -363,54 +441,78 @@ test_matches_transform (void)
 
   RDS_TEST_REQUIRE_GPU ();
   stream = new_stream ();
-  for (guint f = 0; f < G_N_ELEMENTS (cases); f++) {
-    for (int bl = 0; bl <= 1; bl++) {
-      for (guint ci = 0; ci < 12; ci++) {
-        const Combo *cb = &combos[ci];  /* every colour, order and normalisation */
-        RdsBufSurface *src = create_surf (cases[f].fmt, cases[f].sw, cases[f].sh, 1), *conv;
-        RdsPreprocessJob job = make_job (src, 0, cases[f].net_w, cases[f].net_h, cases[f].aspect, bl, cb);
-        gboolean gray = cb->color == RDS_PREPROCESS_GRAY;
-        RdsBufSurfTransformParams tp = {
-          .transform_flag = RDS_BUFSURF_TRANSFORM_FILTER,
-          .transform_filter = bl ? RdsBufSurfTransformInter_Bilinear : RdsBufSurfTransformInter_Nearest,
-        };
-        HostImage hc;
-        float *t;
+  for (guint f = 0; f < G_N_ELEMENTS (cases); f++)
+    for (int bl = 0; bl <= 1; bl++)
+      for (guint ci = 0; ci < 12; ci++) {       /* every colour, order and normalisation */
+        max_d = MAX (max_d, diff_from_transform (cases[f].fmt, cases[f].sw, cases[f].sh, NULL, cases[f].net_w,
+                cases[f].net_h, cases[f].aspect, bl, &combos[ci], 11 + f + bl, stream));
+        g_assert_cmpfloat (max_d, <=, TOL);
+      }
+  g_test_message ("against rds_buf_surf_transform + normalisation: max |diff| %g", max_d);
+  g_assert_cmpint (hipStreamDestroy (stream), ==, hipSuccess);
+}
 
-        fill_random (src, 0, 11 + f + bl);
-        src->numFilled = 1;
-        conv = create_surf (gray ? RDS_BUF_COLOR_FORMAT_GRAY8 : RDS_BUF_COLOR_FORMAT_RGBA, job.dw, job.dh, 1);
-        g_assert_cmpint (rds_buf_surf_transform (src, conv, &tp), ==, RdsBufSurfTransformError_Success);
-        snapshot (conv, 0, &hc);
-        t = run_job (&job, 1, 0, NAN, stream);
+/* Source rects: the same property with src_rect, for NV12 and RGBA, every aspect mode and filter, into a square
+ * and a wide network, three combos per case (rotating, so every combo runs with every format). */
+static void
+test_crop_matches_transform (void)
+{
+  static const RdsBufSurfaceColorFormat fmts[] = { RDS_BUF_COLOR_FORMAT_NV12, RDS_BUF_COLOR_FORMAT_RGBA };
+  static const guint nets[][2] = { {64, 64}, {96, 48} };
+  hipStream_t stream;
+  double max_d = 0.0;
+  guint rot = 0;
 
-        for (guint y = 0; y < job.out_h; y++)
-          for (guint x = 0; x < job.out_w; x++)
-            for (guint c = 0; c < job.channels; c++) {
-              gboolean inside = x >= job.dl && x < job.dl + job.dw && y >= job.dt && y < job.dt + job.dh;
-              double b = 0.0, d;
+  RDS_TEST_REQUIRE_GPU ();
+  stream = new_stream ();
+  for (guint f = 0; f < G_N_ELEMENTS (fmts); f++)
+    for (guint r = 0; r < G_N_ELEMENTS (crops); r++)
+      for (guint n = 0; n < G_N_ELEMENTS (nets); n++)
+        for (int a = ASPECT_OFF; a <= ASPECT_SYMMETRIC; a++)
+          for (int bl = 0; bl <= 1; bl++)
+            for (guint k = 0; k < 3; k++) {
+              const Combo *cb = &combos[rot++ % 12];
+              const RdsBufSurfTransformRect *rc = &crops[r].rect;
+              double d = diff_from_transform (fmts[f], crops[r].sw, crops[r].sh, rc, nets[n][0], nets[n][1],
+                  (Aspect) a, bl, cb, 70 + r, stream);
 
-              if (inside) {
-                const guint8 *px = hc.im.plane[0] + (gsize) (y - job.dt) * hc.im.pitch[0]
-                    + (gsize) (x - job.dl) * (gray ? 1 : 4);
-                b = gray ? px[0] : px[cb->color == RDS_PREPROCESS_BGR ? 2 - c : c];
-              }
-              d = fabs ((double) t[tensor_index (&job, x, y, c)]
-                  - (double) job.scale * (b - (double) job.offsets[c]));
-              if (isnan (d))
-                d = G_MAXDOUBLE;
+              if (d > TOL)
+                g_test_message ("%s %ux%u rect %u,%u %ux%u -> %ux%u %s %s %s %s scale %s: max diff %g",
+                    fmt_name (fmts[f]), crops[r].sw, crops[r].sh, rc->left, rc->top, rc->width, rc->height,
+                    nets[n][0], nets[n][1],
+                    aspect_names[a], bl ? "bilinear" : "nearest", color_names[cb->color],
+                    cb->nhwc ? "NHWC" : "NCHW", cb->norm ? "1/255" : "1", d);
+              g_assert_cmpfloat (d, <=, TOL);
               max_d = MAX (max_d, d);
             }
-        g_assert_cmpfloat (max_d, <=, TOL);
+  g_test_message ("source rects against rds_buf_surf_transform + normalisation: max |diff| %g", max_d);
+  g_assert_cmpint (hipStreamDestroy (stream), ==, hipSuccess);
+}
 
-        g_free (t);
-        host_image_clear (&hc);
-        g_assert_cmpint (rds_buf_surface_destroy (conv), ==, 0);
-        g_assert_cmpint (rds_buf_surface_destroy (src), ==, 0);
-      }
-    }
-  }
-  g_test_message ("against rds_buf_surf_transform + normalisation: max |diff| %g", max_d);
+/* Source rects against the CPU reference: NV12 and RGBA, every aspect mode and filter, two combos per case. */
+static void
+test_crop_reference (void)
+{
+  static const RdsBufSurfaceColorFormat fmts[] = { RDS_BUF_COLOR_FORMAT_NV12, RDS_BUF_COLOR_FORMAT_RGBA };
+  static const guint nets[][2] = { {64, 64}, {96, 48} };
+  hipStream_t stream;
+  Stats st = { 0 };
+  guint cases = 0, rot = 0;
+
+  RDS_TEST_REQUIRE_GPU ();
+  stream = new_stream ();
+  for (guint f = 0; f < G_N_ELEMENTS (fmts); f++)
+    for (guint r = 0; r < G_N_ELEMENTS (crops); r++)
+      for (guint n = 0; n < G_N_ELEMENTS (nets); n++)
+        for (int a = ASPECT_OFF; a <= ASPECT_SYMMETRIC; a++)
+          for (int bl = 0; bl <= 1; bl++, cases++) {
+            const Combo *cbs[2] = { &combos[rot % 12], &combos[(rot + 5) % 12] };
+
+            rot++;
+            check_case (fmts[f], crops[r].sw, crops[r].sh, &crops[r].rect, nets[n][0], nets[n][1], (Aspect) a, bl,
+                cbs, 2, stream, &st);
+          }
+  report ("source rects of 640x360 and 333x187", cases * 2, &st);
   g_assert_cmpint (hipStreamDestroy (stream), ==, hipSuccess);
 }
 
@@ -489,6 +591,21 @@ test_invalid (void)
   g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
   job = good, job.src.pitch[0] = 0;
   g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
+  /* source rects: inside the slot and non-empty; sw 0 is the whole slot, with sx, sy and sh 0 too */
+  job = good, job.sx = 63, job.sy = 47, job.sw = 1, job.sh = 1;
+  g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, 0);
+  job = good, job.sx = 1, job.sw = 64, job.sh = 48;     /* past the right edge */
+  g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
+  job = good, job.sy = 47, job.sw = 1, job.sh = 2;      /* past the bottom edge */
+  g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
+  job = good, job.sw = 10;      /* sh 0 */
+  g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
+  job = good, job.sh = 10;      /* sw 0 */
+  g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
+  job = good, job.sx = 3;       /* sw 0 */
+  g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
+  job = good, job.sx = 0xffffffffu, job.sw = 2, job.sh = 1;     /* sx + sw wraps */
+  g_assert_cmpint (rds_infer_preprocess_launch (&job, dev, 0, NULL), ==, -1);
   /* 4:2:0 sources need their chroma planes */
   {
     RdsBufSurface *nv12 = create_surf (RDS_BUF_COLOR_FORMAT_NV12, 63, 47, 1);
@@ -518,8 +635,24 @@ test_invalid (void)
 
     rds_infer_letterbox (32, 32, 64, 50, TRUE, TRUE, &lb);
     job = good;
-    g_assert_false (rds_infer_preprocess_job_set_source (&job, &src->surfaceList[0], &lb));
+    g_assert_false (rds_infer_preprocess_job_set_source (&job, &src->surfaceList[0], NULL, &lb));
     g_assert_true (memcmp (&job, &good, sizeof (job)) == 0);
+  }
+  /* and one computed for the slot when the source is a rect of it */
+  {
+    RdsBufSurfTransformRect rect = {.left = 2,.top = 3,.width = 20,.height = 10 };
+    RdsInferLetterbox lb;
+
+    rds_infer_letterbox (32, 32, 64, 48, TRUE, TRUE, &lb);
+    job = good;
+    g_assert_false (rds_infer_preprocess_job_set_source (&job, &src->surfaceList[0], &rect, &lb));
+    g_assert_true (memcmp (&job, &good, sizeof (job)) == 0);
+    rds_infer_letterbox (32, 32, 20, 10, TRUE, TRUE, &lb);
+    g_assert_true (rds_infer_preprocess_job_set_source (&job, &src->surfaceList[0], &rect, &lb));
+    g_assert_cmpuint (job.sx, ==, 2);
+    g_assert_cmpuint (job.sy, ==, 3);
+    g_assert_cmpuint (job.sw, ==, 20);
+    g_assert_cmpuint (job.sh, ==, 10);
   }
   g_assert_cmpint (hipFree (dev), ==, hipSuccess);
   g_assert_cmpint (rds_buf_surface_destroy (src), ==, 0);
@@ -606,6 +739,8 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/preprocess/matrix-720p", test_matrix_full);
   g_test_add_func ("/gpu/preprocess/matrix-sizes", test_matrix_sizes);
   g_test_add_func ("/gpu/preprocess/matches-transform", test_matches_transform);
+  g_test_add_func ("/gpu/preprocess/crop-reference", test_crop_reference);
+  g_test_add_func ("/gpu/preprocess/crop-matches-transform", test_crop_matches_transform);
   g_test_add_func ("/gpu/preprocess/batch-isolation", test_batch_isolation);
   g_test_add_func ("/gpu/preprocess/timing", test_timing);
   return g_test_run ();

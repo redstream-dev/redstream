@@ -6,11 +6,14 @@
  * - start (READY -> PAUSED) loads the config file, applies the properties that were set (a property set explicitly
  *   wins over the file, also when set to its default value), and builds or loads the engine, synchronously. Any
  *   error fails the state change with a message naming the file (or the property), the key and the value.
- * - Per batch, one at a time on the element's own non-blocking stream: the frame list is read under the meta lock,
- *   then, without the lock, the preprocessing kernel writes each frame's slot (frame_meta->batch_id) of the network
- *   input and unfilled slots are zeroed, the engine runs, the outputs are copied to pinned host memory and the
+ * - Per batch, one at a time on the element's own non-blocking stream: the frame list is read under the meta lock
+ *   into inference units, each a source rect of a frame's slot (primary mode: one per frame, the whole slot, into
+ *   image frame_meta->batch_id). Units run in chunks of at most batch-size: without the lock, the preprocessing
+ *   kernel writes each unit's image of the network input and the chunk's unused images are zeroed, the engine runs
+ *   (always batch-size images), the outputs are copied to pinned host memory of the chunk's output set and the
  *   stream is synchronized once; the parser and the post-processing run on the CPU, and the meta lock is taken again
- *   to add the objects and tensor meta. Inferred frames get bInferDone.
+ *   to add the chunk's objects and tensor meta. Primary mode is one chunk per batch. Inferred frames get
+ *   bInferDone.
  * - interval N: one batch is inferred, the next N pass untouched (bInferDone FALSE); the count restarts at start
  *   and after a flush.
  * - Output buffers are refcounted sets (rds-infer-output.h) that tensor metas keep alive, also in demuxed copies.
@@ -81,14 +84,17 @@ typedef enum
   WARN_RAW_OUTPUT = 1 << 3,
 } WarnOnce;
 
-/* One frame of the batch being inferred. */
+/* One inference unit of the batch: a source rect of a frame's slot, inferred as one image of its chunk. */
 typedef struct
 {
   RdsMetaRef frame;             /* resolved under the batch lock before use */
+  RdsMetaRef obj;               /* the object it crops; unused (zeroed) in primary mode */
   guint source_id, slot;
-  RdsInferLetterbox lb;
+  RdsBufSurfTransformRect src;  /* in slot pixels; primary mode: the whole slot */
+  guint image;                  /* in the chunk's network input and output set; primary mode: the slot */
+  RdsInferLetterbox lb;         /* for src's size */
   guint det_start, n_dets;      /* in self->dets */
-} FrameJob;
+} InferUnit;
 
 struct _GstRdsInfer
 {
@@ -118,13 +124,15 @@ struct _GstRdsInfer
   RdsInferDims *out_dims;
   const gchar **out_names;      /* the engine's */
   guint batch_count;            /* batches seen since start or the last flush */
+  guint64 unit_count;           /* units inferred since start */
   guint warned;                 /* WarnOnce */
-  GArray *jobs;                 /* FrameJob */
+  GArray *units;                /* InferUnit, the current batch's */
   GArray *objects;              /* RdsInferObjectDetectionInfo, one frame's parser output */
   GArray *dets;                 /* RdsInferDetection, every frame's */
   GByteArray *scratch;
   RdsInferLayerInfo *layers;    /* one frame's output layers, for the parser */
   gboolean *slot_used;          /* batch_size entries: the current batch has a frame in that slot */
+  gboolean *image_used;         /* batch_size entries: the current chunk has a unit in that image */
 };
 
 #define RDS_INFER_CAPS \
@@ -380,6 +388,7 @@ release_resources (GstRdsInfer * self)
   g_clear_pointer (&self->out_names, g_free);
   g_clear_pointer (&self->layers, g_free);
   g_clear_pointer (&self->slot_used, g_free);
+  g_clear_pointer (&self->image_used, g_free);
   self->n_outputs = 0;
 }
 
@@ -513,6 +522,7 @@ gst_rds_infer_start (GstBaseTransform * trans)
   gboolean ok;
 
   self->batch_count = 0;
+  self->unit_count = 0;
   if (!(self->cfg = configure (self, NULL, &err))) {
     post_config_error (self, err);
     g_error_free (err);
@@ -560,6 +570,7 @@ gst_rds_infer_start (GstBaseTransform * trans)
     return FALSE;
   }
   self->slot_used = g_new0 (gboolean, self->cfg->batch_size);
+  self->image_used = g_new0 (gboolean, self->cfg->batch_size);
   self->outputs = rds_infer_output_pool_new (self->gpu, self->cfg->batch_size, self->n_outputs, self->out_dims,
       self->out_names);
   GST_INFO_OBJECT (self, "network %ux%ux%u, batch %u, %u outputs, interval %u", self->net.channels,
@@ -604,20 +615,21 @@ warn_once (GstRdsInfer * self, WarnOnce what, const gchar * msg)
   }
 }
 
-/* Reads the frame list (under the meta lock) into self->jobs and self->slot_used; FALSE with an element error on a
- * bad batch. */
+/* Reads the frame list (under the meta lock) into self->units, one unit per frame (the whole slot, as image
+ * batch_id), and self->slot_used; FALSE with an element error on a bad batch. */
 static gboolean
 snapshot_frames (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf)
 {
   guint batch = self->cfg->batch_size;
   gboolean ok = TRUE;
 
-  g_array_set_size (self->jobs, 0);
+  g_array_set_size (self->units, 0);
   memset (self->slot_used, 0, batch * sizeof (gboolean));
   rds_acquire_meta_lock (bm);
   for (GList * l = bm->frame_meta_list; l; l = l->next) {
     RdsFrameMeta *fm = l->data;
-    FrameJob job = {.frame = rds_meta_ref (fm),.source_id = fm->source_id,.slot = fm->batch_id };
+    InferUnit unit = {.frame = rds_meta_ref (fm),.source_id = fm->source_id,.slot = fm->batch_id,
+      .image = fm->batch_id };
 
     if (fm->batch_id >= batch || fm->batch_id >= surf->batchSize) {
       ok = FALSE;
@@ -630,28 +642,30 @@ snapshot_frames (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * su
       continue;
     }
     self->slot_used[fm->batch_id] = TRUE;
-    g_array_append_val (self->jobs, job);
+    unit.src.width = surf->surfaceList[fm->batch_id].width;
+    unit.src.height = surf->surfaceList[fm->batch_id].height;
+    g_array_append_val (self->units, unit);
   }
   rds_release_meta_lock (bm);
   return ok;
 }
 
-/* Parser and post-processing of every frame, on the host outputs of @set. */
+/* Parser and post-processing of the units @first .. @first + @n - 1 (a chunk), on the host outputs of its @set. */
 static void
-parse_frames (GstRdsInfer * self, RdsInferOutputSet * set)
+parse_units (GstRdsInfer * self, RdsInferOutputSet * set, guint first, guint n)
 {
   RdsInferConfig *cfg = self->cfg;
 
   g_array_set_size (self->dets, 0);
-  for (guint f = 0; f < self->jobs->len; f++) {
-    FrameJob *job = &g_array_index (self->jobs, FrameJob, f);
+  for (guint u = first; u < first + n; u++) {
+    InferUnit *unit = &g_array_index (self->units, InferUnit, u);
     GError *err = NULL;
     RdsInferPostFlags flags;
 
-    job->det_start = self->dets->len;
-    job->n_dets = 0;
+    unit->det_start = self->dets->len;
+    unit->n_dets = 0;
     for (guint i = 0; i < self->n_outputs; i++) {
-      gsize offset = (gsize) job->slot * self->out_dims[i].numElements;
+      gsize offset = (gsize) unit->image * self->out_dims[i].numElements;
 
       self->layers[i].buffer = set->host[i] + offset;
       self->layers[i].deviceBuffer = set->dev[i] + offset;
@@ -659,14 +673,14 @@ parse_frames (GstRdsInfer * self, RdsInferOutputSet * set)
     g_array_set_size (self->objects, 0);
     if (!rds_infer_parser_parse (self->parser, self->layers, self->n_outputs, &self->net, self->objects, &err)) {
       gchar *msg = g_strdup_printf ("Parser %s failed on a frame of source %u, which gets no objects: %s",
-          rds_infer_parser_get_func_name (self->parser), job->source_id, err->message);
+          rds_infer_parser_get_func_name (self->parser), unit->source_id, err->message);
 
       warn_once (self, WARN_PARSE, msg);
       g_free (msg);
       g_error_free (err);
       continue;
     }
-    flags = rds_infer_postprocess (cfg, &job->lb, (const RdsInferObjectDetectionInfo *) self->objects->data,
+    flags = rds_infer_postprocess (cfg, &unit->lb, (const RdsInferObjectDetectionInfo *) self->objects->data,
         self->objects->len, self->scratch, self->dets);
     if (flags & RDS_INFER_POST_INVALID)
       warn_once (self, WARN_POST_INVALID, "The parser returned invalid objects (a class id >= "
@@ -674,7 +688,7 @@ parse_frames (GstRdsInfer * self, RdsInferOutputSet * set)
     if (flags & RDS_INFER_POST_ROTATED)
       warn_once (self, WARN_POST_ROTATED, "The parser returned objects with a rotation_angle; oriented boxes are "
           "not supported, the angle is ignored");
-    job->n_dets = self->dets->len - job->det_start;
+    unit->n_dets = self->dets->len - unit->det_start;
   }
 }
 
@@ -703,30 +717,32 @@ add_object (GstRdsInfer * self, RdsBatchMeta * bm, RdsFrameMeta * fm, const RdsI
   rds_add_obj_meta_to_frame (fm, om, NULL);
 }
 
+/* The results of the units @first .. @first + @n - 1 (a chunk); their tensor metas hold a ref on the chunk's @set
+ * and name their image in it. In primary mode the unit is the frame: objects, tensor meta and bInferDone per frame. */
 static void
-attach_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set)
+attach_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set, guint first, guint n)
 {
   RdsInferConfig *cfg = self->cfg;
   gboolean tensor_meta = cfg->output_tensor_meta || cfg->network_type == 100;
 
   rds_acquire_meta_lock (bm);
-  for (guint f = 0; f < self->jobs->len; f++) {
-    FrameJob *job = &g_array_index (self->jobs, FrameJob, f);
-    RdsFrameMeta *fm = rds_meta_ref_resolve (bm->frame_meta_list, &job->frame);
+  for (guint u = first; u < first + n; u++) {
+    InferUnit *unit = &g_array_index (self->units, InferUnit, u);
+    RdsFrameMeta *fm = rds_meta_ref_resolve (bm->frame_meta_list, &unit->frame);
 
     /* A frame removed while the lock was released gets nothing, even when the pool reused its address. */
     if (!fm)
       continue;
     if (cfg->network_type == 0) {
-      for (guint i = 0; i < job->n_dets; i++)
-        add_object (self, bm, fm, &g_array_index (self->dets, RdsInferDetection, job->det_start + i));
+      for (guint i = 0; i < unit->n_dets; i++)
+        add_object (self, bm, fm, &g_array_index (self->dets, RdsInferDetection, unit->det_start + i));
       GST_DEBUG_OBJECT (self, "source %u frame %d: %u objects", fm->source_id, fm->frame_num,
-          job->n_dets);
+          unit->n_dets);
     }
     if (tensor_meta) {
       RdsUserMeta *um = rds_acquire_user_meta_from_pool (bm);
 
-      um->user_meta_data = rds_infer_tensor_meta_new (set, job->slot, cfg->gie_unique_id, &self->net,
+      um->user_meta_data = rds_infer_tensor_meta_new (set, unit->image, cfg->gie_unique_id, &self->net,
           cfg->maintain_aspect_ratio, cfg->symmetric_padding);
       um->base_meta.meta_type = RDS_INFER_TENSOR_OUTPUT_META;
       um->base_meta.copy_func = rds_infer_tensor_meta_copy;
@@ -738,55 +754,29 @@ attach_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet * set)
   rds_release_meta_lock (bm);
 }
 
-static GstFlowReturn
-gst_rds_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
+/* Infers the units @first .. @first + @n - 1 (n <= batch-size, distinct images below batch-size) as one engine run
+ * and attaches their results; FALSE with an element error. Each chunk has its own output set from the pool; the
+ * chunk's tensor metas keep it alive after this returns. */
+static gboolean
+infer_chunk (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf, guint first, guint n)
 {
-  GstRdsInfer *self = GST_RDS_INFER (trans);
   RdsInferConfig *cfg = self->cfg;
-  RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (buf);
-  RdsBufSurface *surf = rds_buffer_get_surface (buf);
   RdsInferOutputSet *set = NULL;
   GError *err = NULL;
-  gint64 t0 = 0;
 
-  if (!bm || !surf) {
-    GST_ELEMENT_ERROR (self, STREAM, FORMAT, ("rdsinfer needs batches from rdsstreammux"),
-        ("the buffer has no %s", !bm ? "RdsBatchMeta" : "memory:RDS surface"));
-    return GST_FLOW_ERROR;
-  }
-  if (self->batch_count++ % (cfg->interval + 1) != 0) {
-    GST_LOG_OBJECT (self, "batch skipped (interval %u)", cfg->interval);
-    return GST_FLOW_OK;
-  }
-  if (surf->memType == RDS_BUF_MEM_SYSTEM || surf->gpuId != self->gpu) {
-    GST_ELEMENT_ERROR (self, STREAM, FORMAT, ("rdsinfer needs batches in GPU memory on its gpu-id (%u)", self->gpu),
-        ("memory type %d on GPU %u", surf->memType, surf->gpuId));
-    return GST_FLOW_ERROR;
-  }
-  if (!snapshot_frames (self, bm, surf))
-    return GST_FLOW_ERROR;
-  if (self->jobs->len == 0) {
-    GST_LOG_OBJECT (self, "batch without frames");
-    return GST_FLOW_OK;
-  }
-  if (gst_debug_category_get_threshold (GST_CAT_DEFAULT) >= GST_LEVEL_DEBUG)
-    t0 = g_get_monotonic_time ();
-
-  /* Set on every batch and not restored: the streaming thread only runs our GPU work while it is in here, and
-   * whatever ran on it before may have left another device current. */
-  if (hipSetDevice ((int) self->gpu) != hipSuccess) {
-    GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("GPU %u is not available", self->gpu), (NULL));
-    return GST_FLOW_ERROR;
-  }
-  /* 1. preprocessing: each frame into its slot's image, unfilled slots zeroed */
-  for (guint f = 0; f < self->jobs->len; f++) {
-    FrameJob *job = &g_array_index (self->jobs, FrameJob, f);
-    const RdsBufSurfaceParams *sp = &surf->surfaceList[job->slot];
+  GST_DEBUG_OBJECT (self, "chunk of %u units (%u..%u of %u)", n, first, first + n - 1, self->units->len);
+  /* 1. preprocessing: each unit's source rect into its image, the unused images zeroed */
+  memset (self->image_used, 0, cfg->batch_size * sizeof (gboolean));
+  for (guint u = first; u < first + n; u++) {
+    InferUnit *unit = &g_array_index (self->units, InferUnit, u);
+    const RdsBufSurfaceParams *sp = &surf->surfaceList[unit->slot];
     RdsPreprocessJob pj = { 0 };
 
-    rds_infer_letterbox (self->net.width, self->net.height, sp->width, sp->height, cfg->maintain_aspect_ratio,
-        cfg->symmetric_padding, &job->lb);
-    (void) rds_infer_preprocess_job_set_source (&pj, sp, &job->lb);
+    g_assert (unit->image < cfg->batch_size && !self->image_used[unit->image]);
+    self->image_used[unit->image] = TRUE;
+    rds_infer_letterbox (self->net.width, self->net.height, unit->src.width, unit->src.height,
+        cfg->maintain_aspect_ratio, cfg->symmetric_padding, &unit->lb);
+    (void) rds_infer_preprocess_job_set_source (&pj, sp, &unit->src, &unit->lb);
     pj.channels = self->channels;
     pj.color = cfg->model_color_format;
     pj.nhwc = cfg->network_input_order == 1;
@@ -794,16 +784,17 @@ gst_rds_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     pj.scale = cfg->net_scale_factor;
     for (guint c = 0; c < 3; c++)
       pj.offsets[c] = c < cfg->n_offsets ? cfg->offsets[c] : 0.0f;
-    if (rds_infer_preprocess_launch (&pj, self->input, job->slot, self->stream) != 0) {
+    if (rds_infer_preprocess_launch (&pj, self->input, unit->image, self->stream) != 0) {
       GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Preprocessing failed"),
-          ("slot %u: %ux%u, format %d", job->slot, sp->width, sp->height, sp->colorFormat));
+          ("slot %u: %ux%u, format %d, rect %u,%u %ux%u", unit->slot, sp->width, sp->height, sp->colorFormat,
+              unit->src.left, unit->src.top, unit->src.width, unit->src.height));
       goto fail;
     }
   }
-  for (guint slot = 0; slot < cfg->batch_size; slot++)
-    if (!self->slot_used[slot])
-      HIP_OR_FAIL (hipMemsetAsync (self->input + slot * self->image_floats, 0,
-              self->image_floats * sizeof (gfloat), self->stream), "zeroing unfilled slots");
+  for (guint image = 0; image < cfg->batch_size; image++)
+    if (!self->image_used[image])
+      HIP_OR_FAIL (hipMemsetAsync (self->input + image * self->image_floats, 0,
+              self->image_floats * sizeof (gfloat), self->stream), "zeroing unused images");
 
   /* 2. inference and the copy to the host, one sync */
   if (!(set = rds_infer_output_pool_acquire (self->outputs, &err))) {
@@ -824,20 +815,65 @@ gst_rds_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 
   /* 3. parsing on the CPU, then the metadata under the lock */
   if (cfg->network_type == 0)
-    parse_frames (self, set);
-  attach_results (self, bm, set);
-  if (t0)
-    GST_DEBUG_OBJECT (self, "batch of %u frames: %.3f ms", self->jobs->len,
-        (g_get_monotonic_time () - t0) / 1000.0);
+    parse_units (self, set, first, n);
+  attach_results (self, bm, set, first, n);
+  self->unit_count += n;
   rds_infer_output_set_unref (set);
-  return GST_FLOW_OK;
+  return TRUE;
 
 fail:
   /* work already queued may still read the batch or write the set: wait for it before either goes */
   (void) hipStreamSynchronize (self->stream);
   if (set)
     rds_infer_output_set_unref (set);
-  return GST_FLOW_ERROR;
+  return FALSE;
+}
+
+static GstFlowReturn
+gst_rds_infer_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
+{
+  GstRdsInfer *self = GST_RDS_INFER (trans);
+  RdsInferConfig *cfg = self->cfg;
+  RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (buf);
+  RdsBufSurface *surf = rds_buffer_get_surface (buf);
+  gint64 t0 = 0;
+
+  if (!bm || !surf) {
+    GST_ELEMENT_ERROR (self, STREAM, FORMAT, ("rdsinfer needs batches from rdsstreammux"),
+        ("the buffer has no %s", !bm ? "RdsBatchMeta" : "memory:RDS surface"));
+    return GST_FLOW_ERROR;
+  }
+  if (self->batch_count++ % (cfg->interval + 1) != 0) {
+    GST_LOG_OBJECT (self, "batch skipped (interval %u)", cfg->interval);
+    return GST_FLOW_OK;
+  }
+  if (surf->memType == RDS_BUF_MEM_SYSTEM || surf->gpuId != self->gpu) {
+    GST_ELEMENT_ERROR (self, STREAM, FORMAT, ("rdsinfer needs batches in GPU memory on its gpu-id (%u)", self->gpu),
+        ("memory type %d on GPU %u", surf->memType, surf->gpuId));
+    return GST_FLOW_ERROR;
+  }
+  if (!snapshot_frames (self, bm, surf))
+    return GST_FLOW_ERROR;
+  if (self->units->len == 0) {
+    GST_LOG_OBJECT (self, "batch without frames");
+    return GST_FLOW_OK;
+  }
+  if (gst_debug_category_get_threshold (GST_CAT_DEFAULT) >= GST_LEVEL_DEBUG)
+    t0 = g_get_monotonic_time ();
+
+  /* Set on every batch and not restored: the streaming thread only runs our GPU work while it is in here, and
+   * whatever ran on it before may have left another device current. */
+  if (hipSetDevice ((int) self->gpu) != hipSuccess) {
+    GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("GPU %u is not available", self->gpu), (NULL));
+    return GST_FLOW_ERROR;
+  }
+  /* primary mode has at most batch-size units (one per slot): one chunk */
+  for (guint first = 0; first < self->units->len; first += cfg->batch_size)
+    if (!infer_chunk (self, bm, surf, first, MIN (cfg->batch_size, self->units->len - first)))
+      return GST_FLOW_ERROR;
+  if (t0)
+    GST_DEBUG_OBJECT (self, "batch of %u units: %.3f ms", self->units->len, (g_get_monotonic_time () - t0) / 1000.0);
+  return GST_FLOW_OK;
 }
 
 /* ---- test hooks ---- */
@@ -851,6 +887,12 @@ rds_infer_test_get_output_sets (GstElement * element, guint * n_sets, guint * n_
     return FALSE;
   rds_infer_output_pool_get_counts (self->outputs, n_sets, n_free);
   return TRUE;
+}
+
+guint64
+rds_infer_test_get_unit_count (GstElement * element)
+{
+  return GST_RDS_INFER (element)->unit_count;
 }
 
 gboolean
@@ -1023,7 +1065,7 @@ gst_rds_infer_finalize (GObject * object)
   g_free (self->infer_on_class_ids);
   g_free (self->filter_out_class_ids);
   g_free (self->model_engine_file);
-  g_array_unref (self->jobs);
+  g_array_unref (self->units);
   g_array_unref (self->objects);
   g_array_unref (self->dets);
   g_byte_array_unref (self->scratch);
@@ -1129,7 +1171,7 @@ gst_rds_infer_init (GstRdsInfer * self)
   self->batch_size = DEFAULT_BATCH_SIZE;
   self->interval = DEFAULT_INTERVAL;
   self->gpu_id = DEFAULT_GPU_ID;
-  self->jobs = g_array_new (FALSE, FALSE, sizeof (FrameJob));
+  self->units = g_array_new (FALSE, FALSE, sizeof (InferUnit));
   self->objects = g_array_new (FALSE, FALSE, sizeof (RdsInferObjectDetectionInfo));
   self->dets = g_array_new (FALSE, FALSE, sizeof (RdsInferDetection));
   self->scratch = g_byte_array_new ();
