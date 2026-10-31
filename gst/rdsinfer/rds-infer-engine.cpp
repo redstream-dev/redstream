@@ -679,15 +679,18 @@ run_async (RdsInferEngine * e, const float *input, float *const *outputs, hipStr
       e->program.run_async (params, stream));
 }
 
-/* One run on zeros, on a stream of our own, synchronized: the first run after loading takes longer. */
+/* One run on zeros, synchronized: the first run after loading takes longer. On @caller_stream when set (the stream
+ * the caller's runs will use), else on a stream of our own, destroyed after the run. With ROCm 10.1 the latter can
+ * lose the first work on a stream the caller made before the open: its kernels never run, the copies on it do, and
+ * every HIP call succeeds (see AGENTS.md). */
 static gboolean
-warm_up (RdsInferEngine * e, GError ** error)
+warm_up (RdsInferEngine * e, hipStream_t caller_stream, GError ** error)
 {
   std::vector<float *> outs (e->outputs.size (), nullptr);
   float *input = nullptr;
-  hipStream_t stream = nullptr;
+  hipStream_t stream = caller_stream;
   gsize in_bytes = e->input_bytes;
-  gboolean ok = HIP_CHECK (hipStreamCreateWithFlags (&stream, hipStreamNonBlocking), error)
+  gboolean ok = (stream || HIP_CHECK (hipStreamCreateWithFlags (&stream, hipStreamNonBlocking), error))
       && HIP_CHECK (hipMalloc ((void **) &input, in_bytes), error)
       && HIP_CHECK (hipMemsetAsync (input, 0, in_bytes, stream), error);
 
@@ -700,7 +703,7 @@ warm_up (RdsInferEngine * e, GError ** error)
       (void) hipFree (o);
   if (input)
     (void) hipFree (input);
-  if (stream)
+  if (stream && stream != caller_stream)
     (void) hipStreamDestroy (stream);
   return ok;
 }
@@ -944,7 +947,7 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
   }
   if (e->program_path)
     e->manifest_path = g_strconcat (e->program_path, ".json", NULL);
-  if (!warm_up (e.get (), error))
+  if (!warm_up (e.get (), (hipStream_t) opts->warm_up_stream, error))
     return NULL;
   return e.release ();
 }

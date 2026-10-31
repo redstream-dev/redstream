@@ -47,6 +47,10 @@ typedef struct
   /* Look up and save the program only here (+ ".json"), instead of engine_file and the cache names; NULL: unset.
    * When a build is needed and its directory can't be written, fails with OUTPUT before building. */
   const gchar *output_file;
+  /* The stream (a hipStream_t; not the null stream) for the warm-up run that ends the open: the one the caller's
+   * runs will use. NULL: a stream of the engine's own, destroyed after the run (see warm_up in the .cpp: with ROCm
+   * 10.1 that can cost the first runs on a stream made before the open, so an element passes its own). */
+  void *warm_up_stream;
 } RdsInferEngineOptions;
 
 typedef struct _RdsInferEngine RdsInferEngine;
@@ -60,7 +64,7 @@ G_GNUC_INTERNAL gboolean rds_infer_engine_validate_tensor_size (const gsize * di
 /* Loads a matching cached program (engine_file first, then the cache name in the model's directory, then in
  * $XDG_CACHE_HOME/redstream/) or builds one and saves it under the cache name. With no_build, the same lookup
  * decides whether the program is up to date (rds-compile). The model's input must be a float NCHW tensor whose batch
- * dimension is symbolic (or fixed at batch_size). Ends with one warm-up run. */
+ * dimension is symbolic (or fixed at batch_size). Ends with one warm-up run, synchronized (on warm_up_stream). */
 G_GNUC_INTERNAL RdsInferEngine *rds_infer_engine_open (const RdsInferEngineOptions * opts, GError ** error);
 
 /* The .mxr loaded or written; NULL when a built program couldn't be saved (a warning says why). */

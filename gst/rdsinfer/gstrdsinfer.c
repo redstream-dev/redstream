@@ -410,6 +410,8 @@ open_engine (GstRdsInfer * self, GError ** error)
 
   if (!rds_infer_config_get_engine_options (cfg, &opts, dims, error))
     return FALSE;
+  /* the warm-up on the stream the element runs on (see rds-infer-engine.h) */
+  opts.warm_up_stream = self->stream;
   if (!(self->engine = rds_infer_engine_open (&opts, &err))) {
     gchar *msg = rds_infer_config_format_engine_error (cfg, err);
 

@@ -129,7 +129,7 @@ static RdsInferEngine *
 open_engine (const gchar * onnx, const gchar * engine_file, guint batch, gboolean fp16, const guint * dims,
     gboolean force)
 {
-  RdsInferEngineOptions opts = { onnx, engine_file, batch, 0, fp16, dims, force, FALSE, NULL };
+  RdsInferEngineOptions opts = { onnx, engine_file, batch, 0, fp16, dims, force, FALSE, NULL, NULL };
   GError *err = NULL;
   RdsInferEngine *e = rds_infer_engine_open (&opts, &err);
 
@@ -415,7 +415,7 @@ test_onnx_reader_truncated (void)
 static void
 test_invalid_options (void)
 {
-  RdsInferEngineOptions opts = { SCALE2, NULL, 0, 0, FALSE, dims_64x48, FALSE, FALSE, NULL };
+  RdsInferEngineOptions opts = { SCALE2, NULL, 0, 0, FALSE, dims_64x48, FALSE, FALSE, NULL, NULL };
   static const guint zero_dims[3] = { 3, 0, 48 };
   GError *err = NULL;
 
@@ -658,7 +658,7 @@ test_engine_file (void)
 static RdsInferEngine *
 open_no_build (const gchar * onnx, const gchar * engine_file, const gchar * output_file, guint batch, GError ** err)
 {
-  RdsInferEngineOptions opts = { onnx, engine_file, batch, 0, FALSE, dims_64x48, FALSE, TRUE, output_file };
+  RdsInferEngineOptions opts = { onnx, engine_file, batch, 0, FALSE, dims_64x48, FALSE, TRUE, output_file, NULL };
 
   return rds_infer_engine_open (&opts, err);
 }
@@ -729,7 +729,7 @@ static void
 test_output_file (void)
 {
   gchar *onnx, *dir, *out, *out_json, *other, *nodir;
-  RdsInferEngineOptions opts = { NULL, NULL, 2, 0, FALSE, dims_64x48, FALSE, FALSE, NULL };
+  RdsInferEngineOptions opts = { NULL, NULL, 2, 0, FALSE, dims_64x48, FALSE, FALSE, NULL, NULL };
   RdsInferEngine *e;
   GError *err = NULL;
   GDir *d;
@@ -1066,7 +1066,7 @@ test_external_data (void)
 {
   GByteArray *model = external_data_model ();
   gchar *dir, *onnx;
-  RdsInferEngineOptions opts = { NULL, NULL, 1, 0, FALSE, NULL, FALSE, FALSE, NULL };
+  RdsInferEngineOptions opts = { NULL, NULL, 1, 0, FALSE, NULL, FALSE, FALSE, NULL, NULL };
   GError *err = NULL;
 
   RDS_TEST_REQUIRE_GPU ();
@@ -1112,7 +1112,7 @@ static void
 test_fixed_batch (void)
 {
   gchar *onnx, *dir;
-  RdsInferEngineOptions opts = { NULL, NULL, 2, 0, FALSE, dims_64x48, FALSE, FALSE, NULL };
+  RdsInferEngineOptions opts = { NULL, NULL, 2, 0, FALSE, dims_64x48, FALSE, FALSE, NULL, NULL };
   GError *err = NULL;
   RdsInferEngine *e;
 
@@ -1137,7 +1137,7 @@ static void
 test_errors (void)
 {
   RdsInferEngineOptions opts = { RDS_TEST_MODELS "/missing.onnx", NULL, 1, 0, FALSE, dims_64x48, FALSE, FALSE,
-    NULL
+    NULL, NULL
   };
   static const guint wrong_c[3] = { 4, 64, 48 };
   GError *err = NULL;
@@ -1699,6 +1699,55 @@ check_fixeddet (guint batch)
 
 /* Each committed classifier and detector test model compiles and gives the expected output, at batch 1 and 2 (their
  * batch is symbolic, the engine compiles it static). */
+/* The first run of a fresh engine on a stream made before it was opened, as rdsinfer does: engine after engine on
+ * the same cached program, each fed another input, each first run gives that input's means; every other engine
+ * warms up on that stream (warm_up_stream, as rdsinfer does), the others on a stream of their own. */
+static void
+test_first_run (void)
+{
+  gchar *onnx, *dir = make_model_dir_full (MEANCLS, TRUE, &onnx);
+  const guint batch = 4, plane = CLS_SIZE * CLS_SIZE;
+  gfloat *in = g_new (gfloat, batch * 3 * plane), out[4 * 3];
+  gfloat *d_in, *d_out;
+
+  RDS_TEST_REQUIRE_GPU ();
+  rds_infer_engine_free (open_engine (onnx, NULL, batch, FALSE, NULL, FALSE));
+  HIP_OK (hipMalloc ((void **) &d_in, batch * 3 * plane * sizeof (gfloat)));
+  HIP_OK (hipMalloc ((void **) &d_out, sizeof out));
+  for (guint e = 0; e < 40; e++) {
+    hipStream_t stream;
+    RdsInferEngine *eng;
+    GError *err = NULL;
+
+    for (guint i = 0; i < batch * 3 * plane; i++)
+      in[i] = (gfloat) (e + 1 + i / plane);
+    HIP_OK (hipStreamCreateWithFlags (&stream, hipStreamNonBlocking));
+    {
+      RdsInferEngineOptions opts = { onnx, NULL, batch, 0, FALSE, NULL, FALSE, FALSE, NULL, e % 2 ? NULL : stream };
+
+      eng = rds_infer_engine_open (&opts, &err);
+      g_assert_no_error (err);
+      g_assert_false (rds_infer_engine_was_built (eng));
+    }
+    HIP_OK (hipMemcpyAsync (d_in, in, batch * 3 * plane * sizeof (gfloat), hipMemcpyHostToDevice, stream));
+    HIP_OK (hipMemsetAsync (d_out, 0xFF, sizeof out, stream));
+    g_assert_true (rds_infer_engine_run_async (eng, d_in, &d_out, stream, &err));
+    g_assert_no_error (err);
+    HIP_OK (hipMemcpyAsync (out, d_out, sizeof out, hipMemcpyDeviceToHost, stream));
+    HIP_OK (hipStreamSynchronize (stream));
+    for (guint i = 0; i < batch * 3; i++)
+      g_assert_cmpfloat (out[i], ==, (gfloat) (e + 1 + i));
+    rds_infer_engine_free (eng);
+    HIP_OK (hipStreamDestroy (stream));
+  }
+  HIP_OK (hipFree (d_in));
+  HIP_OK (hipFree (d_out));
+  g_free (in);
+  remove_dir (dir);
+  g_free (dir);
+  g_free (onnx);
+}
+
 static void
 test_test_models (void)
 {
@@ -1744,6 +1793,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-engine/fixed-batch", test_fixed_batch);
   g_test_add_func ("/gpu/infer-engine/errors", test_errors);
   g_test_add_func ("/gpu/infer-engine/test-models", test_test_models);
+  g_test_add_func ("/gpu/infer-engine/first-run", test_first_run);
   g_test_add_func ("/gpu/infer-yolo/smoke", test_yolo_smoke);
   g_test_add_func ("/gpu/infer-yolo/parity", test_yolo_parity);
   g_test_add_func ("/gpu/infer-yolo/cls-parity", test_yolo_cls_parity);

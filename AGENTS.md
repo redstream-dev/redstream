@@ -160,6 +160,15 @@ Known gotchas:
   stream sync between the copy and the launch it drew correctly; `HIP_LAUNCH_BLOCKING=1` and SDMA copies did not
   help. `rds_osd_gpu_new` loads its kernels up front with `hipFuncGetAttributes`; do the same for a kernel whose first
   launch follows other work on its stream.
+- An engine warm-up on a stream made for it and destroyed after it could, with ROCm 10.1, lose the first work on a
+  stream made before the open: `rdsinfer`'s first chunk on its own stream ran none of its kernels (a device-side
+  counter in the preprocessing kernel stayed put; the network input and outputs kept the previous element's data),
+  while the copies on that stream ran and every HIP call returned success. No `hipStreamSynchronize` or
+  `hipDeviceSynchronize` around the warm-up or the chunk avoided it. Seen only under ASan, in
+  `element_infer_secondary`, and which test failed moved with ASan's `quarantine_size_mb`, so host memory freed and
+  then used inside the HIP runtime is the likely cause. The warm-up now runs on the element's own stream
+  (`RdsInferEngineOptions.warm_up_stream`); with it, the configurations that failed nearly every run (16 and
+  256 MiB) pass.
 - MIOpen (MIGraphX's convolutions) keeps its databases under `$HOME/.config/miopen`. GLib tests with
   `G_TEST_OPTION_ISOLATE_DIRS` set `HOME=/dev/null`, so such tests point `MIOPEN_USER_DB_PATH` and
   `MIOPEN_CUSTOM_CACHE_DIR` somewhere writable, and `AMD_COMGR_CACHE_DIR` too, since the isolated

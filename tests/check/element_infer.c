@@ -3032,6 +3032,40 @@ test_classifier_unknown_symbol (void)
   g_free (extra);
 }
 
+/* The first batch of a fresh element: fresh elements one after the other in this process, each on an object of
+ * another colour than the last one's, each classify their first object right and leave its crop in the network
+ * input (the previous element's input and outputs, freed, are often handed out again at the same addresses). The
+ * engine's warm-up runs on the element's own stream (see warm_up in rds-infer-engine.cpp). */
+static void
+test_classifier_fresh_elements (void)
+{
+  static const WantLabel want[] = {
+    {0, 0, 3, 0.78125f, "red"}, {0, 1, 3, 0.625f, "green"}, {0, 2, 3, 0.99609375f, "blue"},
+  };
+  static const guint8 rgb[][3] = { {200, 0, 0}, {0, 160, 0}, {0, 0, 255} };
+  gchar *cfg = classifier_config ("cls-fresh.txt", "meancls.onnx", 4, RGB_LABELS, NULL);
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  for (guint e = 0; e < 12; e++) {
+    guint c = e % G_N_ELEMENTS (rgb);
+    GstHarness *h = classifier_harness (cfg, NULL);
+    gfloat *input = g_new (gfloat, 3 * 32 * 32);
+    GstBuffer *in = colour_batch (1), *out;
+    RdsObjectMeta *om = add_colour_object (in, 0, 0, 0, rgb[c][0], rgb[c][1], rgb[c][2], "T");
+
+    out = push_pull (h, in);
+    g_assert_true (hook_read_input (h->element, input, 3 * 32 * 32));
+    for (guint ch = 0; ch < 3; ch++)
+      g_assert_cmpfloat (input[ch * 32 * 32], ==, rgb[c][ch] / 256.0f);
+    check_classifier (om, 0, 1, 4, NULL, &want[c], 1);
+    gst_buffer_unref (out);
+    g_free (input);
+    gst_harness_teardown (h);
+  }
+  g_free (cfg);
+}
+
 /* With output-tensor-meta a classified object gets both metas; the tensor holds the raw means. */
 static void
 test_classifier_tensor_meta (void)
@@ -3667,6 +3701,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-secondary/classifier-custom-throw", test_classifier_custom_throw);
   g_test_add_func ("/gpu/infer-secondary/classifier-unknown-symbol", test_classifier_unknown_symbol);
   g_test_add_func ("/gpu/infer-secondary/classifier-tensor-meta", test_classifier_tensor_meta);
+  g_test_add_func ("/gpu/infer-secondary/classifier-fresh-elements", test_classifier_fresh_elements);
   g_test_add_func ("/gpu/infer-secondary/cache-hits", test_cache_hits);
   g_test_add_func ("/gpu/infer-secondary/cache-growth", test_cache_growth);
   g_test_add_func ("/gpu/infer-secondary/cache-interval", test_cache_interval);
