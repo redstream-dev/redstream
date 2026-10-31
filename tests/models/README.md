@@ -104,6 +104,66 @@ hashes in `DERIVED_SHA256` in `export-yolo11n.py` and here.
 The reference has 16 objects: 9 person, 3 car, and one each of truck, motorcycle, handbag and umbrella.
 `pipeline_infer` compares rdsinfer's detections with it per class, for the classes with at least 3 objects.
 
+## Fetched: YOLO11n-cls (`.cache/models/yolo11n-cls.onnx`)
+
+Ultralytics YOLO11n-cls (an ImageNet classifier, 1000 classes) is AGPL-3.0 too, so it is never committed either.
+`fetch-yolo11n-cls.sh` runs `fetch-yolo11n.sh` first (the classifier's reference data uses the street photo and its
+detections), downloads `yolo11n-cls.pt` from the Ultralytics assets release (sha256
+`c62d41bf9625777760018bf914d2e6cd472420ccd01706d97a61cb6c82502bd7`) and exports it in the same container, with the
+same pins and venv:
+
+```bash
+tests/models/fetch-yolo11n-cls.sh    # on the host; needs Docker and network access
+```
+
+- The export: `export(format='onnx', imgsz=224, opset=17, dynamic=True, simplify=True)`, the `date` metadata entry
+  removed. Input `images [batch, 3, height, width]`.
+- Ultralytics' export outputs the logits; its predictor applies the softmax. An nvinfer-style classifier takes the
+  output as probabilities (the built-in parser's argmax and `classifier-threshold`), so the script appends a
+  `Softmax` (axis 1) to the graph: output `output0 [batch, 1000]`, probabilities. Ultralytics' own export is kept in
+  `.cache/yolo-export/yolo11n-cls-logits.onnx` for the reference predictions.
+- The result is checked against a pinned sha256 (`24a6b3b8b4be388e25aabd840d03b4a08b045496530e222cdaac6557a049a33b`,
+  11,343,500 bytes), as for YOLO11n: on a mismatch the script prints both hashes and fails.
+- `imagenet-labels.txt`: the 1000 class names on one line, `;`-separated, in class-index order (a classifier's label
+  file has one line per output layer).
+
+Reference data, in `.cache/models/` (made with YOLO11n-cls, so never committed):
+
+| File | Contents |
+|---|---|
+| `street-cls-ref.json` | the vehicles (car, motorcycle, bus, truck) of `street-ref.json`, each as three boxes (as detected, and grown by 1.15 and 1.3 about its centre, clipped to the image), each box with its crop of `street-1280x720.rgba` aligned as `rdsinfer` crops it in secondary mode (origin floored and rounded up to even, size floored and rounded down to even, clipped to the image) and Ultralytics `predict` on that crop (`imgsz=224`: the shorter side resized to 224, bilinear, then the centre 224×224; RGB scaled to [0, 1]): the top-1 class, label and probability, and the top 5; and `stretch_top1`, the top two of `yolo11n-cls.onnx` in ONNX Runtime (CPU, one thread) on the crop as the rds-test2 classifier config preprocesses it (stretched to 224×224, OpenCV bilinear, RGB scaled to [0, 1]) |
+| `cls-parity-in.f32` | 1×3×224×224 float32 (little-endian): the first vehicle crop through Ultralytics' classify transform |
+| `cls-parity-out.f32` | 1×1000 float32: ONNX Runtime's CPU output (one thread) on that input, with the softmax |
+
+The street photo has 5 vehicles (3 car, a truck and a motorcycle; YOLO11n finds no other above confidence 0.05), so
+the grown boxes make 15 crops. With the pinned environment the files are
+byte-identical from run to run; their sha256 (x86-64; only a warning on a mismatch):
+
+```
+6750e1f95e38ac5e68296941a8d8cef29270a07162a4688e399ee2fef7fbdedf  imagenet-labels.txt
+558d97e42c3f125eb12dc9d15fdb8d5613cddd2e4fd93f95586d761587225bba  street-cls-ref.json
+790903d030e5ed95af6675a9a4df450fde1f712309f89911235eb6bbf0349f92  cls-parity-in.f32
+061022fe280da4d120df48291c1fe077085797b2902766a766b31544fc662499  cls-parity-out.f32
+```
+
+As for YOLO11n, the up-to-date check only looks for the files: after changing the pins, delete them (and
+`yolo11n-cls.onnx`) and record the new hashes in `DERIVED_SHA256` in `export-yolo11n-cls.py` and here.
+`infer_engine_yolo` (`/gpu/infer-yolo/cls-parity`), `pipeline_infer` (`/gpu/infer-yolo/cls-crops`), `rds_test2_yolo`
+and `rds_test2_soak` use them, and skip without them.
+
+What `/gpu/infer-yolo/cls-crops` asserts, and why not Ultralytics' top-1. Ultralytics classifies a crop after resizing
+its shorter side to 224 and taking the centre square. nvinfer-style preprocessing has no centre crop: it stretches
+the whole crop to the network size or letterboxes it (`maintain-aspect-ratio`). YOLO11n-cls is unsure on these small
+street crops (top-1 mostly at 0.2 to 0.5, often among related classes: minivan, beach_wagon, police_van), so the two
+transforms often pick different top-1 classes; on the 5 boxes as detected, rdsinfer agreed with Ultralytics on 3 when
+stretching and on 2 when letterboxing, and the same transforms on the CPU in ONNX Runtime gave the same answers as
+rdsinfer. So the test checks:
+- correctness, against `stretch_top1` (the sample config's transform, reproduced on the CPU): every crop has the same
+  top-1 with a probability within 0.05, except where ONNX Runtime's top two are within 0.05 of each other (a near tie
+  that resampling differences can flip);
+- sanity, against Ultralytics: at least 80 % of our top-1 are in Ultralytics' top 5. The top-1 agreement is only
+  printed.
+
 ## Fetched: the street clip for the tracker tests (`.cache/media/crosswalk-720p.h264`)
 
 **Video:** [Diagonal crosswalk at Yonge & Dundas in

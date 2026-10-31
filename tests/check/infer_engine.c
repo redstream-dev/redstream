@@ -1,7 +1,8 @@
 /* rdsinfer's MIGraphX engine and its program cache, on the committed scale2 test models (output = 2 x input) in a
  * temporary directory; the other committed test models (classifiers and a detector) each on a known input; the ONNX
- * reader on its own (cpu). The YOLO11n cases run only when the model has been fetched
- * (tests/models/fetch-yolo11n.sh); their programs are cached in the build directory, not next to the model.
+ * reader on its own (cpu). The YOLO11n and YOLO11n-cls cases run only when the models have been fetched
+ * (tests/models/fetch-yolo11n.sh, fetch-yolo11n-cls.sh); their programs are cached in the build directory, not next
+ * to the model.
  * Internal: links the plugin's static core library only.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
@@ -23,10 +24,15 @@
 #define YOLO RDS_TEST_CACHE_MODELS "/yolo11n.onnx"
 #define YOLO_REF_IN RDS_TEST_CACHE_MODELS "/yolo-parity-in.f32"
 #define YOLO_REF_OUT RDS_TEST_CACHE_MODELS "/yolo-parity-out.f32"
+#define YOLO_CLS RDS_TEST_CACHE_MODELS "/yolo11n-cls.onnx"
+#define YOLO_CLS_REF_IN RDS_TEST_CACHE_MODELS "/cls-parity-in.f32"
+#define YOLO_CLS_REF_OUT RDS_TEST_CACHE_MODELS "/cls-parity-out.f32"
 
 static const guint dims_64x48[3] = { 3, 64, 48 };
 /* The YOLO11n export has a symbolic height and width, so infer-dims are needed. */
 static const guint dims_640[3] = { 3, 640, 640 };
+/* The YOLO11n-cls export's too (tests/models/fetch-yolo11n-cls.sh). */
+static const guint dims_224[3] = { 3, 224, 224 };
 
 #define HIP_OK(x) g_assert_cmpint ((x), ==, hipSuccess)
 
@@ -1194,16 +1200,18 @@ test_errors (void)
 
 /* ----- YOLO11n (when fetched) ----- */
 
-/* The fetched model behind a symlink in the build directory, so its programs are cached there. */
+/* The fetched model @target behind a symlink in the build directory, so its programs are cached there. */
 static gchar *
-yolo_link (void)
+cache_model_link (const gchar * target)
 {
   gchar *dir = g_build_filename (RDS_TEST_BUILD_DIR, "infer-engine-yolo", NULL);
-  gchar *link = g_build_filename (dir, "yolo11n.onnx", NULL);
+  gchar *base = g_path_get_basename (target);
+  gchar *link = g_build_filename (dir, base, NULL);
 
   g_assert_cmpint (g_mkdir_with_parents (dir, 0755), ==, 0);
   if (!g_file_test (link, G_FILE_TEST_IS_SYMLINK))
-    g_assert_cmpint (symlink (YOLO, link), ==, 0);
+    g_assert_cmpint (symlink (target, link), ==, 0);
+  g_free (base);
   g_free (dir);
   return link;
 }
@@ -1225,7 +1233,7 @@ test_yolo_smoke (void)
     g_test_skip ("no " YOLO " (run tests/models/fetch-yolo11n.sh)");
     return;
   }
-  link = yolo_link ();
+  link = cache_model_link (YOLO);
   t0 = g_get_monotonic_time ();
   e = open_engine (link, NULL, 1, FALSE, dims_640, FALSE);
   g_test_message ("first open (%s): %.1f s", rds_infer_engine_was_built (e) ? "built" : "loaded",
@@ -1370,7 +1378,7 @@ test_yolo_parity (void)
     g_test_skip ("needs " YOLO ", " YOLO_REF_IN " and " YOLO_REF_OUT);
     return;
   }
-  link = yolo_link ();
+  link = cache_model_link (YOLO);
   e = open_engine (link, NULL, 1, FALSE, dims_640, FALSE);
   g_assert_true (g_file_get_contents (YOLO_REF_IN, &in, &in_len, NULL));
   g_assert_true (g_file_get_contents (YOLO_REF_OUT, &ref, &ref_len, NULL));
@@ -1411,6 +1419,77 @@ test_yolo_parity (void)
     g_array_unref (ours);
     g_array_unref (theirs);
   }
+  g_free (out);
+  g_free (ref);
+  g_free (in);
+  rds_infer_engine_free (e);
+  g_free (link);
+}
+
+#define CLS_CLASSES 1000
+/* the engine's probabilities against ONNX Runtime's: measured 2.7e-7 with MIGraphX in redstream:dev; the margin is for
+ * other MIGraphX versions and GPUs (kernels that sum in another order) */
+#define CLS_PARITY_TOL 1e-4f
+
+static guint
+argmax (const gfloat * v, guint n)
+{
+  guint best = 0;
+
+  for (guint i = 1; i < n; i++)
+    if (v[i] > v[best])
+      best = i;
+  return best;
+}
+
+/* YOLO11n-cls (its export with a Softmax appended, so the output is probabilities) against ONNX Runtime's output on
+ * a stored input (raw little-endian float32: a vehicle crop of the street photo through Ultralytics' classify
+ * transform, 1x3x224x224 in, 1x1000 out): every probability within CLS_PARITY_TOL, the same top-1. */
+static void
+test_yolo_cls_parity (void)
+{
+  gchar *link, *in, *ref;
+  gsize in_len, ref_len, n_out;
+  RdsInferEngine *e;
+  guint dims[8], ndims, ours, theirs;
+  const gchar *name;
+  gfloat *out, max_diff = 0.0f;
+  gdouble sum = 0.0;
+
+  RDS_TEST_REQUIRE_GPU ();
+  if (!g_file_test (YOLO_CLS, G_FILE_TEST_IS_REGULAR) || !g_file_test (YOLO_CLS_REF_IN, G_FILE_TEST_IS_REGULAR)
+      || !g_file_test (YOLO_CLS_REF_OUT, G_FILE_TEST_IS_REGULAR)) {
+    g_test_skip ("needs " YOLO_CLS ", " YOLO_CLS_REF_IN " and " YOLO_CLS_REF_OUT
+        " (run tests/models/fetch-yolo11n-cls.sh)");
+    return;
+  }
+  link = cache_model_link (YOLO_CLS);
+  e = open_engine (link, NULL, 1, FALSE, dims_224, FALSE);
+  g_assert_cmpuint (rds_infer_engine_get_n_outputs (e), ==, 1);
+  rds_infer_engine_get_output (e, 0, &name, dims, &ndims);
+  g_assert_cmpstr (name, ==, "output0");
+  g_assert_cmpuint (ndims, ==, 1);
+  g_assert_cmpuint (dims[0], ==, CLS_CLASSES);
+  g_assert_true (g_file_get_contents (YOLO_CLS_REF_IN, &in, &in_len, NULL));
+  g_assert_true (g_file_get_contents (YOLO_CLS_REF_OUT, &ref, &ref_len, NULL));
+  g_assert_cmpuint (in_len, ==, 3 * 224 * 224 * sizeof (gfloat));
+  g_assert_cmpuint (ref_len, ==, CLS_CLASSES * sizeof (gfloat));
+  out = run_engine (e, 1, (const gfloat *) in, &n_out);
+  g_assert_cmpuint (n_out, ==, CLS_CLASSES);
+  for (gsize i = 0; i < n_out; i++) {
+    gfloat d = fabsf (out[i] - ((const gfloat *) ref)[i]);
+
+    if (!(d <= max_diff))
+      max_diff = isnan (d) ? INFINITY : d;
+    sum += out[i];
+  }
+  ours = argmax (out, CLS_CLASSES);
+  theirs = argmax ((const gfloat *) ref, CLS_CLASSES);
+  g_test_message ("max |diff| against ONNX Runtime: %g; top-1 %u (%.4f), ONNX Runtime %u (%.4f); sum %.4f",
+      max_diff, ours, out[ours], theirs, ((const gfloat *) ref)[theirs], sum);
+  g_assert_cmpfloat (max_diff, <=, CLS_PARITY_TOL);
+  g_assert_cmpuint (ours, ==, theirs);
+  g_assert_cmpfloat (fabs (sum - 1.0), <=, 1e-3);
   g_free (out);
   g_free (ref);
   g_free (in);
@@ -1667,5 +1746,6 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-engine/test-models", test_test_models);
   g_test_add_func ("/gpu/infer-yolo/smoke", test_yolo_smoke);
   g_test_add_func ("/gpu/infer-yolo/parity", test_yolo_parity);
+  g_test_add_func ("/gpu/infer-yolo/cls-parity", test_yolo_cls_parity);
   return g_test_run ();
 }
