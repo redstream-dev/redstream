@@ -188,8 +188,8 @@ gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
   rds-event          stream events (pad added/deleted, stream start/EOS/segment/reset)
   rds_compat.h       DeepStream compat header (+ rds-compat-aliases.h, rds-compat-remap.c); rds_compat_infer.h
                      (C++) adds the custom parser ABI names, for parser libraries only
-  rds-infer*.h       rdsinfer types (C), its tensor output meta (rds-infer-meta.h) and the custom bbox parser ABI
-                     (rds-infer-custom-impl.h, C++); headers only
+  rds-infer*.h       rdsinfer types (C), its tensor output meta (rds-infer-meta.h) and the custom bbox and classifier
+                     parser ABI (rds-infer-custom-impl.h, C++); headers only
   rds-transform      rds_buf_surf_transform: batched crop/scale/colour conversion (NvBufSurfTransform-shaped), and
                      rds_buf_surf_transform_composite (many surfaces into one, NvBufSurfTransformComposite-shaped)
   rds-transform-kernels.hip  its HIP kernels (amdclang++, linked in as an object); their device helpers

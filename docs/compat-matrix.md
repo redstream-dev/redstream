@@ -663,9 +663,10 @@ A classifier (`network-type=1`, `process-mode=2`) attaches what it finds to each
 | Label order | ours | in output-layer order (8.0 prepends) |
 | `num_classes` | ours | the layer's class count (8.0 sets 0); 0 for a custom parser's attribute whose `attributeIndex` is not an output layer |
 | Long labels | ours | a label longer than `result_label` (127 bytes) is truncated there and kept whole in `pResult_label`; otherwise `pResult_label` is NULL (8.0 never sets it) |
-| Label file gaps | ours | an argmax past the layer's labels, a layer without a line and no label file all attach the meta with an empty label (8.0 attaches nothing for the first and the last, an empty label for the second); start warns when there is no label file |
+| Label file gaps | ours | an argmax past the layer's labels, a layer without a line and no label file all attach the meta with an empty label (8.0 attaches nothing for the first and the last, an empty label for the second); start warns when there is no label file, or one whose line or label counts don't fit the output layers |
 | Display text | DeepStream 8.0 behaviour | `text_params.display_text` gets `" "` and then `"<label> "` per label attached (`"T"` becomes `"T red "`, NULL becomes `" blue "`, a second classifier makes it `"T red  x "`); with a custom parser `" "` and its description (`"T desc"`); unchanged when nothing is attached. `obj_label` is never changed |
 | Empty description | ours | a custom parser that leaves `descString` empty gets the labels in the display text, as the built-in parser does (8.0 not observed) |
+| Description without attributes | ours | a custom parser that sets `descString` but returns no attributes attaches nothing: no classifier meta, and the display text is unchanged (8.0 not observed) |
 | Custom parser | DeepStream 8.0 behaviour | `parse-classifier-func-name` in `custom-lib-path`, called once per object with that object's output layers (dims without the batch), the network info and `classifier-threshold`; each attribute becomes a label (`attributeLabel` → `result_label`, `attributeValue` → `result_class_id`, `attributeIndex` → `label_id`, `attributeConfidence` → `result_prob`), not thresholded again. rdsinfer frees the `attributeLabel`s |
 | Custom parser label | ours | a NULL `attributeLabel` is an empty label |
 | Unknown parse function | DeepStream 8.0 behaviour, ours | a `parse-classifier-func-name` the library doesn't have fails start (DeepStream 8.0 behaviour); the error names the key (ours) |
@@ -720,7 +721,9 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
   output layer i, `;`-separated and not trimmed; one trailing `;` on a line is ignored (`a;b;` is `a`, `b`), an empty
   label elsewhere is kept (`a;;b`), and an empty line is a layer without labels. Only the CR of a CRLF line end and
   trailing blank lines are left out.
-  Without `labelfile-path`, a warning: the classifier output gets empty labels (ours).
+  Without `labelfile-path`, a warning: the classifier output gets empty labels (ours). A file with a line count other
+  than the network's output layers, or a line whose label count isn't its layer's class count, is one warning at
+  start, and its labels are used as they are (ours).
 - Keys the mode or the network type doesn't use are a warning when set to something other than their default: the
   secondary-mode keys (`operate-on-*`, `input-object-*`, `secondary-reinfer-interval`, `classifier-async-mode`) in
   primary mode, the classifier keys outside classifiers, and `interval` in secondary mode (DeepStream 8.0 behaviour:

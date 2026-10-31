@@ -59,6 +59,8 @@ G_GNUC_INTERNAL void rds_infer_output_pool_get_totals (RdsInferOutputPool * pool
     guint64 * freed);
 
 G_GNUC_INTERNAL RdsInferOutputSet *rds_infer_output_set_ref (RdsInferOutputSet * set);
+/* Any thread. The last unref may trim the pool's free sets, which calls hipFree on the calling thread: a streaming
+ * thread, when a buffer's last tensor meta goes there. */
 G_GNUC_INTERNAL void rds_infer_output_set_unref (RdsInferOutputSet * set);
 
 /* A tensor meta for image @image of @set (it takes a ref on the set, kept in priv_data). One allocation, freed by

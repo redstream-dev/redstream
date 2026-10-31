@@ -508,6 +508,34 @@ open_parser (GstRdsInfer * self, GError ** error)
   return ok;
 }
 
+/* A label file that doesn't fit the network (a line count other than the output layers, or a line whose label count
+ * isn't its layer's element count) is one warning at start (ours): the labels are used as they are. */
+static void
+check_classifier_labels (GstRdsInfer * self)
+{
+  RdsInferConfig *cfg = self->cfg;
+  GString *msg;
+
+  if (!cfg->labelfile_path)
+    return;
+  msg = g_string_new (NULL);
+  /* each mismatch as "; <what>", the first "; " left out */
+  if (cfg->classifier_labels->len != self->n_outputs)
+    g_string_append_printf (msg, "; %u label lines for %u output layers", cfg->classifier_labels->len,
+        self->n_outputs);
+  for (guint i = 0; i < MIN (cfg->classifier_labels->len, self->n_outputs); i++) {
+    guint n = g_strv_length (g_ptr_array_index (cfg->classifier_labels, i));
+
+    if (n != self->out_dims[i].numElements)
+      g_string_append_printf (msg, "; line %u has %u labels for the %u classes of output layer %s", i + 1, n,
+          self->out_dims[i].numElements, self->out_names[i]);
+  }
+  if (msg->len > 0)
+    GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("%s:labelfile-path: %s: %s", cfg->config_path,
+            cfg->labelfile_path, msg->str + 2), (NULL));
+  g_string_free (msg, TRUE);
+}
+
 /* The classifier parser: parse-classifier-func-name in custom-lib-path, else the built-in one; errors name the key. */
 static gboolean
 open_classifier_parser (GstRdsInfer * self, GError ** error)
@@ -537,6 +565,7 @@ open_classifier_parser (GstRdsInfer * self, GError ** error)
     g_error_free (err);
     return FALSE;
   }
+  check_classifier_labels (self);
   return TRUE;
 }
 

@@ -126,10 +126,11 @@ gst_rds_infer_classify_units (GstRdsInfer * self, RdsInferOutputSet * set, guint
 }
 
 /* With a cache: the results of the units @first .. @first + @n - 1 (a chunk, parsed) go to their objects' entries,
- * before they are attached: a classifier's result (an empty one too), or for a detector the inference alone. What
- * is then attached is the value stored in the entry (the entry holds a copy of it). A unit whose parser failed
- * leaves its entry as it was, and a classifier attaches the entry's stored result instead, so the object keeps its
- * classification (ours). A stale request (none in sync mode: flushes and stream events come between batches)
+ * before they are attached: a classifier's result (an empty one too), or for a detector the inference alone. The
+ * entry stores its own copy, and what is then attached is the unit's cls_results slot, the parsed result itself: a
+ * value equal to the stored one, not the stored object. A unit whose parser failed leaves its entry as it was, and
+ * its slot gets a copy of the entry's stored result (if any), which a classifier attaches instead, so the object
+ * keeps its classification (ours). A stale request (none in sync mode: flushes and stream events come between batches)
  * attaches nothing. No batch meta lock needed. */
 void
 gst_rds_infer_complete_requests (GstRdsInfer * self, guint first, guint n)
@@ -176,7 +177,7 @@ gst_rds_infer_cancel_requests (GstRdsInfer * self, guint first)
 
 /* Attaches the classifier @result to @om, with the batch lock held (@bm is @om's batch). @result is only read, so
  * the same result can be attached to other objects or again later. A result without labels attaches nothing and
- * leaves the display text alone; otherwise:
+ * leaves the display text alone, also a custom parser's with a descString but no attributes (ours); otherwise:
  * - one RdsClassifierMeta (DeepStream 8.0 behaviour: num_labels, unique_component_id @unique_id, classifier_type
  *   @classifier_type, stored as is: the metas don't own it, so it must be interned or static; NULL for none),
  *   appended to the object's classifier metas (ours: 8.0 prepends);

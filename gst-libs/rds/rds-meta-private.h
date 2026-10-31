@@ -57,7 +57,8 @@ rds_meta_ref (gpointer meta)
 }
 
 /* The meta that @ref names, if it is still in @list and from the same acquisition; else NULL. With the batch lock
- * held. Only a meta found in @list is dereferenced. */
+ * held. Only a meta found in @list is dereferenced. A linear search: resolving n refs into a list is O(n x
+ * length) (rdsinfer's units x a frame's objects), fine for the object counts a frame has. */
 static inline gpointer
 rds_meta_ref_resolve (GList * list, const RdsMetaRef * ref)
 {

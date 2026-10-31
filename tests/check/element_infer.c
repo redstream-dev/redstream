@@ -2813,6 +2813,50 @@ test_classifier_label_gaps (void)
   g_free (long_label);
 }
 
+/* A label file whose line count isn't the number of output layers, or a line whose label count isn't its layer's
+ * class count, is one warning at start (ours), and the classifier runs all the same; a matching file warns not. */
+static void
+test_classifier_label_count (void)
+{
+  static const WantLabel red = { 0, 0, 3, 0.78125f, "red" };
+  static const struct
+  {
+    const gchar *name, *labels, *want;
+  } cases[] = {
+    {"cls-count-short.txt", "red;green\n", "line 1 has 2 labels for the 3 classes of output layer "},
+    {"cls-count-lines.txt", "red;green;blue\nx;y;z\n", "2 label lines for 1 output layers"},
+    {"cls-count-ok.txt", RGB_LABELS, NULL},
+  };
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  for (guint c = 0; c < G_N_ELEMENTS (cases); c++) {
+    gchar *cfg = classifier_config (cases[c].name, "meancls.onnx", 4, cases[c].labels, NULL), *texts;
+    GstBus *bus = gst_bus_new ();
+    GstHarness *h = classifier_harness (cfg, bus);
+    GstBuffer *in, *out;
+    RdsObjectMeta *om;
+
+    g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, (cases[c].want ? 1 : 0));
+    if (cases[c].want) {
+      g_assert_nonnull (strstr (texts, cases[c].name));
+      g_assert_nonnull (strstr (texts, ":labelfile-path: "));
+      g_assert_nonnull (strstr (texts, cases[c].want));
+    }
+    g_free (texts);
+    in = colour_batch (1);
+    om = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
+    out = push_pull (h, in);
+    check_classifier (om, 0, 1, 4, NULL, &red, 1);
+    check_object_kept (om, "T red ");
+    /* only at start */
+    g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, NULL), ==, 0);
+    gst_buffer_unref (out);
+    harness_teardown_with_bus (h, bus);
+    g_free (cfg);
+  }
+}
+
 /* Two classifiers in a row both attach to the object: the second's meta after the first's (ours: 8.0 prepends), and
  * the display text grows by each one's labels (DeepStream 8.0 behaviour). */
 static void
@@ -3615,6 +3659,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-secondary/classifier-two-layers", test_classifier_two_layers);
   g_test_add_func ("/gpu/infer-secondary/classifier-no-labels", test_classifier_no_labels);
   g_test_add_func ("/gpu/infer-secondary/classifier-label-gaps", test_classifier_label_gaps);
+  g_test_add_func ("/gpu/infer-secondary/classifier-label-count", test_classifier_label_count);
   g_test_add_func ("/gpu/infer-secondary/classifier-chained", test_classifier_chained);
   g_test_add_func ("/gpu/infer-secondary/classifier-custom", test_classifier_custom);
   g_test_add_func ("/gpu/infer-secondary/classifier-custom-false", test_classifier_custom_false);

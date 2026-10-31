@@ -175,7 +175,8 @@ rds_infer_output_set_ref (RdsInferOutputSet * set)
  * pool keeps (the rule above RDS_INFER_OUTPUT_MAX_FREE in rds-infer-output.h) are taken off the free list, least
  * recently used first, and freed outside the lock: set_free switches to the pool's GPU and restores the thread's
  * device, and a free set has no GPU work pending (the element synchronized its stream before attaching the metas).
- * The pool ref this set held keeps the pool alive until then. */
+ * The pool ref this set held keeps the pool alive until then. Trimming calls hipFree on this thread, often a
+ * streaming thread. */
 void
 rds_infer_output_set_unref (RdsInferOutputSet * set)
 {
