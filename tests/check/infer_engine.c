@@ -1,5 +1,6 @@
 /* rdsinfer's MIGraphX engine and its program cache, on the committed scale2 test models (output = 2 x input) in a
- * temporary directory; the ONNX reader on its own (cpu). The YOLO11n cases run only when the model has been fetched
+ * temporary directory; the other committed test models (classifiers and a detector) each on a known input; the ONNX
+ * reader on its own (cpu). The YOLO11n cases run only when the model has been fetched
  * (tests/models/fetch-yolo11n.sh); their programs are cached in the build directory, not next to the model.
  * Internal: links the plugin's static core library only.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
@@ -16,6 +17,9 @@
 
 #define SCALE2 RDS_TEST_MODELS "/scale2.onnx"
 #define SCALE2_B1 RDS_TEST_MODELS "/scale2-b1.onnx"
+#define MEANCLS RDS_TEST_MODELS "/meancls.onnx"
+#define MEANCLS2 RDS_TEST_MODELS "/meancls2.onnx"
+#define FIXEDDET RDS_TEST_MODELS "/fixeddet.onnx"
 #define YOLO RDS_TEST_CACHE_MODELS "/yolo11n.onnx"
 #define YOLO_REF_IN RDS_TEST_CACHE_MODELS "/yolo-parity-in.f32"
 #define YOLO_REF_OUT RDS_TEST_CACHE_MODELS "/yolo-parity-out.f32"
@@ -26,23 +30,28 @@ static const guint dims_640[3] = { 3, 640, 640 };
 
 #define HIP_OK(x) g_assert_cmpint ((x), ==, hipSuccess)
 
-/* A fresh temporary directory holding a copy of @model as scale2.onnx. */
+/* A fresh temporary directory holding a copy of @model as scale2.onnx, or under its own name with @keep_name. The
+ * scale2 tests copy every model as scale2.onnx, scale2-b1 and hand-made ones included, so their program names
+ * (scale2_b<N>_...) are the same whichever model they started from. */
 static gchar *
-make_model_dir (const gchar * model, gchar ** onnx)
+make_model_dir_full (const gchar * model, gboolean keep_name, gchar ** onnx)
 {
   GError *err = NULL;
-  gchar *dir = g_dir_make_tmp ("rds-engine-XXXXXX", &err), *contents;
+  gchar *dir = g_dir_make_tmp ("rds-engine-XXXXXX", &err), *contents, *base = g_path_get_basename (model);
   gsize len;
 
   g_assert_no_error (err);
   g_assert_true (g_file_get_contents (model, &contents, &len, &err));
   g_assert_no_error (err);
-  *onnx = g_build_filename (dir, "scale2.onnx", NULL);
+  *onnx = g_build_filename (dir, keep_name ? base : "scale2.onnx", NULL);
+  g_free (base);
   g_assert_true (g_file_set_contents (*onnx, contents, len, &err));
   g_assert_no_error (err);
   g_free (contents);
   return dir;
 }
+
+#define make_model_dir(model, onnx) make_model_dir_full ((model), FALSE, (onnx))
 
 static void
 remove_dir (const gchar * dir)
@@ -135,14 +144,15 @@ input_pattern (gsize n)
   return v;
 }
 
-/* Runs @e on @input (host, batch * c * h * w floats) and returns output 0 (host). The output buffer is filled with
- * 0xFF bytes (NaN) first, so an output MIGraphX didn't write into our buffer can never compare equal. */
-static gfloat *
-run_engine (RdsInferEngine * e, guint batch, const gfloat * input, gsize * n_out)
+/* Runs @e on @input (host, batch * c * h * w floats) and returns every output (host; free each, then the array), with
+ * their float counts in @n_out. The output buffers are filled with 0xFF bytes (NaN) first, so an output MIGraphX
+ * didn't write into our buffer can never compare equal. */
+static gfloat **
+run_engine_all (RdsInferEngine * e, guint batch, const gfloat * input, gsize n_out[8])
 {
   guint c, h, w, n_outputs = rds_infer_engine_get_n_outputs (e);
   gsize in_n, out_n[8];
-  gfloat *d_in, *d_out[8], *out;
+  gfloat *d_in, *d_out[8], **out;
   hipStream_t stream;
   GError *err = NULL;
 
@@ -160,14 +170,32 @@ run_engine (RdsInferEngine * e, guint batch, const gfloat * input, gsize * n_out
   }
   g_assert_true (rds_infer_engine_run_async (e, d_in, d_out, stream, &err));
   g_assert_no_error (err);
-  out = g_new (gfloat, out_n[0]);
-  HIP_OK (hipMemcpyAsync (out, d_out[0], out_n[0] * sizeof (gfloat), hipMemcpyDeviceToHost, stream));
+  out = g_new (gfloat *, n_outputs);
+  for (guint i = 0; i < n_outputs; i++) {
+    out[i] = g_new (gfloat, out_n[i]);
+    HIP_OK (hipMemcpyAsync (out[i], d_out[i], out_n[i] * sizeof (gfloat), hipMemcpyDeviceToHost, stream));
+  }
   HIP_OK (hipStreamSynchronize (stream));
-  for (guint i = 0; i < n_outputs; i++)
+  for (guint i = 0; i < n_outputs; i++) {
     HIP_OK (hipFree (d_out[i]));
+    n_out[i] = out_n[i];
+  }
   HIP_OK (hipFree (d_in));
   HIP_OK (hipStreamDestroy (stream));
-  *n_out = out_n[0];
+  return out;
+}
+
+/* run_engine_all's output 0 only. */
+static gfloat *
+run_engine (RdsInferEngine * e, guint batch, const gfloat * input, gsize * n_out)
+{
+  gsize n[8];
+  gfloat **all = run_engine_all (e, batch, input, n), *out = all[0];
+
+  for (guint i = 1; i < rds_infer_engine_get_n_outputs (e); i++)
+    g_free (all[i]);
+  g_free (all);
+  *n_out = n[0];
   return out;
 }
 
@@ -1236,7 +1264,7 @@ test_yolo_smoke (void)
   g_free (link);
 }
 
-/* ---- YOLO11n detections from a raw output, for the parity check ---- */
+/* ---- detections from a raw YOLO-layout output: the parity check, the test detector ---- */
 
 #define YOLO_CLASSES 80
 #define YOLO_ANCHORS 8400
@@ -1249,53 +1277,58 @@ detection_by_confidence (gconstpointer a, gconstpointer b)
   return ca < cb ? 1 : ca > cb ? -1 : 0;
 }
 
-/* @out (84 x 8400, one image) through the built-in YOLO parser and the post-processing at confidence >= @threshold
- * with per-class NMS at IoU 0.45, in network pixels (640x640 frame, no letterbox). Returns RdsInferDetection sorted
- * by confidence, highest first. */
+/* @out ((4 + @n_classes) x @n_anchors, one image) through the built-in YOLO parser and the post-processing at
+ * confidence >= @threshold with per-class NMS at IoU 0.45, in network pixels (an @net_size square frame, no
+ * letterbox). Returns RdsInferDetection sorted by confidence, highest first. */
 static GArray *
-yolo_detections (const gfloat * out, gfloat threshold)
+parse_detections (const gfloat * out, guint n_classes, guint n_anchors, guint net_size, gfloat threshold)
 {
   RdsInferConfig cfg = { 0 };
-  RdsInferClassAttrs attrs[YOLO_CLASSES];
-  gfloat pre[YOLO_CLASSES], post[YOLO_CLASSES] = { 0 };
+  RdsInferClassAttrs *attrs = g_new (RdsInferClassAttrs, n_classes);
+  gfloat *pre = g_new (gfloat, n_classes), *post = g_new0 (gfloat, n_classes);
   RdsInferLayerInfo layer = { 0 };
-  RdsInferNetworkInfo net = { 640, 640, 3 };
+  RdsInferNetworkInfo net = { net_size, net_size, 3 };
   RdsInferLetterbox lb;
   RdsInferParser *parser;
   GArray *objects = g_array_new (FALSE, FALSE, sizeof (RdsInferObjectDetectionInfo));
   GArray *dets = g_array_new (FALSE, FALSE, sizeof (RdsInferDetection));
   GError *err = NULL;
 
-  for (guint c = 0; c < YOLO_CLASSES; c++) {
+  for (guint c = 0; c < n_classes; c++) {
     attrs[c] = (RdsInferClassAttrs) {.pre_cluster_threshold = threshold,.nms_iou_threshold = 0.45f,.topk = -1 };
     pre[c] = threshold;
   }
-  cfg.num_detected_classes = YOLO_CLASSES;
+  cfg.num_detected_classes = n_classes;
   cfg.cluster_mode = 2;
   cfg.class_attrs = attrs;
   cfg.filter_out_class_ids = g_array_new (FALSE, FALSE, sizeof (guint));
   layer.dataType = RDS_INFER_DATA_FLOAT;
   layer.inferDims.numDims = 2;
-  layer.inferDims.d[0] = 4 + YOLO_CLASSES;
-  layer.inferDims.d[1] = YOLO_ANCHORS;
-  layer.inferDims.numElements = (4 + YOLO_CLASSES) * YOLO_ANCHORS;
+  layer.inferDims.d[0] = 4 + n_classes;
+  layer.inferDims.d[1] = n_anchors;
+  layer.inferDims.numElements = (4 + n_classes) * n_anchors;
   layer.layerName = "output0";
   layer.buffer = (gpointer) out;
 
   parser = rds_infer_parser_open_builtin (RDS_INFER_PARSER_YOLO, &err);
   g_assert_no_error (err);
-  rds_infer_parser_set_detection_params (parser, YOLO_CLASSES, pre, post);
+  rds_infer_parser_set_detection_params (parser, n_classes, pre, post);
   g_assert_true (rds_infer_parser_parse (parser, &layer, 1, &net, objects, &err));
   g_assert_no_error (err);
-  rds_infer_letterbox (640, 640, 640, 640, TRUE, TRUE, &lb);
+  rds_infer_letterbox (net_size, net_size, net_size, net_size, TRUE, TRUE, &lb);
   g_assert_cmpint (rds_infer_postprocess (&cfg, &lb, (const RdsInferObjectDetectionInfo *) objects->data,
           objects->len, NULL, dets), ==, 0);
   g_array_sort (dets, detection_by_confidence);
   rds_infer_parser_free (parser);
   g_array_unref (cfg.filter_out_class_ids);
   g_array_unref (objects);
+  g_free (post);
+  g_free (pre);
+  g_free (attrs);
   return dets;
 }
+
+#define yolo_detections(out, threshold) parse_detections ((out), YOLO_CLASSES, YOLO_ANCHORS, 640, (threshold))
 
 /* Every one of the first @n of @top (or all, if fewer) has a detection in @pool with the same class, confidence
  * within 0.02 and each box edge within 1 px; returns how many of them were checked. */
@@ -1385,6 +1418,219 @@ test_yolo_parity (void)
   g_free (link);
 }
 
+/* ----- the classifier and detector test models ----- */
+
+#define CLS_SIZE 32             /* meancls's and meancls2's fixed height and width */
+#define DET_SIZE 64             /* fixeddet's */
+#define DET_CLASSES 2
+#define DET_ANCHORS 8
+
+/* @batch images of 3 x CLS_SIZE x CLS_SIZE: image 0 pure red (1, 0, 0), the others a pattern different in each
+ * channel and image. Their per-channel means (computed in double) go to @means (batch x 3). */
+static gfloat *
+classifier_input (guint batch, gdouble * means)
+{
+  const gsize plane = CLS_SIZE * CLS_SIZE;
+  gfloat *in = g_new (gfloat, batch * 3 * plane);
+
+  for (guint b = 0; b < batch; b++)
+    for (guint c = 0; c < 3; c++) {
+      gfloat *p = in + (b * 3 + c) * plane;
+      gdouble sum = 0.0;
+
+      for (gsize i = 0; i < plane; i++) {
+        p[i] = b == 0 ? (c == 0 ? 1.0f : 0.0f) : (gfloat) ((i * (c + 2) + b * 5) % 17) / 16.0f;
+        sum += p[i];
+      }
+      means[b * 3 + c] = sum / plane;
+    }
+  return in;
+}
+
+/* @model (meancls or meancls2, with @n_outputs outputs) at @batch: the input and output shapes, then each output on
+ * classifier_input: output0 the per-channel means, output1 (if any) 1 - the means. */
+static void
+check_classifier (const gchar * model, guint batch, guint n_outputs)
+{
+  gchar *onnx, *dir, *base, *prefix;
+  RdsInferEngine *e;
+  guint c, h, w, dims[8], ndims;
+  const gchar *name;
+  gsize n_out[8];
+  gdouble *means = g_new (gdouble, batch * 3);
+  gfloat *in, **out;
+
+  dir = make_model_dir_full (model, TRUE, &onnx);
+  /* no infer-dims: the model's height and width are fixed */
+  e = open_engine (onnx, NULL, batch, FALSE, NULL, FALSE);
+  base = g_path_get_basename (model);
+  *strrchr (base, '.') = '\0';
+  prefix = g_strdup_printf ("%s_b%u_3x%ux%u_", base, batch, CLS_SIZE, CLS_SIZE);
+  g_assert_nonnull (strstr (rds_infer_engine_get_program_path (e), prefix));
+  rds_infer_engine_get_input (e, &c, &h, &w);
+  g_assert_cmpuint (c, ==, 3);
+  g_assert_cmpuint (h, ==, CLS_SIZE);
+  g_assert_cmpuint (w, ==, CLS_SIZE);
+  g_assert_cmpstr (rds_infer_engine_get_input_name (e), ==, "images");
+  g_assert_cmpuint (rds_infer_engine_get_n_outputs (e), ==, n_outputs);
+  for (guint i = 0; i < n_outputs; i++) {
+    gchar *expected = g_strdup_printf ("output%u", i);
+
+    rds_infer_engine_get_output (e, i, &name, dims, &ndims);
+    g_assert_cmpstr (name, ==, expected);
+    g_assert_cmpuint (ndims, ==, 1);
+    g_assert_cmpuint (dims[0], ==, 3);
+    g_assert_cmpuint (rds_infer_engine_get_output_elements (e, i), ==, 3);
+    g_free (expected);
+  }
+
+  in = classifier_input (batch, means);
+  out = run_engine_all (e, batch, in, n_out);
+  for (guint i = 0; i < n_outputs; i++) {
+    g_assert_cmpuint (n_out[i], ==, batch * 3);
+    for (guint k = 0; k < batch * 3; k++) {
+      gdouble expected = i == 0 ? means[k] : 1.0 - means[k];
+
+      if (!(fabs (out[i][k] - expected) <= 1e-5))
+        g_error ("%s output%u[%u] = %g, expected %g", base, i, k, out[i][k], expected);
+    }
+  }
+  /* the red image: class 0 at 1.0, the others at 0 */
+  g_assert_cmpfloat_with_epsilon (out[0][0], 1.0f, 1e-5);
+  g_assert_cmpfloat_with_epsilon (out[0][1], 0.0f, 1e-5);
+  g_assert_cmpfloat_with_epsilon (out[0][2], 0.0f, 1e-5);
+  for (guint i = 0; i < n_outputs; i++)
+    g_free (out[i]);
+  g_free (out);
+  g_free (in);
+  g_free (means);
+  g_free (prefix);
+  g_free (base);
+  rds_infer_engine_free (e);
+  remove_dir (dir);
+  g_free (dir);
+  g_free (onnx);
+}
+
+/* fixeddet's constant output (see make-test-models.py): per box its anchor, then cx, cy, w, h (network pixels) and
+ * the two class scores; the other anchors are all zero. */
+static const struct
+{
+  guint anchor;
+  gfloat v[4 + DET_CLASSES];
+} fixeddet_boxes[] = {
+  {0, {16.0f, 16.0f, 16.0f, 16.0f, 0.9f, 0.05f}},
+  {2, {48.0f, 16.0f, 20.0f, 12.0f, 0.05f, 0.8f}},
+  {3, {60.0f, 60.0f, 16.0f, 16.0f, 0.85f, 0.05f}},
+  {5, {4.0f, 48.0f, 16.0f, 20.0f, 0.75f, 0.0f}},
+  {6, {58.0f, 30.0f, 12.0f, 8.0f, 0.0f, 0.7f}},
+  {7, {44.0f, 44.0f, 24.0f, 16.0f, 0.05f, 0.6f}},
+};
+
+/* What the built-in YOLO parser and the post-processing make of it (64x64 frame, no letterbox), by confidence:
+ * class, confidence, box (left, top, width, height) and the box clipped to the frame: past the right and bottom
+ * edges, exactly at the right edge (not clipped), past the left edge. */
+static const struct
+{
+  guint class_id;
+  gfloat confidence;
+  RdsInferBox box, rect;
+} fixeddet_expected[] = {
+  {0, 0.9f, {8.0f, 8.0f, 16.0f, 16.0f}, {8.0f, 8.0f, 16.0f, 16.0f}},
+  {0, 0.85f, {52.0f, 52.0f, 16.0f, 16.0f}, {52.0f, 52.0f, 12.0f, 12.0f}},
+  {1, 0.8f, {38.0f, 10.0f, 20.0f, 12.0f}, {38.0f, 10.0f, 20.0f, 12.0f}},
+  {0, 0.75f, {-4.0f, 38.0f, 16.0f, 20.0f}, {0.0f, 38.0f, 12.0f, 20.0f}},
+  {1, 0.7f, {52.0f, 26.0f, 12.0f, 8.0f}, {52.0f, 26.0f, 12.0f, 8.0f}},
+  {1, 0.6f, {32.0f, 36.0f, 24.0f, 16.0f}, {32.0f, 36.0f, 24.0f, 16.0f}},
+};
+
+static void
+check_fixeddet (guint batch)
+{
+  const gsize per_image = (4 + DET_CLASSES) * DET_ANCHORS;
+  gchar *onnx, *dir, *prefix;
+  RdsInferEngine *e;
+  guint c, h, w, dims[8], ndims;
+  const gchar *name;
+  gfloat expected[(4 + DET_CLASSES) * DET_ANCHORS] = { 0 }, *in, *out;
+  gsize n_out;
+  GRand *rand;
+
+  dir = make_model_dir_full (FIXEDDET, TRUE, &onnx);
+  e = open_engine (onnx, NULL, batch, FALSE, NULL, FALSE);
+  prefix = g_strdup_printf ("fixeddet_b%u_3x%ux%u_", batch, DET_SIZE, DET_SIZE);
+  g_assert_nonnull (strstr (rds_infer_engine_get_program_path (e), prefix));
+  rds_infer_engine_get_input (e, &c, &h, &w);
+  g_assert_cmpuint (c, ==, 3);
+  g_assert_cmpuint (h, ==, DET_SIZE);
+  g_assert_cmpuint (w, ==, DET_SIZE);
+  g_assert_cmpuint (rds_infer_engine_get_n_outputs (e), ==, 1);
+  rds_infer_engine_get_output (e, 0, &name, dims, &ndims);
+  g_assert_cmpstr (name, ==, "output0");
+  g_assert_cmpuint (ndims, ==, 2);
+  g_assert_cmpuint (dims[0], ==, 4 + DET_CLASSES);
+  g_assert_cmpuint (dims[1], ==, DET_ANCHORS);
+
+  /* the output doesn't depend on the input's values: random ones in [0, 1) */
+  rand = g_rand_new_with_seed (7);
+  in = g_new (gfloat, (gsize) batch * 3 * DET_SIZE * DET_SIZE);
+  for (gsize i = 0; i < (gsize) batch * 3 * DET_SIZE * DET_SIZE; i++)
+    in[i] = (gfloat) g_rand_double (rand);
+  out = run_engine (e, batch, in, &n_out);
+  g_assert_cmpuint (n_out, ==, batch * per_image);
+  for (guint i = 0; i < G_N_ELEMENTS (fixeddet_boxes); i++)
+    for (guint r = 0; r < 4 + DET_CLASSES; r++)
+      expected[r * DET_ANCHORS + fixeddet_boxes[i].anchor] = fixeddet_boxes[i].v[r];
+  for (guint b = 0; b < batch; b++) {
+    GArray *dets;
+
+    for (gsize i = 0; i < per_image; i++)
+      if (!(fabsf (out[b * per_image + i] - expected[i]) <= 1e-6f))
+        g_error ("image %u output0[%" G_GSIZE_FORMAT "] = %g, expected %g", b, i, out[b * per_image + i],
+            expected[i]);
+    /* at the default pre-cluster-threshold */
+    dets = parse_detections (out + b * per_image, DET_CLASSES, DET_ANCHORS, DET_SIZE, 0.25f);
+    g_assert_cmpuint (dets->len, ==, G_N_ELEMENTS (fixeddet_expected));
+    for (guint i = 0; i < dets->len; i++) {
+      const RdsInferDetection *d = &g_array_index (dets, RdsInferDetection, i);
+      const RdsInferBox *eb = &fixeddet_expected[i].box, *er = &fixeddet_expected[i].rect;
+
+      g_assert_cmpuint (d->class_id, ==, fixeddet_expected[i].class_id);
+      g_assert_cmpfloat_with_epsilon (d->confidence, fixeddet_expected[i].confidence, 1e-6);
+      g_assert_cmpfloat_with_epsilon (d->box.left, eb->left, 1e-4);
+      g_assert_cmpfloat_with_epsilon (d->box.top, eb->top, 1e-4);
+      g_assert_cmpfloat_with_epsilon (d->box.width, eb->width, 1e-4);
+      g_assert_cmpfloat_with_epsilon (d->box.height, eb->height, 1e-4);
+      g_assert_cmpfloat_with_epsilon (d->rect.left, er->left, 1e-4);
+      g_assert_cmpfloat_with_epsilon (d->rect.top, er->top, 1e-4);
+      g_assert_cmpfloat_with_epsilon (d->rect.width, er->width, 1e-4);
+      g_assert_cmpfloat_with_epsilon (d->rect.height, er->height, 1e-4);
+    }
+    g_array_unref (dets);
+  }
+  g_rand_free (rand);
+  g_free (out);
+  g_free (in);
+  g_free (prefix);
+  rds_infer_engine_free (e);
+  remove_dir (dir);
+  g_free (dir);
+  g_free (onnx);
+}
+
+/* Each committed classifier and detector test model compiles and gives the expected output, at batch 1 and 2 (their
+ * batch is symbolic, the engine compiles it static). */
+static void
+test_test_models (void)
+{
+  RDS_TEST_REQUIRE_GPU ();
+  check_classifier (MEANCLS, 1, 1);
+  check_classifier (MEANCLS, 2, 1);
+  check_classifier (MEANCLS2, 2, 2);
+  check_fixeddet (1);
+  check_fixeddet (2);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1418,6 +1664,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-engine/fp16", test_fp16);
   g_test_add_func ("/gpu/infer-engine/fixed-batch", test_fixed_batch);
   g_test_add_func ("/gpu/infer-engine/errors", test_errors);
+  g_test_add_func ("/gpu/infer-engine/test-models", test_test_models);
   g_test_add_func ("/gpu/infer-yolo/smoke", test_yolo_smoke);
   g_test_add_func ("/gpu/infer-yolo/parity", test_yolo_parity);
   return g_test_run ();

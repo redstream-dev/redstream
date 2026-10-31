@@ -351,11 +351,12 @@ meson test -C build-rel --print-errorlogs
   the same layout as the C code. No exception crosses into C: every C-callable function catches at its boundary and
   turns the exception into a `GError` (or a failed parse), and calls into user parser libraries are wrapped in
   try/catch. Executables that link `rdsinfer-core` need `link_language : 'cpp'`.
-- **Test models.** The committed `tests/models/scale2*.onnx` are our own tiny models (`make-test-models.py`), so the
-  element tests run offline and compile in seconds. YOLO11n is AGPL-3.0: `tests/models/fetch-yolo11n.sh` exports it
-  (pinned versions and hashes, `PYTHONHASHSEED=0` for a reproducible export) into the git-ignored `.cache/models`,
-  with its test reference data. Never commit it or anything derived from it; tests that need it `g_test_skip` with
-  a message naming the script.
+- **Test models.** The committed `tests/models/*.onnx` are our own tiny models (`make-test-models.py`), so the
+  element tests run offline and compile in seconds: `scale2` (output = 2 x input), the classifiers `meancls` and
+  `meancls2` (channel means; two outputs) and the detector `fixeddet` (constant YOLO-layout boxes). YOLO11n is
+  AGPL-3.0: `tests/models/fetch-yolo11n.sh` exports it (pinned versions and hashes, `PYTHONHASHSEED=0` for a
+  reproducible export) into the git-ignored `.cache/models`, with its test reference data. Never commit it or
+  anything derived from it; tests that need it `g_test_skip` with a message naming the script.
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
 - The compat-matrix lints (`/cpu/infer-config/compat-matrix`, `/cpu/tracker-config/compat-matrix`) run only in
   builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
