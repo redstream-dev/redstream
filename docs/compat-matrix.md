@@ -551,7 +551,7 @@ is set.
 | `unique-id` | uint | `1` (ours) | supported | overrides `gie-unique-id`; range 0..`G_MAXUINT` as documented (the config key starts at 1) |
 | `process-mode` | uint | `1` | supported | overrides `process-mode`; `2`: secondary mode, see "Secondary mode" (classifiers run only there) |
 | `infer-on-gie-id` | int | `-1` | supported | -1..`G_MAXINT` (DeepStream 8.0's type and default: -1 is every GIE); overrides `operate-on-gie-id`; a warning when set in primary mode |
-| `infer-on-class-ids` | string | none | supported | colon-separated class ids (`1:2:4`; `-1` in it: every class, ours); overrides `operate-on-class-ids`; a warning when set in primary mode |
+| `infer-on-class-ids` | string | none | supported | colon-separated class ids (`1:2:4`; `-1` in it: every class, DeepStream 8.0 behaviour); overrides `operate-on-class-ids`; a warning when set in primary mode |
 | `filter-out-class-ids` | string | none | supported | semicolon-separated class ids (`1;2`); replaces the file's list (an empty string clears it) |
 | `model-engine-file` | string | none | supported | a compiled MIGraphX program (`.mxr`), loaded when its manifest matches the model and the device, else rebuilt into the cache name; used as given (a config-file value is relative to the config file). A TensorRT `.engine` is ignored with a warning. Changing it while PLAYING (on-the-fly model update) is not supported |
 | `batch-size` | uint | `1` (ours) | supported | 1..1024. Primary mode: frames of a batch go to the network image of their slot (`batch_id`); a frame in a slot at or above `batch-size` is an error. Secondary mode: objects inferred together, see "Secondary mode" |
@@ -621,22 +621,32 @@ gave its address to a new one.
 **DeepStream 8.0 behaviour** (observed where the docs are silent) or **ours** (where 8.0 settles nothing, crashes or
 is inconsistent).
 
+Keys and properties: `process-mode` is a property and a config key; `infer-on-gie-id` and `infer-on-class-ids` are
+properties that override the config keys `operate-on-gie-id` and `operate-on-class-ids`;
+`input-object-min/max-width/height`, `secondary-reinfer-interval` and the classifier keys (`classifier-threshold`,
+`classifier-type`, `parse-classifier-func-name`, `classifier-async-mode`) are config keys only, as in DeepStream 8.0,
+which has no properties for them. Their rows are in "Config keys: `[property]`".
+
 | Topic | Source | Behaviour |
 |---|---|---|
 | Which frames | DeepStream 8.0 behaviour | every frame of every batch, with `bInferDone` TRUE or FALSE; `interval` is ignored (a warning when set). `bInferDone` is never set or cleared |
-| Which objects | DeepStream 8.0 behaviour | `operate-on-gie-id` (-1: every GIE; 0 is a real id), `operate-on-class-ids` (empty: every class) and `input-object-min/max-width/height` (inclusive, 0: no limit) on `rect_params`; see the config keys |
-| Crop | DeepStream 8.0 behaviour | the object's `rect_params`, origin rounded up to even, size down to even (at least 2); overflow past the right or bottom edge is clipped |
-| Crop outside the frame | ours | a negative origin or a box wholly outside is clipped too (8.0 fails); a crop with less than 2 pixels left, or a side under 1 pixel, is skipped (logged at debug level) |
-| Crop in the network input | DeepStream 8.0 behaviour | stretched to the network, or with `maintain-aspect-ratio` scaled by min(W/w, H/h) to even sizes, at the top-left or centred with `symmetric-padding` |
-| Batching | DeepStream 8.0 behaviour | objects in frame list order, then object list order, in chunks of `batch-size` that continue across the frames of a batch but never across batches: 10 objects at `batch-size` 4 run as 4, 4, 2. The network always runs `batch-size` images; unused ones are zeroed |
-| Tensor meta | DeepStream 8.0 behaviour | one per inferred object (a detector's parents included), on the object's `obj_user_meta_list`; none on the frame or the batch |
-| Detector objects (children) | DeepStream 8.0 behaviour | per crop, with the crop's own thresholds and NMS (never across crops); `parent` is the cropped object, `unique_component_id` this element's `gie-unique-id`, `class_id`, `confidence`, `obj_label` and the text from the parser and label file, `object_id` untracked |
-| Child geometry | ours | network → crop → frame pixels with one consistent mapping; `rect_params` clipped to the frame, `detector_bbox_info` the unclipped box (8.0 can be a pixel off and doesn't clip). A child wholly outside its crop is dropped; one partly outside keeps its part inside the frame |
+| Which objects | DeepStream 8.0 behaviour | `operate-on-gie-id` (-1: every GIE, this element's own id included; 0 is a real id), `operate-on-class-ids` (empty: every class) and `input-object-min/max-width/height` (inclusive, on the float `rect_params` size, 0: no limit); objects added by this element in the same buffer are not inferred on |
+| Class id -1, negative class ids | ours, DeepStream 8.0 behaviour | `-1` in `operate-on-class-ids` in the config file is every class, as the property's `-1` is in 8.0 (8.0 aborts on the config value); with a class list set, an object with a negative `class_id` is not selected (8.0 aborts); with no list it is (DeepStream 8.0 behaviour) |
+| Crop | DeepStream 8.0 behaviour | the object's `rect_params` (`detector_bbox_info` and `tracker_bbox_info` are not used): origin floored, then rounded up to even (11 → 12, 43.7 → 44), size floored, then down to even, at least 2 (15.6 → 14, 1 → 2); a side under 1 pixel is skipped; overflow past the right or bottom edge is clipped and the rest stretched to the network |
+| Crop outside the frame | ours | a negative origin, a box larger than the frame or wholly outside it is clipped too (8.0 fails the pipeline); a crop with less than 2 pixels left is skipped (logged at debug level). The origin is aligned before the clip |
+| Crop in the network input | DeepStream 8.0 behaviour | stretched to the network, or with `maintain-aspect-ratio` scaled by min(W/w, H/h) with the scaled size floored to even (24×16 into 16×16 is 16×10), at the top-left, or with `symmetric-padding` at floor((net − exact scaled size) / 2); padding is pixel value 0 before normalisation. The crop is resampled to 8 bits, then normalised as in primary mode |
+| Scaling filter | ours | `scaling-filter` defaults to 1 (bilinear) in both modes (8.0's default is nearest). Nearest samples at pixel centres, as `rds_buf_surf_transform` does: a 32-pixel crop into 16 reads columns 1, 3, 5, … (8.0 reads 0, 2, 4, …), so nearest-filter inputs can differ from 8.0's by one source pixel. `scaling-filter=3` works (bilinear; 8.0 fails the pipeline) |
+| Batching | DeepStream 8.0 behaviour | objects in frame list order, then object list order, in chunks of `batch-size` that continue across the frames of a batch but never across batches: 10 objects at `batch-size` 4 run as 4, 4, 2; two batches of 5 as 4, 1 and 4, 1 |
+| Chunk size | ours | the compiled program has a fixed batch of `batch-size` images: a chunk with fewer objects runs them all the same, its unused images zeroed, so a chunk costs nearly as much with few objects as when full: no per-object saving (8.0 rebuilds the model for 1 to `batch-size` images and runs the actual count). The results per object are the same |
+| Tensor meta | DeepStream 8.0 behaviour | one per inferred object (a detector's parents and classified objects included), on the object's `obj_user_meta_list`; none on the frame or the batch (see "Per-object cache"). `unique_id` is the `gie-unique-id`, the layer dims are those of one object (no batch), the host and device pointers point at the object's slice, `network_info` is the network's size and `maintain_aspect_ratio` / `symmetric_padding` the config's values |
+| Detector objects (children) | DeepStream 8.0 behaviour | per crop, with the class attributes' thresholds, NMS per class (never across crops), `detected-min/max-*` in frame pixels and `filter-out-class-ids`; `parent` is the cropped object, `unique_component_id` this element's `gie-unique-id`, `class_id`, `confidence`, `obj_label` and the text from the parser and label file, `object_id` untracked |
+| Detector thresholds | ours | the class attributes' defaults are those of the key table in both modes: `pre-cluster-threshold` 0.25 (8.0's is 0.2) |
+| Child geometry | ours | network → crop → frame pixels with one consistent mapping; `rect_params` clipped to the frame, `detector_bbox_info` the unclipped box (8.0 maps with the unaligned parent origin, so it can be a pixel off, doesn't clip, and moves negative coordinates to the parent's origin without shrinking the box). A child wholly outside its crop is dropped; one partly outside keeps its part inside the frame |
 | Child order | ours | appended to the frame's object list after the existing objects, crop by crop (8.0 prepends) |
 | Detector chains | DeepStream 8.0 behaviour | a second `rdsinfer` with `infer-on-gie-id` = the detector's `gie-unique-id` infers on its children |
 | `roi-top-offset`, `roi-bottom-offset` | ours | not applied (measured from a crop's edges they would be surprising), with a warning; 8.0 not observed |
 | Parser returns false | ours | one warning per element, that object gets no children but its tensor meta is still attached (as in primary mode), the other objects are unaffected (8.0 crashes) |
-| Classifiers (`network-type=1`) | DeepStream 8.0 behaviour | secondary mode only (primary mode fails at start); see "Classifier output (classifier meta)" and "Per-object cache" |
+| Classifiers (`network-type=1`) | ours | secondary mode only for now: a classifier in primary mode fails at start; see "Classifier output (classifier meta)" and "Per-object cache" |
 
 #### Classifier output (classifier meta)
 
@@ -738,9 +748,9 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `offsets` | float list | none | >= 0 | supported | one per input channel (a count that doesn't match is an error); unset: 0 |
 | `model-color-format` | int | `0` (ours) | 0..2 | supported | 0 RGB, 1 BGR, 2 GRAY (ours: the Y plane of NV12 frames, BT.601 luma of RGB frames) |
 | `network-input-order` | int | `0` (ours) | 0..1 | supported | 0 NCHW, 1 NHWC |
-| `maintain-aspect-ratio` | bool | `0` (ours) |  | supported | scale = min(W/w, H/h), the scaled size rounded to nearest; padding is pixel value 0 before normalisation (ours) |
+| `maintain-aspect-ratio` | bool | `0` (ours) |  | supported | scale = min(W/w, H/h), the scaled size rounded to nearest (on crops in secondary mode: floored to even, see "Secondary mode"); padding is pixel value 0 before normalisation (ours) |
 | `symmetric-padding` | bool | `0` (ours) |  | supported | with `maintain-aspect-ratio`: the scaled frame is centred (offset rounded down); without it, at the top-left |
-| `scaling-filter` | int | `1` (ours) | 0..6 | supported | the `RdsBufSurfTransform_Inter` values: 1 (bilinear) and 2-4 sample bilinearly, the others nearest, as in `rds_buf_surf_transform` |
+| `scaling-filter` | int | `1` (ours) | 0..6 | supported | the `RdsBufSurfTransform_Inter` values: 1 (bilinear) and 2-4 sample bilinearly, the others nearest, as in `rds_buf_surf_transform` (nearest at pixel centres, see "Secondary mode") |
 | `num-detected-classes` | uint | none | 1..65536 | supported | required for detectors |
 | `cluster-mode` | int | `2` (ours) | 0..4 | supported | accepted values: 2, 4 (NMS, none). GroupRectangles (0), DBSCAN (1) and hybrid (3) fail at start |
 | `parse-bbox-func-name` | string | none |  | supported | required for detectors: `RdsInferParseYolo` (built in) or a function in `custom-lib-path` |

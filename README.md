@@ -160,6 +160,24 @@ Four copies of the clip through the whole `rds-test3` chain run at about 44–46
 the detector sets the pace, and the tiler and OSD add about 2.5 ms per batch (2.1 ms tiling, 0.4 ms drawing; release
 build).
 
+The `rds-test2` sample adds a secondary classifier, shaped like DeepStream's `deepstream-test2`: after the tracker,
+YOLO11n-cls (ImageNet classes) runs in `rdsinfer`'s secondary mode on the cars, motorcycles, buses and trucks of at
+least 64×64 pixels, and its label is appended to each vehicle's text (ImageNet has no plain "car" class: expect
+labels such as `minivan` or `sports_car`). Each tracked vehicle is classified once and keeps its label while it is
+tracked (inferred again only when its box grows by more than 1.2 times), as DeepStream does. It prints each source's
+object, vehicle and labelled counts per frame, then the most frequent labels. It needs YOLO11n-cls as well (see
+"Getting started"):
+
+```bash
+GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test2/rds-test2 \
+  file://$PWD/.cache/media/crosswalk-720p.h264 file://$PWD/.cache/media/crosswalk-720p.h264
+```
+
+With four copies of the clip (four URIs) it runs at about 39 fps (`--no-display`, release build). The classifier runs
+on about one batch in ten: of the 9576 times a vehicle was selected (once per vehicle and frame), 608 were inferred
+and the rest, 93.7 %, were served from the cache. Classifying every vehicle on every frame
+(`secondary-reinfer-interval: 0`) slows the sample to about 32 fps.
+
 ## How it maps to DeepStream
 
 | DeepStream | Redstream | Status |
@@ -168,7 +186,7 @@ build).
 | `nvurisrcbin` | `rdsurisrcbin` | works (file and RTSP URIs, RTSP reconnection) |
 | `nvvideoconvert` | `rdsvideoconvert` | works |
 | `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` | works (video; the default, scaling mux. DeepStream's zero-copy "new mux" mode is planned) |
-| `nvinfer` | `rdsinfer` (MIGraphX) | works (primary detector) |
+| `nvinfer` | `rdsinfer` (MIGraphX) | works (primary and secondary detectors, secondary classifiers, tensor output; primary classifiers and segmentation planned) |
 | `nvtracker` | `rdstracker` | works (IOU, NvSORT) |
 | `nvdsosd` | `rdsosd` | works |
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | works |
@@ -191,10 +209,12 @@ build).
 - Acceptance test: NVIDIA's `deepstream-test3` sample, ported with `#ifdef`s only, produces equivalent detections.
 
 **M2: production-style multi-model pipeline**
+- Done: secondary inference (`process-mode=2`): detectors, classifiers and tensor-output models on object crops, with
+  DeepStream's per-object classifier cache and the `rds-test2` sample.
+- Next: sliced inference (SAHI-style tiles of large frames, reusing the secondary-mode crops), then `rdsanalytics`
+  (ROI and line-crossing analytics) and the H.264 encoder for a recording branch.
 - Pose detector with keypoints.
-- Secondary models on object crops, with raw tensor output (ReID embeddings, attribute classifiers).
 - Metadata edits in pad probes.
-- ROI and line-crossing analytics, and an H.264 recording branch.
 
 **On request: audio analytics**
 
@@ -217,7 +237,9 @@ Early numbers on a 2-CU Ryzen 9 7900X iGPU:
 - YOLO11n 640×640 FP16 via MIGraphX: about 60 inferences/s.
 - `rdsinfer` with YOLO11n FP32, four 720p sources at batch 4 (decode, batching, inference and post-processing):
   about 50 fps; about 48 fps with `rdstracker` (NvSORT) after it; about 44–46 fps through the whole `rds-test3`
-  chain (tracker, tiler and OSD, to a fakesink).
+  chain (tracker, tiler and OSD, to a fakesink); about 39 fps for `rds-test2` (YOLO11n-cls on the vehicles as well).
+- YOLO11n-cls FP32 at 224×224, secondary mode with `batch-size` 16: about 26 ms per run with 4 crops and about 29 ms
+  with 16 (the compiled program has a fixed batch, so fewer crops save almost nothing).
 - `rdsosd` at 1280×720 with about 60 objects, release build: about 0.3 ms per frame on the GPU (about 1.2 ms with
   `process-mode=0`, the CPU drawing and the GPU↔CPU syncs included). On 1920×1080 frames from `rdsstreamdemux`,
   which it draws on a private copy: about 0.9 ms on the GPU, about 7 ms on the CPU (the copy's CPU staging).
@@ -273,6 +295,15 @@ git-ignored `.cache/media/` and is never committed; the tests that need it skip 
 
 ```bash
 tests/models/fetch-tracker-clip.sh
+```
+
+`rds-test2` and the classifier tests also need YOLO11n-cls (AGPL-3.0 too), exported the same way with an ImageNet
+label file; then run the sample on the street clip (`--no-display` runs to a fakesink):
+
+```bash
+tests/models/fetch-yolo11n-cls.sh
+GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test2/rds-test2 --no-display \
+  file://$PWD/.cache/media/crosswalk-720p.h264
 ```
 
 More tools from the build tree:

@@ -15,12 +15,12 @@ tiler → OSD → display, `samples/rds-test3`). The libgstrds core is in place 
 metadata, events, read-only surface views, the `rds_buf_surf_transform` GPU transform and its many-to-one composite).
 The elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
 `rdsstreammux` (the default scaling mux: batches of fixed-size slots), `rdsstreamdemux` (zero-copy per-source
-views of the batch), `rdsinfer` (MIGraphX primary and secondary detector, secondary classifier: nvinfer configs,
-custom bbox and classifier parsers, object, classifier and tensor meta), `rdstracker` (the IOU and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs),
-`rdsmultistreamtiler` (batches into one tiled frame), `rdsosd` (boxes, text, lines, arrows, circles and the clock,
-drawn on the GPU by default or on the CPU, the same pixels, Pango for text), `rdslogger` (per-stream FPS lines),
-`rdsvideosink` (display through a stock GStreamer sink) and `rdsurisrcbin` (file and RTSP sources, with RTSP
-reconnection). Nothing here is stable.
+views of the batch), `rdsinfer` (MIGraphX primary and secondary detector, secondary classifier with the per-object
+cache: nvinfer configs, custom bbox and classifier parsers, object, classifier and tensor meta), `rdstracker` (the IOU
+and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs), `rdsmultistreamtiler` (batches into one
+tiled frame), `rdsosd` (boxes, text, lines, arrows, circles and the clock, drawn on the GPU by default or on the CPU,
+the same pixels, Pango for text), `rdslogger` (per-stream FPS lines), `rdsvideosink` (display through a stock
+GStreamer sink) and `rdsurisrcbin` (file and RTSP sources, with RTSP reconnection). Nothing here is stable.
 
 ## Architecture principles
 
@@ -46,7 +46,7 @@ reconnection). Nothing here is stable.
 | `nvvideoconvert` | `rdsvideoconvert` | convert, scale and crop on `memory:RDS`; copies stock VA input via a linear path |
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | |
 | `nvstreammux` / `nvstreamdemux` | `rdsstreammux` / `rdsstreamdemux` | default (scaling) mux done; the zero-copy new mux and its config file come later |
-| `nvinfer` | `rdsinfer` | primary + secondary, custom parser ABI, tensor meta |
+| `nvinfer` | `rdsinfer` | primary detector; secondary detectors, classifiers (per-object cache) and tensor-output models; custom bbox and classifier parser ABI, tensor meta. Primary classifiers and segmentation later |
 | `nvtracker` | `rdstracker` | IOU and NvSORT done (CPU); NvDCF / NvDeepSORT later |
 | `nvdsosd` | `rdsosd` | bbox, text, lines, circles |
 | `nvdsanalytics` | `rdsanalytics` | ROI, line crossing, direction, overcrowding (M2) |
@@ -116,6 +116,10 @@ Known gotchas:
   `$XDG_CACHE_HOME/redstream/`), with a `.mxr.json` manifest (model hash, MIGraphX and HIP versions, device,
   shapes, options) that must match for the program to load. Tests reuse these caches: never delete them casually,
   and never run two YOLO11n tests in parallel (`is_parallel : false`, generous `timeout`s).
+- A compiled MIGraphX program has a fixed batch size (`batch-size`): `rdsinfer` runs all of its images whatever
+  the number filled (the rest zeroed), so a secondary-mode chunk of 4 objects costs nearly as much as one of 16: no
+  per-object saving (YOLO11n-cls at 224×224, batch 16, on the gfx1036 iGPU: about 26 ms with 4, about 29 ms with
+  16). Pick a secondary model's `batch-size` for the objects a batch usually has, not the most it can have.
 - MIGraphX gives every symbolic ONNX dimension a default (1) when it parses a model, silently. Whether a dimension is
   fixed or symbolic comes from our own reader (`rds-infer-onnx`), which reads the file's declared input dims.
 - MIGraphX's C++ exceptions always say "Failed to call function"; the real reason is on stderr. Error messages name
@@ -199,9 +203,10 @@ gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; secondary mod
                    element struct they share in gstrdsinfer-private.h; refcounted output sets and tensor meta in
                    rds-infer-output; test hooks exported for element_infer). rds-infer-config parses
                    nvinfer key-file/YAML configs from one key table; rds-infer-parse loads custom parser libraries
-                   (dlopen, ABI version check) and has the built-in YOLO and classifier parsers; rds-infer-post does the detection
-                   post-processing (letterbox geometry, NMS, ROI/size filters); rds-infer-units the secondary-mode
-                   geometry (object selection, aligned crops, crop letterbox, children back to the frame);
+                   (dlopen, ABI version check) and has the built-in YOLO and classifier parsers; rds-infer-post does
+                   the detection post-processing (letterbox geometry, NMS, ROI/size filters); rds-infer-units the
+                   secondary-mode geometry (object selection, aligned crops, crop letterbox, children back to the
+                   frame);
                    rds-infer-cache the per-object cache (which tracked objects are due, classifier results as values,
                    its own mutex taken after the batch meta lock, stale completions dropped by seq and epoch);
                    rds-infer-engine compiles ONNX with MIGraphX and caches the program (.mxr + .mxr.json manifest),
