@@ -640,7 +640,7 @@ which has no properties for them. Their rows are in "Config keys: `[property]`".
 | Chunk size | ours | the compiled program has a fixed batch of `batch-size` images: a chunk with fewer objects runs them all the same, its unused images zeroed, so a chunk costs nearly as much with few objects as when full: no per-object saving (8.0 rebuilds the model for 1 to `batch-size` images and runs the actual count). The results per object are the same |
 | Tensor meta | DeepStream 8.0 behaviour | one per inferred object (a detector's parents and classified objects included), on the object's `obj_user_meta_list`; none on the frame or the batch (see "Per-object cache"). `unique_id` is the `gie-unique-id`, the layer dims are those of one object (no batch), the host and device pointers point at the object's slice, `network_info` is the network's size and `maintain_aspect_ratio` / `symmetric_padding` the config's values |
 | Detector objects (children) | DeepStream 8.0 behaviour | per crop, with the class attributes' thresholds, NMS per class (never across crops), `detected-min/max-*` in frame pixels and `filter-out-class-ids`; `parent` is the cropped object, `unique_component_id` this element's `gie-unique-id`, `class_id`, `confidence`, `obj_label` and the text from the parser and label file, `object_id` untracked |
-| Detector thresholds | ours | the class attributes' defaults are those of the key table in both modes: `pre-cluster-threshold` 0.25 (8.0's is 0.2) |
+| Detector thresholds | DeepStream 8.0 behaviour | the class attributes' defaults are those of the key table in both modes: `pre-cluster-threshold` 0.2, as in 8.0 |
 | Child geometry | ours | network → crop → frame pixels with one consistent mapping; `rect_params` clipped to the frame, `detector_bbox_info` the unclipped box (8.0 maps with the unaligned parent origin, so it can be a pixel off, doesn't clip, and moves negative coordinates to the parent's origin without shrinking the box). A child wholly outside its crop is dropped; one partly outside keeps its part inside the frame |
 | Child order | ours | appended to the frame's object list after the existing objects, crop by crop (8.0 prepends) |
 | Detector chains | DeepStream 8.0 behaviour | a second `rdsinfer` with `infer-on-gie-id` = the detector's `gie-unique-id` infers on its children |
@@ -805,7 +805,7 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | Key | Type | Default | Range | Status | Notes |
 |---|---|---|---|---|---|
 | `threshold` | float | none | >= 0 | supported | legacy name of `pre-cluster-threshold`, which wins if both are set |
-| `pre-cluster-threshold` | float | `0.25` (ours) | >= 0 | supported | objects with a lower confidence are dropped before clustering |
+| `pre-cluster-threshold` | float | `0.2` (ours) | >= 0 | supported | objects with a lower confidence are dropped before clustering; the default is DeepStream 8.0's |
 | `post-cluster-threshold` | float | `0.0` (ours) | >= 0 | supported | objects with a lower confidence are dropped after clustering |
 | `nms-iou-threshold` | float | `0.45` (ours) | >= 0 | supported | `cluster-mode=2`: a box is suppressed when its IoU with a kept box of its class is above it |
 | `topk` | int | `-1` (ours) | >= -1 | supported | `cluster-mode=2`: the best K per class and frame after NMS; -1 keeps all, 0 none |

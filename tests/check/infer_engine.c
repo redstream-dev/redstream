@@ -1668,7 +1668,7 @@ check_fixeddet (guint batch)
         g_error ("image %u output0[%" G_GSIZE_FORMAT "] = %g, expected %g", b, i, out[b * per_image + i],
             expected[i]);
     /* at the default pre-cluster-threshold */
-    dets = parse_detections (out + b * per_image, DET_CLASSES, DET_ANCHORS, DET_SIZE, 0.25f);
+    dets = parse_detections (out + b * per_image, DET_CLASSES, DET_ANCHORS, DET_SIZE, 0.2f);
     g_assert_cmpuint (dets->len, ==, G_N_ELEMENTS (fixeddet_expected));
     for (guint i = 0; i < dets->len; i++) {
       const RdsInferDetection *d = &g_array_index (dets, RdsInferDetection, i);

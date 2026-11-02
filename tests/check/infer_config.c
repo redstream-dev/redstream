@@ -274,7 +274,7 @@ test_defaults (void)
   for (guint i = 0; i < 2; i++) {
     RdsInferClassAttrs *a = &cfg->class_attrs[i];
 
-    g_assert_cmpfloat (a->pre_cluster_threshold, ==, 0.25f);
+    g_assert_cmpfloat (a->pre_cluster_threshold, ==, 0.2f);
     g_assert_cmpfloat (a->post_cluster_threshold, ==, 0.0f);
     g_assert_cmpfloat (a->nms_iou_threshold, ==, 0.45f);
     g_assert_cmpint (a->topk, ==, -1);
@@ -481,7 +481,7 @@ test_yaml_null (void)
   g_assert_cmpuint (cfg->filter_out_class_ids->len, ==, 0);
   g_assert_cmpstr (cfg->onnx_file, ==, tilde);  /* quoted "~" */
   g_assert_cmpstr (cfg->labels[0], ==, "");
-  g_assert_cmpfloat (cfg->class_attrs[0].pre_cluster_threshold, ==, 0.25f);
+  g_assert_cmpfloat (cfg->class_attrs[0].pre_cluster_threshold, ==, 0.2f);
   g_assert_cmpuint (cfg->warnings->len, ==, 0);
   g_free (tilde);
   rds_infer_config_free (cfg);

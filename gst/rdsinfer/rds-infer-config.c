@@ -233,8 +233,9 @@ static const KeyInfo keys[] = {
   /* [class-attrs-all] and [class-attrs-<id>] */
   {.name = "threshold",.group = CLS,.type = TYPE_FLOAT,.status = SUP,.min = 0,.max = G_MAXFLOAT,
       .field = C (pre_cluster_threshold),.note = "legacy name of pre-cluster-threshold, which wins if both are set"},
+  /* DeepStream 8.0 behaviour: 8.0's default */
   {.name = "pre-cluster-threshold",.group = CLS,.type = TYPE_FLOAT,.status = SUP,.min = 0,.max = G_MAXFLOAT,
-      .def = "0.25",.field = C (pre_cluster_threshold)},
+      .def = "0.2",.field = C (pre_cluster_threshold)},
   {.name = "post-cluster-threshold",.group = CLS,.type = TYPE_FLOAT,.status = SUP,.min = 0,.max = G_MAXFLOAT,
       .def = "0.0",.field = C (post_cluster_threshold)},
   {.name = "nms-iou-threshold",.group = CLS,.type = TYPE_FLOAT,.status = SUP,.min = 0,.max = G_MAXFLOAT,

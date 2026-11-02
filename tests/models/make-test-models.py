@@ -26,7 +26,7 @@
                          7  44  44  24  16  0.05     0.6      1, 0.6,  32, 36, 24, 16
 
                   The other anchors are all zero. With num-detected-classes 2, the built-in YOLO parser and the
-                  default pre-cluster-threshold (0.25) give these six detections; every other score is 0.05 or
+                  default pre-cluster-threshold (0.2) give these six detections; every other score is 0.05 or
                   less, and no two boxes overlap, so NMS keeps them all.
 
 Every output depends on the input through real ops: a multiply (scale2), reductions (meancls, meancls2), and for
