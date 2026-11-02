@@ -617,8 +617,9 @@ rds_infer_parser_classify (RdsInferParser * parser, const RdsInferLayerInfo * la
         a.attributeConfidence, label);
   }
   free_attr_labels (parser);
-  /* an empty descString is no description (ours): the display text then gets the labels */
-  if (!parser->builtin && !parser->desc.empty ()) {
+  /* a custom parser always has a description, also an empty one (DeepStream 8.0 behaviour): the display text then
+   * gets no labels */
+  if (!parser->builtin) {
     g_free (result->desc);
     result->desc = g_strdup (parser->desc.c_str ());
   }

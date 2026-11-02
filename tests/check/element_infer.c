@@ -592,38 +592,55 @@ test_start_config_errors (void)
 
 /* One classifier result attached to two objects, and twice to one of them: each attach makes its own metas from the
  * values (the result is only read), the display text grows each time, classifier_type is stored as given; a result
- * with a description but no labels attaches nothing. ASan checks the ownership. */
+ * with a description but no labels attaches nothing; one with labels and an empty description (a custom parser's
+ * empty descString) adds " " and no labels to the display text (DeepStream 8.0 behaviour). ASan checks the
+ * ownership. */
 static void
 test_classifier_attach (void)
 {
   RdsBatchMeta *bm = rds_create_batch_meta (1);
   RdsFrameMeta *fm = rds_acquire_frame_meta_from_pool (bm);
-  RdsObjectMeta *om[2];
+  RdsObjectMeta *om[3];
   RdsInferClassifierResult *r = rds_infer_classifier_result_new (), *empty = rds_infer_classifier_result_new ();
+  RdsInferClassifierResult *no_desc = rds_infer_classifier_result_new ();
   const gchar *type = g_intern_string ("attach-test");
 
   load_hooks ();
   rds_add_frame_meta_to_batch (bm, fm);
-  for (guint i = 0; i < 2; i++) {
+  for (guint i = 0; i < 3; i++) {
     om[i] = rds_acquire_obj_meta_from_pool (bm);
-    om[i]->text_params.display_text = i ? NULL : g_strdup ("T");
+    om[i]->text_params.display_text = i == 1 ? NULL : g_strdup ("T");
     rds_add_obj_meta_to_frame (fm, om[i], NULL);
   }
   rds_infer_classifier_result_add (r, 0, 1, 3, 0.5f, "b");
   rds_infer_classifier_result_add (r, 1, 0, 2, 0.25f, "x");
   empty->desc = g_strdup ("d");
+  rds_infer_classifier_result_add (no_desc, 0, 2, 3, 0.75f, "c");
+  no_desc->desc = g_strdup ("");
 
   hook_attach_classifier_result (bm, om[0], r, 4, type);
   hook_attach_classifier_result (bm, om[1], r, 4, type);
   hook_attach_classifier_result (bm, om[0], r, 5, NULL);
   hook_attach_classifier_result (bm, om[1], empty, 4, type);
+  hook_attach_classifier_result (bm, om[2], no_desc, 4, type);
   rds_infer_classifier_result_free (r);
   rds_infer_classifier_result_free (empty);
+  rds_infer_classifier_result_free (no_desc);
 
   g_assert_cmpstr (om[0]->text_params.display_text, ==, "T b x  b x ");
   g_assert_cmpstr (om[1]->text_params.display_text, ==, " b x ");
   g_assert_cmpuint (g_list_length (om[0]->classifier_meta_list), ==, 2);
   g_assert_cmpuint (g_list_length (om[1]->classifier_meta_list), ==, 1);
+  g_assert_cmpstr (om[2]->text_params.display_text, ==, "T ");
+  g_assert_cmpuint (g_list_length (om[2]->classifier_meta_list), ==, 1);
+  {
+    const RdsClassifierMeta *c = om[2]->classifier_meta_list->data;
+    const RdsLabelInfo *li = c->label_info_list->data;
+
+    g_assert_cmpuint (c->num_labels, ==, 1);
+    g_assert_cmpuint (li->result_class_id, ==, 2);
+    g_assert_cmpstr (li->result_label, ==, "c");
+  }
   for (guint i = 0; i < 3; i++) {
     RdsClassifierMeta *c = g_list_nth_data (i < 2 ? om[0]->classifier_meta_list : om[1]->classifier_meta_list,
         i < 2 ? i : 0);
@@ -2954,8 +2971,8 @@ test_classifier_custom_false (void)
   g_free (extra);
 }
 
-/* A custom parser that leaves descString empty: the display text gets its labels, as for the built-in parser (ours:
- * 8.0 not observed). */
+/* A custom parser that leaves descString empty: the display text gets " " and no labels (DeepStream 8.0 behaviour);
+ * the classifier meta still has them. */
 static void
 test_classifier_custom_no_desc (void)
 {
@@ -2974,7 +2991,7 @@ test_classifier_custom_no_desc (void)
   om = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
   out = push_pull (h, in);
   check_classifier (om, 0, 1, 4, NULL, &red, 1);
-  check_object_kept (om, "T attr0-32x32 ");
+  check_object_kept (om, "T ");
   gst_buffer_unref (out);
   gst_harness_teardown (h);
   g_free (cfg);

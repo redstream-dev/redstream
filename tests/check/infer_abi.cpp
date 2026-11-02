@@ -732,8 +732,8 @@ test_classifier_custom (void)
   rds_infer_parser_free (parser);
 }
 
-/* A custom parser's empty descString is no description (ours): desc stays NULL, the labels make the display text. An
- * attribute whose index is past the layers has no class count (0). */
+/* A custom parser's empty descString is kept as an empty description (DeepStream 8.0 behaviour): desc is "", so the
+ * display text gets no labels. An attribute whose index is past the layers has no class count (0). */
 static void
 test_classifier_custom_no_desc (void)
 {
@@ -745,7 +745,7 @@ test_classifier_custom_no_desc (void)
   g_assert_true (classify (parser, layers, r, NULL));
   g_assert_cmpuint (r->labels->len, ==, 1);
   check_label (r, 0, 0, 128, 3, 0.3f, "attr0-32x32");
-  g_assert_null (r->desc);
+  g_assert_cmpstr (r->desc, ==, "");
   rds_infer_classifier_result_free (r);
   rds_infer_parser_free (parser);
 

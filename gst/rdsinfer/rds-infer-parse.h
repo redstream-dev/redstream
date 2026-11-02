@@ -54,8 +54,8 @@ typedef struct
 typedef struct
 {
   GArray *labels;               /* RdsInferClassifierLabel, in the parser's order; clearing it frees the strings */
-  gchar *desc;                  /* owned: a custom parser's descString; NULL for the built-in parser and for an
-                                 * empty descString (ours) */
+  gchar *desc;                  /* owned: a custom parser's descString, "" when it left it empty; NULL for the
+                                 * built-in parser */
 } RdsInferClassifierResult;
 
 G_GNUC_INTERNAL RdsInferClassifierResult *rds_infer_classifier_result_new (void);
@@ -114,7 +114,7 @@ G_GNUC_INTERNAL gboolean rds_infer_parser_parse (RdsInferParser * parser, const 
     guint n_layers, const RdsInferNetworkInfo * network_info, GArray * objects, GError ** error);
 
 /* Calls a classifier parser on one image's @n_layers output layers and appends its labels to @result (and, for a
- * custom parser with a non-empty descString, sets its desc to it: an empty one is no description, ours). A custom
+ * custom parser, sets its desc to its descString, also an empty one: DeepStream 8.0 behaviour). A custom
  * parser's attributes are taken as they are: attributeLabel NULL is "", and no threshold is applied (the parser
  * applies classifier-threshold itself); every attributeLabel is freed, also after a false return or an exception.
  * On failure @result is left as it was and @error says why, as for rds_infer_parser_parse. */
