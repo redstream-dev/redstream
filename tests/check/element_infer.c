@@ -6,7 +6,7 @@
  * secondary detectors on fixeddet and their chains, objects replaced while the lock is released, parser failures and
  * the ROI offsets; classifiers on meancls and meancls2 (built-in and custom parsers, thresholds, labels, display
  * text, chains) and their per-object cache (tracked ids, growth, the reinfer interval, stream events, eviction; a
- * detector with the interval).
+ * detector with the interval), also with dynamic batch on; dynamic batch on chunks of objects.
  * The element's test hooks (gstrdsinfer.h) are looked up in the loaded plugin.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
@@ -773,13 +773,33 @@ harness_teardown_with_bus (GstHarness * h, GstBus * bus)
   gst_object_unref (bus);
 }
 
+/* Set while a test runs again with the dynamic-batch property on (run_dynamic). */
+static gboolean infer_dynamic;
+
 static GstElement *
 new_infer (const gchar * config)
 {
   GstElement *e = gst_element_factory_make ("rdsinfer", NULL);
 
   g_object_set (e, "config-file-path", config, NULL);
+  if (infer_dynamic)
+    g_object_set (e, "dynamic-batch", TRUE, NULL);
   return e;
+}
+
+typedef struct
+{
+  const gchar *name;
+  GTestFunc func;
+} CacheTest;
+
+/* Runs the CacheTest @data with every element of new_infer () on dynamic-batch=1. */
+static void
+run_dynamic (gconstpointer data)
+{
+  infer_dynamic = TRUE;
+  ((const CacheTest *) data)->func ();
+  infer_dynamic = FALSE;
 }
 
 static RdsFrameMeta *
@@ -3294,6 +3314,65 @@ test_classifier_tensor_meta (void)
   g_free (cfg);
 }
 
+/* dynamic-batch=1 (ours) in secondary mode: a chunk's objects take its images from 0, so it runs on the smallest
+ * program of 1, 2 and 4 that holds its object count, and 5 objects run as a chunk of 4, then one of 1. The classifier
+ * meta, labels, display text and tensor meta are those of dynamic-batch=0, which always runs batch-size. Every object
+ * has its own colour and value, so a result given to the wrong object shows. */
+static void
+test_secondary_dynamic_batch (void)
+{
+  static const guint counts[] = { 2, 3, 5, 1, 4 }, want_on[] = { 2, 4, 1, 1, 4 };
+  static const gchar *const names[] = { "red", "green", "blue" };
+  gchar *off = classifier_config ("cls-dyn-off.txt", "meancls.onnx", 4, RGB_LABELS,
+      "classifier-type=colour\noutput-tensor-meta=1\ndynamic-batch=0\n");
+  gchar *on = classifier_config ("cls-dyn-on.txt", "meancls.onnx", 4, RGB_LABELS,
+      "classifier-type=colour\noutput-tensor-meta=1\ndynamic-batch=1\n");
+
+  RDS_TEST_REQUIRE_GPU ();
+  load_hooks ();
+  for (guint run = 0; run < 2; run++) {
+    GstHarness *h = classifier_harness (run ? on : off, NULL);
+    guint64 units = 0;
+
+    g_assert_cmpuint (hook_get_last_run_size (h->element), ==, 0);
+    for (guint b = 0; b < G_N_ELEMENTS (counts); b++) {
+      GstBuffer *in = colour_batch (2), *out;
+      RdsObjectMeta *om[5];
+
+      /* object i: channel i % 3 at 100 + 20 i, the others 0; three in frame 0, the rest in frame 1 */
+      for (guint i = 0; i < counts[b]; i++) {
+        guint8 v = (guint8) (100 + 20 * i), rgb[3] = { 0, 0, 0 };
+
+        rgb[i % 3] = v;
+        om[i] = add_colour_object (in, i < 3 ? 0 : 1, (i % 3) * 32, 0, rgb[0], rgb[1], rgb[2], "T");
+      }
+      out = push_pull (h, in);
+      units += counts[b];
+      g_assert_cmpuint (hook_get_unit_count (h->element), ==, units);
+      g_assert_cmpuint (hook_get_last_run_size (h->element), ==, (run ? want_on[b] : 4));
+      for (guint i = 0; i < counts[b]; i++) {
+        gfloat v = (100 + 20 * i) / 256.0f;
+        WantLabel want = { 0, i % 3, 3, v, names[i % 3] };
+        gchar *text = g_strdup_printf ("T %s ", names[i % 3]);
+        RdsInferTensorMeta *tm = obj_tensor_meta (om[i]);
+
+        check_classifier (om[i], 0, 1, 4, "colour", &want, 1);
+        check_object_kept (om[i], text);
+        g_assert_nonnull (tm);
+        g_assert_cmpuint (tm->unique_id, ==, 4);
+        g_assert_cmpuint (tm->num_output_layers, ==, 1);
+        for (guint ch = 0; ch < 3; ch++)
+          g_assert_cmpfloat (((const gfloat *) tm->out_buf_ptrs_host[0])[ch], ==, ch == i % 3 ? v : 0.0f);
+        g_free (text);
+      }
+      gst_buffer_unref (out);
+    }
+    gst_harness_teardown (h);
+  }
+  g_free (off);
+  g_free (on);
+}
+
 /* ---- gpu: the per-object cache ---- */
 
 /* An object of GIE 1 with tracked id @id, @size x @size at (@left, @top) of frame @frame, painted (@r, @g, @b),
@@ -3317,9 +3396,13 @@ push_tracked (GstHarness * h, guint64 id, guint8 r, guint8 g, guint64 units, con
 {
   GstBuffer *in = colour_batch (1), *out;
   RdsObjectMeta *om = add_tracked (in, 0, id, 0, 0, 32, r, g, 0, "T");
+  guint64 before = hook_get_unit_count (h->element);
 
   out = push_pull (h, in);
   g_assert_cmpuint (hook_get_unit_count (h->element), ==, units);
+  /* inferred: a one-object chunk, on the batch-1 program with dynamic-batch on (run_dynamic) */
+  if (units > before)
+    g_assert_cmpuint (hook_get_last_run_size (h->element), ==, (infer_dynamic ? 1 : 4));
   check_classifier (om, 0, 1, 4, NULL, want, 1);
   gst_buffer_unref (out);
 }
@@ -3396,6 +3479,9 @@ test_cache_growth (void)
 
     out = push_pull (h, in);
     g_assert_cmpuint (hook_get_unit_count (h->element), ==, steps[i].units);
+    /* inferred: a one-object chunk, on the batch-1 program with dynamic-batch on (run_dynamic) */
+    if (steps[i].units > (i ? steps[i - 1].units : 0))
+      g_assert_cmpuint (hook_get_last_run_size (h->element), ==, (infer_dynamic ? 1 : 4));
     check_classifier (om, 0, 1, 4, NULL, steps[i].want, 1);
     gst_buffer_unref (out);
   }
@@ -3444,6 +3530,8 @@ test_cache_detector_interval (void)
     parents[2] = add_test_object (in, 0, 2, 0, 10, 10, 40, 40);
     out = push_pull (h, in);
     g_assert_cmpuint (hook_get_unit_count (h->element), ==, units[f]);
+    /* one chunk: both parents on due frames, the untracked one alone in between (batch 1 with dynamic-batch on) */
+    g_assert_cmpuint (hook_get_last_run_size (h->element), ==, (infer_dynamic ? (f % 2 ? 1 : 2) : 2));
     if (f % 2 == 0) {
       check_children (out, parents);
     } else {
@@ -3900,16 +3988,30 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-secondary/classifier-unknown-symbol", test_classifier_unknown_symbol);
   g_test_add_func ("/gpu/infer-secondary/classifier-tensor-meta", test_classifier_tensor_meta);
   g_test_add_func ("/gpu/infer-secondary/classifier-fresh-elements", test_classifier_fresh_elements);
-  g_test_add_func ("/gpu/infer-secondary/cache-hits", test_cache_hits);
-  g_test_add_func ("/gpu/infer-secondary/cache-growth", test_cache_growth);
-  g_test_add_func ("/gpu/infer-secondary/cache-interval", test_cache_interval);
-  g_test_add_func ("/gpu/infer-secondary/cache-detector-interval", test_cache_detector_interval);
-  g_test_add_func ("/gpu/infer-secondary/cache-async-mode", test_cache_async_mode);
-  g_test_add_func ("/gpu/infer-secondary/cache-events", test_cache_events);
-  g_test_add_func ("/gpu/infer-secondary/cache-eviction", test_cache_eviction);
-  g_test_add_func ("/gpu/infer-secondary/cache-filtered-kept", test_cache_filtered_kept);
-  g_test_add_func ("/gpu/infer-secondary/cache-parser-failure", test_cache_parser_failure);
-  g_test_add_func ("/gpu/infer-secondary/cache-chunk-failure", test_cache_chunk_failure);
+  {
+    /* the cache tests, then again with dynamic-batch on: the cache does not depend on the program a chunk runs on */
+    static const CacheTest cache_tests[] = {
+      {"hits", test_cache_hits}, {"growth", test_cache_growth}, {"interval", test_cache_interval},
+      {"detector-interval", test_cache_detector_interval}, {"async-mode", test_cache_async_mode},
+      {"events", test_cache_events}, {"eviction", test_cache_eviction},
+      {"filtered-kept", test_cache_filtered_kept}, {"parser-failure", test_cache_parser_failure},
+      {"chunk-failure", test_cache_chunk_failure},
+    };
+
+    for (guint i = 0; i < G_N_ELEMENTS (cache_tests); i++) {
+      gchar *path = g_strdup_printf ("/gpu/infer-secondary/cache-%s", cache_tests[i].name);
+
+      g_test_add_func (path, cache_tests[i].func);
+      g_free (path);
+    }
+    for (guint i = 0; i < G_N_ELEMENTS (cache_tests); i++) {
+      gchar *path = g_strdup_printf ("/gpu/infer-secondary/cache-%s-dynamic", cache_tests[i].name);
+
+      g_test_add_data_func (path, &cache_tests[i], run_dynamic);
+      g_free (path);
+    }
+  }
+  g_test_add_func ("/gpu/infer-secondary/dynamic-batch", test_secondary_dynamic_batch);
   ret = g_test_run ();
   if (dev_alloc)
     gst_object_unref (dev_alloc);
