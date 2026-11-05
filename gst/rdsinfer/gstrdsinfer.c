@@ -14,13 +14,13 @@
  *     list order, then object list order, in chunks of batch-size that continue across the frames of a batch, unit
  *     i of a chunk into image i (DeepStream 8.0 behaviour). No hard limit: the unit array is reused and grows.
  *   Units run in chunks of at most batch-size: without the lock, the preprocessing kernel writes each unit's image
- *   of the network input and the chunk's unused images are zeroed, the engine runs (always batch-size images), the
- *   outputs are copied to pinned host memory of the chunk's output set and the stream is synchronized once; the
- *   parser and the post-processing run on the CPU, and the meta lock is taken again to add the chunk's results,
- *   which go to frames that are still there (and in secondary mode objects: RdsMetaRef). Inferred frames get
- *   bInferDone in primary mode; secondary mode doesn't touch it (DeepStream 8.0 behaviour), and attaches to the
- *   object: its tensor meta, a detector's children with the object as parent, a classifier's classifier meta
- *   (gstrdsinfer-secondary.c).
+ *   of the network input and the chunk's unused images are zeroed, the engine runs (batch-size images; with
+ *   dynamic-batch (ours), the smallest program that holds the chunk), the outputs are copied to pinned host memory
+ *   of the chunk's output set and the stream is synchronized once; the parser and the post-processing run on the
+ *   CPU, and the meta lock is taken again to add the chunk's results, which go to frames that are still there (and
+ *   in secondary mode objects: RdsMetaRef). Inferred frames get bInferDone in primary mode; secondary mode doesn't
+ *   touch it (DeepStream 8.0 behaviour), and attaches to the object: its tensor meta, a detector's children with the
+ *   object as parent, a classifier's classifier meta (gstrdsinfer-secondary.c).
  * - The per-object cache (secondary mode, rds-infer-cache.h; DeepStream 8.0 behaviour except where it says ours): a
  *   classifier infers a tracked object only when it is due (a new id, growth above 1.2 x the area at its last
  *   inference, secondary-reinfer-interval) and attaches the stored result on the other frames, without tensor meta;
@@ -362,7 +362,7 @@ release_resources (GstRdsInfer * self)
   int prev = 0;
   gboolean switched = FALSE;
 
-  if (self->stream || self->input || self->engine) {
+  if (self->stream || self->input || self->engines) {
     switched = rds_infer_device_enter (self->gpu, &prev);
     if (self->stream)
       (void) hipStreamSynchronize (self->stream);
@@ -370,7 +370,8 @@ release_resources (GstRdsInfer * self)
   /* the streaming thread has stopped (the base class stops after deactivating the pads), so no parser call or
    * engine run is still going */
   g_clear_pointer (&self->parser, rds_infer_parser_free);
-  g_clear_pointer (&self->engine, rds_infer_engine_free);
+  self->engine = NULL;
+  g_clear_pointer (&self->engines, rds_infer_engine_set_free);
   /* sets still referenced by metas stay alive, with the pool */
   g_clear_pointer (&self->outputs, rds_infer_output_pool_unref);
   if (self->input)
@@ -402,7 +403,8 @@ post_config_error (GstRdsInfer * self, GError * err)
     GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("%s", err->message), (NULL));
 }
 
-/* Opens the engine and checks its input against the preprocessing settings; errors name the config key. */
+/* Opens the engine set (dynamic-batch: one program per size) and checks the batch-size program's input against the
+ * preprocessing settings; errors name the config key. */
 static gboolean
 open_engine (GstRdsInfer * self, GError ** error)
 {
@@ -411,13 +413,14 @@ open_engine (GstRdsInfer * self, GError ** error)
   guint dims[3], d0, d1, d2, c, h, w;
   RdsInferEngineOptions opts;
   GError *err = NULL;
-  GPtrArray *warnings;
+  const gchar *fallback;
+  guint n;
 
   if (!rds_infer_config_get_engine_options (cfg, &opts, dims, error))
     return FALSE;
   /* the warm-up on the stream the element runs on (see rds-infer-engine.h) */
   opts.warm_up_stream = self->stream;
-  if (!(self->engine = rds_infer_engine_open (&opts, &err))) {
+  if (!(self->engines = rds_infer_engine_set_open (&opts, cfg->dynamic_batch, &err))) {
     gchar *msg = rds_infer_config_format_engine_error (cfg, err);
 
     g_set_error_literal (error, RDS_INFER_CONFIG_ERROR, RDS_INFER_CONFIG_ERROR_INVALID, msg);
@@ -425,15 +428,29 @@ open_engine (GstRdsInfer * self, GError ** error)
     g_error_free (err);
     return FALSE;
   }
-  /* tests/tools/rds_compile.sh matches these two messages. */
-  if (rds_infer_engine_was_built (self->engine))
-    GST_INFO_OBJECT (self, "built %s because %s", GST_STR_NULL (rds_infer_engine_get_program_path (self->engine)),
-        rds_infer_engine_get_build_reason (self->engine));
-  else
-    GST_INFO_OBJECT (self, "loaded %s", rds_infer_engine_get_program_path (self->engine));
-  warnings = rds_infer_engine_get_warnings (self->engine);
-  for (guint i = 0; i < warnings->len; i++)
-    GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("%s", (const gchar *) g_ptr_array_index (warnings, i)), (NULL));
+  self->engine = rds_infer_engine_set_get_main (self->engines);
+  if ((fallback = rds_infer_engine_set_get_fallback_reason (self->engines)))
+    GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("%s:dynamic-batch: %s", cfg->config_path, fallback), (NULL));
+  n = rds_infer_engine_set_get_n (self->engines);
+  for (guint p = 0; p < n; p++) {
+    RdsInferEngine *e = rds_infer_engine_set_get (self->engines, p);
+    GPtrArray *warnings = rds_infer_engine_get_warnings (e);
+    /* with more than one program, the smaller ones' warnings name their size */
+    gchar *owned = e == self->engine ? NULL : g_strdup_printf ("batch %u program: ",
+        rds_infer_engine_set_get_size (self->engines, p));
+    const gchar *prefix = owned ? owned : "";
+
+    /* tests/tools/rds_compile.sh matches these two messages. */
+    if (rds_infer_engine_was_built (e))
+      GST_INFO_OBJECT (self, "built %s because %s", GST_STR_NULL (rds_infer_engine_get_program_path (e)),
+          rds_infer_engine_get_build_reason (e));
+    else
+      GST_INFO_OBJECT (self, "loaded %s", rds_infer_engine_get_program_path (e));
+    for (guint i = 0; i < warnings->len; i++)
+      GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("%s%s", prefix, (const gchar *) g_ptr_array_index (warnings,
+                  i)), (NULL));
+    g_free (owned);
+  }
 
   rds_infer_engine_get_input (self->engine, &d0, &d1, &d2);
   c = nhwc ? d2 : d0;
@@ -587,6 +604,7 @@ gst_rds_infer_start (GstBaseTransform * trans)
 
   self->batch_count = 0;
   self->unit_count = 0;
+  self->last_run_size = 0;
   if (!(self->cfg = configure (self, &err))) {
     post_config_error (self, err);
     g_error_free (err);
@@ -868,16 +886,27 @@ attach_frame_results (GstRdsInfer * self, RdsBatchMeta * bm, RdsInferOutputSet *
 }
 
 /* Infers the units @first .. @first + @n - 1 (n <= batch-size, distinct images below batch-size) as one engine run
- * and attaches their results; FALSE with an element error. Each chunk has its own output set from the pool; the
- * chunk's tensor metas keep it alive after this returns. */
+ * and attaches their results; FALSE with an element error. The run is on the smallest program of the set that holds
+ * the chunk's highest image (batch-size without dynamic-batch): only that program's images are zeroed, run and
+ * copied to the host, so the images above it, in the input and in the output set, hold stale data that nothing
+ * reads (every reader reads a unit's own image). Each chunk has its own output set from the pool; the chunk's
+ * tensor metas keep it alive after this returns. */
 static gboolean
 infer_chunk (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf, guint first, guint n)
 {
   RdsInferConfig *cfg = self->cfg;
   RdsInferOutputSet *set = NULL;
+  RdsInferEngine *engine;
   GError *err = NULL;
+  guint n_run = 0, prog, size;
 
-  GST_DEBUG_OBJECT (self, "chunk of %u units (%u..%u of %u)", n, first, first + n - 1, self->units->len);
+  for (guint u = first; u < first + n; u++)
+    n_run = MAX (n_run, g_array_index (self->units, InferUnit, u).image + 1);
+  prog = rds_infer_engine_set_pick (self->engines, n_run);
+  engine = rds_infer_engine_set_get (self->engines, prog);
+  size = rds_infer_engine_set_get_size (self->engines, prog);
+  GST_DEBUG_OBJECT (self, "chunk of %u units (%u..%u of %u) on the batch-%u program", n, first, first + n - 1,
+      self->units->len, size);
   /* 1. preprocessing: each unit's source rect into its image, the unused images zeroed */
   memset (self->image_used, 0, cfg->batch_size * sizeof (gboolean));
   for (guint u = first; u < first + n; u++) {
@@ -902,7 +931,7 @@ infer_chunk (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf, 
       goto fail;
     }
   }
-  for (guint image = 0; image < cfg->batch_size; image++)
+  for (guint image = 0; image < size; image++)
     if (!self->image_used[image])
       HIP_OR_FAIL (hipMemsetAsync (self->input + image * self->image_floats, 0,
               self->image_floats * sizeof (gfloat), self->stream), "zeroing unused images");
@@ -913,14 +942,14 @@ infer_chunk (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf, 
     g_error_free (err);
     goto fail;
   }
-  if (!rds_infer_engine_run_async (self->engine, self->input, set->dev, self->stream, &err)) {
+  if (!rds_infer_engine_run_async (engine, self->input, set->dev, self->stream, &err)) {
     GST_ELEMENT_ERROR (self, RESOURCE, FAILED, ("Inference failed"), ("%s", err->message));
     g_error_free (err);
     goto fail;
   }
   for (guint i = 0; i < self->n_outputs; i++)
     HIP_OR_FAIL (hipMemcpyAsync (set->host[i], set->dev[i],
-            (gsize) cfg->batch_size * self->out_dims[i].numElements * sizeof (gfloat), hipMemcpyDeviceToHost,
+            (gsize) size * self->out_dims[i].numElements * sizeof (gfloat), hipMemcpyDeviceToHost,
             self->stream), "copying the outputs");
   HIP_OR_FAIL (hipStreamSynchronize (self->stream), "inference");
 
@@ -936,6 +965,7 @@ infer_chunk (GstRdsInfer * self, RdsBatchMeta * bm, const RdsBufSurface * surf, 
   else
     attach_frame_results (self, bm, set, first, n);
   self->unit_count += n;
+  self->last_run_size = size;
   rds_infer_output_set_unref (set);
   return TRUE;
 
@@ -1034,6 +1064,12 @@ rds_infer_test_get_output_set_totals (GstElement * element, guint64 * allocated,
     return FALSE;
   rds_infer_output_pool_get_totals (self->outputs, allocated, freed);
   return TRUE;
+}
+
+guint
+rds_infer_test_get_last_run_size (GstElement * element)
+{
+  return GST_RDS_INFER (element)->last_run_size;
 }
 
 guint64

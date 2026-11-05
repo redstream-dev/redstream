@@ -20,10 +20,12 @@ GST_ELEMENT_REGISTER_DECLARE (rdsinfer);
  *   structure named "rdsinfer-config" whose fields are config key names; NULL with @error as start would fail.
  * - get_output_sets: the output sets allocated and the ones in the free list; FALSE when not started.
  * - get_output_set_totals: the output sets allocated and freed since start; FALSE when not started.
- * - read_input: copies the first @n_floats of the network input tensor (batch-size images) to @dst; FALSE when
- *   not started or @n_floats is too large.
+ * - read_input: copies the first @n_floats of the network input tensor (batch-size images; with dynamic-batch, the
+ *   images above the last chunk's program are stale) to @dst; FALSE when not started or @n_floats is too large.
  * - get_unit_count: the inference units inferred since start (primary mode: one per frame, secondary mode: one per
  *   object inferred on).
+ * - get_last_run_size: the batch size of the program the last chunk ran on (batch-size, or with dynamic-batch the
+ *   smallest program that held it); 0 before the first chunk since start.
  * - get_cache_size: the entries in the per-object cache (secondary-mode classifiers; 0 without a cache). Takes only
  *   the cache's own lock, so it may also be called from a pad probe while the stream runs.
  * - attach_classifier_result: gst_rds_infer_attach_classifier_result (gstrdsinfer-private.h), for a test that builds
@@ -35,6 +37,7 @@ __attribute__ ((visibility ("default"))) gboolean rds_infer_test_get_output_sets
 __attribute__ ((visibility ("default"))) gboolean rds_infer_test_read_input (GstElement * element, gfloat * dst,
     gsize n_floats);
 __attribute__ ((visibility ("default"))) guint64 rds_infer_test_get_unit_count (GstElement * element);
+__attribute__ ((visibility ("default"))) guint rds_infer_test_get_last_run_size (GstElement * element);
 __attribute__ ((visibility ("default"))) guint rds_infer_test_get_cache_size (GstElement * element);
 __attribute__ ((visibility ("default"))) gboolean rds_infer_test_get_output_set_totals (GstElement * element,
     guint64 * allocated, guint64 * freed);

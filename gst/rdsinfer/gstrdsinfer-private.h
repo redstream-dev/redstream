@@ -9,6 +9,7 @@
 #include "rds-infer-cache.h"
 #include "rds-infer-config.h"
 #include "rds-infer-engine.h"
+#include "rds-infer-engine-set.h"
 #include "rds-infer-output.h"
 #include "rds-infer-parse.h"
 #include "rds-infer-post.h"
@@ -62,7 +63,8 @@ struct _GstRdsInfer
 
   /* from start to stop (streaming thread; test hooks read it while idle) */
   RdsInferConfig *cfg;
-  RdsInferEngine *engine;
+  RdsInferEngineSet *engines;   /* one program of batch-size, or with dynamic-batch one per size */
+  RdsInferEngine *engine;       /* the set's batch-size program (owned by the set) */
   RdsInferParser *parser;
   RdsInferOutputPool *outputs;
   hipStream_t stream;
@@ -76,6 +78,7 @@ struct _GstRdsInfer
   const gchar **out_names;      /* the engine's */
   guint batch_count;            /* batches seen since start or the last flush */
   guint64 unit_count;           /* units inferred since start */
+  guint last_run_size;          /* the batch size of the program the last chunk ran on; 0 before the first */
   guint warned;                 /* WarnOnce */
   gboolean secondary;           /* process-mode=2 */
   const gchar *classifier_type; /* classifier-type, interned (the classifier metas point at it); NULL if unset */

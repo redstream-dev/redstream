@@ -34,7 +34,8 @@ typedef struct _RdsInferEngineSet RdsInferEngineSet;
  * buffers: a batch-major NCHW buffer of batch-size images holds a valid tensor of any fewer. */
 G_GNUC_INTERNAL RdsInferEngineSet *rds_infer_engine_set_open (const RdsInferEngineOptions * opts, gboolean dynamic,
     GError ** error);
-/* Why @dynamic was not honoured (see rds_infer_engine_set_open), or NULL. */
+/* Why @dynamic was not honoured (see rds_infer_engine_set_open), or NULL; phrased to follow the key name
+ * ("needs a model with ..."). */
 G_GNUC_INTERNAL const gchar *rds_infer_engine_set_get_fallback_reason (RdsInferEngineSet * set);
 /* The batch-size program: the one whose input, outputs, paths and build status describe the set. */
 G_GNUC_INTERNAL RdsInferEngine *rds_infer_engine_set_get_main (RdsInferEngineSet * set);

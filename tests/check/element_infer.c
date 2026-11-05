@@ -1,11 +1,12 @@
 /* rdsinfer: registration, pad templates, properties and how they override the config file (cpu); start errors,
  * the tensor path on the scale2 test model (output = 2 x input) against the CPU preprocessing reference, a restart,
- * partial batches, tensor meta through rdsstreamdemux, interval, the detector path with the fixture parser, and
- * concurrent metadata readers (gpu, skipped without a ROCm device); secondary mode (/gpu/infer-secondary): object
- * crops, chunks, object selection, secondary detectors on fixeddet and their chains, objects replaced while the lock
- * is released, parser failures and the ROI offsets; classifiers on meancls and meancls2 (built-in and custom
- * parsers, thresholds, labels, display text, chains) and their per-object cache (tracked ids, growth, the reinfer
- * interval, stream events, eviction; a detector with the interval).
+ * partial batches, dynamic batch (the program each batch runs on, the fallback on a fixed batch), tensor meta
+ * through rdsstreamdemux, interval, the detector path with the fixture parser, and concurrent metadata readers (gpu,
+ * skipped without a ROCm device); secondary mode (/gpu/infer-secondary): object crops, chunks, object selection,
+ * secondary detectors on fixeddet and their chains, objects replaced while the lock is released, parser failures and
+ * the ROI offsets; classifiers on meancls and meancls2 (built-in and custom parsers, thresholds, labels, display
+ * text, chains) and their per-object cache (tracked ids, growth, the reinfer interval, stream events, eviction; a
+ * detector with the interval).
  * The element's test hooks (gstrdsinfer.h) are looked up in the loaded plugin.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
@@ -34,6 +35,7 @@ typedef gboolean (*GetOutputSetsFunc) (GstElement * element, guint * n_sets, gui
 typedef gboolean (*ReadInputFunc) (GstElement * element, gfloat * dst, gsize n_floats);
 typedef guint64 (*GetUnitCountFunc) (GstElement * element);
 typedef gboolean (*GetOutputSetTotalsFunc) (GstElement * element, guint64 * allocated, guint64 * freed);
+typedef guint (*GetLastRunSizeFunc) (GstElement * element);
 typedef void (*AttachClassifierResultFunc) (gpointer batch_meta, gpointer obj_meta, gconstpointer result,
     gint unique_id, const gchar * classifier_type);
 
@@ -43,6 +45,7 @@ static ReadInputFunc hook_read_input;
 static GetUnitCountFunc hook_get_unit_count;
 static GetOutputSetTotalsFunc hook_get_output_set_totals;
 static AttachClassifierResultFunc hook_attach_classifier_result;
+static GetLastRunSizeFunc hook_get_last_run_size;
 
 static void
 load_hooks (void)
@@ -67,6 +70,7 @@ load_hooks (void)
           (gpointer *) & hook_get_output_set_totals));
   g_assert_true (g_module_symbol (module, "rds_infer_test_attach_classifier_result",
           (gpointer *) & hook_attach_classifier_result));
+  g_assert_true (g_module_symbol (module, "rds_infer_test_get_last_run_size", (gpointer *) & hook_get_last_run_size));
   /* the module stays open: the plugin is never unloaded either */
   gst_object_unref (plugin);
 }
@@ -1076,6 +1080,165 @@ test_restart (void)
   g_assert_true (hook_get_output_sets (e, &n_sets, &n_free));
   g_assert_cmpuint (n_sets, ==, 1);
   g_assert_cmpuint (n_free, ==, 1);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
+  harness_teardown_with_bus (h, bus);
+  g_free (cfg);
+}
+
+/* ---- gpu: dynamic batch ---- */
+
+#define DYN_IMAGE (3 * 48 * 64)
+
+/* Pushes four 4-slot 96x64 NV12 batches with 1, 2, 3 and 4 frames (patterns 31 + f) through a started element @e
+ * (TENSOR_CONFIG, batch-size 4) in @h, checks every frame's tensor meta against the CPU reference and the size of the
+ * program each batch ran on against @want, and copies the frames' host tensors to @tensors (10 images: 1 + 2 + 3 +
+ * 4), when not NULL. */
+static void
+push_dynamic_batches (GstHarness * h, GstElement * e, const guint want[4], gfloat * tensors)
+{
+  static const gfloat offsets[3] = { 10, 20, 30 };
+  guint k = 0;
+
+  for (guint f = 1; f <= 4; f++) {
+    GstBuffer *in = make_batch (RDS_BUF_COLOR_FORMAT_NV12, 96, 64, 4, f, 31 + f), *out;
+    RdsBufSurface *s = rds_buffer_get_surface (in);
+
+    g_assert_cmpint (gst_harness_push (h, gst_buffer_ref (in)), ==, GST_FLOW_OK);
+    out = gst_harness_pull (h);
+    g_assert_cmpuint (hook_get_last_run_size (e), ==, want[f - 1]);
+    for (guint i = 0; i < f; i++, k++) {
+      RdsFrameMeta *fm = nth_frame (out, i);
+      RdsInferTensorMeta *tm = frame_tensor_meta (fm);
+      HostImage src;
+
+      g_assert_true (fm->bInferDone);
+      g_assert_null (fm->obj_meta_list);
+      g_assert_nonnull (tm);
+      g_assert_cmpuint (tm->output_layers_info[0].inferDims.numElements, ==, DYN_IMAGE);
+      snapshot (s, i, &src);
+      check_tensor_image (&src, tm->out_buf_ptrs_host[0], 64, 48, 0, 2, 64, 43, TRUE, 0.5f, offsets);
+      host_image_clear (&src);
+      if (tensors)
+        memcpy (tensors + (gsize) k * DYN_IMAGE, tm->out_buf_ptrs_host[0], DYN_IMAGE * sizeof (gfloat));
+    }
+    gst_buffer_unref (out);
+    gst_buffer_unref (in);
+  }
+}
+
+/* dynamic-batch=1 (ours): a batch of n frames runs on the smallest program of 1, 2 and 4 that holds them, with the
+ * same tensors as dynamic-batch=0, which always runs batch-size. */
+static void
+test_dynamic_batch (void)
+{
+  static const guint want_off[4] = { 4, 4, 4, 4 }, want_on[4] = { 1, 2, 4, 4 };
+  gchar *off = write_file ("dyn-off.txt", TENSOR_CONFIG "batch-size=4\ndynamic-batch=0\n");
+  gchar *on = write_file ("dyn-on.txt", TENSOR_CONFIG "batch-size=4\ndynamic-batch=1\n");
+  gfloat *t_off = g_new (gfloat, 10 * DYN_IMAGE), *t_on = g_new (gfloat, 10 * DYN_IMAGE);
+  GstBus *bus = gst_bus_new ();
+  GstElement *e;
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  load_hooks ();
+  e = new_infer (off);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 96, 64);
+  g_assert_cmpuint (hook_get_last_run_size (e), ==, 0);
+  push_dynamic_batches (h, e, want_off, t_off);
+  gst_harness_teardown (h);
+
+  e = new_infer (on);
+  gst_element_set_bus (e, bus);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 96, 64);
+  /* scale2's batch is symbolic: no fallback warning */
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, NULL), ==, 0);
+  push_dynamic_batches (h, e, want_on, t_on);
+  g_assert_cmpint (memcmp (t_off, t_on, 10 * DYN_IMAGE * sizeof (gfloat)), ==, 0);
+  /* the same batches again, after a full one: each frame's tensor is still right */
+  push_dynamic_batches (h, e, want_on, NULL);
+  g_assert_cmpuint (hook_get_unit_count (e), ==, 20);
+  /* primary mode: the highest occupied slot decides, so one frame in slot 3 runs on the batch-4 program */
+  {
+    static const gfloat offsets[3] = { 10, 20, 30 };
+    GstBuffer *in = make_batch (RDS_BUF_COLOR_FORMAT_NV12, 96, 64, 4, 1, 41), *out;
+    RdsFrameMeta *fm = nth_frame (in, 0);
+    RdsInferTensorMeta *tm;
+    HostImage src;
+
+    fm->batch_id = 3;
+    g_assert_cmpint (gst_harness_push (h, gst_buffer_ref (in)), ==, GST_FLOW_OK);
+    out = gst_harness_pull (h);
+    g_assert_cmpuint (hook_get_last_run_size (e), ==, 4);
+    tm = frame_tensor_meta (nth_frame (out, 0));
+    g_assert_nonnull (tm);
+    snapshot (rds_buffer_get_surface (in), 3, &src);
+    check_tensor_image (&src, tm->out_buf_ptrs_host[0], 64, 48, 0, 2, 64, 43, TRUE, 0.5f, offsets);
+    host_image_clear (&src);
+    gst_buffer_unref (out);
+    gst_buffer_unref (in);
+  }
+  g_assert_cmpuint (hook_get_unit_count (e), ==, 21);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
+  harness_teardown_with_bus (h, bus);
+  g_free (t_off);
+  g_free (t_on);
+  g_free (off);
+  g_free (on);
+}
+
+/* The dynamic-batch property overrides the config file, both ways. */
+static void
+test_dynamic_batch_property (void)
+{
+  static const guint want_off[4] = { 4, 4, 4, 4 }, want_on[4] = { 1, 2, 4, 4 };
+  gchar *off = write_file ("dyn-prop-off.txt", TENSOR_CONFIG "batch-size=4\ndynamic-batch=0\n");
+  gchar *on = write_file ("dyn-prop-on.txt", TENSOR_CONFIG "batch-size=4\ndynamic-batch=1\n");
+  GstElement *e;
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_model ();
+  load_hooks ();
+  e = new_infer (off);
+  g_object_set (e, "dynamic-batch", TRUE, NULL);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 96, 64);
+  push_dynamic_batches (h, e, want_on, NULL);
+  gst_harness_teardown (h);
+
+  e = new_infer (on);
+  g_object_set (e, "dynamic-batch", FALSE, NULL);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 96, 64);
+  push_dynamic_batches (h, e, want_off, NULL);
+  gst_harness_teardown (h);
+  g_free (off);
+  g_free (on);
+}
+
+/* dynamic-batch=1 on a model whose batch is fixed (scale2-b4): one warning at start, and every batch runs the
+ * batch-size program, with the right tensors. */
+static void
+test_dynamic_batch_fallback (void)
+{
+  static const guint want[4] = { 4, 4, 4, 4 };
+  gchar *cfg = write_file ("dyn-fixed.txt", "[property]\nonnx-file=scale2-b4.onnx\ninfer-dims=3;48;64\n"
+      "network-type=100\noutput-tensor-meta=1\nmaintain-aspect-ratio=1\nsymmetric-padding=1\nnet-scale-factor=0.5\n"
+      "offsets=10;20;30\nbatch-size=4\ndynamic-batch=1\n"), *texts;
+  GstBus *bus = gst_bus_new ();
+  GstElement *e;
+  GstHarness *h;
+
+  RDS_TEST_REQUIRE_GPU ();
+  ensure_test_model ("scale2-b4.onnx");
+  load_hooks ();
+  e = new_infer (cfg);
+  gst_element_set_bus (e, bus);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 96, 64);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 1);
+  g_assert_nonnull (strstr (texts, "dynamic-batch"));
+  g_free (texts);
+  push_dynamic_batches (h, e, want, NULL);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, NULL), ==, 0);
   g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
   harness_teardown_with_bus (h, bus);
   g_free (cfg);
@@ -3700,6 +3863,9 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer/no-batch-meta", test_no_batch_meta);
   g_test_add_func ("/gpu/infer/tensor-meta", test_tensor_meta);
   g_test_add_func ("/gpu/infer/restart", test_restart);
+  g_test_add_func ("/gpu/infer/dynamic-batch", test_dynamic_batch);
+  g_test_add_func ("/gpu/infer/dynamic-batch-property", test_dynamic_batch_property);
+  g_test_add_func ("/gpu/infer/dynamic-batch-fallback", test_dynamic_batch_fallback);
   g_test_add_func ("/gpu/infer/demux", test_demux);
   g_test_add_func ("/gpu/infer/interval", test_interval);
   g_test_add_func ("/gpu/infer/detector", test_detector);

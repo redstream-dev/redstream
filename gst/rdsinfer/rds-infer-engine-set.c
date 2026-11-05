@@ -103,8 +103,8 @@ rds_infer_engine_set_open (const RdsInferEngineOptions * opts, gboolean dynamic,
       return NULL;
     }
     if (!symbolic) {
-      fallback = g_strdup_printf ("dynamic-batch needs a model with a symbolic batch dimension, and %s fixes it: "
-          "running batch-size %u only", opts->onnx_file, opts->batch_size);
+      fallback = g_strdup_printf ("needs a model with a symbolic batch dimension, and %s fixes it: running "
+          "batch-size %u only", opts->onnx_file, opts->batch_size);
       dynamic = FALSE;
     }
   }
