@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-infer-engine.h"
+#include "rds-infer-engine-set.h"
 #include "rds-infer-onnx.h"
 #include "rds-infer-parse.h"
 #include "rds-infer-post.h"
@@ -1852,6 +1853,188 @@ test_first_run (void)
   g_free (onnx);
 }
 
+/* ----- the engine set (dynamic-batch) ----- */
+
+static RdsInferEngineSet *
+open_set (const gchar * onnx, guint batch, gboolean dynamic)
+{
+  RdsInferEngineOptions opts = { onnx, NULL, batch, 0, FALSE, dims_64x48, FALSE, FALSE, NULL, NULL };
+  GError *err = NULL;
+  RdsInferEngineSet *set = rds_infer_engine_set_open (&opts, dynamic, &err);
+
+  g_assert_no_error (err);
+  g_assert_nonnull (set);
+  return set;
+}
+
+/* Runs every program of @set on one batch-major buffer of batch-size distinct images (shared device buffers, as
+ * rdsinfer allocates them once at batch-size), and checks each size's first n output images equal the batch-size
+ * program's, which are exactly 2 x input. */
+static void
+check_set_scale2 (RdsInferEngineSet * set, guint batch)
+{
+  RdsInferEngine *main_e = rds_infer_engine_set_get_main (set);
+  guint c, h, w;
+  gsize img, n_in;
+  gfloat *in, *ref, *out, *d_in, *d_out;
+  hipStream_t stream;
+  GError *err = NULL;
+
+  rds_infer_engine_get_input (main_e, &c, &h, &w);
+  img = (gsize) c * h * w;
+  g_assert_cmpuint (rds_infer_engine_get_output_elements (main_e, 0), ==, img);
+  n_in = batch * img;
+  in = input_pattern (n_in);
+  ref = g_new (gfloat, n_in);
+  out = g_new (gfloat, n_in);
+  HIP_OK (hipStreamCreateWithFlags (&stream, hipStreamNonBlocking));
+  HIP_OK (hipMalloc ((void **) &d_in, n_in * sizeof (gfloat)));
+  HIP_OK (hipMalloc ((void **) &d_out, n_in * sizeof (gfloat)));
+  HIP_OK (hipMemcpyAsync (d_in, in, n_in * sizeof (gfloat), hipMemcpyHostToDevice, stream));
+
+  HIP_OK (hipMemsetAsync (d_out, 0xFF, n_in * sizeof (gfloat), stream));
+  g_assert_true (rds_infer_engine_run_async (main_e, d_in, &d_out, stream, &err));
+  g_assert_no_error (err);
+  HIP_OK (hipMemcpyAsync (ref, d_out, n_in * sizeof (gfloat), hipMemcpyDeviceToHost, stream));
+  HIP_OK (hipStreamSynchronize (stream));
+  for (gsize i = 0; i < n_in; i++)
+    if (ref[i] != 2.0f * in[i])
+      g_error ("batch %u output[%" G_GSIZE_FORMAT "] = %g, expected %g", batch, i, ref[i], 2.0f * in[i]);
+
+  for (guint s = 0; s < rds_infer_engine_set_get_n (set); s++) {
+    RdsInferEngine *e = rds_infer_engine_set_get (set, s);
+    guint n = rds_infer_engine_set_get_size (set, s);
+
+    HIP_OK (hipMemsetAsync (d_out, 0xFF, n_in * sizeof (gfloat), stream));
+    g_assert_true (rds_infer_engine_run_async (e, d_in, &d_out, stream, &err));
+    g_assert_no_error (err);
+    HIP_OK (hipMemcpyAsync (out, d_out, n_in * sizeof (gfloat), hipMemcpyDeviceToHost, stream));
+    HIP_OK (hipStreamSynchronize (stream));
+    for (gsize i = 0; i < n * img; i++)
+      if (out[i] != ref[i])
+        g_error ("batch %u program output[%" G_GSIZE_FORMAT "] = %g, the batch %u program's %g", n, i, out[i],
+            batch, ref[i]);
+  }
+  HIP_OK (hipFree (d_in));
+  HIP_OK (hipFree (d_out));
+  HIP_OK (hipStreamDestroy (stream));
+  g_free (in);
+  g_free (ref);
+  g_free (out);
+}
+
+/* scale2 at batch 4 with dynamic-batch: programs of 1, 2 and 4, each its own cache entry, the same output prefixes,
+ * all loaded from the cache the second time; one program without dynamic-batch; one program and a fallback reason
+ * for a model with a fixed batch; the engine's own errors for no ONNX file and batch-size 0. */
+static void
+test_engine_set (void)
+{
+  static const guint want[] = { 1, 2, 4 };
+  gchar *onnx, *dir, *b4_onnx, *b4_dir;
+  RdsInferEngineSet *set;
+  RdsInferEngineOptions opts = { NULL, NULL, 4, 0, FALSE, dims_64x48, FALSE, FALSE, NULL, NULL };
+  GError *err = NULL;
+
+  RDS_TEST_REQUIRE_GPU ();
+  dir = make_model_dir (SCALE2, &onnx);
+  for (guint round = 0; round < 2; round++) {
+    set = open_set (onnx, 4, TRUE);
+    g_assert_null (rds_infer_engine_set_get_fallback_reason (set));
+    g_assert_cmpuint (rds_infer_engine_set_get_n (set), ==, G_N_ELEMENTS (want));
+    for (guint i = 0; i < G_N_ELEMENTS (want); i++) {
+      RdsInferEngine *e = rds_infer_engine_set_get (set, i);
+      gchar *prefix = g_strdup_printf ("scale2_b%u_3x64x48_", want[i]);
+      gchar *base = g_path_get_basename (rds_infer_engine_get_program_path (e));
+
+      g_assert_cmpuint (rds_infer_engine_set_get_size (set, i), ==, want[i]);
+      g_test_message ("round %u: %s %s", round, base, rds_infer_engine_was_built (e) ? "built" : "loaded");
+      g_assert_true (g_str_has_prefix (base, prefix));
+      g_assert_true (g_str_has_prefix (rds_infer_engine_get_program_path (e), dir));
+      g_assert_true (rds_infer_engine_was_built (e) == (round == 0));
+      g_free (base);
+      g_free (prefix);
+    }
+    g_assert_true (rds_infer_engine_set_get_main (set) == rds_infer_engine_set_get (set, 2));
+    g_assert_cmpuint (rds_infer_engine_set_pick (set, 1), ==, 0);
+    g_assert_cmpuint (rds_infer_engine_set_pick (set, 2), ==, 1);
+    g_assert_cmpuint (rds_infer_engine_set_pick (set, 3), ==, 2);
+    g_assert_cmpuint (rds_infer_engine_set_pick (set, 4), ==, 2);
+    check_set_scale2 (set, 4);
+    rds_infer_engine_set_free (set);
+  }
+
+  set = open_set (onnx, 4, FALSE);
+  g_assert_cmpuint (rds_infer_engine_set_get_n (set), ==, 1);
+  g_assert_cmpuint (rds_infer_engine_set_get_size (set, 0), ==, 4);
+  g_assert_cmpuint (rds_infer_engine_set_pick (set, 1), ==, 0);
+  g_assert_null (rds_infer_engine_set_get_fallback_reason (set));
+  g_assert_false (rds_infer_engine_was_built (rds_infer_engine_set_get_main (set)));
+  rds_infer_engine_set_free (set);
+
+  /* batch-size 1: one program, nothing to fall back from. */
+  set = open_set (onnx, 1, TRUE);
+  g_assert_cmpuint (rds_infer_engine_set_get_n (set), ==, 1);
+  g_assert_null (rds_infer_engine_set_get_fallback_reason (set));
+  check_set_scale2 (set, 1);
+  rds_infer_engine_set_free (set);
+
+  b4_dir = make_model_dir_full (SCALE2_B4, TRUE, &b4_onnx);
+  set = open_set (b4_onnx, 4, TRUE);
+  g_assert_cmpuint (rds_infer_engine_set_get_n (set), ==, 1);
+  g_assert_cmpuint (rds_infer_engine_set_get_size (set, 0), ==, 4);
+  g_assert_nonnull (rds_infer_engine_set_get_fallback_reason (set));
+  g_test_message ("%s", rds_infer_engine_set_get_fallback_reason (set));
+  g_assert_nonnull (strstr (rds_infer_engine_set_get_fallback_reason (set), "symbolic batch"));
+  check_set_scale2 (set, 4);
+  rds_infer_engine_set_free (set);
+
+  /* No ONNX file: the one program's open fails as the engine's does, unprefixed. */
+  g_assert_null (rds_infer_engine_set_open (&opts, TRUE, &err));
+  g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_INVALID);
+  g_test_message ("%s", err->message);
+  g_assert_true (g_str_has_prefix (err->message, "invalid engine options"));
+  g_clear_error (&err);
+
+  /* batch-size 0: the engine's own refusal too. */
+  opts.onnx_file = onnx;
+  opts.batch_size = 0;
+  g_assert_null (rds_infer_engine_set_open (&opts, TRUE, &err));
+  g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_INVALID);
+  g_test_message ("%s", err->message);
+  g_assert_true (g_str_has_prefix (err->message, "invalid engine options"));
+  g_clear_error (&err);
+
+  remove_dir (b4_dir);
+  g_free (b4_dir);
+  g_free (b4_onnx);
+  remove_dir (dir);
+  g_free (dir);
+  g_free (onnx);
+}
+
+/* A smaller program that can't be had fails the whole open, naming its size: with no_build, the batch 4 program
+ * cached and the batch 1 and 2 ones not. */
+static void
+test_engine_set_partial (void)
+{
+  gchar *onnx, *dir;
+  RdsInferEngineOptions opts = { NULL, NULL, 4, 0, FALSE, dims_64x48, FALSE, TRUE, NULL, NULL };
+  GError *err = NULL;
+
+  RDS_TEST_REQUIRE_GPU ();
+  dir = make_model_dir (SCALE2, &onnx);
+  rds_infer_engine_set_free (open_set (onnx, 4, FALSE));
+  opts.onnx_file = onnx;
+  g_assert_null (rds_infer_engine_set_open (&opts, TRUE, &err));
+  g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_NOT_CACHED);
+  g_test_message ("%s", err->message);
+  g_assert_true (g_str_has_prefix (err->message, "batch 2 program: "));
+  g_clear_error (&err);
+  remove_dir (dir);
+  g_free (dir);
+  g_free (onnx);
+}
+
 static void
 test_test_models (void)
 {
@@ -1899,6 +2082,8 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-engine/errors", test_errors);
   g_test_add_func ("/gpu/infer-engine/test-models", test_test_models);
   g_test_add_func ("/gpu/infer-engine/first-run", test_first_run);
+  g_test_add_func ("/gpu/infer-engine/engine-set", test_engine_set);
+  g_test_add_func ("/gpu/infer-engine/engine-set-partial", test_engine_set_partial);
   g_test_add_func ("/gpu/infer-yolo/smoke", test_yolo_smoke);
   g_test_add_func ("/gpu/infer-yolo/parity", test_yolo_parity);
   g_test_add_func ("/gpu/infer-yolo/cls-parity", test_yolo_cls_parity);
