@@ -12,6 +12,9 @@ common_test_env = {
   # memory_hip's concurrent views test, ~2 % of runs). Copies done by blit kernels instead avoid it, at no measured
   # cost on the gfx1036 iGPU; more queues avoid it too but slow pipelines down.
   'HSA_ENABLE_SDMA' : '0',
+  # ROCm 10.1 on the gfx1036 iGPU, under host load: a kernel's writes now and then don't reach the next kernel on the
+  # same stream (stale or NaN outputs, no error; see AGENTS.md). Uncached GPU mappings avoid it.
+  'HSA_DISABLE_CACHE' : '1',
 }
 # Sanitized plugins can't be loaded by gst-plugin-scanner (not linked with the ASan runtime): scan in-process.
 # b_sanitize was a string option ('none', 'address,undefined') before meson 1.8 and is an array option since;

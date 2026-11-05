@@ -48,8 +48,7 @@ typedef struct
    * When a build is needed and its directory can't be written, fails with OUTPUT before building. */
   const gchar *output_file;
   /* The stream (a hipStream_t; not the null stream) for the warm-up run that ends the open: the one the caller's
-   * runs will use. NULL: a stream of the engine's own, destroyed after the run (see warm_up in the .cpp: with ROCm
-   * 10.1 that can cost the first runs on a stream made before the open, so an element passes its own). */
+   * runs will use; an element passes its own. NULL: a stream of the engine's own, destroyed after the run. */
   void *warm_up_stream;
 } RdsInferEngineOptions;
 

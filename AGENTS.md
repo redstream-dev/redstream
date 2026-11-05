@@ -160,15 +160,23 @@ Known gotchas:
   stream sync between the copy and the launch it drew correctly; `HIP_LAUNCH_BLOCKING=1` and SDMA copies did not
   help. `rds_osd_gpu_new` loads its kernels up front with `hipFuncGetAttributes`; do the same for a kernel whose first
   launch follows other work on its stream.
-- An engine warm-up on a stream made for it and destroyed after it could, with ROCm 10.1, lose the first work on a
-  stream made before the open: `rdsinfer`'s first chunk on its own stream ran none of its kernels (a device-side
-  counter in the preprocessing kernel stayed put; the network input and outputs kept the previous element's data),
-  while the copies on that stream ran and every HIP call returned success. No `hipStreamSynchronize` or
-  `hipDeviceSynchronize` around the warm-up or the chunk avoided it. Seen only under ASan, in
-  `element_infer_secondary`, and which test failed moved with ASan's `quarantine_size_mb`, so host memory freed and
-  then used inside the HIP runtime is the likely cause. The warm-up now runs on the element's own stream
-  (`RdsInferEngineOptions.warm_up_stream`); with it, the configurations that failed nearly every run (16 and
-  256 MiB) pass.
+- ROCm 10.1 on the gfx1036 iGPU (run as gfx1030), when the host is busy: a kernel's writes now and then don't
+  reach the next kernel on the same in-order stream, with no error. A plain HIP loop on one long-lived stream (a
+  kernel writes the input, a second scales it into the output, a third checks the output), with no copies, no new
+  streams and no allocations in the loop, gave 0 bad iterations in 25000 on an idle host and 21 to 94 per 25000
+  with CPU and memory-bandwidth load (`dd if=/dev/zero of=/dev/null bs=64M` and busy loops); typically a contiguous
+  64 KiB of the output was stale. Pageable or pinned copies, SDMA on or off, fresh or reused streams,
+  `AMD_SERIALIZE_KERNEL=3`, `GPU_MAX_HW_QUEUES=16` and `HIP_FORCE_DEV_KERNARG` all still failed;
+  `HSA_DISABLE_CACHE=1` (allocations mapped uncached on the GPU) gave 0 in 25000. In our tests it showed as NaN
+  outputs (the 0xFF sentinel) from an engine's first run in `infer_engine`'s GPU cases, in 3 to 13 runs out of 20
+  depending on the host's load, while a profiler trace had the copies and the kernel all executed, in order. A
+  rerun of the same engine was right. `tests/meson.build` sets `HSA_DISABLE_CACHE=1` for every test: it cost
+  nothing measurable in `infer_engine` (3.1 s) or the YOLO11n parity case, but `rds-test3` (two 720p sources,
+  release build) went from ~21.5 to ~16.5 fps per source, so don't use it outside the tests.
+- `rdsinfer`'s engine warm-up runs on the element's own stream (`RdsInferEngineOptions.warm_up_stream`; NULL: a
+  stream of the engine's own). It was moved there for a failure seen under ASan in `element_infer_secondary`: the
+  first chunk on the element's stream ran as if none of its kernels had, while its copies ran and every HIP call
+  returned success. That fits the coherence failure above, and the move most likely only shifted the timing.
 - MIOpen (MIGraphX's convolutions) keeps its databases under `$HOME/.config/miopen`. GLib tests with
   `G_TEST_OPTION_ISOLATE_DIRS` set `HOME=/dev/null`, so such tests point `MIOPEN_USER_DB_PATH` and
   `MIOPEN_CUSTOM_CACHE_DIR` somewhere writable, and `AMD_COMGR_CACHE_DIR` too, since the isolated

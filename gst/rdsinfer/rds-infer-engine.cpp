@@ -680,9 +680,8 @@ run_async (RdsInferEngine * e, const float *input, float *const *outputs, hipStr
 }
 
 /* One run on zeros, synchronized: the first run after loading takes longer. On @caller_stream when set (the stream
- * the caller's runs will use), else on a stream of our own, destroyed after the run. With ROCm 10.1 the latter can
- * lose the first work on a stream the caller made before the open: its kernels never run, the copies on it do, and
- * every HIP call succeeds (see AGENTS.md). */
+ * the caller's runs will use), else on a stream of our own, destroyed after the run (see AGENTS.md on why rdsinfer
+ * passes its own). */
 static gboolean
 warm_up (RdsInferEngine * e, hipStream_t caller_stream, GError ** error)
 {
