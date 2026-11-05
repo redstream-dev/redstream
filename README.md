@@ -71,6 +71,12 @@ Jetson-specific hardware blocks.
   a DeepStream custom bbox parser library, recompiled against `rds/rds_compat_infer.h`. Secondary mode
   (`process-mode=2`) runs detectors, classifiers (classifier meta, with the built-in argmax parser or a DeepStream
   custom classifier parser) and tensor-output models on the crops of objects that upstream elements found.
+  A compiled MIGraphX program has a fixed batch, so a partial batch normally costs as much as a full one. With
+  `dynamic-batch=1` (ours, off by default) `rdsinfer` also compiles programs for the powers of two below
+  `batch-size` and runs each batch or chunk on the smallest that holds it: YOLO11n with one frame in a
+  `batch-size` 4 pipeline takes about 31 ms instead of 95 ms. It costs one compile per size on a cold cache and about
+  80–115 MB of GPU memory per extra program. In primary mode the highest occupied slot decides, not the number of
+  frames: one frame in slot 3 still runs on the batch-4 program.
 - **`rdstracker`** (`nvtracker`): gives detected objects persistent IDs with the IOU and NvSORT trackers of
   NvMultiObjectTracker, on the CPU, reading the same YAML low-level config files (NvDCF and NvDeepSORT configs run
   as NvSORT). Where NVIDIA's docs leave behaviour open, it follows observed DeepStream 8.0 behaviour, and the compat
@@ -239,7 +245,8 @@ Early numbers on a 2-CU Ryzen 9 7900X iGPU:
   about 50 fps; about 48 fps with `rdstracker` (NvSORT) after it; about 44–46 fps through the whole `rds-test3`
   chain (tracker, tiler and OSD, to a fakesink); about 39 fps for `rds-test2` (YOLO11n-cls on the vehicles as well).
 - YOLO11n-cls FP32 at 224×224, secondary mode with `batch-size` 16: about 26 ms per run with 4 crops and about 29 ms
-  with 16 (the compiled program has a fixed batch, so fewer crops save almost nothing).
+  with 16 (the compiled program has a fixed batch, so fewer crops save almost nothing unless `dynamic-batch` is
+  on).
 - `rdsosd` at 1280×720 with about 60 objects, release build: about 0.3 ms per frame on the GPU (about 1.2 ms with
   `process-mode=0`, the CPU drawing and the GPU↔CPU syncs included). On 1920×1080 frames from `rdsstreamdemux`,
   which it draws on a private copy: about 0.9 ms on the GPU, about 7 ms on the CPU (the copy's CPU staging).

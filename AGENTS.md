@@ -116,10 +116,19 @@ Known gotchas:
   `$XDG_CACHE_HOME/redstream/`), with a `.mxr.json` manifest (model hash, MIGraphX and HIP versions, device,
   shapes, options) that must match for the program to load. Tests reuse these caches: never delete them casually,
   and never run two YOLO11n tests in parallel (`is_parallel : false`, generous `timeout`s).
-- A compiled MIGraphX program has a fixed batch size (`batch-size`): `rdsinfer` runs all of its images whatever
-  the number filled (the rest zeroed), so a secondary-mode chunk of 4 objects costs nearly as much as one of 16: no
-  per-object saving (YOLO11n-cls at 224×224, batch 16, on the gfx1036 iGPU: about 26 ms with 4, about 29 ms with
-  16). Pick a secondary model's `batch-size` for the objects a batch usually has, not the most it can have.
+- A compiled MIGraphX program has a fixed batch size (`batch-size`): by default `rdsinfer` runs all of its images
+  whatever the number filled (the rest zeroed), so a secondary-mode chunk of 4 objects costs nearly as much as one
+  of 16 (YOLO11n-cls at 224×224, batch 16, on the gfx1036 iGPU: about 26 ms with 4, about 29 ms with 16). Pick a
+  secondary model's `batch-size` for the objects a batch usually has, not the most it can have.
+- `dynamic-batch=1` (ours, `rds-infer-engine-set`) compiles one fixed program per power of two below `batch-size`
+  plus `batch-size` (16: 1, 2, 4, 8, 16) and runs each chunk on the smallest that holds its highest image: in primary
+  mode the highest occupied slot (`batch_id`), not the frame count; in secondary mode the object count. YOLO11n, one
+  frame at `batch-size` 4: about 31 ms on the batch-1 program, 95 ms on the batch-4 one (latency is roughly linear
+  in the batch). The cost: one compile per size on a cold cache (YOLO11n: ~1.5 min each), and ~80–115 MB of GPU
+  memory per extra program, since MIGraphX 2.18 can't share weights between programs. Results agree with the
+  `batch-size` program only up to float rounding (different kernels), so tests compare with a tolerance. MIGraphX's
+  dynamic shapes are not used: in 2.18 they compile every size anyway and copy the weights for each, YOLO11n doesn't
+  parse that way, and one such compile hung the GPU.
 - MIGraphX gives every symbolic ONNX dimension a default (1) when it parses a model, silently. Whether a dimension is
   fixed or symbolic comes from our own reader (`rds-infer-onnx`), which reads the file's declared input dims.
 - MIGraphX's C++ exceptions always say "Failed to call function"; the real reason is on stderr. Error messages name
@@ -227,7 +236,10 @@ gst/rdsinfer/      libgstrdsinfer plugin: rdsinfer (gstrdsinfer.c; secondary mod
                    rds-infer-cache the per-object cache (which tracked objects are due, classifier results as values,
                    its own mutex taken after the batch meta lock, stale completions dropped by seq and epoch);
                    rds-infer-engine compiles ONNX with MIGraphX and caches the program (.mxr + .mxr.json manifest),
-                   reading the model's declared input dims with the small protobuf reader rds-infer-onnx. These are
+                   reading the model's declared input dims with the small protobuf reader rds-infer-onnx;
+                   rds-infer-engine-set is the set of fixed-batch programs of one model (dynamic-batch: one per
+                   power of two below batch-size, plus batch-size; the pick of the smallest that holds a chunk;
+                   all-or-nothing open, the fallback for a fixed batch dimension). These are
                    in the static rdsinfer-core library (C and C++: link it with link_language 'cpp'), shared with the
                    tests; the letterbox + normalisation kernel (rds-infer-preprocess.hip) is the static
                    rdsinfer-preprocess; config corpus in tests/check/infer-configs, test parser modules built from
@@ -283,7 +295,8 @@ samples/rds-test3/ clean-room test3-style multi-stream sample (end to end: nvuri
                    OSD, display; --dry-run, --no-display, --pgie-config, --tracker-config, the RTSP options; Ctrl-C
                    stops with an EOS)
 samples/tracker/   our IOU and NvSORT low-level tracker configs for rdstracker (tuned on the street clip)
-tools/rds-compile/ rds-compile: pre-builds rdsinfer's program with its config parser and engine (exit 2: up to date)
+tools/rds-compile/ rds-compile: pre-builds rdsinfer's programs (every program of a dynamic batch) with its config
+                   parser and engine set (exit 2: all up to date)
 tools/rds-rtsp-serve/ rds-rtsp-serve: a test pattern or a looped file over RTSP, with a TCP fault relay in front (freeze,
                    cut, refuse on a schedule). Its server and relay (rtsp-test-server, gst-rtsp-server on its own thread
                    and context) are the static rtsp-test-server library the tests link (its shared option gives every

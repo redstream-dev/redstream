@@ -555,7 +555,7 @@ is set.
 | `filter-out-class-ids` | string | none | supported | semicolon-separated class ids (`1;2`); replaces the file's list (an empty string clears it) |
 | `model-engine-file` | string | none | supported | a compiled MIGraphX program (`.mxr`), loaded when its manifest matches the model and the device, else rebuilt into the cache name; used as given (a config-file value is relative to the config file). A TensorRT `.engine` is ignored with a warning. Changing it while PLAYING (on-the-fly model update) is not supported |
 | `batch-size` | uint | `1` (ours) | supported | 1..1024. Primary mode: frames of a batch go to the network image of their slot (`batch_id`); a frame in a slot at or above `batch-size` is an error. Secondary mode: objects inferred together, see "Secondary mode" |
-| `dynamic-batch` | boolean | `FALSE` (ours) | supported | ours (nvinfer has no such property): also compile programs for the powers of two below `batch-size` and run each chunk on the smallest that holds it |
+| `dynamic-batch` | boolean | `FALSE` (ours) | supported | ours (nvinfer has no such property); overrides the config key: also compile programs for the powers of two below `batch-size` (4: 1, 2, 4; 6: 1, 2, 4, 6) and run each chunk on the smallest that holds its highest image. Primary mode: the highest occupied slot (`batch_id`) decides, not the number of frames, so one frame in slot 3 runs on the batch-4 program. Secondary mode: a chunk's objects take images 0 to n-1, so the object count decides. `batch-size` keeps its meaning, the most images one run takes. A model with a fixed batch dimension falls back to the `batch-size` program alone, with a warning at start. Costs and caching: see "Models and compiled programs"; changeable only in NULL or READY |
 | `interval` | int | `0` (ours) | supported | 0..32: infer one batch, skip the next `interval` (they pass with `bInferDone` FALSE and no objects); the count restarts at start and after a flush (ours); ignored in secondary mode, with a warning (DeepStream 8.0 behaviour) |
 | `gpu-id` | uint | `0` | supported | the GPU for preprocessing and inference; the batch must be in GPU memory on it |
 | `output-tensor-meta` | boolean | `FALSE` | supported | one `RdsInferTensorMeta` per inferred frame, or per object in secondary mode (also always with `network-type=100`), see "Tensor output meta" |
@@ -612,9 +612,9 @@ freed (ours).
 One batch at a time, synchronously (ours; nvinfer's threading isn't documented): preprocessing and inference on the
 element's own non-blocking stream, one synchronization per batch (per chunk of `batch-size` objects in secondary
 mode), parsing on the CPU. Slots without a frame (a partial batch) and unused images of a chunk are zeroed, not
-inferred on stale pixels. The batch's metadata lock is held only to read the frame list and to add the results,
-never during GPU work; results for a frame or object removed in between are dropped, also when the metadata pool
-gave its address to a new one.
+inferred on stale pixels (with `dynamic-batch`, those of the program that runs). The batch's metadata lock is held
+only to read the frame list and to add the results, never during GPU work; results for a frame or object removed in
+between are dropped, also when the metadata pool gave its address to a new one.
 
 #### Secondary mode
 
@@ -638,7 +638,7 @@ which has no properties for them. Their rows are in "Config keys: `[property]`".
 | Crop in the network input | DeepStream 8.0 behaviour | stretched to the network, or with `maintain-aspect-ratio` scaled by min(W/w, H/h) with the scaled size floored to even (24×16 into 16×16 is 16×10), at the top-left, or with `symmetric-padding` at floor((net − exact scaled size) / 2); padding is pixel value 0 before normalisation. The crop is resampled to 8 bits, then normalised as in primary mode |
 | Scaling filter | ours | `scaling-filter` defaults to 1 (bilinear) in both modes (8.0's default is nearest). Nearest samples at pixel centres, as `rds_buf_surf_transform` does: a 32-pixel crop into 16 reads columns 1, 3, 5, … (8.0 reads 0, 2, 4, …), so nearest-filter inputs can differ from 8.0's by one source pixel. `scaling-filter=3` works (bilinear; 8.0 fails the pipeline) |
 | Batching | DeepStream 8.0 behaviour | objects in frame list order, then object list order, in chunks of `batch-size` that continue across the frames of a batch but never across batches: 10 objects at `batch-size` 4 run as 4, 4, 2; two batches of 5 as 4, 1 and 4, 1 |
-| Chunk size | ours | the compiled program has a fixed batch of `batch-size` images: a chunk with fewer objects runs them all the same, its unused images zeroed, so a chunk costs nearly as much with few objects as when full: no per-object saving (8.0 rebuilds the model for 1 to `batch-size` images and runs the actual count). The results per object are the same |
+| Chunk size | ours | the compiled program has a fixed batch of `batch-size` images: a chunk with fewer objects runs them all the same, its unused images zeroed, so a chunk costs nearly as much with few objects as when full (8.0 rebuilds the model for 1 to `batch-size` images and runs the actual count). With `dynamic-batch`, a chunk of n objects runs on the smallest program of at least n images, so smaller chunks cost less: 5 objects at `batch-size` 4 run as 4, then 1 on the batch-1 program. The results per object are the same, up to float rounding between programs |
 | Tensor meta | DeepStream 8.0 behaviour | one per inferred object (a detector's parents and classified objects included), on the object's `obj_user_meta_list`; none on the frame or the batch (see "Per-object cache"). `unique_id` is the `gie-unique-id`, the layer dims are those of one object (no batch), the host and device pointers point at the object's slice, `network_info` is the network's size and `maintain_aspect_ratio` / `symmetric_padding` the config's values |
 | Detector objects (children) | DeepStream 8.0 behaviour | per crop, with the class attributes' thresholds, NMS per class (never across crops), `detected-min/max-*` in frame pixels and `filter-out-class-ids`; `parent` is the cropped object, `unique_component_id` this element's `gie-unique-id`, `class_id`, `confidence`, `obj_label` and the text from the parser and label file, `object_id` untracked |
 | Detector thresholds | DeepStream 8.0 behaviour | the class attributes' defaults are those of the key table in both modes: `pre-cluster-threshold` 0.2, as in 8.0 |
@@ -741,7 +741,7 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `labelfile-path` | path | none |  | supported | see "Config files" |
 | `infer-dims` | dims | none | 1..2147483647 | supported | `C;H;W` of one input image (also for `network-input-order=1`); required when the model's height or width is symbolic |
 | `output-blob-names` | string list | none |  | accepted no-op | all outputs are passed to the parser and to the tensor meta |
-| `batch-size` | uint | `1` (ours) | 1..1024 | supported | the program is compiled for this batch size; the model's batch dimension must be symbolic or equal to it |
+| `batch-size` | uint | `1` (ours) | 1..1024 | supported | the program is compiled for this batch size (with `dynamic-batch`, the largest program of the set); the model's batch dimension must be symbolic or equal to it |
 | `dynamic-batch` | bool | `0` (ours) |  | supported | ours (nvinfer has no such key): as the property |
 | `network-mode` | int | `0` (ours) | 0..3 | supported | accepted values: 0, 2 (FP32, FP16; inputs and outputs stay FP32). INT8 (1) and BEST (3) fail at start |
 | `network-type` | int | `0` (ours) | 0..100 | supported | accepted values: 0, 1, 100 (detector; classifier, in secondary mode only; no post-processing, tensor meta only). A classifier in primary mode and segmentation (2, 3) fail at start |
@@ -861,6 +861,15 @@ gives at most one object, its best class (no objectness score). Another output l
 - Lookup: `model-engine-file`, then the cache name next to the model, then in `$XDG_CACHE_HOME/redstream/`. A stale
   `model-engine-file` is never overwritten: the rebuilt program goes to the cache name, and later starts load that
   copy with a warning that `model-engine-file` doesn't match. A TensorRT `.engine` file is ignored with a warning.
+- With `dynamic-batch` (ours), every program of the set is compiled or loaded at start: the `batch-size` one first,
+  then the smaller ones in descending order. Each is an ordinary cache entry with its own `_b<N>_` name and
+  manifest. All or nothing: a program that fails fails the start, and the error names its size (`batch 2 program:
+  ...`). `model-engine-file` applies to the `batch-size` program only; the smaller ones always use their cache names.
+  Each extra program costs a compile on a cold cache (YOLO11n on the gfx1036 iGPU: about 1.5 min per size) and its
+  own GPU memory (about 80–115 MB each; MIGraphX 2.18 can't share weights between programs). The programs are
+  different kernels, so their results agree with the `batch-size` program's only up to float rounding (YOLO11n: at
+  most 1.13e-6 in confidence and 1.22e-4 px in the boxes). MIGraphX's own dynamic shapes are not used: in 2.18 they
+  compile every size anyway, copy the weights for each, and don't parse YOLO11n.
 - The element runs the program once on start (a warm-up), so the first batch isn't slower than the rest.
 
 #### Pre-building programs: `rds-compile` (`trtexec`)
