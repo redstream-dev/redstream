@@ -68,7 +68,8 @@ typedef struct
   gssize field;                 /* offset + 1 into RdsInferConfig (property) or RdsInferClassAttrs; 0: not stored */
   gint accept[3];               /* with n_accept > 0, the only supported values; others are rejected */
   guint n_accept;
-  const gchar *note;            /* why the key is a no-op or rejected, or why other values are rejected */
+  const gchar *note;            /* why the key is a no-op or rejected, why other values are rejected, or what a
+                                 * key of ours does */
 } KeyInfo;
 
 #define P(f) (G_STRUCT_OFFSET (RdsInferConfig, f) + 1)
@@ -99,6 +100,9 @@ static const KeyInfo keys[] = {
       .note = "all outputs are passed to the parser and to the tensor meta"},
   {.name = "batch-size",.group = PROP,.type = TYPE_UINT,.status = SUP,.min = 1,.max = RDS_INFER_MAX_BATCH_SIZE,
       .def = "1",.field = P (batch_size)},
+  {.name = "dynamic-batch",.group = PROP,.type = TYPE_BOOL,.status = SUP,.def = "0",.field = P (dynamic_batch),
+      .note = "ours: also compile programs for the powers of two below batch-size and run each chunk on the "
+        "smallest that holds it"},
   {.name = "network-mode",.group = PROP,.type = TYPE_INT,.status = SUP,.min = 0,.max = 3,.def = "0",
         .field = P (network_mode),.accept = {0, 2},.n_accept = 2,
       .note = "only FP32 (0) and FP16 (2) are supported; INT8 (1) and BEST (3) are not"},

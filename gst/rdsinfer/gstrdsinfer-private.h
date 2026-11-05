@@ -55,7 +55,7 @@ struct _GstRdsInfer
   gchar *config_file_path, *infer_on_class_ids, *filter_out_class_ids, *model_engine_file;
   guint unique_id, process_mode, batch_size, gpu_id;
   gint infer_on_gie_id, interval;
-  gboolean output_tensor_meta, raw_output_file_write, output_instance_mask, input_tensor_meta,
+  gboolean dynamic_batch, output_tensor_meta, raw_output_file_write, output_instance_mask, input_tensor_meta,
       crop_objects_to_roi_boundary, clip_object_outside_roi;
   gpointer raw_output_generated_callback, raw_output_generated_userdata;
   guint32 set_mask;

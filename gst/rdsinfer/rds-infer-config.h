@@ -52,6 +52,7 @@ typedef struct
   guint infer_dims[3];                          /* C, H, W */
   gboolean has_infer_dims;
   gboolean maintain_aspect_ratio, symmetric_padding, output_tensor_meta;
+  gboolean dynamic_batch;                       /* ours: also compile the powers of two below batch_size */
   GArray *filter_out_class_ids;                 /* guint, never NULL */
   RdsInferClassAttrs *class_attrs;              /* num_detected_classes entries, after inheritance */
   /* Detectors: NULL-terminated, num_detected_classes entries ("" if none; all "" for a classifier). */
@@ -139,7 +140,8 @@ typedef struct
   const gchar *default_value;   /* as it would be written in the file; NULL: none (unset or zero) */
   const gchar *range;           /* "MIN..MAX", ">= MIN" or "> MIN" (of each element for lists); NULL: not a number */
   const gchar *accepted;        /* the supported values, e.g. "2, 4", when not every value in range is; else NULL */
-  const gchar *note;            /* why a key is a no-op or rejected, or why other values are rejected; NULL: none */
+  const gchar *note;            /* why a key is a no-op or rejected, why other values are rejected, or what a key of
+                                 * ours does; NULL: none */
 } RdsInferKeyDesc;
 
 /* @key and its strings are valid during the call only. */

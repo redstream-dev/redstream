@@ -56,6 +56,7 @@ GST_DEBUG_CATEGORY (gst_rds_infer_debug);
 #define DEFAULT_PROCESS_MODE 1
 #define DEFAULT_INFER_ON_GIE_ID -1     /* every GIE, as DeepStream 8.0's */
 #define DEFAULT_BATCH_SIZE 1
+#define DEFAULT_DYNAMIC_BATCH FALSE
 #define DEFAULT_INTERVAL 0
 #define DEFAULT_GPU_ID 0
 
@@ -70,6 +71,7 @@ enum
   PROP_FILTER_OUT_CLASS_IDS,
   PROP_MODEL_ENGINE_FILE,
   PROP_BATCH_SIZE,
+  PROP_DYNAMIC_BATCH,
   PROP_INTERVAL,
   PROP_GPU_ID,
   PROP_OUTPUT_TENSOR_META,
@@ -166,7 +168,7 @@ configure (GstRdsInfer * self, GError ** error)
   guint32 set;
   guint unique_id, process_mode, batch_size, gpu_id;
   gint on_gie_id, interval;
-  gboolean tensor_meta, raw_write, instance_mask, tensor_input, crop, clip;
+  gboolean dynamic_batch, tensor_meta, raw_write, instance_mask, tensor_input, crop, clip;
   gpointer raw_cb;
   GArray *ids;
 
@@ -180,6 +182,7 @@ configure (GstRdsInfer * self, GError ** error)
   process_mode = self->process_mode;
   on_gie_id = self->infer_on_gie_id;
   batch_size = self->batch_size;
+  dynamic_batch = self->dynamic_batch;
   gpu_id = self->gpu_id;
   interval = self->interval;
   tensor_meta = self->output_tensor_meta;
@@ -207,6 +210,7 @@ configure (GstRdsInfer * self, GError ** error)
   OVERRIDE (PROP_PROCESS_MODE, "process-mode", cfg->process_mode = (gint) process_mode);
   OVERRIDE (PROP_INFER_ON_GIE_ID, "operate-on-gie-id", cfg->operate_on_gie_id = on_gie_id);
   OVERRIDE (PROP_BATCH_SIZE, "batch-size", cfg->batch_size = batch_size);
+  OVERRIDE (PROP_DYNAMIC_BATCH, "dynamic-batch", cfg->dynamic_batch = dynamic_batch);
   OVERRIDE (PROP_INTERVAL, "interval", cfg->interval = (guint) interval);
   OVERRIDE (PROP_GPU_ID, "gpu-id", cfg->gpu_id = gpu_id);
   OVERRIDE (PROP_OUTPUT_TENSOR_META, "output-tensor-meta", cfg->output_tensor_meta = tensor_meta);
@@ -330,6 +334,7 @@ rds_infer_test_get_config (GstElement * element, GError ** error)
     warnings = join_warnings (cfg->warnings);
     s = gst_structure_new ("rdsinfer-config",
         "batch-size", G_TYPE_UINT, cfg->batch_size,
+        "dynamic-batch", G_TYPE_BOOLEAN, cfg->dynamic_batch,
         "interval", G_TYPE_UINT, cfg->interval,
         "gie-unique-id", G_TYPE_UINT, cfg->gie_unique_id,
         "process-mode", G_TYPE_INT, cfg->process_mode,
@@ -1107,6 +1112,9 @@ gst_rds_infer_set_property (GObject * object, guint prop_id, const GValue * valu
     case PROP_BATCH_SIZE:
       self->batch_size = g_value_get_uint (value);
       break;
+    case PROP_DYNAMIC_BATCH:
+      self->dynamic_batch = g_value_get_boolean (value);
+      break;
     case PROP_INTERVAL:
       self->interval = g_value_get_int (value);
       break;
@@ -1176,6 +1184,9 @@ gst_rds_infer_get_property (GObject * object, guint prop_id, GValue * value, GPa
       break;
     case PROP_BATCH_SIZE:
       g_value_set_uint (value, self->batch_size);
+      break;
+    case PROP_DYNAMIC_BATCH:
+      g_value_set_boolean (value, self->dynamic_batch);
       break;
     case PROP_INTERVAL:
       g_value_set_int (value, self->interval);
@@ -1279,6 +1290,10 @@ gst_rds_infer_class_init (GstRdsInferClass * klass)
       g_param_spec_uint ("batch-size", "Batch size", "Frames (primary mode) or objects (secondary mode) inferred "
           "together", 1, RDS_INFER_MAX_BATCH_SIZE,
           DEFAULT_BATCH_SIZE, PFLAGS));
+  g_object_class_install_property (gobject_class, PROP_DYNAMIC_BATCH,
+      g_param_spec_boolean ("dynamic-batch", "Dynamic batch",
+          "Also compile programs for the powers of two below batch-size and run each chunk on the smallest that "
+          "holds it (ours)", DEFAULT_DYNAMIC_BATCH, PFLAGS));
   g_object_class_install_property (gobject_class, PROP_INTERVAL,
       g_param_spec_int ("interval", "Interval", "Batches skipped after each inferred batch", 0,
           RDS_INFER_MAX_INTERVAL, DEFAULT_INTERVAL, PFLAGS));
@@ -1331,6 +1346,7 @@ gst_rds_infer_init (GstRdsInfer * self)
   self->process_mode = DEFAULT_PROCESS_MODE;
   self->infer_on_gie_id = DEFAULT_INFER_ON_GIE_ID;
   self->batch_size = DEFAULT_BATCH_SIZE;
+  self->dynamic_batch = DEFAULT_DYNAMIC_BATCH;
   self->interval = DEFAULT_INTERVAL;
   self->gpu_id = DEFAULT_GPU_ID;
   self->units = g_array_new (FALSE, FALSE, sizeof (InferUnit));

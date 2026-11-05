@@ -156,6 +156,11 @@ if rds_infer_enabled
       dependencies : [rdsinfer_core_dep],
       link_language : 'cpp'),
     suite : 'cpu', env : internal_test_env, protocol : 'tap')
+  # The engine set's program batch sizes (dynamic-batch).
+  test('infer_engine_set', executable('infer_engine_set', 'check' / 'infer_engine_set.c',
+      dependencies : [rdsinfer_core_dep],
+      link_language : 'cpp'),
+    suite : 'cpu', env : internal_test_env, protocol : 'tap')
   # The secondary-mode per-object cache: when tracked objects are due, eviction, stale completions, a second thread.
   test('infer_cache', executable('infer_cache', 'check' / 'infer_cache.c',
       dependencies : [rdsinfer_core_dep],

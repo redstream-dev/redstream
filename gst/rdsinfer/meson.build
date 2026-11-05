@@ -10,7 +10,7 @@ dl_dep = dependency('dl')
 rds_headers_dep = rds_dep.partial_dependency(compile_args : true, includes : true)
 rdsinfer_core = static_library('rdsinfer-core',
   files('rds-infer-config.c', 'rds-infer-parse.cpp', 'rds-infer-post.c', 'rds-infer-units.c',
-    'rds-infer-cache.c', 'rds-infer-engine.cpp', 'rds-infer-onnx.c'),
+    'rds-infer-cache.c', 'rds-infer-engine.cpp', 'rds-infer-engine-set.c', 'rds-infer-onnx.c'),
   c_args : ['-DG_LOG_DOMAIN="rdsinfer"'],
   cpp_args : ['-DG_LOG_DOMAIN="rdsinfer"'],
   dependencies : [glib_dep, rds_plugin_common_dep, dl_dep, rds_headers_dep, hip_dep, migraphx_dep, json_glib_dep],

@@ -208,6 +208,7 @@ test_properties (void)
     {"filter-out-class-ids", G_TYPE_STRING},
     {"model-engine-file", G_TYPE_STRING},
     {"batch-size", G_TYPE_UINT},
+    {"dynamic-batch", G_TYPE_BOOLEAN},
     {"interval", G_TYPE_INT},
     {"gpu-id", G_TYPE_UINT},
     {"output-tensor-meta", G_TYPE_BOOLEAN},
@@ -244,6 +245,18 @@ test_properties (void)
     g_object_set (e, "infer-on-gie-id", 0, NULL);
     g_object_get (e, "infer-on-gie-id", &v, NULL);
     g_assert_cmpint (v, ==, 0);
+  }
+  /* dynamic-batch (ours): off by default */
+  {
+    gboolean b = TRUE;
+
+    g_assert_false (G_PARAM_SPEC_BOOLEAN (g_object_class_find_property (G_OBJECT_GET_CLASS (e),
+                "dynamic-batch"))->default_value);
+    g_object_get (e, "dynamic-batch", &b, NULL);
+    g_assert_false (b);
+    g_object_set (e, "dynamic-batch", TRUE, NULL);
+    g_object_get (e, "dynamic-batch", &b, NULL);
+    g_assert_true (b);
   }
   g_object_get (e, "config-file-path", &path, NULL);
   g_assert_null (path);
@@ -336,7 +349,7 @@ static void
 test_override (void)
 {
   gchar *cfg = write_file ("override.txt", BASE_CONFIG "batch-size=1\ninterval=3\ngie-unique-id=5\n"
-      "output-tensor-meta=1\nfilter-out-class-ids=7\n");
+      "output-tensor-meta=1\nfilter-out-class-ids=7\ndynamic-batch=1\n");
   GstElement *e = gst_element_factory_make ("rdsinfer", NULL);
   GstStructure *s;
   GError *err = NULL;
@@ -351,18 +364,20 @@ test_override (void)
   g_assert_true (gst_structure_get_uint (s, "interval", &u) && u == 3);
   g_assert_true (gst_structure_get_uint (s, "gie-unique-id", &u) && u == 5);
   g_assert_true (gst_structure_get_boolean (s, "output-tensor-meta", &b) && b);
+  g_assert_true (gst_structure_get_boolean (s, "dynamic-batch", &b) && b);
   g_assert_cmpstr (gst_structure_get_string (s, "filter-out-class-ids"), ==, "7");
   gst_structure_free (s);
 
   g_object_set (e, "batch-size", 4, "interval", 0, "unique-id", 0, "output-tensor-meta", FALSE,
       "filter-out-class-ids", "1;2", "infer-on-class-ids", "1:2:4", "model-engine-file", "/x/y.mxr",
-      "gpu-id", 0, NULL);
+      "gpu-id", 0, "dynamic-batch", FALSE, NULL);
   s = hook_get_config (e, &err);
   g_assert_no_error (err);
   g_assert_true (gst_structure_get_uint (s, "batch-size", &u) && u == 4);
   g_assert_true (gst_structure_get_uint (s, "interval", &u) && u == 0);
   g_assert_true (gst_structure_get_uint (s, "gie-unique-id", &u) && u == 0);
   g_assert_true (gst_structure_get_boolean (s, "output-tensor-meta", &b) && !b);
+  g_assert_true (gst_structure_get_boolean (s, "dynamic-batch", &b) && !b);
   g_assert_cmpstr (gst_structure_get_string (s, "filter-out-class-ids"), ==, "1;2");
   g_assert_cmpstr (gst_structure_get_string (s, "operate-on-class-ids"), ==, "1;2;4");
   g_assert_cmpstr (gst_structure_get_string (s, "model-engine-file"), ==, "/x/y.mxr");

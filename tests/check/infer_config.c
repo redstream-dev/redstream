@@ -263,6 +263,7 @@ test_defaults (void)
   g_assert_false (cfg->maintain_aspect_ratio);
   g_assert_false (cfg->symmetric_padding);
   g_assert_false (cfg->output_tensor_meta);
+  g_assert_false (cfg->dynamic_batch);
   g_assert_cmpint (cfg->scaling_filter, ==, 1);
   g_assert_false (cfg->has_infer_dims);
   g_assert_null (cfg->model_engine_file);
@@ -485,6 +486,39 @@ test_yaml_null (void)
   g_assert_cmpuint (cfg->warnings->len, ==, 0);
   g_free (tilde);
   rds_infer_config_free (cfg);
+}
+
+/* dynamic-batch (ours): a bool in [property], off by default, the same in key files and YAML. */
+static void
+test_dynamic_batch (void)
+{
+  static const struct
+  {
+    const gchar *name, *text;
+    gboolean want;
+  } cases[] = {
+    {"pgie.txt", DETECTOR_TXT "batch-size=8\ndynamic-batch=1\n", TRUE},
+    {"pgie.txt", DETECTOR_TXT "dynamic-batch=0\n", FALSE},
+    {"pgie.yml", DETECTOR_YML "  batch-size: 8\n  dynamic-batch: 1\n", TRUE},
+    {"pgie.yml", DETECTOR_YML "  dynamic-batch: true\n", TRUE},
+  };
+
+  for (guint i = 0; i < G_N_ELEMENTS (cases); i++) {
+    gchar *path = tmp_config (cases[i].name, cases[i].text, NULL);
+    GError *err = NULL;
+    RdsInferConfig *cfg = load_checked (path, &err);
+
+    g_test_message ("%s", cases[i].text);
+    g_assert_no_error (err);
+    g_assert_cmpint (cfg->dynamic_batch, ==, cases[i].want);
+    g_assert_cmpuint (cfg->warnings->len, ==, 0);
+    rds_infer_config_free (cfg);
+    tmp_cleanup (path);
+  }
+  text_fails ("pgie.txt", DETECTOR_TXT "dynamic-batch=maybe\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "dynamic-batch: maybe: ", NULL);
+  text_fails ("pgie.yml", DETECTOR_YML "  dynamic-batch: 2\n", RDS_INFER_CONFIG_ERROR_INVALID,
+      "dynamic-batch: 2: ", NULL);
 }
 
 /* Numbers: trailing text, inf and nan, out-of-range integers and floats. */
@@ -1360,6 +1394,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-config/malformed-yaml", test_malformed_yaml);
   g_test_add_func ("/cpu/infer-config/yaml-keyfile", test_yaml_keyfile);
   g_test_add_func ("/cpu/infer-config/yaml-null", test_yaml_null);
+  g_test_add_func ("/cpu/infer-config/dynamic-batch", test_dynamic_batch);
   g_test_add_func ("/cpu/infer-config/numbers", test_numbers);
   g_test_add_func ("/cpu/infer-config/keyfile-values", test_keyfile_values);
   g_test_add_func ("/cpu/infer-config/labels", test_labels);
