@@ -253,15 +253,16 @@ if rds_infer_enabled
     suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300,
     depends : rds_plugins + [infer_parser_fixture])
 
-  # rdsinfer end to end with YOLO11n: detections on a street photo against Ultralytics, batch 4 against batch 1, and
-  # YOLO11n-cls in secondary mode (rds-test2's classifier config) on the photo's vehicles (pipeline_infer; skipped
-  # until tests/models/fetch-yolo11n.sh and fetch-yolo11n-cls.sh have run), and the four-source soak (its own entry,
-  # pipeline_infer_soak, about 4 min, also in the soak suite: `--no-suite soak` leaves it out; with scale2 when
-  # YOLO11n isn't fetched, so the leak check always runs). The
-  # YOLO11n programs are cached in the build directory next to infer_engine's; a first compile takes about a minute at
-  # batch 1 and more at batch 4, so the timeouts are generous. Never in parallel: one compile or soak at a time.
+  # rdsinfer end to end with YOLO11n: detections on a street photo against Ultralytics, batch 4 against batch 1, a
+  # partial batch with dynamic-batch on and off (it builds the batch-2 program too), and YOLO11n-cls in secondary mode
+  # (rds-test2's classifier config) on the photo's vehicles (pipeline_infer; skipped until tests/models/fetch-yolo11n.sh
+  # and fetch-yolo11n-cls.sh have run), and the four-source soak (its own entry, pipeline_infer_soak, about 4 min, also
+  # in the soak suite: `--no-suite soak` leaves it out; with scale2 when YOLO11n isn't fetched, so the leak check always
+  # runs). The YOLO11n programs are cached in the build directory next to infer_engine's; a first compile takes about a
+  # minute at batch 1 and more at batch 4, so the timeouts are generous. Never in parallel: one compile or soak at a
+  # time.
   pipeline_infer_exe = executable('pipeline_infer', 'check' / 'pipeline_infer.c',
-    dependencies : pipeline_deps + [json_glib_dep],
+    dependencies : pipeline_deps + [json_glib_dep, dependency('gmodule-2.0')],
     c_args : [
       '-DRDS_TEST_MODELS="@0@"'.format(meson.current_source_dir() / 'models'),
       '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),

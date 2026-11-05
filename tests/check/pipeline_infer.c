@@ -1,9 +1,9 @@
 /* rdsinfer end to end with YOLO11n (gpu): detections on a public street photo against Ultralytics' own prediction
- * (through RGBA and through NV12 batches), the same frame on four sources at batch 4 against batch 1, YOLO11n-cls in
- * secondary mode (the rds-test2 sample's classifier config) on crops of the photo's vehicles (the top-1 against ONNX
- * Runtime's on the same stretched crop; at least 80 % in Ultralytics' top 5, its top-1 rate printed only), and a long
- * four-source run through the decoder and the mux (the soak, its own test entry) that neither leaks host nor GPU
- * memory.
+ * (through RGBA and through NV12 batches), the same frame on four sources at batch 4 against batch 1, on one source at
+ * batch 4 with dynamic-batch on (the batch-1 program) against off (the batch-4 one), YOLO11n-cls in secondary mode (the
+ * rds-test2 sample's classifier config) on crops of the photo's vehicles (the top-1 against ONNX Runtime's on the same
+ * stretched crop; at least 80 % in Ultralytics' top 5, its top-1 rate printed only), and a long four-source run through
+ * the decoder and the mux (the soak, its own test entry) that neither leaks host nor GPU memory.
  * The YOLO11n and YOLO11n-cls models and the reference data come from tests/models/fetch-yolo11n.sh and
  * fetch-yolo11n-cls.sh (.cache/models, never committed); the tests that need them skip without them. Without them the
  * soak runs the committed scale2 model, so the leak check always runs.
@@ -12,6 +12,7 @@
 #include "rds-test-media.h"
 #include "rds-test-soak.h"
 
+#include <gmodule.h>
 #include <gst/app/gstappsrc.h>
 #include <json-glib/json-glib.h>
 #include <math.h>
@@ -187,15 +188,72 @@ collect_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user
   return GST_PAD_PROBE_OK;
 }
 
-/* The street image on @n_sources sources (one frame each) -> rdsstreammux (1280x720, batch @n_sources; RGBA
- * batches when @rgba, else the mux's default NV12) -> rdsinfer (YOLO11n, batch @n_sources) -> fakesink. Returns the
- * detections per source; each got exactly one frame. */
+/* rdsinfer's test hook (gstrdsinfer.h), looked up in the plugin module: the batch size of the program the last chunk
+ * ran on. */
+typedef guint (*GetLastRunSizeFunc) (GstElement * element);
+static GetLastRunSizeFunc hook_get_last_run_size;
+
 static void
-run_street (guint n_sources, gboolean rgba, Collected * c)
+load_hooks (void)
 {
-  gchar *cfg = yolo_config (n_sources);
+  GstPlugin *found, *plugin;
+  GModule *module;
+
+  if (hook_get_last_run_size)
+    return;
+  found = gst_registry_find_plugin (gst_registry_get (), "rdsinfer");
+  g_assert_nonnull (found);
+  plugin = gst_plugin_load (found);
+  g_assert_nonnull (plugin);
+  gst_object_unref (found);
+  module = g_module_open (gst_plugin_get_filename (plugin), G_MODULE_BIND_LOCAL);
+  g_assert_nonnull (module);
+  g_assert_true (g_module_symbol (module, "rds_infer_test_get_last_run_size", (gpointer *) & hook_get_last_run_size));
+  /* the module stays open: the plugin is never unloaded either */
+  gst_object_unref (plugin);
+}
+
+/* What a street run reports besides the detections: the batch size of the program its last chunk ran on, and the
+ * mean time a batch spent in rdsinfer (sink pad to source pad: rdsinfer infers in transform_ip, which basetransform's
+ * chain calls before it pushes). */
+typedef struct
+{
+  guint run_size, batches;
+  gint64 in_us, total_us;
+} StreetRun;
+
+static GstPadProbeReturn
+infer_in_probe (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gpointer user_data)
+{
+  ((StreetRun *) user_data)->in_us = g_get_monotonic_time ();
+  return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn
+infer_out_probe (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gpointer user_data)
+{
+  StreetRun *r = user_data;
+
+  r->total_us += g_get_monotonic_time () - r->in_us;
+  r->batches++;
+  return GST_PAD_PROBE_OK;
+}
+
+static gdouble
+street_run_latency_ms (const StreetRun * r)
+{
+  return r->batches ? r->total_us / 1e3 / r->batches : 0.0;
+}
+
+/* The street image on @n_sources sources (one frame each) -> rdsstreammux (1280x720, batch @batch; RGBA batches
+ * when @rgba, else the mux's default NV12) -> rdsinfer (YOLO11n, batch @batch, the dynamic-batch property
+ * @dynamic) -> fakesink. Returns the detections per source; each got exactly one frame. Fills @run, if not NULL. */
+static void
+run_street_full (guint n_sources, guint batch, gboolean rgba, gboolean dynamic, Collected * c, StreetRun * run)
+{
+  gchar *cfg = yolo_config (batch);
   GString *desc = g_string_new (NULL);
-  GstElement *pipe, *sink;
+  GstElement *pipe, *sink, *infer = NULL;
   GstPad *pad;
   GError *err = NULL;
 
@@ -208,8 +266,8 @@ run_street (guint n_sources, gboolean rgba, Collected * c)
         "height=%u framerate=30/1 ! m.sink_%u ", STREET_W * STREET_H * 4, STREET_W, STREET_H, i);
   /* RGBA batches keep the photo as it is; NV12 (the mux's default) halves the chroma resolution */
   g_string_append_printf (desc, "rdsstreammux name=m width=%u height=%u batch-size=%u ! %s"
-      "rdsinfer config-file-path=%s ! fakesink name=k sync=false", STREET_W, STREET_H, n_sources,
-      rgba ? "video/x-raw(memory:RDS),format=RGBA ! " : "", cfg);
+      "rdsinfer name=infer config-file-path=%s dynamic-batch=%s ! fakesink name=k sync=false", STREET_W, STREET_H,
+      batch, rgba ? "video/x-raw(memory:RDS),format=RGBA ! " : "", cfg, dynamic ? "true" : "false");
   pipe = gst_parse_launch (desc->str, &err);
   g_assert_no_error (err);
   g_string_free (desc, TRUE);
@@ -218,15 +276,38 @@ run_street (guint n_sources, gboolean rgba, Collected * c)
   gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, collect_probe, c, NULL);
   gst_object_unref (pad);
   gst_object_unref (sink);
+  if (run) {
+    load_hooks ();
+    memset (run, 0, sizeof (*run));
+    infer = gst_bin_get_by_name (GST_BIN (pipe), "infer");
+    pad = gst_element_get_static_pad (infer, "sink");
+    gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, infer_in_probe, run, NULL);
+    gst_object_unref (pad);
+    pad = gst_element_get_static_pad (infer, "src");
+    gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, infer_out_probe, run, NULL);
+    gst_object_unref (pad);
+  }
 
   g_assert_cmpint (gst_element_set_state (pipe, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
   /* a first YOLO11n compile takes about a minute at batch 1 and more at batch 4 on a small GPU */
   wait_eos (pipe, 600 * GST_SECOND);
+  if (run) {
+    /* the hook is reset at start; read it before the pipeline is torn down */
+    run->run_size = hook_get_last_run_size (infer);
+    gst_object_unref (infer);
+  }
   gst_element_set_state (pipe, GST_STATE_NULL);
   gst_object_unref (pipe);
   g_free (cfg);
   for (guint i = 0; i < n_sources; i++)
     g_assert_cmpuint (c->frames[i], ==, 1);
+}
+
+/* run_street_full with a batch of @n_sources and dynamic-batch off. */
+static void
+run_street (guint n_sources, gboolean rgba, Collected * c)
+{
+  run_street_full (n_sources, n_sources, rgba, FALSE, c, NULL);
 }
 
 static void
@@ -414,9 +495,53 @@ test_detect_nv12 (void)
   check_street (FALSE, 0.8);
 }
 
-/* The street image on four sources at batch 4: every slot gets the batch-1 detections. Each batch-4 detection is
- * paired with the unpaired batch-1 detection of its class with the highest IoU; the counts must be equal and each
- * pair within 1e-3 confidence and 0.5 px per box value. */
+/* How far the detections of programs of different batch sizes may differ: the programs are different kernels, so they
+ * agree only to float rounding. */
+#define PROGRAM_CONF_TOL 1e-3f
+#define PROGRAM_PX_TOL 0.5f
+
+/* Pairs each detection of @got with the unpaired detection of @want of its class with the highest IoU; the counts must
+ * be equal (@what names @got in the failure). Raises @max_conf and @max_px to the largest confidence and box value
+ * differences of the pairs. */
+static void
+pair_dets (const gchar * what, GArray * want, GArray * got, gfloat * max_conf, gfloat * max_px)
+{
+  gboolean *used = g_new0 (gboolean, MAX (want->len, 1));
+
+  g_assert_cmpuint (got->len, ==, want->len);
+  for (guint i = 0; i < got->len; i++) {
+    const Det *b = &g_array_index (got, Det, i), *a;
+    gint best = -1;
+    gfloat best_iou = 0.0f;
+
+    for (guint j = 0; j < want->len; j++) {
+      const Det *w = &g_array_index (want, Det, j);
+      gfloat v;
+
+      if (used[j] || w->class_id != b->class_id)
+        continue;
+      v = iou (w, b);
+      if (best < 0 || v > best_iou) {
+        best_iou = v;
+        best = (gint) j;
+      }
+    }
+    if (best < 0)
+      g_error ("%s: no reference detection of class %d left for (%.1f, %.1f, %.1f, %.1f)", what, b->class_id,
+          b->left, b->top, b->width, b->height);
+    used[best] = TRUE;
+    a = &g_array_index (want, Det, best);
+    *max_conf = MAX (*max_conf, fabsf (a->confidence - b->confidence));
+    *max_px = MAX (*max_px, fabsf (a->left - b->left));
+    *max_px = MAX (*max_px, fabsf (a->top - b->top));
+    *max_px = MAX (*max_px, fabsf (a->width - b->width));
+    *max_px = MAX (*max_px, fabsf (a->height - b->height));
+  }
+  g_free (used);
+}
+
+/* The street image on four sources at batch 4: every slot gets the batch-1 detections, paired with pair_dets; each
+ * pair within PROGRAM_CONF_TOL confidence and PROGRAM_PX_TOL px per box value. */
 static void
 test_batch4 (void)
 {
@@ -424,7 +549,6 @@ test_batch4 (void)
   Collected one, four;
   GArray *want;
   gfloat max_conf = 0.0f, max_px = 0.0f;
-  gboolean *used;
 
   RDS_TEST_REQUIRE_GPU ();
   if (!have_yolo (need))
@@ -433,48 +557,52 @@ test_batch4 (void)
   run_street (4, TRUE, &four);
   want = one.dets[0];
   g_assert_cmpuint (want->len, >, 0);
-  used = g_new (gboolean, want->len);
   for (guint s = 0; s < 4; s++) {
-    GArray *got = four.dets[s];
+    gchar *what = g_strdup_printf ("batch 4, slot %u", s);
 
-    g_assert_cmpuint (got->len, ==, want->len);
-    memset (used, 0, want->len * sizeof (gboolean));
-    for (guint i = 0; i < got->len; i++) {
-      const Det *b = &g_array_index (got, Det, i), *a;
-      gint best = -1;
-      gfloat best_iou = 0.0f;
-
-      for (guint j = 0; j < want->len; j++) {
-        const Det *w = &g_array_index (want, Det, j);
-        gfloat v;
-
-        if (used[j] || w->class_id != b->class_id)
-          continue;
-        v = iou (w, b);
-        if (best < 0 || v > best_iou) {
-          best_iou = v;
-          best = (gint) j;
-        }
-      }
-      if (best < 0)
-        g_error ("slot %u: no batch-1 detection of class %d left for (%.1f, %.1f, %.1f, %.1f)", s, b->class_id,
-            b->left, b->top, b->width, b->height);
-      used[best] = TRUE;
-      a = &g_array_index (want, Det, best);
-      max_conf = MAX (max_conf, fabsf (a->confidence - b->confidence));
-      max_px = MAX (max_px, fabsf (a->left - b->left));
-      max_px = MAX (max_px, fabsf (a->top - b->top));
-      max_px = MAX (max_px, fabsf (a->width - b->width));
-      max_px = MAX (max_px, fabsf (a->height - b->height));
-    }
+    pair_dets (what, want, four.dets[s], &max_conf, &max_px);
+    g_free (what);
   }
   g_test_message ("%u objects per slot; batch 4 vs batch 1: max |confidence diff| %g, max box diff %g px",
       want->len, max_conf, max_px);
-  g_assert_cmpfloat (max_conf, <=, 1e-3f);
-  g_assert_cmpfloat (max_px, <=, 0.5f);
-  g_free (used);
+  g_assert_cmpfloat (max_conf, <=, PROGRAM_CONF_TOL);
+  g_assert_cmpfloat (max_px, <=, PROGRAM_PX_TOL);
   collected_clear (&one);
   collected_clear (&four);
+}
+
+/* dynamic-batch (ours) on a partial batch: the street image on one source at batch 4. With dynamic-batch=1 the frame
+ * runs on the batch-1 program, with dynamic-batch=0 on the batch-4 one (the hook says which); the detections are the
+ * same (paired with pair_dets): the same classes and counts, confidences within PROGRAM_CONF_TOL and boxes within
+ * PROGRAM_PX_TOL px. The time the batch spent in rdsinfer is printed either way, not checked. */
+static void
+test_dynamic_partial (void)
+{
+  const gchar *need[] = { STREET, NULL };
+  Collected off, on;
+  StreetRun r_off, r_on;
+  gfloat max_conf = 0.0f, max_px = 0.0f;
+
+  RDS_TEST_REQUIRE_GPU ();
+  if (!have_yolo (need))
+    return;
+  run_street_full (1, 4, TRUE, FALSE, &off, &r_off);
+  run_street_full (1, 4, TRUE, TRUE, &on, &r_on);
+  g_test_message ("one frame at batch-size 4: dynamic-batch=0 ran the batch-%u program, first batch %.1f ms; "
+      "dynamic-batch=1 the batch-%u program, first batch %.1f ms", r_off.run_size, street_run_latency_ms (&r_off),
+      r_on.run_size, street_run_latency_ms (&r_on));
+  g_assert_cmpuint (r_off.batches, ==, 1);
+  g_assert_cmpuint (r_on.batches, ==, 1);
+  g_assert_cmpuint (r_off.run_size, ==, 4);
+  g_assert_cmpuint (r_on.run_size, ==, 1);
+  g_assert_cmpuint (off.dets[0]->len, >, 0);
+  pair_dets ("dynamic-batch=1", off.dets[0], on.dets[0], &max_conf, &max_px);
+  g_test_message ("%u objects; dynamic-batch=1 vs 0: max |confidence diff| %g, max box diff %g px",
+      off.dets[0]->len, max_conf, max_px);
+  g_assert_cmpfloat (max_conf, <=, PROGRAM_CONF_TOL);
+  g_assert_cmpfloat (max_px, <=, PROGRAM_PX_TOL);
+  collected_clear (&off);
+  collected_clear (&on);
 }
 
 /* ---- the secondary classifier ---- */
@@ -922,6 +1050,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-yolo/detect", test_detect);
   g_test_add_func ("/gpu/infer-yolo/detect-nv12", test_detect_nv12);
   g_test_add_func ("/gpu/infer-yolo/batch4", test_batch4);
+  g_test_add_func ("/gpu/infer-yolo/dynamic-partial", test_dynamic_partial);
   g_test_add_func ("/gpu/infer-yolo/cls-crops", test_cls_crops);
   g_test_add_func ("/gpu/infer-soak/yolo", test_infer_soak);
   ret = g_test_run ();
