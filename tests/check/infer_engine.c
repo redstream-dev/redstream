@@ -18,6 +18,7 @@
 
 #define SCALE2 RDS_TEST_MODELS "/scale2.onnx"
 #define SCALE2_B1 RDS_TEST_MODELS "/scale2-b1.onnx"
+#define SCALE2_B4 RDS_TEST_MODELS "/scale2-b4.onnx"
 #define MEANCLS RDS_TEST_MODELS "/meancls.onnx"
 #define MEANCLS2 RDS_TEST_MODELS "/meancls2.onnx"
 #define FIXEDDET RDS_TEST_MODELS "/fixeddet.onnx"
@@ -1084,6 +1085,109 @@ test_external_data (void)
   g_free (onnx);
 }
 
+/* A hand-encoded model with no nodes: input images [?, 3, 4, 4], its batch dimension neither set nor named; with
+ * rank 0, a shape with no dims; with no_shape, a tensor type with no shape. */
+static GByteArray *
+unnamed_batch_model (gboolean rank0, gboolean no_shape)
+{
+  GByteArray *model = g_byte_array_new (), *graph = g_byte_array_new (), *input = g_byte_array_new ();
+  GByteArray *type = g_byte_array_new (), *tensor = g_byte_array_new (), *shape = g_byte_array_new ();
+
+  if (!rank0) {
+    put_bytes (shape, 1, "", 0);
+    for (guint i = 0; i < 3; i++) {
+      GByteArray *dim = g_byte_array_new ();
+
+      put_int (dim, 1, i == 0 ? 3 : 4);
+      put_msg (shape, 1, dim);
+    }
+  }
+  put_int (tensor, 1, RDS_INFER_ONNX_FLOAT);
+  if (no_shape)
+    g_byte_array_unref (shape);
+  else
+    put_msg (tensor, 2, shape);
+  put_msg (type, 1, tensor);
+  put_bytes (input, 1, "images", 6);
+  put_msg (input, 2, type);
+  put_msg (graph, 11, input);
+  put_int (model, 1, 8);
+  put_msg (model, 7, graph);
+  return model;
+}
+
+static gboolean
+symbolic_batch (const gchar * onnx)
+{
+  gboolean symbolic = -1;
+  GError *err = NULL;
+
+  g_assert_true (rds_infer_engine_model_has_symbolic_batch (onnx, &symbolic, &err));
+  g_assert_no_error (err);
+  g_assert_true (symbolic == TRUE || symbolic == FALSE);
+  return symbolic;
+}
+
+/* Whether the batch dimension is symbolic, from the file alone (no GPU): a named dim_param, or a dim neither set
+ * nor named, as the engine accepts both; fixed when the model sets it. */
+static void
+test_symbolic_batch (void)
+{
+  GByteArray *model = unnamed_batch_model (FALSE, FALSE);
+  gchar *dir, *onnx, *missing;
+  gboolean symbolic = -1;
+  GError *err = NULL;
+
+  g_assert_true (symbolic_batch (SCALE2));
+  g_assert_true (symbolic_batch (MEANCLS));
+  g_assert_true (symbolic_batch (FIXEDDET));
+  g_assert_false (symbolic_batch (SCALE2_B1));
+  g_assert_false (symbolic_batch (SCALE2_B4));
+
+  dir = make_model_dir (SCALE2, &onnx);
+  write_file (onnx, (const gchar *) model->data, model->len);
+  g_assert_true (symbolic_batch (onnx));
+
+  /* An input with no batch dimension (rank 0, or no shape), a file that isn't a model, and one that isn't there.
+   * symbolic is left alone on errors. */
+  for (guint i = 0; i < 2; i++) {
+    GByteArray *bad = unnamed_batch_model (i == 0, i == 1);
+    RdsInferOnnxInfo *info = rds_infer_onnx_read_info (bad->data, bad->len, &err);
+
+    g_assert_no_error (err);
+    g_assert_true (((RdsInferOnnxValue *) g_ptr_array_index (info->inputs, 0))->has_shape == (i == 0));
+    rds_infer_onnx_info_free (info);
+    write_file (onnx, (const gchar *) bad->data, bad->len);
+    g_assert_false (rds_infer_engine_model_has_symbolic_batch (onnx, &symbolic, &err));
+    g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL);
+    g_test_message ("%s", err->message);
+    g_assert_nonnull (strstr (err->message, "no batch dimension"));
+    g_clear_error (&err);
+    g_assert_cmpint (symbolic, ==, -1);
+    g_byte_array_unref (bad);
+  }
+  write_file (onnx, "\x3a\xff\xff\xff\xff\x0f", 6);
+  g_assert_false (rds_infer_engine_model_has_symbolic_batch (onnx, &symbolic, &err));
+  g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL);
+  g_test_message ("%s", err->message);
+  g_assert_nonnull (strstr (err->message, onnx));
+  g_clear_error (&err);
+  g_assert_cmpint (symbolic, ==, -1);
+
+  missing = g_build_filename (dir, "missing.onnx", NULL);
+  g_assert_false (rds_infer_engine_model_has_symbolic_batch (missing, &symbolic, &err));
+  g_assert_error (err, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_FILE);
+  g_test_message ("%s", err->message);
+  g_clear_error (&err);
+  g_assert_cmpint (symbolic, ==, -1);
+
+  g_free (missing);
+  g_byte_array_unref (model);
+  remove_dir (dir);
+  g_free (dir);
+  g_free (onnx);
+}
+
 static void
 test_fp16 (void)
 {
@@ -1779,6 +1883,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-engine/onnx-reader", test_onnx_reader);
   g_test_add_func ("/cpu/infer-engine/onnx-reader-truncated", test_onnx_reader_truncated);
   g_test_add_func ("/cpu/infer-engine/onnx-reader-external", test_onnx_reader_external);
+  g_test_add_func ("/cpu/infer-engine/symbolic-batch", test_symbolic_batch);
   g_test_add_func ("/cpu/infer-engine/invalid-options", test_invalid_options);
   g_test_add_func ("/gpu/infer-engine/build-and-cache", test_build_and_cache);
   g_test_add_func ("/gpu/infer-engine/invalidation", test_invalidation);

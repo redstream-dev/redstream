@@ -5,6 +5,7 @@
   scale2.onnx     images float[batch,3,height,width] -> output0 = images * 2.0 (batch, height and width
                   symbolic; the channel dim is fixed at 3)
   scale2-b1.onnx  the same with batch fixed to 1
+  scale2-b4.onnx  the same with batch fixed to 4
   meancls.onnx    images float[batch,3,32,32] -> output0 float[batch,3] = the mean of each channel (ReduceMean
                   over height and width): a classifier whose class scores are the channel means, so with
                   net-scale-factor 1/255 a pure red crop is class 0 at 1.0
@@ -129,6 +130,7 @@ def main():
     models = (
         ("scale2.onnx", make_scale2("batch")),
         ("scale2-b1.onnx", make_scale2(1)),
+        ("scale2-b4.onnx", make_scale2(4)),
         ("meancls.onnx", make_meancls(False)),
         ("meancls2.onnx", make_meancls(True)),
         ("fixeddet.onnx", make_fixeddet()),

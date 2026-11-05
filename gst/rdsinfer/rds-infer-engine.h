@@ -60,6 +60,13 @@ typedef struct _RdsInferEngine RdsInferEngine;
 G_GNUC_INTERNAL gboolean rds_infer_engine_validate_tensor_size (const gsize * dims, guint n_dims,
     guint batch_size, gsize max_elements, guint * narrowed_dims, gsize * elements, gsize * bytes, GError ** error);
 
+/* Reads @onnx_file's declared input dims (no GPU needed) and sets *symbolic to whether the batch dimension is
+ * symbolic (named, or neither set nor named): the batch dimensions rds_infer_engine_open accepts at any batch_size.
+ * FALSE with *symbolic untouched when the file can't be read (RDS_INFER_ENGINE_ERROR_FILE) or isn't a model with
+ * one input that has a batch dimension (RDS_INFER_ENGINE_ERROR_MODEL). */
+G_GNUC_INTERNAL gboolean rds_infer_engine_model_has_symbolic_batch (const gchar * onnx_file, gboolean * symbolic,
+    GError ** error);
+
 /* Loads a matching cached program (engine_file first, then the cache name in the model's directory, then in
  * $XDG_CACHE_HOME/redstream/) or builds one and saves it under the cache name. With no_build, the same lookup
  * decides whether the program is up to date (rds-compile). The model's input must be a float NCHW tensor whose batch

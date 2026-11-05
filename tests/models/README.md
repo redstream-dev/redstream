@@ -1,6 +1,6 @@
 # Test models
 
-## Committed: `scale2.onnx`, `scale2-b1.onnx`, `meancls.onnx`, `meancls2.onnx`, `fixeddet.onnx`
+## Committed: `scale2.onnx`, `scale2-b1.onnx`, `scale2-b4.onnx`, `meancls.onnx`, `meancls2.onnx`, `fixeddet.onnx`
 
 Our own tiny models (a few hundred bytes each), so the rdsinfer tests run offline and compile in seconds:
 
@@ -8,6 +8,7 @@ Our own tiny models (a few hundred bytes each), so the rdsinfer tests run offlin
 |---|---|---|
 | `scale2.onnx` | `images` float `[batch, 3, height, width]` (channels fixed at 3, the rest symbolic) | `output0 = images × 2.0` |
 | `scale2-b1.onnx` | the same with batch fixed to 1 | the same |
+| `scale2-b4.onnx` | the same with batch fixed to 4 | the same |
 | `meancls.onnx` | `images` float `[batch, 3, 32, 32]` (batch symbolic) | `output0 [batch, 3]`: the mean of each channel. A classifier: with `net-scale-factor` 1/255 a pure red crop is class 0 at 1.0 |
 | `meancls2.onnx` | the same | `output0` the channel means, `output1 = 1 − output0`: two output layers (two classifier attributes) |
 | `fixeddet.onnx` | `images` float `[batch, 3, 64, 64]` (batch symbolic) | `output0 [batch, 6, 8]`: a 2-class detector in the YOLO layout `[4 + classes, anchors]` (cx, cy, w, h in network pixels, then the class scores) whose output is the same constant for every image |

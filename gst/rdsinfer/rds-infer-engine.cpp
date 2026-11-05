@@ -756,6 +756,57 @@ model_error (GError ** error, RdsInferEngineError code, const gchar * onnx_file,
   g_error_free (err);
 }
 
+/* Reads @onnx_file into *onnx and its declared inputs and outputs into *info (the caller frees both, also on
+ * errors), and returns its one input. */
+static RdsInferOnnxValue *
+model_input_read (const gchar * onnx_file, gchar ** onnx, gsize * onnx_len, RdsInferOnnxInfo ** info,
+    GError ** error)
+{
+  GError *err = NULL;
+
+  if (!g_file_get_contents (onnx_file, onnx, onnx_len, &err)) {
+    g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_FILE, "%s", err->message);
+    g_error_free (err);
+    return NULL;
+  }
+  if (!(*info = rds_infer_onnx_read_info ((const guint8 *) *onnx, *onnx_len, &err))) {
+    model_error (error, RDS_INFER_ENGINE_ERROR_MODEL, onnx_file, err);
+    return NULL;
+  }
+  if ((*info)->inputs->len != 1) {
+    g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL,
+        "%s: the model has %u inputs; only models with one input are supported", onnx_file, (*info)->inputs->len);
+    return NULL;
+  }
+  return (RdsInferOnnxValue *) g_ptr_array_index ((*info)->inputs, 0);
+}
+
+gboolean
+rds_infer_engine_model_has_symbolic_batch (const gchar * onnx_file, gboolean * symbolic, GError ** error)
+{
+  gchar *onnx = NULL;
+  gsize onnx_len = 0;
+  RdsInferOnnxInfo *info = NULL;
+  RdsInferOnnxValue *in;
+  gboolean ok = FALSE;
+
+  g_return_val_if_fail (onnx_file != NULL && symbolic != NULL, FALSE);
+  if (!(in = model_input_read (onnx_file, &onnx, &onnx_len, &info, error)))
+    goto out;
+  if (!in->has_shape || in->n_dims == 0) {
+    g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL,
+        "%s: input %s declares %s, so no batch dimension", onnx_file, in->name, in->has_shape ? "rank 0" : "no shape");
+    goto out;
+  }
+  /* As input_lens_get: any batch dimension the model doesn't set (named or not) takes the batch size asked for. */
+  *symbolic = in->dims[0] <= 0;
+  ok = TRUE;
+out:
+  rds_infer_onnx_info_free (info);
+  g_free (onnx);
+  return ok;
+}
+
 static RdsInferEngine *
 engine_open (const RdsInferEngineOptions * opts, GError ** error)
 {
@@ -796,15 +847,8 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
   if (!device_scope_ok (scope, opts->gpu_id, error) || !device_info_get (opts->gpu_id, &st.dev, error))
     return NULL;
 
-  if (!g_file_get_contents (opts->onnx_file, &st.onnx, &st.onnx_len, &err)) {
-    g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_FILE, "%s", err->message);
-    g_error_free (err);
+  if (!(in = model_input_read (opts->onnx_file, &st.onnx, &st.onnx_len, &st.info, error)))
     return NULL;
-  }
-  if (!(st.info = rds_infer_onnx_read_info ((const guint8 *) st.onnx, st.onnx_len, &err))) {
-    model_error (error, RDS_INFER_ENGINE_ERROR_MODEL, opts->onnx_file, err);
-    return NULL;
-  }
   /* The manifest hashes the .onnx file only, so weights in other files could change unnoticed. */
   if (st.info->external_tensor) {
     g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL,
@@ -812,13 +856,6 @@ engine_open (const RdsInferEngineOptions * opts, GError ** error)
         "(export the model with its weights inside the .onnx file)", opts->onnx_file, st.info->external_tensor);
     return NULL;
   }
-  if (st.info->inputs->len != 1) {
-    g_set_error (error, RDS_INFER_ENGINE_ERROR, RDS_INFER_ENGINE_ERROR_MODEL,
-        "%s: the model has %u inputs; only models with one input are supported", opts->onnx_file,
-        st.info->inputs->len);
-    return NULL;
-  }
-  in = (RdsInferOnnxValue *) g_ptr_array_index (st.info->inputs, 0);
   if (!input_lens_get (in, opts, input_lens, &err)
       || !rds_infer_engine_validate_tensor_size (input_lens.data () + 1, 3, opts->batch_size, G_MAXSIZE,
           input_dims, NULL, &input_bytes, &err)) {
