@@ -1,13 +1,14 @@
 #!/bin/sh
 # SPDX-License-Identifier: LGPL-2.1-or-later
-# Usage: rds_compile.sh <rds-compile> <gst-launch-1.0> <scale2.onnx> <work dir>
+# Usage: rds_compile.sh <rds-compile> <gst-launch-1.0> <scale2.onnx> <work dir> <scale2-b4.onnx>
 # rds-compile on the scale2 test model in <work dir>/rds-compile: build, up to date, --force, overrides, -o, option
-# and config errors, then rdsinfer in gst-launch-1.0 loading the program instead of building it. An empty
+# and config errors, dynamic-batch (every program of the set; the fallback on scale2-b4, whose batch is fixed), then
+# rdsinfer in gst-launch-1.0 loading the program instead of building it. An empty
 # <rds-compile> (built without rdsinfer) or no ROCm device skips; an empty <gst-launch-1.0> (not found, or a sanitized
 # build, whose plugins it can't load) skips the element checks.
 # <work dir>/rds-compile is removed on exit.
 set -eu
-compile=$1 launch=$2 model=$3 work=$4
+compile=$1 launch=$2 model=$3 work=$4 fixed_model=$5
 
 if [ -z "$compile" ]; then
   echo 'built without rdsinfer: skipped'
@@ -132,6 +133,95 @@ bad_option -c "$dir/missing.txt"
 run 1 -c "$bad"
 echo "$err" | grep -qF "rds-compile: $bad:onnx-file: " || fail 'bad config: unexpected message'
 compile_msg=$(echo "$err" | sed -n 's/^rds-compile: //p' | head -n 1)
+
+# dynamic-batch: batch-size 4 is the programs b1, b2 and b4, each with its manifest, printed in that order
+dyn=$dir/dyn
+mkdir -p "$dyn"
+cp "$model" "$dyn/scale2.onnx"
+dcfg=$dyn/cfg.txt
+printf '[property]\nonnx-file=scale2.onnx\ninfer-dims=3;48;64\nnetwork-type=100\nbatch-size=4\ndynamic-batch=1\n' \
+  >"$dcfg"
+# programs DIR: the .mxr files in DIR, sorted by batch size, one per line
+programs() {
+  ls "$1"/*.mxr | sed 's/.*_b\([0-9]*\)_[^/]*$/\1 &/' | sort -n | cut -d' ' -f2-
+}
+run 0 -c "$dcfg"
+dprogs=$(programs "$dyn")
+[ "$(echo "$dprogs" | wc -l)" -eq 3 ] || fail "dynamic-batch: programs $dprogs"
+[ "$out" = "$dprogs" ] || fail "dynamic-batch: printed $out, the programs are $dprogs"
+for b in 1 2 4; do
+  p=$(echo "$dprogs" | grep "/scale2_b${b}_3x48x64_gfx.*_fp32\.mxr$") || fail "dynamic-batch: no b$b program"
+  [ -f "$p.json" ] || fail "dynamic-batch: $p has no manifest"
+  echo "$err" | grep -qF "rds-compile: built $p because " || fail "dynamic-batch: no build reason for $p"
+done
+b2=$(echo "$dprogs" | grep '_b2_')
+# up to date only when every program is
+run 2 -c "$dcfg"
+[ "$out" = "$dprogs" ] || fail "dynamic-batch up to date: printed $out"
+# one program gone: built again, alone; the others are loaded
+rm "$b2"
+run 0 -c "$dcfg"
+[ "$out" = "$dprogs" ] || fail "dynamic-batch, b2 removed: printed $out"
+[ "$(echo "$err" | grep -c '^rds-compile: built ')" -eq 1 ] || fail 'dynamic-batch, b2 removed: not one build'
+echo "$err" | grep -qF "rds-compile: built $b2 because " || fail 'dynamic-batch, b2 removed: b2 not built'
+[ -f "$b2" ] || fail "dynamic-batch, b2 removed: $b2 is missing"
+run 2 -c "$dcfg"
+# one program corrupt (empty): the same
+: >"$b2"
+run 0 -c "$dcfg"
+[ "$out" = "$dprogs" ] || fail "dynamic-batch, b2 truncated: printed $out"
+[ "$(echo "$err" | grep -c '^rds-compile: built ')" -eq 1 ] || fail 'dynamic-batch, b2 truncated: not one build'
+echo "$err" | grep -qF "rds-compile: built $b2 because " || fail 'dynamic-batch, b2 truncated: b2 not built'
+[ -s "$b2" ] || fail "dynamic-batch, b2 truncated: $b2 is still empty"
+run 2 -c "$dcfg"
+run 0 --force -c "$dcfg"
+[ "$(echo "$err" | grep -c '^rds-compile: built .* because .*forced')" -eq 3 ] \
+  || fail 'dynamic-batch --force: not 3 builds'
+# -o: places the batch-size program only; the smaller ones keep their cache names
+odyn=$dir/odyn
+mkdir -p "$odyn"
+cp "$model" "$odyn/scale2.onnx"
+printf '[property]\nonnx-file=scale2.onnx\ninfer-dims=3;48;64\nnetwork-type=100\nbatch-size=4\ndynamic-batch=1\n' \
+  >"$odyn/cfg.txt"
+run 0 -c "$odyn/cfg.txt" -o "$odyn/out/main.mxr"
+oprogs=$(programs "$odyn")
+[ "$(echo "$oprogs" | wc -l)" -eq 2 ] || fail "dynamic-batch -o: cache programs $oprogs"
+echo "$oprogs" | grep -q '/scale2_b1_' && echo "$oprogs" | grep -q '/scale2_b2_' || fail "dynamic-batch -o: $oprogs"
+[ "$out" = "$(printf '%s\n%s' "$oprogs" "$odyn/out/main.mxr")" ] || fail "dynamic-batch -o: printed $out"
+[ -f "$odyn/out/main.mxr.json" ] && [ "$(ls "$odyn/out")" = "$(printf 'main.mxr\nmain.mxr.json')" ] \
+  || fail "dynamic-batch -o: $odyn/out holds $(ls "$odyn/out")"
+run 2 -c "$odyn/cfg.txt" -o "$odyn/out/main.mxr"
+# --dynamic-batch overrides the key: batch 2 on cfg is b1 (built above) and b2 fp32
+run 0 -c "$cfg" -b 2 --dynamic-batch
+[ "$(echo "$out" | wc -l)" -eq 2 ] || fail "--dynamic-batch: printed $out"
+[ "$(echo "$out" | head -n 1)" = "$prog" ] || fail "--dynamic-batch: printed $out"
+echo "$out" | tail -n 1 | grep -q "^$dir/scale2_b2_3x48x64_gfx.*_fp32\.mxr$" || fail "--dynamic-batch: printed $out"
+[ "$(echo "$err" | grep -c '^rds-compile: built ')" -eq 1 ] || fail '--dynamic-batch: not one build'
+# a model whose batch is fixed: the batch-size program alone, with a warning naming the key (or the option)
+fdir=$dir/fixed
+mkdir -p "$fdir"
+cp "$fixed_model" "$fdir/scale2-b4.onnx"
+fcfg=$fdir/cfg.txt
+printf '[property]\nonnx-file=scale2-b4.onnx\ninfer-dims=3;48;64\nnetwork-type=100\nbatch-size=4\ndynamic-batch=1\n' \
+  >"$fcfg"
+run 0 -c "$fcfg"
+case $out in
+  "$fdir"/scale2-b4_b4_*_fp32.mxr) ;;
+  *) fail "dynamic-batch fallback: printed $out" ;;
+esac
+[ "$(programs "$fdir")" = "$out" ] || fail "dynamic-batch fallback: programs $(programs "$fdir")"
+echo "$err" | grep -qF "rds-compile: warning: $fcfg:dynamic-batch: needs a model with a symbolic batch dimension" \
+  || fail 'dynamic-batch fallback: no warning'
+run 2 -c "$fcfg"
+echo "$err" | grep -qF "rds-compile: warning: $fcfg:dynamic-batch: " || fail 'dynamic-batch fallback: no warning'
+sed -i '/^dynamic-batch=/d' "$fcfg"
+run 2 -c "$fcfg" --dynamic-batch
+echo "$err" | grep -q '^rds-compile: warning: --dynamic-batch: needs a model' \
+  || fail '--dynamic-batch fallback: no warning'
+run 2 -c "$fcfg"
+if echo "$err" | grep 'warning' | grep -q 'dynamic-batch:'; then
+  fail 'dynamic-batch off: a dynamic-batch warning'
+fi
 
 if [ -z "$launch" ]; then
   echo 'no gst-launch-1.0 given (not found, or a sanitized build): element checks skipped'

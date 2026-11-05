@@ -497,7 +497,8 @@ if rds_infer_enabled
   rds_compile_depends += rds_compile_exe
 endif
 rds_compile_args = [rds_compile_path, gst_launch.found() and not asan ? gst_launch.full_path() : '',
-  meson.current_source_dir() / 'models' / 'scale2.onnx', meson.current_build_dir()]
+  meson.current_source_dir() / 'models' / 'scale2.onnx', meson.current_build_dir(),
+  meson.current_source_dir() / 'models' / 'scale2-b4.onnx']
 test('rds_compile', find_program('tools/rds_compile.sh'), args : rds_compile_args,
   suite : 'gpu', is_parallel : false, timeout : 300,
   env : environment(common_test_env + {

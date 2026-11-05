@@ -869,17 +869,22 @@ The element compiles the model on its first start, which takes minutes on a smal
 of time with the element's own config parser and engine, so the program lands where the element looks for it:
 
 ```bash
-rds-compile -c CONFIG [-b BATCH] [--fp16|--fp32] [-g GPU] [-o OUT.mxr] [--force]
+rds-compile -c CONFIG [-b BATCH] [--fp16|--fp32] [-g GPU] [--dynamic-batch] [-o OUT.mxr] [--force]
 ```
 
-- `-b`, `--fp16`/`--fp32` and `-g` override `batch-size`, `network-mode` and `gpu-id`; `--fp16` with `--fp32` is an
-  error. Without `-o` the program is looked up and written like the element does (`model-engine-file`, then the
-  cache name next to the ONNX file, then `$XDG_CACHE_HOME/redstream/`). `-o` looks up and writes only that file,
-  with its manifest next to it as `OUT.mxr.json` (an unwritable directory is an error before building); point
-  `model-engine-file` at it.
-- Prints the program's path on stdout; the build reason, warnings and errors (with the element's messages) on
-  stderr.
-- Exit status: 0 built, 1 error, 2 already up to date (the element would load it; `--force` rebuilds).
+- `-b`, `--fp16`/`--fp32`, `-g` and `--dynamic-batch` override `batch-size`, `network-mode`, `gpu-id` and
+  `dynamic-batch` (sets it to 1); `--fp16` with `--fp32` is an error. Without `-o` the program is looked up and
+  written like the element does (`model-engine-file`, then the cache name next to the ONNX file, then
+  `$XDG_CACHE_HOME/redstream/`). `-o` looks up and writes only that file, with its manifest next to it as
+  `OUT.mxr.json` (an unwritable directory is an error before building); point `model-engine-file` at it.
+- With `dynamic-batch`, every program of the set is built (one per power of two below `batch-size`, plus
+  `batch-size`); those already up to date are loaded, not rebuilt. `-o` places only the `batch-size` program; the
+  smaller ones always use their cache names. A model with a fixed batch dimension builds the `batch-size` program
+  alone, with the element's warning.
+- Prints each program's path on stdout, one per line in ascending batch size (the `batch-size` one last); the build
+  reasons, warnings and errors (with the element's messages) on stderr.
+- Exit status: 0 built (at least one program), 1 error, 2 already up to date (the element would load every
+  program; `--force` rebuilds them all).
 
 ### `rdstracker` (`nvtracker`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker))
 
