@@ -1235,15 +1235,17 @@ test_dynamic_batch_property (void)
   g_free (on);
 }
 
-/* dynamic-batch=1 on a model whose batch is fixed (scale2-b4): one warning at start, and every batch runs the
- * batch-size program, with the right tensors. */
+/* dynamic-batch=1 on a model whose batch is fixed (scale2-b4): one warning at start, naming what turned it on (the
+ * file's key or, with @by_property, the element property), and every batch runs the batch-size program, with the
+ * right tensors. */
 static void
-test_dynamic_batch_fallback (void)
+dynamic_batch_fallback (gboolean by_property)
 {
   static const guint want[4] = { 4, 4, 4, 4 };
-  gchar *cfg = write_file ("dyn-fixed.txt", "[property]\nonnx-file=scale2-b4.onnx\ninfer-dims=3;48;64\n"
-      "network-type=100\noutput-tensor-meta=1\nmaintain-aspect-ratio=1\nsymmetric-padding=1\nnet-scale-factor=0.5\n"
-      "offsets=10;20;30\nbatch-size=4\ndynamic-batch=1\n"), *texts;
+  gchar *text = g_strconcat ("[property]\nonnx-file=scale2-b4.onnx\ninfer-dims=3;48;64\nnetwork-type=100\n"
+      "output-tensor-meta=1\nmaintain-aspect-ratio=1\nsymmetric-padding=1\nnet-scale-factor=0.5\n"
+      "offsets=10;20;30\nbatch-size=4\n", by_property ? "" : "dynamic-batch=1\n", NULL);
+  gchar *cfg = write_file ("dyn-fixed.txt", text), *texts, *want_prefix;
   GstBus *bus = gst_bus_new ();
   GstElement *e;
   GstHarness *h;
@@ -1252,16 +1254,34 @@ test_dynamic_batch_fallback (void)
   ensure_test_model ("scale2-b4.onnx");
   load_hooks ();
   e = new_infer (cfg);
+  if (by_property)
+    g_object_set (e, "dynamic-batch", TRUE, NULL);
   gst_element_set_bus (e, bus);
   h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_NV12, 96, 64);
   g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 1);
-  g_assert_nonnull (strstr (texts, "dynamic-batch"));
+  want_prefix = by_property ? g_strdup ("element property dynamic-batch: ") : g_strdup_printf ("%s:dynamic-batch: ",
+      cfg);
+  g_assert_true (g_str_has_prefix (texts, want_prefix));
+  g_free (want_prefix);
   g_free (texts);
   push_dynamic_batches (h, e, want, NULL);
   g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, NULL), ==, 0);
   g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_ERROR, NULL), ==, 0);
   harness_teardown_with_bus (h, bus);
   g_free (cfg);
+  g_free (text);
+}
+
+static void
+test_dynamic_batch_fallback (void)
+{
+  dynamic_batch_fallback (FALSE);
+}
+
+static void
+test_dynamic_batch_fallback_property (void)
+{
+  dynamic_batch_fallback (TRUE);
 }
 
 /* ---- gpu: through rdsstreammux and rdsstreamdemux ---- */
@@ -3954,6 +3974,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer/dynamic-batch", test_dynamic_batch);
   g_test_add_func ("/gpu/infer/dynamic-batch-property", test_dynamic_batch_property);
   g_test_add_func ("/gpu/infer/dynamic-batch-fallback", test_dynamic_batch_fallback);
+  g_test_add_func ("/gpu/infer/dynamic-batch-fallback-property", test_dynamic_batch_fallback_property);
   g_test_add_func ("/gpu/infer/demux", test_demux);
   g_test_add_func ("/gpu/infer/interval", test_interval);
   g_test_add_func ("/gpu/infer/detector", test_detector);

@@ -210,7 +210,9 @@ configure (GstRdsInfer * self, GError ** error)
   OVERRIDE (PROP_PROCESS_MODE, "process-mode", cfg->process_mode = (gint) process_mode);
   OVERRIDE (PROP_INFER_ON_GIE_ID, "operate-on-gie-id", cfg->operate_on_gie_id = on_gie_id);
   OVERRIDE (PROP_BATCH_SIZE, "batch-size", cfg->batch_size = batch_size);
-  OVERRIDE (PROP_DYNAMIC_BATCH, "dynamic-batch", cfg->dynamic_batch = dynamic_batch);
+  self->dynamic_batch_by_property = FALSE;
+  OVERRIDE (PROP_DYNAMIC_BATCH, "dynamic-batch", cfg->dynamic_batch = dynamic_batch;
+      self->dynamic_batch_by_property = TRUE);
   OVERRIDE (PROP_INTERVAL, "interval", cfg->interval = (guint) interval);
   OVERRIDE (PROP_GPU_ID, "gpu-id", cfg->gpu_id = gpu_id);
   OVERRIDE (PROP_OUTPUT_TENSOR_META, "output-tensor-meta", cfg->output_tensor_meta = tensor_meta);
@@ -429,7 +431,10 @@ open_engine (GstRdsInfer * self, GError ** error)
     return FALSE;
   }
   self->engine = rds_infer_engine_set_get_main (self->engines);
-  if ((fallback = rds_infer_engine_set_get_fallback_reason (self->engines)))
+  /* naming the property when it set the key, as rds-compile names --dynamic-batch */
+  if ((fallback = rds_infer_engine_set_get_fallback_reason (self->engines)) && self->dynamic_batch_by_property)
+    GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("element property dynamic-batch: %s", fallback), (NULL));
+  else if (fallback)
     GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("%s:dynamic-batch: %s", cfg->config_path, fallback), (NULL));
   n = rds_infer_engine_set_get_n (self->engines);
   for (guint p = 0; p < n; p++) {

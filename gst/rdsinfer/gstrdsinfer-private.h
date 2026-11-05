@@ -63,6 +63,7 @@ struct _GstRdsInfer
 
   /* from start to stop (streaming thread; test hooks read it while idle) */
   RdsInferConfig *cfg;
+  gboolean dynamic_batch_by_property;   /* the dynamic-batch property, not the file, set cfg->dynamic_batch */
   RdsInferEngineSet *engines;   /* one program of batch-size, or with dynamic-batch one per size */
   RdsInferEngine *engine;       /* the set's batch-size program (owned by the set) */
   RdsInferParser *parser;

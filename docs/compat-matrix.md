@@ -555,7 +555,7 @@ is set.
 | `filter-out-class-ids` | string | none | supported | semicolon-separated class ids (`1;2`); replaces the file's list (an empty string clears it) |
 | `model-engine-file` | string | none | supported | a compiled MIGraphX program (`.mxr`), loaded when its manifest matches the model and the device, else rebuilt into the cache name; used as given (a config-file value is relative to the config file). A TensorRT `.engine` is ignored with a warning. Changing it while PLAYING (on-the-fly model update) is not supported |
 | `batch-size` | uint | `1` (ours) | supported | 1..1024. Primary mode: frames of a batch go to the network image of their slot (`batch_id`); a frame in a slot at or above `batch-size` is an error. Secondary mode: objects inferred together, see "Secondary mode" |
-| `dynamic-batch` | boolean | `FALSE` (ours) | supported | ours (nvinfer has no such property); overrides the config key: also compile programs for the powers of two below `batch-size` (4: 1, 2, 4; 6: 1, 2, 4, 6) and run each chunk on the smallest that holds its highest image. Primary mode: the highest occupied slot (`batch_id`) decides, not the number of frames, so one frame in slot 3 runs on the batch-4 program. Secondary mode: a chunk's objects take images 0 to n-1, so the object count decides. `batch-size` keeps its meaning, the most images one run takes. A model with a fixed batch dimension falls back to the `batch-size` program alone, with a warning at start. Costs and caching: see "Models and compiled programs"; changeable only in NULL or READY |
+| `dynamic-batch` | boolean | `FALSE` (ours) | supported | ours (nvinfer has no such property); overrides the config key: also compile programs for the powers of two below `batch-size` (4: 1, 2, 4; 6: 1, 2, 4, 6) and run each chunk on the smallest that holds its highest image. Primary mode: the highest occupied slot (`batch_id`) decides, not the number of frames, so one frame in slot 3 runs on the batch-4 program. Secondary mode: a chunk's objects take images 0 to n-1, so the object count decides. `batch-size` keeps its meaning, the most images one run takes. A model with a fixed batch dimension falls back to the `batch-size` program alone, with a warning at start. With `batch-size` 1 it has no effect: there is no smaller program. Costs and caching: see "Models and compiled programs"; changeable only in NULL or READY |
 | `interval` | int | `0` (ours) | supported | 0..32: infer one batch, skip the next `interval` (they pass with `bInferDone` FALSE and no objects); the count restarts at start and after a flush (ours); ignored in secondary mode, with a warning (DeepStream 8.0 behaviour) |
 | `gpu-id` | uint | `0` | supported | the GPU for preprocessing and inference; the batch must be in GPU memory on it |
 | `output-tensor-meta` | boolean | `FALSE` | supported | one `RdsInferTensorMeta` per inferred frame, or per object in secondary mode (also always with `network-type=100`), see "Tensor output meta" |
@@ -887,9 +887,10 @@ rds-compile -c CONFIG [-b BATCH] [--fp16|--fp32] [-g GPU] [--dynamic-batch] [-o 
   `$XDG_CACHE_HOME/redstream/`). `-o` looks up and writes only that file, with its manifest next to it as
   `OUT.mxr.json` (an unwritable directory is an error before building); point `model-engine-file` at it.
 - With `dynamic-batch`, every program of the set is built (one per power of two below `batch-size`, plus
-  `batch-size`); those already up to date are loaded, not rebuilt. `-o` places only the `batch-size` program; the
-  smaller ones always use their cache names. A model with a fixed batch dimension builds the `batch-size` program
-  alone, with the element's warning.
+  `batch-size`); those already up to date are loaded, not rebuilt. The up-to-date check is the element's own open:
+  it briefly loads every program onto the GPU (YOLO11n: about 80–115 MB each). `-o` places only the `batch-size`
+  program; the smaller ones always use their cache names. A model with a fixed batch dimension builds the
+  `batch-size` program alone, with the element's warning.
 - Prints each program's path on stdout, one per line in ascending batch size (the `batch-size` one last); the build
   reasons, warnings and errors (with the element's messages) on stderr.
 - Exit status: 0 built (at least one program), 1 error, 2 already up to date (the element would load every
