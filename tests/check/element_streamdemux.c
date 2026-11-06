@@ -728,6 +728,141 @@ test_dynamic_pads (void)
   demux_clear (&d);
 }
 
+typedef struct
+{
+  Demux *d;
+  GstPad *src;
+  GMutex lock;
+  GCond cond;
+  gboolean in_caps;
+  gboolean events_dropped;      /* the src pad's sticky events are gone (pad deactivated) */
+  gint chained;
+} ReleaseCtx;
+
+/* On the sink: holds the caps that gst_pad_push re-sends to the new peer until the release has deactivated the
+ * src pad, then (up to 100 ms) until it has dropped the pad's sticky events. */
+static GstPadProbeReturn
+release_caps_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer data)
+{
+  ReleaseCtx *c = data;
+  gint64 end;
+  gboolean flushing = FALSE;
+
+  if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_EVENT (info)) != GST_EVENT_CAPS)
+    return GST_PAD_PROBE_OK;
+  g_mutex_lock (&c->lock);
+  c->in_caps = TRUE;
+  g_cond_broadcast (&c->cond);
+  g_mutex_unlock (&c->lock);
+  for (guint i = 0; i < 5000 && !flushing; i++) {
+    GST_OBJECT_LOCK (c->src);
+    flushing = GST_PAD_IS_FLUSHING (c->src);
+    GST_OBJECT_UNLOCK (c->src);
+    if (!flushing)
+      g_usleep (1000);
+  }
+  g_assert_true (flushing);
+  end = g_get_monotonic_time () + 100 * G_TIME_SPAN_MILLISECOND;
+  g_mutex_lock (&c->lock);
+  while (!c->events_dropped && g_cond_wait_until (&c->cond, &c->lock, end));
+  g_mutex_unlock (&c->lock);
+  return GST_PAD_PROBE_OK;
+}
+
+/* notify::caps of the src pad: deactivation dropped its sticky events. Keeps it linked a while (the release
+ * unlinks it next), so a push that went on regardless would reach the sink. */
+static void
+release_caps_notify (G_GNUC_UNUSED GObject * pad, G_GNUC_UNUSED GParamSpec * pspec, gpointer data)
+{
+  ReleaseCtx *c = data;
+  gboolean first;
+
+  g_mutex_lock (&c->lock);
+  first = c->in_caps && !c->events_dropped;
+  if (first) {
+    c->events_dropped = TRUE;
+    g_cond_broadcast (&c->cond);
+  }
+  g_mutex_unlock (&c->lock);
+  if (first)
+    g_usleep (100 * 1000);
+}
+
+static gboolean
+release_sink_event (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstObject * parent, GstEvent * event)
+{
+  gst_event_unref (event);
+  return TRUE;
+}
+
+static gpointer
+release_push_thread (gpointer data)
+{
+  static const guint only1[] = { 1 };
+  ReleaseCtx *c = data;
+
+  push_batch (c->d, 1, only1, 1);
+  return NULL;
+}
+
+static GstFlowReturn
+release_sink_chain (GstPad * pad, G_GNUC_UNUSED GstObject * parent, GstBuffer * buf)
+{
+  ReleaseCtx *c = g_object_get_data (G_OBJECT (pad), "ctx");
+
+  g_atomic_int_inc (&c->chained);
+  gst_buffer_unref (buf);
+  return GST_FLOW_OK;
+}
+
+/* A pad released while a push on it is re-sending its sticky events to a new peer (they were stored while it was
+ * unlinked): the release waits for the push, which must not reach the peer without a segment ("Got data flow
+ * before segment event", fatal here). */
+static void
+test_release_during_push (void)
+{
+  static const guint only1[] = { 1 };
+  ReleaseCtx c = { 0 };
+  GstPad *sink;
+  GThread *t;
+  Demux d;
+
+  g_mutex_init (&c.lock);
+  g_cond_init (&c.cond);
+  demux_init (&d, NULL);
+  demux_start (&d);
+  c.d = &d;
+  c.src = gst_element_request_pad_simple (d.demux, "src_1");
+  /* the first frame stores stream-start, caps and segment on the unlinked pad */
+  g_assert_cmpint (push_batch (&d, 0, only1, 1), ==, GST_FLOW_NOT_LINKED);
+
+  sink = gst_pad_new ("sink", GST_PAD_SINK);
+  g_object_set_data (G_OBJECT (sink), "ctx", &c);
+  gst_pad_set_chain_function (sink, release_sink_chain);
+  gst_pad_set_event_function (sink, release_sink_event);
+  g_assert_true (gst_pad_set_active (sink, TRUE));
+  gst_pad_add_probe (sink, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, release_caps_probe, &c, NULL);
+  g_assert_cmpint (gst_pad_link (c.src, sink), ==, GST_PAD_LINK_OK);
+  g_signal_connect (c.src, "notify::caps", G_CALLBACK (release_caps_notify), &c);
+
+  /* the next frame's push re-sends them to the sink; release the pad meanwhile */
+  t = g_thread_new ("push", release_push_thread, &c);
+  g_mutex_lock (&c.lock);
+  while (!c.in_caps)
+    g_cond_wait (&c.cond, &c.lock);
+  g_mutex_unlock (&c.lock);
+  gst_element_release_request_pad (d.demux, c.src);
+  g_thread_join (t);
+  g_assert_cmpint (g_atomic_int_get (&c.chained), ==, 0);
+
+  gst_pad_set_active (sink, FALSE);
+  gst_object_unref (sink);
+  gst_object_unref (c.src);
+  demux_clear (&d);
+  g_cond_clear (&c.cond);
+  g_mutex_clear (&c.lock);
+}
+
 /* A downstream pixel writer (make_writable + WRITE map) gets its own copy: the batch slot and the other views
  * stay as they were. */
 static void
@@ -1202,6 +1337,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/demux/restart-after-eos", test_restart_after_eos);
   g_test_add_func ("/cpu/demux/flow-combiner", test_flow_combiner);
   g_test_add_func ("/cpu/demux/dynamic-pads", test_dynamic_pads);
+  g_test_add_func ("/cpu/demux/release-during-push", test_release_during_push);
   g_test_add_func ("/cpu/demux/writer-isolated", test_writer_isolated);
   g_test_add_func ("/cpu/demux/queries", test_queries);
   g_test_add_func ("/cpu/demux/upstream-events", test_upstream_events);

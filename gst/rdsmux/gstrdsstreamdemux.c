@@ -30,7 +30,8 @@
  * Flow: the return of a batch combines the pads' returns (GstFlowCombiner): NOT_LINKED only when every pad is.
  * As with tee, FLUSHING or an error from one branch stops the streaming thread for all: block or unlink a branch
  * before stopping it. Pads may be requested and released while PLAYING, from any thread (also from pad-added
- * handlers).
+ * handlers); data and serialized events go out under the src pad's stream lock, so releasing a pad waits for a push in
+ * progress on it.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsstreamdemux.h"
 
@@ -191,9 +192,11 @@ send_eos (GstRdsStreamDemux * self, SrcPad * sp)
   sp->eos = TRUE;
   events = take_pending (self, sp, TRUE);
   g_mutex_unlock (&self->lock);
+  GST_PAD_STREAM_LOCK (sp->pad);
   push_events (sp, events);
   GST_DEBUG_OBJECT (sp->pad, "EOS");
   gst_pad_push_event (sp->pad, gst_event_new_eos ());
+  GST_PAD_STREAM_UNLOCK (sp->pad);
 }
 
 /* Lock held. A new reference to every pad. */
@@ -210,10 +213,13 @@ all_pads (GstRdsStreamDemux * self)
   return pads;
 }
 
-/* Pushes @event (transfer full) on @sp, after its pending stream-start and caps when @sticky. */
+/* Pushes @event (transfer full) on @sp, after its pending stream-start and caps when @sticky. Serialized events
+ * under the pad's stream lock, as data; never flush-start and other out-of-band events, which must get through
+ * while a push on the pad is blocked downstream. */
 static void
 forward (GstRdsStreamDemux * self, SrcPad * sp, GstEvent * event, gboolean sticky)
 {
+  gboolean serialized = GST_EVENT_IS_SERIALIZED (event);
   GList *events = NULL;
 
   if (sticky) {
@@ -221,8 +227,12 @@ forward (GstRdsStreamDemux * self, SrcPad * sp, GstEvent * event, gboolean stick
     events = take_pending (self, sp, FALSE);
     g_mutex_unlock (&self->lock);
   }
+  if (serialized)
+    GST_PAD_STREAM_LOCK (sp->pad);
   push_events (sp, events);
   gst_pad_push_event (sp->pad, event);
+  if (serialized)
+    GST_PAD_STREAM_UNLOCK (sp->pad);
 }
 
 static void
@@ -562,12 +572,18 @@ gst_rds_stream_demux_chain (G_GNUC_UNUSED GstPad * pad, GstObject * parent, GstB
     sp->need_discont = FALSE;
     g_mutex_unlock (&self->lock);
 
+    /* under the pad's stream lock: a release (gst_pad_set_active (FALSE)) then waits for this push before it drops
+     * the pad's sticky events, instead of dropping them while gst_pad_push re-sends them to a new peer */
+    GST_PAD_STREAM_LOCK (sp->pad);
     push_events (sp, events);
     out = make_output (self, batch, f);
-    if (out != NULL) {
+    if (out == NULL) {
+      GST_PAD_STREAM_UNLOCK (sp->pad);
+    } else {
       if (discont)
         GST_BUFFER_FLAG_SET (out, GST_BUFFER_FLAG_DISCONT);
       r = gst_pad_push (sp->pad, out);
+      GST_PAD_STREAM_UNLOCK (sp->pad);
       g_mutex_lock (&self->lock);
       /* a pad released meanwhile returns FLUSHING: that must not stop the others */
       if (sp->registered)
