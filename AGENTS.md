@@ -181,7 +181,19 @@ Known gotchas:
   depending on the host's load, while a profiler trace had the copies and the kernel all executed, in order. A
   rerun of the same engine was right. `tests/meson.build` sets `HSA_DISABLE_CACHE=1` for every test: it cost
   nothing measurable in `infer_engine` (3.1 s) or the YOLO11n parity case, but `rds-test3` (two 720p sources,
-  release build) went from ~21.5 to ~16.5 fps per source, so don't use it outside the tests.
+  release build) went from ~21.5 to ~16.5 fps per source, so don't use it outside the tests. In `rdsosd`'s GPU
+  mode the same bug can read a stale command block and fault the GPU (`Memory access fault` in
+  `rds_osd_upload_kernel` or `rds_osd_draw_kernel`, then SIGABRT): `element_osd` under that load with caching on
+  failed in 30 of 38 runs, against 0 of 80 with `HSA_DISABLE_CACHE=1`.
+- Separately, on the same iGPU under the same load: HIP's 2D copy into host memory (`hipMemcpy2D`,
+  `hipMemcpy2DAsync`, pageable or pinned) now and then completes, by the stream or a blocking call, before its last
+  rows have landed (about the last 60 rows of a 1080p plane kept their old bytes). A plain HIP loop at 1080p gave about
+  3 (pageable) to 7 (pinned) bad copies per 10000 with ROCm's defaults, about 12 with `HSA_ENABLE_SDMA=0`, and for
+  pageable memory it still failed with `HSA_DISABLE_CACHE=1`; a 1D `hipMemcpyAsync` of the same bytes gave 0 in every setting. So every copy
+  from the GPU into host memory goes through `rds_hip_copy_2d_to_host` (`rds-hip-private.h`): one 1D copy of the
+  pitched span, then a row repack on the CPU. Use it for any new GPU-to-host copy. In the tests it showed as
+  `buf_surface_hip`'s `copy-ready` ("drow == srow") and `rdsvideoconvert`'s system-memory outputs (pixel diffs of
+  255).
 - `rdsinfer`'s engine warm-up runs on the element's own stream (`RdsInferEngineOptions.warm_up_stream`; NULL: a
   stream of the engine's own). It was moved there for a failure seen under ASan in `element_infer_secondary`: the
   first chunk on the element's stream ran as if none of its kernels had, while its copies ran and every HIP call

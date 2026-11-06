@@ -665,10 +665,50 @@ copy_compatible (const RdsBufSurfaceParams * s, const RdsBufSurfaceParams * d, g
   return TRUE;
 }
 
+/* The calling thread's bounce buffer for copies into host memory (rds_hip_copy_2d_to_host). */
+typedef struct
+{
+  guint8 *data;
+  gsize size;
+} RdsCopyBounce;
+
+static void
+free_copy_bounce (gpointer data)
+{
+  RdsCopyBounce *b = data;
+
+  g_free (b->data);
+  g_free (b);
+}
+
+static GPrivate copy_bounce_key = G_PRIVATE_INIT (free_copy_bounce);
+
+static RdsCopyBounce *
+get_copy_bounce (void)
+{
+  RdsCopyBounce *b = g_private_get (&copy_bounce_key);
+
+  if (b == NULL) {
+    b = g_new0 (RdsCopyBounce, 1);
+    g_private_set (&copy_bounce_key, b);
+  }
+  return b;
+}
+
+/* Memory the CPU reads directly: HIP's 2D copies into it are unreliable (rds_hip_copy_2d_to_host). */
+static gboolean
+is_host_memory (RdsBufSurfaceMemType t)
+{
+  return t == RDS_BUF_MEM_SYSTEM || t == RDS_BUF_MEM_HIP_PINNED || t == RDS_BUF_MEM_HIP_UNIFIED;
+}
+
 /* Copies the pixel bytes of every plane of the first src->numFilled surfaces. */
 static gboolean
 copy_planes (const RdsBufSurface * src, RdsBufSurface * dst, gboolean host_copy)
 {
+  gboolean to_host = !host_copy && is_host_memory (dst->memType) && !is_cpu_only (src->memType);
+  RdsCopyBounce *bounce = to_host ? get_copy_bounce () : NULL;
+
   for (guint32 i = 0; i < src->numFilled; i++) {
     const RdsBufSurfaceParams *s = &src->surfaceList[i];
     RdsBufSurfaceParams *d = &dst->surfaceList[i];
@@ -683,6 +723,10 @@ copy_planes (const RdsBufSurface * src, RdsBufSurface * dst, gboolean host_copy)
         for (guint32 y = 0; y < rows; y++)
           memcpy (dptr + (gsize) y * d->planeParams.pitch[p], sptr + (gsize) y * s->planeParams.pitch[p],
               row_bytes);
+      } else if (to_host) {
+        if (!RDS_HIP_CHECK (rds_hip_copy_2d_to_host (dptr, d->planeParams.pitch[p], sptr, s->planeParams.pitch[p],
+                    row_bytes, rows, hipStreamPerThread, &bounce->data, &bounce->size)))
+          return FALSE;
       } else if (!RDS_HIP_CHECK (hipMemcpy2DAsync (dptr, d->planeParams.pitch[p], sptr, s->planeParams.pitch[p],
                   row_bytes, rows, hipMemcpyDefault, hipStreamPerThread))) {
         return FALSE;

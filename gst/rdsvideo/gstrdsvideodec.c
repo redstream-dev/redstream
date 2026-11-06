@@ -15,6 +15,7 @@
 
 #include <gst/video/video.h>
 #include <rds/rds.h>
+#include <rds/rds-hip-private.h>
 /* after GLib/GStreamer: HIP defines __noinline__ */
 #include <hip/hip_runtime_api.h>
 #include <rocdecode/rocdecode.h>
@@ -114,6 +115,8 @@ struct _GstRdsVideoDec
   RdsBufSurfaceMemType mem_type;        /* output surfaces' memory type, fixed at start */
   guint extra_surfaces;         /* num-extra-surfaces, fixed at start */
   hipStream_t stream;
+  guint8 *bounce;               /* rds_hip_copy_2d_to_host's buffer, for output in host memory */
+  gsize bounce_size;
   GstVideoCodecState *input_state;
   rocDecVideoCodec codec;
   RocdecVideoParser parser;     /* created lazily on the first frame */
@@ -604,13 +607,23 @@ copy_picture (GstRdsVideoDec * self, GstBuffer * outbuf, void *planes[3], const 
     }
   }
 
-  for (guint i = 0; i < 2 && err == hipSuccess; i++)
-    err = hipMemcpy2DAsync (dst[i], dst_pitch[i], src[i], src_pitch[i], row_bytes[i], rows[i], hipMemcpyDefault,
-        self->stream);
-  if (err == hipSuccess)
-    err = hipStreamSynchronize (self->stream);
-  else
-    (void) hipStreamSynchronize (self->stream);
+  if (surf == NULL || surf->memType == RDS_BUF_MEM_SYSTEM || surf->memType == RDS_BUF_MEM_HIP_PINNED
+      || surf->memType == RDS_BUF_MEM_HIP_UNIFIED) {
+    /* HIP's 2D copies into host memory can finish late (rds_hip_copy_2d_to_host); this one waits per plane */
+    for (guint i = 0; i < 2 && err == hipSuccess; i++)
+      err = rds_hip_copy_2d_to_host (dst[i], dst_pitch[i], src[i], src_pitch[i], row_bytes[i], rows[i],
+          self->stream, &self->bounce, &self->bounce_size);
+    if (err != hipSuccess)
+      (void) hipStreamSynchronize (self->stream);
+  } else {
+    for (guint i = 0; i < 2 && err == hipSuccess; i++)
+      err = hipMemcpy2DAsync (dst[i], dst_pitch[i], src[i], src_pitch[i], row_bytes[i], rows[i], hipMemcpyDefault,
+          self->stream);
+    if (err == hipSuccess)
+      err = hipStreamSynchronize (self->stream);
+    else
+      (void) hipStreamSynchronize (self->stream);
+  }
 
   if (surf != NULL) {
     /* the producer states what it filled, whatever the pool initialised */
@@ -893,6 +906,8 @@ gst_rds_video_dec_stop (GstVideoDecoder * dec)
       GST_WARNING_OBJECT (self, "hipStreamDestroy failed");
     self->stream = NULL;
   }
+  g_clear_pointer (&self->bounce, g_free);
+  self->bounce_size = 0;
   g_clear_pointer (&self->input_state, gst_video_codec_state_unref);
   self->out_width = self->out_height = 0;
   return TRUE;
