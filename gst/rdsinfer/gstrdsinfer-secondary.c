@@ -184,25 +184,28 @@ gst_rds_infer_cancel_requests (GstRdsInfer * self, guint first)
  * - one RdsLabelInfo per label, in the result's order (ours: 8.0 prepends): label_id, result_class_id, result_prob
  *   and result_label (DeepStream 8.0 behaviour); num_classes, the layer's class count (ours: 8.0 sets 0); a label
  *   longer than result_label is truncated there and kept whole in pResult_label (ours: 8.0 sets none);
- * - the display text (DeepStream 8.0 behaviour): "<old> <desc>" with a description (a custom parser's descString,
- *   so just "<old> " when it is empty), else (the built-in parser) "<old> " followed by "<label> " for each label; a
- *   NULL old text counts as "". obj_label is never changed. */
+ * - the display text (DeepStream 8.0 behaviour): "<old> <desc>" with a description (a custom parser's descString;
+ *   one of " " counts), else (the built-in parser) "<old> " followed by "<label> " for each label; a NULL old text
+ *   counts as "". An empty description leaves the text unchanged, NULL included (ours: 8.0 appends " "). obj_label is
+ *   never changed. */
 void
 gst_rds_infer_attach_classifier_result (RdsBatchMeta * bm, RdsObjectMeta * om, const RdsInferClassifierResult * result,
     gint unique_id, const gchar * classifier_type)
 {
   RdsClassifierMeta *cm;
-  GString *text;
+  GString *text = NULL;
 
   if (result->labels->len == 0)
     return;
   cm = rds_acquire_classifier_meta_from_pool (bm);
   cm->unique_component_id = unique_id;
   cm->classifier_type = classifier_type;
-  text = g_string_new (om->text_params.display_text);
-  g_string_append_c (text, ' ');
-  if (result->desc)
-    g_string_append (text, result->desc);
+  if (!result->desc || result->desc[0]) {
+    text = g_string_new (om->text_params.display_text);
+    g_string_append_c (text, ' ');
+    if (result->desc)
+      g_string_append (text, result->desc);
+  }
   for (guint i = 0; i < result->labels->len; i++) {
     const RdsInferClassifierLabel *l = &g_array_index (result->labels, RdsInferClassifierLabel, i);
     RdsLabelInfo *li = rds_acquire_label_info_meta_from_pool (bm);
@@ -219,8 +222,10 @@ gst_rds_infer_attach_classifier_result (RdsBatchMeta * bm, RdsObjectMeta * om, c
       g_string_append_printf (text, "%s ", l->label);
   }
   rds_add_classifier_meta_to_object (om, cm);
-  g_free (om->text_params.display_text);
-  om->text_params.display_text = g_string_free (text, FALSE);
+  if (text) {
+    g_free (om->text_params.display_text);
+    om->text_params.display_text = g_string_free (text, FALSE);
+  }
 }
 
 /* Secondary mode: the results of a chunk go to the unit's object (DeepStream 8.0 behaviour): its tensor meta in the

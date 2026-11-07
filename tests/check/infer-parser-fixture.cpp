@@ -3,9 +3,10 @@
  * FixtureBoxes returns the boxes in infer-parser-fixture.h, FixtureThrow throws, FixtureFail returns false,
  * FixtureFailDark returns false for dark images only. The classifier parsers
  * (CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE): FixtureClassify returns the attributes in
- * infer-parser-fixture.h, FixtureClassifyNoDesc the same without a descString, FixtureClassifyPastLayers one attribute
- * whose index is past the layers, FixtureClassifyFail and FixtureClassifyThrow allocate a label, then return false or
- * throw, FixtureClassifyFailDark returns false for dark images only.
+ * infer-parser-fixture.h, FixtureClassifyNoDesc the same without a descString, FixtureClassifySpaceDesc the same with
+ * a descString of one space, FixtureClassifyPastLayers one attribute whose index is past the layers,
+ * FixtureClassifyFail and FixtureClassifyThrow allocate a label, then return false or throw, FixtureClassifyFailDark
+ * returns false for dark images only.
  * FixtureVisible (in the second file) is FixtureBoxes marked with default visibility, for the build of these
  * sources with -fvisibility=hidden.
  * The box table lives in a second translation unit (infer-parser-fixture-boxes.cpp), which includes the parser
@@ -100,6 +101,9 @@ extern "C" bool FixtureClassify (std::vector<NvDsInferLayerInfo> const &outputLa
 extern "C" bool FixtureClassifyNoDesc (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
     NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
     std::string &descString);
+extern "C" bool FixtureClassifySpaceDesc (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString);
 extern "C" bool FixtureClassifyPastLayers (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
     NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
     std::string &descString);
@@ -143,6 +147,17 @@ FixtureClassifyNoDesc (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
   bool ok = FixtureClassify (outputLayersInfo, networkInfo, classifierThreshold, attrList, descString);
 
   descString.clear ();
+  return ok;
+}
+
+extern "C" bool
+FixtureClassifySpaceDesc (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+    NvDsInferNetworkInfo const &networkInfo, float classifierThreshold, std::vector<NvDsInferAttribute> &attrList,
+    std::string &descString)
+{
+  bool ok = FixtureClassify (outputLayersInfo, networkInfo, classifierThreshold, attrList, descString);
+
+  descString = " ";
   return ok;
 }
 
@@ -195,6 +210,7 @@ FixtureClassifyFailDark (std::vector<NvDsInferLayerInfo> const &outputLayersInfo
 
 CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassify);
 CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassifyNoDesc);
+CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassifySpaceDesc);
 CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassifyPastLayers);
 CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassifyFail);
 CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE (FixtureClassifyThrow);

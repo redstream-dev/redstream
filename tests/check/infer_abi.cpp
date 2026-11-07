@@ -733,7 +733,7 @@ test_classifier_custom (void)
 }
 
 /* A custom parser's empty descString is kept as an empty description (DeepStream 8.0 behaviour): desc is "", so the
- * display text gets no labels. An attribute whose index is past the layers has no class count (0). */
+ * display text gets no labels (and stays unchanged, ours). An attribute whose index is past the layers has no class count (0). */
 static void
 test_classifier_custom_no_desc (void)
 {

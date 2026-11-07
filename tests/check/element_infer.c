@@ -612,23 +612,23 @@ test_start_config_errors (void)
 /* One classifier result attached to two objects, and twice to one of them: each attach makes its own metas from the
  * values (the result is only read), the display text grows each time, classifier_type is stored as given; a result
  * with a description but no labels attaches nothing; one with labels and an empty description (a custom parser's
- * empty descString) adds " " and no labels to the display text (DeepStream 8.0 behaviour). ASan checks the
- * ownership. */
+ * empty descString) attaches its meta and leaves the display text unchanged, NULL included (ours); a description of
+ * one space is not empty: "T" becomes "T  " (DeepStream 8.0 behaviour). ASan checks the ownership. */
 static void
 test_classifier_attach (void)
 {
   RdsBatchMeta *bm = rds_create_batch_meta (1);
   RdsFrameMeta *fm = rds_acquire_frame_meta_from_pool (bm);
-  RdsObjectMeta *om[3];
+  RdsObjectMeta *om[5];
   RdsInferClassifierResult *r = rds_infer_classifier_result_new (), *empty = rds_infer_classifier_result_new ();
-  RdsInferClassifierResult *no_desc = rds_infer_classifier_result_new ();
+  RdsInferClassifierResult *no_desc = rds_infer_classifier_result_new (), *space = rds_infer_classifier_result_new ();
   const gchar *type = g_intern_string ("attach-test");
 
   load_hooks ();
   rds_add_frame_meta_to_batch (bm, fm);
-  for (guint i = 0; i < 3; i++) {
+  for (guint i = 0; i < G_N_ELEMENTS (om); i++) {
     om[i] = rds_acquire_obj_meta_from_pool (bm);
-    om[i]->text_params.display_text = i == 1 ? NULL : g_strdup ("T");
+    om[i]->text_params.display_text = i == 1 || i == 3 ? NULL : g_strdup ("T");
     rds_add_obj_meta_to_frame (fm, om[i], NULL);
   }
   rds_infer_classifier_result_add (r, 0, 1, 3, 0.5f, "b");
@@ -636,22 +636,31 @@ test_classifier_attach (void)
   empty->desc = g_strdup ("d");
   rds_infer_classifier_result_add (no_desc, 0, 2, 3, 0.75f, "c");
   no_desc->desc = g_strdup ("");
+  rds_infer_classifier_result_add (space, 0, 1, 3, 0.75f, "s");
+  space->desc = g_strdup (" ");
 
   hook_attach_classifier_result (bm, om[0], r, 4, type);
   hook_attach_classifier_result (bm, om[1], r, 4, type);
   hook_attach_classifier_result (bm, om[0], r, 5, NULL);
   hook_attach_classifier_result (bm, om[1], empty, 4, type);
   hook_attach_classifier_result (bm, om[2], no_desc, 4, type);
+  hook_attach_classifier_result (bm, om[3], no_desc, 4, type);
+  hook_attach_classifier_result (bm, om[4], space, 4, type);
   rds_infer_classifier_result_free (r);
   rds_infer_classifier_result_free (empty);
   rds_infer_classifier_result_free (no_desc);
+  rds_infer_classifier_result_free (space);
 
   g_assert_cmpstr (om[0]->text_params.display_text, ==, "T b x  b x ");
   g_assert_cmpstr (om[1]->text_params.display_text, ==, " b x ");
   g_assert_cmpuint (g_list_length (om[0]->classifier_meta_list), ==, 2);
   g_assert_cmpuint (g_list_length (om[1]->classifier_meta_list), ==, 1);
-  g_assert_cmpstr (om[2]->text_params.display_text, ==, "T ");
+  g_assert_cmpstr (om[2]->text_params.display_text, ==, "T");
   g_assert_cmpuint (g_list_length (om[2]->classifier_meta_list), ==, 1);
+  g_assert_null (om[3]->text_params.display_text);
+  g_assert_cmpuint (g_list_length (om[3]->classifier_meta_list), ==, 1);
+  g_assert_cmpstr (om[4]->text_params.display_text, ==, "T  ");
+  g_assert_cmpuint (g_list_length (om[4]->classifier_meta_list), ==, 1);
   {
     const RdsClassifierMeta *c = om[2]->classifier_meta_list->data;
     const RdsLabelInfo *li = c->label_info_list->data;
@@ -3189,31 +3198,37 @@ test_classifier_custom_false (void)
   g_free (extra);
 }
 
-/* A custom parser that leaves descString empty: the display text gets " " and no labels (DeepStream 8.0 behaviour);
- * the classifier meta still has them. */
+/* A custom parser that leaves descString empty (FixtureClassifyNoDesc): the classifier meta has its labels and the
+ * display text is unchanged, "T" stays "T" and NULL stays NULL (ours: DeepStream 8.0 appends " "). A descString of
+ * one space (FixtureClassifySpaceDesc) is not empty: "T" becomes "T  " (DeepStream 8.0 behaviour). */
 static void
 test_classifier_custom_no_desc (void)
 {
-  static const WantLabel red = { 0, 200, 3, 0.0f, "attr0-32x32" };
-  gchar *extra = g_strdup_printf ("custom-lib-path=%s\nparse-classifier-func-name=FixtureClassifyNoDesc\n",
-      RDS_TEST_PARSER_FIXTURE);
-  gchar *cfg = classifier_config ("cls-nodesc.txt", "meancls.onnx", 4, RGB_LABELS, extra);
-  GstHarness *h;
-  GstBuffer *in, *out;
-  RdsObjectMeta *om;
+  static const WantLabel red = { 0, 200, 3, 0.0f, "attr0-32x32" }, green = { 0, 0, 3, 0.0f, "attr0-32x32" };
+  static const gchar *funcs[] = { "FixtureClassifyNoDesc", "FixtureClassifySpaceDesc" };
 
   RDS_TEST_REQUIRE_GPU ();
   load_hooks ();
-  h = classifier_harness (cfg, NULL);
-  in = colour_batch (1);
-  om = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
-  out = push_pull (h, in);
-  check_classifier (om, 0, 1, 4, NULL, &red, 1);
-  check_object_kept (om, "T ");
-  gst_buffer_unref (out);
-  gst_harness_teardown (h);
-  g_free (cfg);
-  g_free (extra);
+  for (guint f = 0; f < G_N_ELEMENTS (funcs); f++) {
+    gchar *extra = g_strdup_printf ("custom-lib-path=%s\nparse-classifier-func-name=%s\n", RDS_TEST_PARSER_FIXTURE,
+        funcs[f]);
+    gchar *cfg = classifier_config ("cls-nodesc.txt", "meancls.onnx", 4, RGB_LABELS, extra);
+    GstHarness *h = classifier_harness (cfg, NULL);
+    GstBuffer *in = colour_batch (1), *out;
+    RdsObjectMeta *om[2];
+
+    om[0] = add_colour_object (in, 0, 0, 0, 200, 0, 0, "T");
+    om[1] = add_colour_object (in, 0, 32, 0, 0, 160, 0, NULL);
+    out = push_pull (h, in);
+    check_classifier (om[0], 0, 1, 4, NULL, &red, 1);
+    check_classifier (om[1], 0, 1, 4, NULL, &green, 1);
+    check_object_kept (om[0], f == 0 ? "T" : "T  ");
+    check_object_kept (om[1], f == 0 ? NULL : "  ");
+    gst_buffer_unref (out);
+    gst_harness_teardown (h);
+    g_free (cfg);
+    g_free (extra);
+  }
 }
 
 /* A custom parser that throws (FixtureClassifyThrow, on every object): one warning per element, no classifier meta,
