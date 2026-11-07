@@ -186,8 +186,8 @@ gst_rds_infer_cancel_requests (GstRdsInfer * self, guint first)
  *   longer than result_label is truncated there and kept whole in pResult_label (ours: 8.0 sets none);
  * - the display text (DeepStream 8.0 behaviour): "<old> <desc>" with a description (a custom parser's descString;
  *   one of " " counts), else (the built-in parser) "<old> " followed by "<label> " for each label; a NULL old text
- *   counts as "". An empty description leaves the text unchanged, NULL included (ours: 8.0 appends " "). obj_label is
- *   never changed. */
+ *   counts as "". An empty description leaves the text unchanged, NULL included (ours: 8.0 attaches nothing).
+ *   obj_label is never changed. */
 void
 gst_rds_infer_attach_classifier_result (RdsBatchMeta * bm, RdsObjectMeta * om, const RdsInferClassifierResult * result,
     gint unique_id, const gchar * classifier_type)

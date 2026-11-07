@@ -3238,8 +3238,8 @@ test_classifier_custom_false (void)
 }
 
 /* A custom parser that leaves descString empty (FixtureClassifyNoDesc): the classifier meta has its labels and the
- * display text is unchanged, "T" stays "T" and NULL stays NULL (ours: DeepStream 8.0 appends " "). A descString of
- * one space (FixtureClassifySpaceDesc) is not empty: "T" becomes "T  " (DeepStream 8.0 behaviour). */
+ * display text is unchanged, "T" stays "T" and NULL stays NULL (ours: DeepStream 8.0 attaches nothing). A descString
+ * of one space (FixtureClassifySpaceDesc) is not empty: "T" becomes "T  " (DeepStream 8.0 behaviour). */
 static void
 test_classifier_custom_no_desc (void)
 {
