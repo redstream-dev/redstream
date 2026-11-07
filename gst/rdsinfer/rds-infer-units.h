@@ -74,10 +74,11 @@ G_GNUC_INTERNAL void rds_infer_crop_letterbox (guint net_w, guint net_h, guint c
  * Running rds_infer_postprocess in crop pixels has two effects for the caller:
  * - a child wholly outside the crop is dropped there (its step 9, the clip to the crop) and never gets here; a child
  *   partly outside the crop gets here and keeps its part inside the frame;
- * - roi-top-offset and roi-bottom-offset would act in crop pixels, from the crop's top and bottom edges, so the
- *   element doesn't apply them in secondary mode: it runs the post-processing with both at 0 (ours, not measured on
- *   DeepStream 8.0; the config warns when they are set). The size filters (detected-min/max-w/h) are the same in crop
- *   and frame pixels. */
+ * - roi-top-offset and roi-bottom-offset act in crop pixels, from the top and the bottom edge of the aligned crop: a
+ *   child is kept when its top - the crop's top >= roi-top-offset (DeepStream 8.0 behaviour) and its bottom - the
+ *   crop's top <= crop_h - roi-bottom-offset (ours: 8.0 uses the frame's height there); roi-bottom-offset >= crop_h
+ *   drops every child of the crop (ours). The parents are not filtered (DeepStream 8.0 behaviour). The size filters
+ *   (detected-min/max-w/h) are the same in crop and frame pixels. */
 G_GNUC_INTERNAL gboolean rds_infer_map_child (const RdsBufSurfTransformRect * crop, guint frame_w, guint frame_h,
     const RdsInferDetection * in, RdsInferDetection * out);
 

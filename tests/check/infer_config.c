@@ -856,16 +856,13 @@ test_mode_warnings (void)
   g_assert_cmpuint (cfg->interval, ==, 2);
   rds_infer_config_free (cfg);
 
-  /* the ROI offsets in secondary mode (ours: not applied there), once per key after the class-attrs groups are merged:
-   * "every class" when all classes have the value, else the first class that differs from the default */
+  /* the ROI offsets apply in both modes (in secondary mode from the crop's edges): no warning */
   cfg = load_warnings (DETECTOR_TXT "process-mode=2\n[class-attrs-all]\nroi-top-offset=30\n[class-attrs-1]\n"
       "roi-bottom-offset=4\n", NULL);
-  g_assert_cmpuint (cfg->warnings->len, ==, 2);
-  g_assert_cmpuint (count_warnings (cfg, ":roi-top-offset: 30 (every class): ignored in secondary mode "
-          "(process-mode=2)"), ==, 1);
-  g_assert_cmpuint (count_warnings (cfg, ":roi-bottom-offset: 4 (class 1): ignored in secondary mode"), ==, 1);
+  g_assert_cmpuint (cfg->warnings->len, ==, 0);
+  g_assert_cmpuint (cfg->class_attrs[0].roi_top_offset, ==, 30);
+  g_assert_cmpuint (cfg->class_attrs[1].roi_bottom_offset, ==, 4);
   rds_infer_config_free (cfg);
-  /* in primary mode they apply: no warning */
   cfg = load_warnings (DETECTOR_TXT "[class-attrs-all]\nroi-top-offset=30\nroi-bottom-offset=4\n", NULL);
   g_assert_cmpuint (cfg->warnings->len, ==, 0);
   rds_infer_config_free (cfg);

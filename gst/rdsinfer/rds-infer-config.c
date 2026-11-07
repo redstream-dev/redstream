@@ -246,11 +246,11 @@ static const KeyInfo keys[] = {
       .def = "0.45",.field = C (nms_iou_threshold)},
   {.name = "topk",.group = CLS,.type = TYPE_INT,.status = SUP,.min = -1,.max = G_MAXINT,.def = "-1",
       .field = C (topk)},
-  /* not applied in secondary mode (ours: from a crop's edges they would be surprising) */
-  {.name = "roi-top-offset",.group = CLS,.type = TYPE_UINT,.status = SUP,.scope = SCOPE_PRIMARY,.min = 0,
-      .max = G_MAXINT,.def = "0",.field = C (roi_top_offset)},
-  {.name = "roi-bottom-offset",.group = CLS,.type = TYPE_UINT,.status = SUP,.scope = SCOPE_PRIMARY,.min = 0,
-      .max = G_MAXINT,.def = "0",.field = C (roi_bottom_offset)},
+  /* both modes: in secondary mode from the crop's edges (rds_infer_map_child) */
+  {.name = "roi-top-offset",.group = CLS,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,.def = "0",
+      .field = C (roi_top_offset)},
+  {.name = "roi-bottom-offset",.group = CLS,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,.def = "0",
+      .field = C (roi_bottom_offset)},
   {.name = "detected-min-w",.group = CLS,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,.def = "0",
       .field = C (detected_min_w)},
   {.name = "detected-min-h",.group = CLS,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,.def = "0",

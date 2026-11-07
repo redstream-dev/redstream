@@ -645,7 +645,7 @@ which has no properties for them. Their rows are in "Config keys: `[property]`".
 | Child geometry | ours | network → crop → frame pixels with one consistent mapping; `rect_params` clipped to the frame, `detector_bbox_info` the unclipped box (8.0 maps with the unaligned parent origin, so it can be a pixel off, doesn't clip, and moves negative coordinates to the parent's origin without shrinking the box). A child wholly outside its crop is dropped; one partly outside keeps its part inside the frame |
 | Child order | ours | appended to the frame's object list after the existing objects, crop by crop (8.0 prepends) |
 | Detector chains | DeepStream 8.0 behaviour | a second `rdsinfer` with `infer-on-gie-id` = the detector's `gie-unique-id` infers on its children |
-| `roi-top-offset`, `roi-bottom-offset` | ours | not applied (measured from a crop's edges they would be surprising), with a warning; 8.0 not observed |
+| `roi-top-offset`, `roi-bottom-offset` | DeepStream 8.0 behaviour, ours | applied to the children with the child's class attributes, in crop pixels (frame pixels from the top of the aligned crop the parent was sampled from): a child is kept when its top − the crop's top ≥ `roi-top-offset` (DeepStream 8.0 behaviour) and its bottom − the crop's top ≤ the crop's height − `roi-bottom-offset` (ours: 8.0 compares with the frame's height minus the offset); a `roi-bottom-offset` of the crop's height or more drops every child of that crop (ours). Boundaries included, each offset only when set. The parents are never filtered (DeepStream 8.0 behaviour); no warning |
 | Parser returns false | ours | one warning per element, that object gets no children but its tensor meta is still attached (as in primary mode), the other objects are unaffected (8.0 crashes) |
 | Classifiers (`network-type=1`) | ours | secondary mode only for now: a classifier in primary mode fails at start; see "Classifier output (classifier meta)" and "Per-object cache" |
 
@@ -728,9 +728,8 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 - Keys the mode or the network type doesn't use are a warning when set to something other than their default: the
   secondary-mode keys (`operate-on-*`, `input-object-*`, `secondary-reinfer-interval`, `classifier-async-mode`) in
   primary mode, the classifier keys outside classifiers, and `interval` in secondary mode (DeepStream 8.0 behaviour:
-  it is ignored there). So are `roi-top-offset` and `roi-bottom-offset` in secondary mode (ours: not applied there),
-  once per key after the class-attrs groups are merged: `KEY: VALUE (every class)` when all classes have the value,
-  else `KEY: VALUE (class <id>)` for the first class that has another value than the default.
+  it is ignored there). `roi-top-offset` and `roi-bottom-offset` apply in both modes (in secondary mode from the
+  crop's edges, see "Secondary mode") and never warn.
 
 #### Config keys: `[property]`
 
@@ -811,8 +810,8 @@ The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all
 | `post-cluster-threshold` | float | `0.0` (ours) | >= 0 | supported | objects with a lower confidence are dropped after clustering |
 | `nms-iou-threshold` | float | `0.45` (ours) | >= 0 | supported | `cluster-mode=2`: a box is suppressed when its IoU with a kept box of its class is above it |
 | `topk` | int | `-1` (ours) | >= -1 | supported | `cluster-mode=2`: the best K per class and frame after NMS; -1 keeps all, 0 none |
-| `roi-top-offset` | uint | `0` (ours) | 0..2147483647 | supported | rows ignored at the top of the frame: objects whose centre is above are dropped (ours: the centre). Primary mode only: ignored in secondary mode, with a warning (ours) |
-| `roi-bottom-offset` | uint | `0` (ours) | 0..2147483647 | supported | the same from the bottom |
+| `roi-top-offset` | uint | `0` (ours) | 0..2147483647 | supported | rows ignored at the top of the frame: objects whose top is above it are dropped, a top exactly at it is kept (DeepStream 8.0 behaviour); 0: no test. In secondary mode from the top of the crop (see "Secondary mode") |
+| `roi-bottom-offset` | uint | `0` (ours) | 0..2147483647 | supported | the same from the bottom: objects whose bottom (top + height) is below the frame's height minus it are dropped, a bottom exactly there is kept (DeepStream 8.0 behaviour); 0: no test. The frame's height or more drops every object of the class (ours: 8.0 then skips the test). In secondary mode from the bottom of the crop (see "Secondary mode") |
 | `detected-min-w` | uint | `0` (ours) | 0..2147483647 | supported | narrower objects are dropped |
 | `detected-min-h` | uint | `0` (ours) | 0..2147483647 | supported | lower objects are dropped |
 | `detected-max-w` | uint | `0` (ours) | 0..2147483647 | supported | wider objects are dropped; 0: no maximum |
@@ -835,7 +834,9 @@ object's class attributes:
 4. `post-cluster-threshold`;
 5. mapping from network-input pixels to frame pixels (undoing `maintain-aspect-ratio` / `symmetric-padding`);
 6. `filter-out-class-ids`;
-7. `roi-top-offset` / `roi-bottom-offset`, when set: the box's centre must be in the band;
+7. `roi-top-offset` / `roi-bottom-offset`, each when set: top ≥ `roi-top-offset` and top + height ≤ frame height −
+   `roi-bottom-offset`, boundaries included (DeepStream 8.0 behaviour); a `roi-bottom-offset` of the frame height or
+   more drops everything (ours);
 8. `detected-min-*` / `detected-max-*`, on the unclipped size in frame pixels;
 9. clipping to the frame gives `rect_params`; an object whose clipped box is empty is dropped.
 

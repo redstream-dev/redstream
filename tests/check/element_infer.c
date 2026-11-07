@@ -527,7 +527,7 @@ test_override_secondary (void)
   gst_object_unref (e);
   g_free (cfg);
 
-  /* the ROI offsets follow the final mode too: ignored in secondary mode, with a warning (ours) */
+  /* the ROI offsets apply in either final mode: no warning in either */
   cfg = write_file ("roi-mode.txt", "[property]\nonnx-file=fixeddet.onnx\nnetwork-type=0\nnum-detected-classes=2\n"
       "parse-bbox-func-name=RdsInferParseYolo\n[class-attrs-all]\nroi-top-offset=30\n");
   e = gst_element_factory_make ("rdsinfer", NULL);
@@ -538,9 +538,8 @@ test_override_secondary (void)
   gst_structure_free (s);
   g_object_set (e, "process-mode", 2, NULL);
   s = hook_get_config (e, &err);
-  g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 1);
-  g_assert_nonnull (strstr (gst_structure_get_string (s, "warnings"), "roi-mode.txt:roi-top-offset: 30 (every "
-          "class): ignored in secondary mode (process-mode=2)"));
+  g_assert_no_error (err);
+  g_assert_true (gst_structure_get_uint (s, "n-warnings", &u) && u == 0);
   gst_structure_free (s);
   gst_object_unref (e);
   g_free (cfg);
@@ -2297,35 +2296,75 @@ test_secondary_detector_children (void)
   g_free (cfg);
 }
 
-/* roi-top-offset and roi-bottom-offset are not applied in secondary mode (ours): a band that would drop every child
- * (centre y in [30, 34) of the crop) drops none, and start warns about each key. */
+/* Runs the secondary detector of fixeddet_config with @classes (its class-attrs groups) on run_children's batch: start
+ * posts no warning, the three parents stay as they are, and the children kept are parent 0's @keep0 and parent 1's
+ * @keep1 (indices into children_p0 and children_p1, -1 terminated), in that order. */
 static void
-test_secondary_roi_ignored (void)
+run_secondary_roi (const gchar * classes, const gint * keep0, const gint * keep1)
 {
-  gchar *cfg = fixeddet_config ("secondary-roi.txt", "[class-attrs-all]\nroi-top-offset=30\nroi-bottom-offset=30\n");
+  gchar *cfg = fixeddet_config ("secondary-roi.txt", classes);
   GstBus *bus = gst_bus_new ();
   GstElement *e;
   GstHarness *h;
   GstBuffer *out;
   RdsObjectMeta *parents[3];
-  gchar *texts;
+  GPtrArray *objs;
+  guint n0 = 0, n1 = 0;
+
+  while (keep0[n0] >= 0)
+    n0++;
+  while (keep1[n1] >= 0)
+    n1++;
+  e = new_infer (cfg);
+  gst_element_set_bus (e, bus);
+  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_RGBA, 256, 128);
+  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, NULL), ==, 0);
+  out = run_children (h, parents);
+  objs = all_objects (out);
+  g_assert_cmpuint (objs->len, ==, 3 + n0 + n1);
+  for (guint i = 0; i < 3; i++)
+    g_assert_true (objs->pdata[i] == parents[i]);
+  for (guint i = 0; i < n0; i++)
+    check_object_from (objs->pdata[3 + i], &children_p0[keep0[i]], 5, parents[0]);
+  for (guint i = 0; i < n1; i++)
+    check_object_from (objs->pdata[3 + n0 + i], &children_p1[keep1[i]], 5, parents[1]);
+  check_frames_untouched (out, -1);
+  g_ptr_array_unref (objs);
+  gst_buffer_unref (out);
+  harness_teardown_with_bus (h, bus);
+  g_free (cfg);
+}
+
+/* roi-top-offset and roi-bottom-offset in secondary mode act on the children in crop pixels, from the top and the
+ * bottom edge of the crop each parent was sampled from: a child is kept when its top - the crop's top >=
+ * roi-top-offset (DeepStream 8.0 behaviour) and its bottom - the crop's top <= the crop's height - roi-bottom-offset
+ * (ours: 8.0 uses the frame's height there), with the child's class attributes; a roi-bottom-offset of the crop's
+ * height or more drops every child of that crop. Parents are never filtered, and start doesn't warn.
+ * Children's tops in crop pixels: parent 0 (crop y 40, 64 high) 8, 10, 52, 38, 26, 36; parent 1 (crop y 96, 32 high)
+ * 4, 5, 26, 19, 13, 18. Bottoms: 24, 22, 68, 58, 34, 52 and 12, 11, 34, 29, 17, 26. */
+static void
+test_secondary_roi (void)
+{
+  static const gint all[] = { 0, 1, 2, 3, 4, 5, -1 }, from1[] = { 1, 2, 3, 4, 5, -1 };
+  static const gint b6_p0[] = { 0, 1, 3, 4, 5, -1 }, b6_p1[] = { 0, 1, 4, 5, -1 };
+  static const gint cls_p0[] = { 0, 1, 2, 3, -1 }, cls_p1[] = { 0, 2, 3, -1 }, none[] = { -1 };
 
   RDS_TEST_REQUIRE_GPU ();
   ensure_test_model ("fixeddet.onnx");
   load_hooks ();
-  e = new_infer (cfg);
-  gst_element_set_bus (e, bus);
-  h = harness_for (e, NULL, RDS_BUF_COLOR_FORMAT_RGBA, 256, 128);
-  g_assert_cmpuint (pop_messages (bus, GST_MESSAGE_WARNING, &texts), ==, 2);
-  g_assert_nonnull (strstr (texts, "secondary-roi.txt:roi-top-offset: 30 (every class): ignored in secondary mode"));
-  g_assert_nonnull (strstr (texts, "secondary-roi.txt:roi-bottom-offset: 30 (every class): ignored in secondary "
-          "mode"));
-  g_free (texts);
-  out = run_children (h, parents);
-  check_children (out, parents);
-  gst_buffer_unref (out);
-  harness_teardown_with_bus (h, bus);
-  g_free (cfg);
+  /* top 5: parent 1's child at 5 kept (the boundary), the one at 4 dropped; in frame pixels all would stay */
+  run_secondary_roi ("[class-attrs-all]\nroi-top-offset=5\n", all, from1);
+  /* bottom 6: parent 0 keeps bottoms <= 58 (child 3 exactly), parent 1 bottoms <= 26 (child 5 exactly) */
+  run_secondary_roi ("[class-attrs-all]\nroi-bottom-offset=6\n", b6_p0, b6_p1);
+  /* per class: cars (class 1) with bottom 32, persons with none. Parent 1's crop is 32 high, so it loses all its
+   * cars; parent 0 keeps the cars with bottom <= 32 (child 1) */
+  run_secondary_roi ("[class-attrs-all]\nroi-bottom-offset=32\n[class-attrs-0]\nroi-bottom-offset=0\n", cls_p0, cls_p1);
+  /* top 32: nothing of parent 1's 32-pixel crop is left; parent 0 keeps tops >= 32 */
+  {
+    static const gint t32_p0[] = { 2, 3, 5, -1 };
+
+    run_secondary_roi ("[class-attrs-all]\nroi-top-offset=32\n", t32_p0, none);
+  }
 }
 
 /* The fixture parser @func on scale2 (64x64 network, stretched) as a secondary detector of the objects of GIE 1, GIE
@@ -4009,7 +4048,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/infer-secondary/pool-steady", test_secondary_pool_steady);
   g_test_add_func ("/gpu/infer-secondary/pool-trim", test_secondary_pool_trim);
   g_test_add_func ("/gpu/infer-secondary/chunk-failure", test_secondary_chunk_failure);
-  g_test_add_func ("/gpu/infer-secondary/roi-ignored", test_secondary_roi_ignored);
+  g_test_add_func ("/gpu/infer-secondary/roi", test_secondary_roi);
   g_test_add_func ("/gpu/infer-secondary/classifier-classes", test_classifier_classes);
   g_test_add_func ("/gpu/infer-secondary/classifier-threshold", test_classifier_threshold);
   g_test_add_func ("/gpu/infer-secondary/classifier-two-layers", test_classifier_two_layers);

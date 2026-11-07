@@ -143,16 +143,11 @@ parse_id_list (const gchar * s, const gchar * sep, gint64 min, gint64 max, GArra
   return ok;
 }
 
-/* What secondary mode ignores, after the config warned about it: interval (DeepStream 8.0 behaviour) and the ROI
- * offsets, which postprocessing would apply from a crop's top and bottom edges (ours). */
+/* What secondary mode ignores, after the config warned about it: interval (DeepStream 8.0 behaviour). */
 static void
 ignore_in_secondary_mode (RdsInferConfig * cfg)
 {
   cfg->interval = 0;
-  for (guint i = 0; i < cfg->num_detected_classes; i++) {
-    cfg->class_attrs[i].roi_top_offset = 0;
-    cfg->class_attrs[i].roi_bottom_offset = 0;
-  }
 }
 
 /* What start would run with: the config file with the explicitly set properties applied and validated. Property

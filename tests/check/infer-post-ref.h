@@ -104,7 +104,7 @@ ref_postprocess (const RdsInferConfig * cfg, const RdsInferLetterbox * lb, const
     const RdsInferObjectDetectionInfo *o = &in[i];
     const RdsInferClassAttrs *attrs;
     RdsInferDetection d;
-    gfloat right, bottom, cy;
+    gfloat right, bottom;
     gboolean filtered = FALSE;
 
     if (state[i] != REF_KEPT)
@@ -126,10 +126,13 @@ ref_postprocess (const RdsInferConfig * cfg, const RdsInferLetterbox * lb, const
     if (filtered)
       continue;
 
-    if (attrs->roi_top_offset > 0 || attrs->roi_bottom_offset > 0) {
-      cy = d.box.top + d.box.height / 2;
-      if (cy < (gfloat) attrs->roi_top_offset
-          || cy >= (gfloat) lb->frame_h - (gfloat) attrs->roi_bottom_offset)
+    if (attrs->roi_top_offset > 0 && d.box.top < (gfloat) attrs->roi_top_offset)
+      continue;
+    if (attrs->roi_bottom_offset > 0) {
+      if (attrs->roi_bottom_offset >= lb->frame_h)
+        continue;
+      bottom = d.box.top + d.box.height;
+      if (bottom > (gfloat) lb->frame_h - (gfloat) attrs->roi_bottom_offset)
         continue;
     }
 

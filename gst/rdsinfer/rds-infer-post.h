@@ -79,8 +79,9 @@ typedef enum
  * 5. mapping to frame pixels (rds_infer_letterbox_map); a box that is no longer finite (float overflow) is
  *    dropped as invalid;
  * 6. filter-out-class-ids;
- * 7. when roi-top-offset or roi-bottom-offset is set: the box's centre y must be in
- *    [roi-top-offset, frame_h - roi-bottom-offset) (frame pixels from the top and the bottom edge);
+ * 7. the ROI band (frame pixels from the top and the bottom edge, boundaries included), each offset only when it is
+ *    > 0: roi-top-offset keeps a box with top >= it, roi-bottom-offset one with top + height <= frame_h - it, and
+ *    drops every box when it is >= frame_h. In secondary mode the "frame" is the crop (see rds_infer_map_child);
  * 8. detected-min-w/h and detected-max-w/h (0: no maximum) on the mapped, unclipped size;
  * 9. the box clipped to [0, frame_w] x [0, frame_h] gives rect; an empty rect drops the object.
  * cluster-mode=4 skips 2 and 3. Steps 1 and 3-8 use the class's attributes. The survivors are appended to @out

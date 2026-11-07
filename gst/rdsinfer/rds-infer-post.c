@@ -206,7 +206,7 @@ rds_infer_postprocess (const RdsInferConfig * cfg, const RdsInferLetterbox * lb,
     const RdsInferObjectDetectionInfo *o = &in[c[i].index];
     const RdsInferClassAttrs *attrs = &cfg->class_attrs[o->classId];
     RdsInferDetection d;
-    gfloat m[4], cy;
+    gfloat m[4];
     gboolean filtered = FALSE;
 
     /* 4. Post-cluster threshold. */
@@ -233,12 +233,13 @@ rds_infer_postprocess (const RdsInferConfig * cfg, const RdsInferLetterbox * lb,
     if (filtered)
       continue;
 
-    /* 7. The ROI band, on the box's centre (ours); off when both offsets are 0 (ours). */
-    if (attrs->roi_top_offset > 0 || attrs->roi_bottom_offset > 0) {
-      cy = d.box.top + d.box.height / 2;
-      if (cy < (gfloat) attrs->roi_top_offset || cy >= (gfloat) lb->frame_h - (gfloat) attrs->roi_bottom_offset)
-        continue;
-    }
+    /* 7. The ROI band on the box's top and bottom, boundaries included (DeepStream 8.0 behaviour); each offset only
+     * when set. A bottom offset of the frame height or more drops everything (ours: 8.0 then skips the test). */
+    if (attrs->roi_top_offset > 0 && d.box.top < (gfloat) attrs->roi_top_offset)
+      continue;
+    if (attrs->roi_bottom_offset > 0 && (attrs->roi_bottom_offset >= lb->frame_h
+            || d.box.top + d.box.height > (gfloat) lb->frame_h - (gfloat) attrs->roi_bottom_offset))
+      continue;
 
     /* 8. Size limits on the unclipped box. */
     if (d.box.width < attrs->detected_min_w || d.box.height < attrs->detected_min_h)

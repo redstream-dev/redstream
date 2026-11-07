@@ -857,22 +857,28 @@ test_filter_out (void)
   rds_infer_config_free (cfg);
 }
 
+/* The ROI band (DeepStream 8.0 behaviour): a box is kept when top >= roi-top-offset and top + height <= frame_h -
+ * roi-bottom-offset, the boundaries included; each offset is tested only when it is set, and a roi-bottom-offset of
+ * frame_h or more drops every box of the class (ours). */
 static void
 test_roi (void)
 {
   RdsInferConfig *cfg = make_cfg (2);
   RdsInferObjectDetectionInfo in[] = {
-    obj (0, 0, 90, 10, 18, 0.9f),       /* centre y 99: above the band */
-    obj (0, 20, 90, 10, 20, 0.9f),      /* 100: in */
-    obj (0, 40, 530, 10, 19, 0.9f),     /* 539.5: in */
-    obj (0, 60, 530, 10, 20, 0.9f),     /* 540: below the band (640 - 100) */
-    obj (1, 80, 0, 10, 20, 0.9f),       /* class 1 has no band */
-    obj (0, 100, -100, 10, 160, 0.9f),  /* centre outside the frame, partly inside */
+    obj (0, 0, 100, 10, 20, 0.9f),      /* 0: top exactly 100: in */
+    obj (0, 20, 99.7f, 10, 20, 0.9f),   /* 1: top 99.7: above the band */
+    obj (0, 40, 520, 10, 20, 0.9f),     /* 2: bottom exactly 540 (640 - 100): in */
+    obj (0, 60, 520.3f, 10, 20, 0.9f),  /* 3: bottom 540.3: below the band */
+    obj (0, 80, 90, 10, 40, 0.9f),      /* 4: centre 110 in the band, top 90 above it */
+    obj (0, 100, 500, 10, 60, 0.9f),    /* 5: centre 530 in the band, bottom 560 below it */
+    obj (1, 120, 0, 10, 20, 0.9f),      /* 6: class 1 has no band */
+    obj (0, 140, 300, 10, 500, 0.9f),   /* 7: top in the band, bottom 800 outside the frame */
   };
-  const guint all[] = { 0, 1, 2, 3, 4, 5 }, band[] = { 1, 2, 4 };
+  const guint all[] = { 0, 1, 2, 3, 4, 5, 6, 7 }, band[] = { 0, 2, 6 };
+  const guint top_only[] = { 0, 2, 3, 5, 6, 7 }, bottom_only[] = { 0, 1, 2, 4, 6 };
   GArray *out;
 
-  /* Both offsets 0: no band, even for a centre outside the frame. */
+  /* Both offsets 0: no band. */
   out = post_identity (cfg, in, G_N_ELEMENTS (in));
   assert_kept (out, in, all, G_N_ELEMENTS (all));
   g_array_unref (out);
@@ -883,13 +889,43 @@ test_roi (void)
   assert_kept (out, in, band, G_N_ELEMENTS (band));
   g_array_unref (out);
 
-  /* In frame pixels: 1920x1080 at x3, band [300, 1080 - 30). */
+  /* Only the top offset: no bottom test, even for a box reaching past the frame. */
+  cfg->class_attrs[0].roi_bottom_offset = 0;
+  out = post_identity (cfg, in, G_N_ELEMENTS (in));
+  assert_kept (out, in, top_only, G_N_ELEMENTS (top_only));
+  g_array_unref (out);
+
+  /* Only the bottom offset. */
+  cfg->class_attrs[0].roi_top_offset = 0;
+  cfg->class_attrs[0].roi_bottom_offset = 100;
+  out = post_identity (cfg, in, G_N_ELEMENTS (in));
+  assert_kept (out, in, bottom_only, G_N_ELEMENTS (bottom_only));
+  g_array_unref (out);
+
+  /* Per class: class 1's band [5, 640 - 0], class 0's none. */
+  {
+    RdsInferObjectDetectionInfo cls[] = {
+      obj (1, 0, 5, 10, 20, 0.9f),      /* top exactly 5: in */
+      obj (1, 20, 4.7f, 10, 20, 0.9f),  /* above */
+      obj (0, 40, 0, 10, 20, 0.9f),     /* class 0: no band */
+    };
+    const guint keep[] = { 0, 2 };
+
+    cfg->class_attrs[0].roi_bottom_offset = 0;
+    cfg->class_attrs[1].roi_top_offset = 5;
+    out = post_identity (cfg, cls, G_N_ELEMENTS (cls));
+    assert_kept (out, cls, keep, G_N_ELEMENTS (keep));
+    g_array_unref (out);
+    cfg->class_attrs[1].roi_top_offset = 0;
+  }
+
+  /* In frame pixels: 1920x1080 at x3 (network rows 140..500), band [300, 1080 - 30]. */
   {
     RdsInferObjectDetectionInfo net[] = {
-      obj (0, 0, 140 + 99, 10, 2, 0.9f),        /* centre 100 * 3 = 300: in */
-      obj (0, 0, 140 + 98, 10, 2, 0.9f),        /* 297: out */
-      obj (0, 0, 140 + 349, 10, 2, 0.9f),       /* 1050: out */
-      obj (0, 0, 140 + 348, 10, 2, 0.9f),       /* 1047: in */
+      obj (0, 0, 140 + 100, 10, 2, 0.9f),       /* top 300: in */
+      obj (0, 0, 140 + 99.9f, 10, 2, 0.9f),     /* top 299.7: out */
+      obj (0, 0, 140 + 340, 10, 10, 0.9f),      /* bottom 1050: in */
+      obj (0, 0, 140 + 340, 10, 10.1f, 0.9f),   /* bottom 1050.3: out */
     };
     RdsInferLetterbox lb;
 
@@ -898,17 +934,35 @@ test_roi (void)
     rds_infer_letterbox (640, 640, 1920, 1080, TRUE, TRUE, &lb);
     out = post (cfg, &lb, net, G_N_ELEMENTS (net), NULL);
     g_assert_cmpuint (out->len, ==, 2);
-    assert_box (&det (out, 0)->box, 0, 297, 30, 6);
-    assert_box (&det (out, 1)->box, 0, 1044, 30, 6);
+    assert_box (&det (out, 0)->box, 0, 300, 30, 6);
+    assert_box (&det (out, 1)->box, 0, 1020, 30, 30);
     g_array_unref (out);
   }
 
-  /* A band of no height drops everything of that class. */
+  /* A band of no height keeps only boxes of no height there, which the parser can't return: everything goes. */
   cfg->class_attrs[0].roi_top_offset = 320;
   cfg->class_attrs[0].roi_bottom_offset = 320;
   {
-    const guint only1[] = { 4 };
+    const guint only1[] = { 6 };
 
+    out = post_identity (cfg, in, G_N_ELEMENTS (in));
+    assert_kept (out, in, only1, G_N_ELEMENTS (only1));
+    g_array_unref (out);
+
+    /* roi-bottom-offset >= frame_h drops every box of the class (ours), also with no top offset */
+    cfg->class_attrs[0].roi_top_offset = 0;
+    cfg->class_attrs[0].roi_bottom_offset = 640;
+    out = post_identity (cfg, in, G_N_ELEMENTS (in));
+    assert_kept (out, in, only1, G_N_ELEMENTS (only1));
+    g_array_unref (out);
+    cfg->class_attrs[0].roi_bottom_offset = 1000;
+    out = post_identity (cfg, in, G_N_ELEMENTS (in));
+    assert_kept (out, in, only1, G_N_ELEMENTS (only1));
+    g_array_unref (out);
+
+    /* roi-top-offset >= frame_h: no box starts there inside the frame, so all go (as in DeepStream 8.0) */
+    cfg->class_attrs[0].roi_top_offset = 640;
+    cfg->class_attrs[0].roi_bottom_offset = 0;
     out = post_identity (cfg, in, G_N_ELEMENTS (in));
     assert_kept (out, in, only1, G_N_ELEMENTS (only1));
     g_array_unref (out);
@@ -1062,7 +1116,7 @@ test_combined (void)
     obj (0, 500, 300, 20, 20, 0.7f),    /* 4: kept -> (1500, 480) 60x60 */
     obj (1, 10, 150, 30, 60, 0.95f),    /* other class, same box as 0: filtered out */
     obj (2, 600, 480, 60, 20, 0.5f),    /* 6: clipped -> (1800, 1020) 120x60 */
-    obj (2, 100, 141, 20, 10, 0.5f),    /* centre y 18: outside class 2's band */
+    obj (2, 100, 141, 20, 10, 0.5f),    /* top y 3: above class 2's band */
     obj (2, 200, 400, 2, 20, 0.5f),     /* 6 frame pixels wide: below class 2's minimum */
     obj (2, 300, 400, 20, 20, 0.35f),   /* post-cluster threshold */
     obj (5, 300, 400, 20, 20, 0.9f),    /* invalid class */
