@@ -424,9 +424,9 @@ meson test -C build-rel --print-errorlogs
   builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
   check the rdsinfer key tables in `docs/compat-matrix.md`. A new or changed config key needs its row there; the
   test's message prints the expected row. `/cpu/elements/compat-matrix` does the same for the property tables of
-  `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger`, `rdsvideosink` and `rdsurisrcbin`: every property
-  except those of GstObject, GstElement and GstBin needs a row (GstBaseTransform's `qos` included; GstBin's may have
-  one), and a row naming no property fails too.
+  `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger`, `rdsvideosink`, `rdsurisrcbin` and `rdsanalytics`:
+  every property except those of GstObject, GstElement and GstBin needs a row (GstBaseTransform's `qos` included;
+  GstBin's may have one), and a row naming no property fails too.
 - **Tracker, tiler, OSD, logger and sink behaviour.** Where NVIDIA's docs are silent, `rdstracker`,
   `rdsmultistreamtiler`, `rdsosd`, `rdslogger` and `rdsvideosink` match observed DeepStream 8.0 behaviour, except where
   8.0 is clearly broken; there they do the sane thing. Code comments say "DeepStream 8.0 behaviour" or "ours", and

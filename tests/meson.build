@@ -346,6 +346,15 @@ test('analytics_meta_compat', executable('analytics_meta_compat', 'check' / 'ana
     dependencies : [rds_analytics_dep]),
   suite : 'cpu', env : test_env, protocol : 'tap')
 
+# rdsanalytics: registration, properties and start errors (cpu); scripted object meta on device-memory batches shaped
+# as rdsstreammux makes them: pass-through, the metas, pad_index, reload, stream events, partial batches (gpu).
+element_analytics_exe = executable('element_analytics', 'check' / 'element_analytics.c',
+  dependencies : test_deps + [rds_analytics_dep])
+test('element_analytics_cpu', element_analytics_exe, args : ['-p', '/cpu/analytics'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_analytics', element_analytics_exe, args : ['-p', '/gpu/analytics'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+
 if rds_tracker_enabled and rds_infer_enabled
   # rdstracker end to end on a public street clip with YOLO11n (pipeline_tracker; skipped until
   # tests/models/fetch-tracker-clip.sh and fetch-yolo11n.sh have run), and the four-source soak (its own entry,
@@ -449,7 +458,7 @@ test('element_logger', executable('element_logger', 'check' / 'element_logger.c'
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
 # docs/compat-matrix.md has a property-table row for every property of rdsmultistreamtiler, rdsosd (when built),
-# rdslogger, rdsvideosink and rdsurisrcbin, and none for a property they lack.
+# rdslogger, rdsvideosink, rdsurisrcbin and rdsanalytics, and none for a property they lack.
 test('element_compat_matrix', executable('element_compat_matrix', 'check' / 'element_compat_matrix.c',
     dependencies : test_deps,
     c_args : ['-DRDS_HAVE_OSD=@0@'.format(rds_osd_enabled ? 1 : 0),

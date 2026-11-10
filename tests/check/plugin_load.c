@@ -57,6 +57,20 @@ test_urisrcbin_plugin (void)
   gst_object_unref (plugin);
 }
 
+/* The analytics plugin is always built. */
+static void
+test_analytics_plugin (void)
+{
+  GstPlugin *plugin = gst_registry_find_plugin (gst_registry_get (), "rdsanalytics");
+  GstElementFactory *f = gst_element_factory_find ("rdsanalytics");
+
+  g_assert_nonnull (plugin);
+  g_assert_cmpstr (gst_plugin_get_license (plugin), ==, "LGPL");
+  g_assert_nonnull (f);
+  gst_object_unref (f);
+  gst_object_unref (plugin);
+}
+
 /* RDS_HAVE_INFER comes from the build: rdsinfer is optional (MIGraphX, libyaml, json-glib). */
 #if RDS_HAVE_INFER
 static void
@@ -108,6 +122,7 @@ main (int argc, char **argv)
   g_test_add_func ("/plugin/tiler", test_tiler_plugin);
   g_test_add_func ("/plugin/sink", test_sink_plugin);
   g_test_add_func ("/plugin/urisrcbin", test_urisrcbin_plugin);
+  g_test_add_func ("/plugin/analytics", test_analytics_plugin);
 #if RDS_HAVE_INFER
   g_test_add_func ("/plugin/infer", test_infer_plugin);
 #endif

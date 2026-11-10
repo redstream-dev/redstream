@@ -12,3 +12,13 @@ rdsanalytics_core = static_library('rdsanalytics-core',
 rdsanalytics_core_dep = declare_dependency(link_with : rdsanalytics_core,
   include_directories : include_directories('.'),
   dependencies : [dependency('glib-2.0'), rds_config_parse_dep, rdsanalytics_libm])
+
+gstrdsanalytics = library('gstrdsanalytics',
+  files('plugin.c', 'gstrdsanalytics.c'),
+  c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdsanalytics"'],
+  dependencies : [rds_dep, rds_analytics_dep, gst_dep, gst_base_dep, rdsanalytics_core_dep],
+  gnu_symbol_visibility : 'hidden',
+  install_rpath : rds_install_rpath,
+  install : true,
+  install_dir : get_option('libdir') / 'gstreamer-1.0')
+rds_plugins += gstrdsanalytics
