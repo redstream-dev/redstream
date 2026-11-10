@@ -161,6 +161,12 @@ typedef struct
   guint64 n_obs;                /* observations so far; n = n_obs - 1 */
 } History;
 
+static void
+history_free (History * h)
+{
+  g_free (h);
+}
+
 typedef struct
 {
   const CoreRules *rules;       /* NULL: the stream has no enabled group */
@@ -356,7 +362,7 @@ get_stream (RdsAnalyticsCore * core, guint pad_index)
     st->last_pts = RDS_ANALYTICS_PTS_NONE;
     if (st->rules != NULL && (st->rules->groups[RDS_ANALYTICS_DIRECTION] != NULL
             || st->rules->groups[RDS_ANALYTICS_LINE_CROSSING] != NULL))
-      st->histories = g_hash_table_new_full (g_int64_hash, g_int64_equal, NULL, g_free);
+      st->histories = g_hash_table_new_full (g_int64_hash, g_int64_equal, NULL, (GDestroyNotify) history_free);
     g_hash_table_insert (core->streams, GUINT_TO_POINTER (pad_index), st);
   }
   return st;
@@ -802,8 +808,10 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
       } else {
         History *h = history_get (st, o->id);
 
+        /* every tracked object builds its history, whatever the class filters: line crossing shares it (ours) */
         history_push (h, p);
-        if (dir != NULL)
+        /* direction and STOPPED only for the classes of the group's class-id (DeepStream 8.0 behaviour) */
+        if (dir != NULL && class_passes (dir, o->class_id))
           direction_eval (core, dir, h, o->height, &sp->stopped);
       }
     }

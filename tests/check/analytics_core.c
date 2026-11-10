@@ -1056,7 +1056,7 @@ check_paths (const gchar * config, guint w, guint h, guint n_frames, PathFunc fn
 
 #define RAD(deg) ((deg) * (G_PI / 180.0))
 
-/* the probe's grid of 8 columns, 220 x 120 px apart */
+/* the observed runs' grid of 8 columns, 220 x 120 px apart */
 static void
 grid8 (guint i, gdouble * x, gdouble * y)
 {
@@ -1459,7 +1459,7 @@ static const struct
   guint slot;                   /* the position in 8.0's run */
 } ty_steps[] = {
   {10, 1, 0}, {10, 2, 1}, {20, 2, 7}, {40, 1, 12}, {40, 2, 13}, {80, 1, 18}, {80, 2, 19}, {120, 2, 25}, {120, 3, 26},
-  {200, 2, 31}, {200, 4, 33},
+  {120, 4, 27}, {200, 2, 31}, {200, 4, 33},
 };
 
 static gboolean
@@ -1484,11 +1484,85 @@ test_dir_box_height (void)
     "-@0-49 STOP@50-72 -@73-95 STOP@96-129",    /* h 80, 2 px */
     "-@0-49 STOP@50-129",                       /* h 120, 2 px */
     "-@0-49 STOP@50-66 -@67-101 STOP@102-129",  /* h 120, 3 px */
+    "-@0-49 STOP@50-63 -@64-104 STOP@105-129",  /* h 120, 4 px: STOPPED at 63 and 105 needs a coefficient >= 0.0999 */
     "-@0-49 STOP@50-129",                       /* h 200, 2 px */
     "-@0-49 STOP@50-66 -@67-101 STOP@102-129",  /* h 200, 4 px */
   };
 
   check_paths (DIR_E, 1920, 1080, 130, ty_path, want, G_N_ELEMENTS (want));
+}
+
+/* The sy test is inclusive (DeepStream 8.0 behaviour, as sx's is): an h = 100 box stepping 2 px south at frame 60
+ * reaches sy = 1.0 exactly (25 points at each y) against a limit of 0.1 * sqrt (100) = 1.0, both exact in double,
+ * and stays STOPPED */
+static gboolean
+ty_exact_path (guint i G_GNUC_UNUSED, guint f, gdouble * cx, gdouble * by, gdouble * h)
+{
+  *cx = 300;
+  *by = 400 + (f >= 60 ? 2 : 0);
+  *h = 100;
+  return TRUE;
+}
+
+static void
+test_dir_box_height_inclusive (void)
+{
+  const gchar *want[] = { "-@0-49 STOP@50-129" };
+
+  check_paths (DIR_E, 1920, 1080, 130, ty_exact_path, want, G_N_ELEMENTS (want));
+}
+
+/* x is clamped at 0 (DeepStream 8.0 behaviour): moving west from x 100 at 1.4 px/frame, the object is moving at
+ * observation 50 but STOPPED once the clamped points (x = 0 from frame 71) hold sx under 20; the other speeds,
+ * 1.0 to 2.0 px/f, never reach x = 0 */
+static const gdouble west_speeds[] = { 1.0, 1.2, 1.3, 1.35, 1.36, 1.37, 1.38, 1.39, 1.4, 1.45, 1.5, 2.0 };
+
+static gboolean
+west_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  grid8_110 (i, cx, by);
+  *cx -= west_speeds[i] * f;
+  *by += 20;
+  return TRUE;
+}
+
+static void
+test_dir_clamp_x (void)
+{
+  const gchar *want[] = {
+    "-@0-49 STOP@50-79", "-@0-49 STOP@50-79", "-@0-49 STOP@50-79", "-@0-49 STOP@50-79", "-@0-49 STOP@50-79",
+    "-@0-49 STOP@50-79", "-@0-49 STOP@50-79",   /* 1.0 .. 1.38 px/f: sx <= 20 at observation 50 */
+    "-@0-79",                                   /* 1.39 */
+    "-@0-73 STOP@74-79",                        /* 1.4, from x 100: clamped at 0 */
+    "-@0-79", "-@0-79", "-@0-79",               /* 1.45 .. 2.0 */
+  };
+
+  check_paths (DIR_E, 1920, 1080, 80, west_path, want, G_N_ELEMENTS (want));
+}
+
+/* The direction group's class-id filters direction and STOPPED (DeepStream 8.0 behaviour): under class-id=0 a
+ * class-1 object gets neither, a class-0 one both */
+static void
+test_dir_class_filter (void)
+{
+  RdsAnalyticsCore *core = core_for (PROPERTY "[direction-detection-stream-0]\nenable=1\n"
+      "direction-E=400;360;600;360\nclass-id=0\n");
+  RdsAnalyticsFrameResult r;
+
+  for (guint f = 0; f < 60; f++) {
+    RdsAnalyticsObject objs[] = { obj_at (1, 1, 100 + 10 * f, 300), obj_at (2, 0, 100 + 10 * f, 500),
+      obj_at (3, 1, 900, 600), obj_at (4, 0, 900, 650)
+    };
+
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), objs, G_N_ELEMENTS (objs), &r);
+    g_assert_false (r.objects[0].has_info);
+    g_assert_cmpstr (r.objects[0].dir_status, ==, "");
+    g_assert_cmpstr (r.objects[1].dir_status, ==, f >= 10 ? " DIR:E " : "");
+    g_assert_false (r.objects[2].has_info);
+    g_assert_false (r.objects[2].stopped);
+    g_assert_cmpint (r.objects[3].stopped, ==, f >= 50);
+  }
+  rds_analytics_core_free (core);
 }
 
 /* The angle limit is 60 degrees, inclusive, on both sides: 10 px/frame at each angle from east */
@@ -1637,7 +1711,7 @@ test_dir_needs_group (void)
 }
 
 /* Untracked objects get no direction and no STOPPED, and leave the tracked ones alone; the warning comes once per
- * stream, and only from a stream with a direction group (ours) */
+ * stream, and only from a stream with a direction or line-crossing group (ours) */
 static void
 test_dir_untracked (void)
 {
@@ -1712,6 +1786,9 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-core/direction/absences", test_dir_absences);
   g_test_add_func ("/cpu/analytics-core/direction/threshold", test_dir_threshold);
   g_test_add_func ("/cpu/analytics-core/direction/box-height", test_dir_box_height);
+  g_test_add_func ("/cpu/analytics-core/direction/box-height-inclusive", test_dir_box_height_inclusive);
+  g_test_add_func ("/cpu/analytics-core/direction/clamp-x", test_dir_clamp_x);
+  g_test_add_func ("/cpu/analytics-core/direction/class-filter", test_dir_class_filter);
   g_test_add_func ("/cpu/analytics-core/direction/angle", test_dir_angle);
   g_test_add_func ("/cpu/analytics-core/direction/multi", test_dir_multi);
   g_test_add_func ("/cpu/analytics-core/direction/obj-status", test_dir_obj_status);
