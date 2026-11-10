@@ -251,11 +251,24 @@ Early numbers on a 2-CU Ryzen 9 7900X iGPU:
   `process-mode=0`, the CPU drawing and the GPU↔CPU syncs included). On 1920×1080 frames from `rdsstreamdemux`,
   which it draws on a private copy: about 0.9 ms on the GPU, about 7 ms on the CPU (the copy's CPU staging).
 
-**Known issue (ROCm 10.1):** with more HIP streams than hardware queues, which a multi-stream pipeline easily has,
-an SDMA copy can occasionally fault and abort the process with `Memory access fault by GPU ... on address 0x401000`.
-Set `HSA_ENABLE_SDMA=0` to have copies done by blit kernels instead; on the gfx1036 iGPU this costs nothing
-measurable (about 44 fps for `rds-test3` either way). Raising `GPU_MAX_HW_QUEUES` also avoids it but costs
-throughput (about 29 fps with 16 queues). The test suite sets `HSA_ENABLE_SDMA=0`.
+### Known issues
+
+Both were seen with ROCm 10.1 on the gfx1036 iGPU, which runs as gfx1030 through `HSA_OVERRIDE_GFX_VERSION`, a
+configuration AMD does not support. Whether officially supported GPUs are affected is not known yet.
+
+- **SDMA copy faults.** With more HIP streams than hardware queues, which a multi-stream pipeline easily has, an
+  SDMA copy can occasionally fault and abort the process with `Memory access fault by GPU ... on address 0x401000`.
+  Set `HSA_ENABLE_SDMA=0` to have copies done by blit kernels instead; on the gfx1036 iGPU this costs nothing
+  measurable (about 44 fps for `rds-test3` either way). Raising `GPU_MAX_HW_QUEUES` also avoids it but costs
+  throughput (about 29 fps with 16 queues). The test suite sets `HSA_ENABLE_SDMA=0`.
+- **`rdsosd` GPU faults under heavy host load.** When the host is busy (CPU and memory bandwidth), a kernel's writes
+  now and then don't reach the next kernel on the same stream, with no error from HIP. Most elements then see wrong
+  pixels at worst. `rdsosd`'s GPU drawing (`process-mode` 1 and 2, the default) can instead read a stale command
+  block and fault the GPU: `Memory access fault` in `rds_osd_upload_kernel` or `rds_osd_draw_kernel`, then the
+  process aborts. Under a synthetic load (parallel `dd bs=64M` and busy loops) the OSD tests failed in 30 of 38 runs;
+  on an idle host they never failed. `HSA_DISABLE_CACHE=1` avoids it (0 of 80 runs) but costs about 23 % of
+  `rds-test3`'s throughput, so only the test suite sets it. On affected systems, `process-mode=0` (drawing on the
+  CPU) is not exposed.
 
 ## Getting started (development)
 
