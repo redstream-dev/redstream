@@ -1,10 +1,12 @@
 /* rdsanalytics core: rule scaling, the reference point and the inside test, against DeepStream 8.0's observed
  * results (the observed boxes below: left, top, width, height in frame pixels, and the ROIs 8.0 reported them in);
- * ROI filtering, overcrowding and the object counts on scripted frames.
+ * ROI filtering, overcrowding and the object counts on scripted frames; direction and STOPPED on the scenarios
+ * 8.0 was observed on, against its states frame by frame.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-analytics-core.h"
 
 #include <glib/gstdio.h>
+#include <math.h>
 #include <string.h>
 
 #define PT(x, y) ((RdsAnalyticsPoint) { (x), (y) })
@@ -908,6 +910,770 @@ test_scaled_rules (void)
   rds_analytics_core_free (core);
 }
 
+/* ------------------------------------------------------------------------------------------------------------ */
+/* Direction and STOPPED
+ *
+ * The scenarios below are the ones DeepStream 8.0 was run on, object by object, and the expected strings are its
+ * observed states, frame by frame: runs of "<state>@<first frame>-<last frame>", where the state is STOP
+ * (" STOPPED "), the direction labels joined by "+", or "-" (neither). A run also ends at an absence. */
+
+#define DIR_E PROPERTY "[direction-detection-stream-0]\nenable=1\ndirection-E=400;360;600;360\nclass-id=-1\n"
+#define DIR_S PROPERTY "[direction-detection-stream-0]\nenable=1\ndirection-S=400;360;400;560\nclass-id=-1\n"
+
+/* A core for @text on a @w x @h mux */
+static RdsAnalyticsCore *
+core_for_size (const gchar * text, guint w, guint h)
+{
+  RdsAnalyticsConfig *cfg = load_config (text);
+  RdsAnalyticsCore *core = rds_analytics_core_new (cfg, w, h);
+
+  rds_analytics_config_free (cfg);
+  g_assert_nonnull (core);
+  return core;
+}
+
+/* Where object @i (from 0) is at frame @f: its bottom centre, and its box height when it isn't the default; FALSE
+ * when it is absent */
+typedef gboolean (*PathFunc) (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h);
+
+/* One object's state, checking that its strings agree with it */
+static gchar *
+dir_state (const RdsAnalyticsObjectResult * r)
+{
+  gchar **pieces;
+  GString *s;
+
+  g_assert_nonnull (r->dir_status);
+  if (r->stopped) {
+    g_assert_cmpstr (r->dir_status, ==, "");
+    g_assert_true (g_str_has_suffix (r->obj_status, " STOPPED "));
+    g_assert_true (r->has_info);
+    return g_strdup ("STOP");
+  }
+  g_assert_null (strstr (r->obj_status, "STOPPED"));
+  g_assert_true (g_str_has_suffix (r->obj_status, r->dir_status));
+  if (r->dir_status[0] == '\0')
+    return g_strdup ("-");
+  g_assert_true (r->has_info);
+  /* " DIR:E  DIR:SE " -> "E+SE" */
+  g_assert_true (g_str_has_prefix (r->dir_status, " DIR:") && g_str_has_suffix (r->dir_status, " "));
+  pieces = g_strsplit (r->dir_status, " DIR:", -1);
+  s = g_string_new (NULL);
+  for (guint k = 1; pieces[k] != NULL; k++) {
+    gchar *label = pieces[k];
+
+    g_assert_true (g_str_has_suffix (label, " "));
+    label[strlen (label) - 1] = '\0';
+    g_string_append_printf (s, "%s%s", k > 1 ? "+" : "", label);
+  }
+  g_strfreev (pieces);
+  return g_string_free (s, FALSE);
+}
+
+/* Runs @n_objs objects with ids 1..@n_objs, @bw x @bh boxes (unless @fn gives another height) at the bottom
+ * centres @fn gives, for @n_frames frames of stream 0 through @core. Returns each object's states as runs (a
+ * NULL-terminated array for g_strfreev). */
+static gchar **
+run_paths (RdsAnalyticsCore * core, guint n_objs, guint n_frames, gdouble bw, gdouble bh, PathFunc fn)
+{
+  RdsAnalyticsObject *objs = g_new (RdsAnalyticsObject, n_objs);
+  guint *index = g_new (guint, n_objs);
+  GString **runs = g_new (GString *, n_objs);
+  gchar **prev = g_new0 (gchar *, n_objs);
+  gint *first = g_new (gint, n_objs), *last = g_new (gint, n_objs);
+  gchar **out = g_new0 (gchar *, n_objs + 1);
+
+  for (guint i = 0; i < n_objs; i++)
+    runs[i] = g_string_new (NULL);
+  for (guint f = 0; f < n_frames; f++) {
+    RdsAnalyticsFrameResult r;
+    guint n = 0;
+
+    for (guint i = 0; i < n_objs; i++) {
+      gdouble cx, by, h = bh;
+
+      if (!fn (i, f, &cx, &by, &h))
+        continue;
+      objs[n] = (RdsAnalyticsObject) { i + 1, 0, (gfloat) (cx - bw / 2), (gfloat) (by - h), (gfloat) bw,
+        (gfloat) h };
+      index[n++] = i;
+    }
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), objs, n, &r);
+    g_assert_cmpuint (r.n_objects, ==, n);
+    for (guint k = 0; k < n; k++) {
+      guint i = index[k];
+      gchar *st = dir_state (&r.objects[k]);
+
+      if (prev[i] != NULL && g_str_equal (prev[i], st) && last[i] == (gint) f - 1) {
+        last[i] = f;
+        g_free (st);
+        continue;
+      }
+      if (prev[i] != NULL)
+        g_string_append_printf (runs[i], "%s%s@%d-%d", runs[i]->len ? " " : "", prev[i], first[i], last[i]);
+      g_free (prev[i]);
+      prev[i] = st;
+      first[i] = last[i] = f;
+    }
+  }
+  for (guint i = 0; i < n_objs; i++) {
+    if (prev[i] != NULL)
+      g_string_append_printf (runs[i], "%s%s@%d-%d", runs[i]->len ? " " : "", prev[i], first[i], last[i]);
+    g_free (prev[i]);
+    out[i] = g_string_free (runs[i], FALSE);
+  }
+  g_free (objs);
+  g_free (index);
+  g_free (runs);
+  g_free (prev);
+  g_free (first);
+  g_free (last);
+  return out;
+}
+
+static void
+assert_runs (gchar ** got, const gchar * const *want, guint n)
+{
+  g_assert_cmpuint (g_strv_length (got), ==, n);
+  for (guint i = 0; i < n; i++) {
+    if (!g_str_equal (got[i], want[i]))
+      g_test_message ("object %u", i + 1);
+    g_assert_cmpstr (got[i], ==, want[i]);
+  }
+  g_strfreev (got);
+}
+
+/* Runs the paths on a fresh core for @config on a @w x @h mux, 20x40 boxes, and checks the states */
+static void
+check_paths (const gchar * config, guint w, guint h, guint n_frames, PathFunc fn, const gchar * const *want,
+    guint n_objs)
+{
+  RdsAnalyticsCore *core = core_for_size (config, w, h);
+
+  assert_runs (run_paths (core, n_objs, n_frames, 20, 40, fn), want, n_objs);
+  rds_analytics_core_free (core);
+}
+
+#define RAD(deg) ((deg) * (G_PI / 180.0))
+
+/* the probe's grid of 8 columns, 220 x 120 px apart */
+static void
+grid8 (guint i, gdouble * x, gdouble * y)
+{
+  *x = 100 + (i % 8) * 220;
+  *y = 100 + (i / 8) * 120;
+}
+
+/* ... and the one 110 px apart, from y 80 */
+static void
+grid8_110 (guint i, gdouble * x, gdouble * y)
+{
+  *x = 100 + (i % 8) * 220;
+  *y = 80 + (i / 8) * 110;
+}
+
+/* Ramps from rest: static, then east at v px/frame from frame 60 on (3840x1080 frames). The first direction comes
+ * 3 frames after the start at 50 px/f, 41 frames after at 1.5 px/f, and never at 1 px/f. */
+static const gdouble ramp_speeds[] = { 1, 1.5, 2, 3, 5, 8, 10, 15, 20, 30, 50 };
+
+static gboolean
+ramp_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  grid8 (i, cx, by);
+  *cx += ramp_speeds[i] * MAX (0, (gint) f - 60);
+  return TRUE;
+}
+
+static void
+test_dir_ramp (void)
+{
+  const gchar *want[] = {
+    "-@0-49 STOP@50-119",                       /* 1 px/f */
+    "-@0-49 STOP@50-100 E@101-119",             /* 1.5 */
+    "-@0-49 STOP@50-89 E@90-119",               /* 2 */
+    "-@0-49 STOP@50-80 E@81-119",               /* 3 */
+    "-@0-49 STOP@50-74 E@75-119",               /* 5 */
+    "-@0-49 STOP@50-69 E@70-119",               /* 8 */
+    "-@0-49 STOP@50-68 E@69-119",               /* 10 */
+    "-@0-49 STOP@50-66 E@67-119",               /* 15 */
+    "-@0-49 STOP@50-64 E@65-119",               /* 20 */
+    "-@0-49 STOP@50-63 E@64-119",               /* 30 */
+    "-@0-49 STOP@50-62 E@63-119",               /* 50 */
+  };
+
+  check_paths (DIR_E, 3840, 1080, 120, ramp_path, want, G_N_ELEMENTS (want));
+}
+
+/* East from frame 0 at v px/frame (1920x1080): the first direction comes at observation 10 from 6 px/f on, never
+ * at 9; below 1.39 px/f the object is STOPPED from observation 50 */
+static const gdouble onset_speeds[] = { 0.25, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20 };
+
+static gboolean
+onset_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  *cx = 150 + (i % 6) * 180 + onset_speeds[i] * f;
+  *by = 150 + (i / 6) * 170;
+  return TRUE;
+}
+
+static void
+test_dir_onset (void)
+{
+  const gchar *want[] = {
+    "-@0-49 STOP@50-79", "-@0-49 STOP@50-79", "-@0-49 STOP@50-79", "-@0-49 STOP@50-79",   /* 0.25 .. 1 */
+    "-@0-36 E@37-79",                           /* 1.5 */
+    "-@0-27 E@28-79",                           /* 2 */
+    "-@0-22 E@23-79",                           /* 2.5 */
+    "-@0-18 E@19-79",                           /* 3 */
+    "-@0-14 E@15-79",                           /* 4: the mean of the first two points as the reference */
+    "-@0-11 E@12-79",                           /* 5 */
+    "-@0-9 E@10-79", "-@0-9 E@10-79", "-@0-9 E@10-79", "-@0-9 E@10-79", "-@0-9 E@10-79", "-@0-9 E@10-79",
+    "-@0-9 E@10-79", "-@0-9 E@10-79",           /* 6 .. 20 */
+  };
+
+  check_paths (DIR_E, 1920, 1080, 80, onset_path, want, G_N_ELEMENTS (want));
+}
+
+/* Static, then a one-frame jump of J px east at frame jump_at, then static again (1920x1080) */
+static const gdouble jump_sizes[] = { 30, 50, 52, 53, 54, 55, 56, 58, 60, 70, 100, 200 };
+static guint jump_at;
+
+static gboolean
+jump_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  grid8 (i, cx, by);
+  if (f >= jump_at)
+    *cx += jump_sizes[i];
+  return TRUE;
+}
+
+/* A jump at frame 5 shows at observation 10, not before; at frame 20, 55 px shows at once and 54 never */
+static void
+test_dir_jump_filling (void)
+{
+  const gchar *want5[] = {
+    "-@0-49 STOP@50-149", "-@0-49 STOP@50-149", "-@0-49 STOP@50-149", "-@0-49 STOP@50-149",
+    "-@0-49 STOP@50-149",                       /* 30 .. 54 */
+    "-@0-9 E@10-49 STOP@50-149", "-@0-9 E@10-49 STOP@50-149", "-@0-9 E@10-49 STOP@50-149",
+    "-@0-9 E@10-49 STOP@50-149", "-@0-9 E@10-49 STOP@50-149",       /* 55 .. 70 */
+    "-@0-9 E@10-51 STOP@52-149",                /* 100 */
+    "-@0-9 E@10-52 -@53-53 STOP@54-149",        /* 200 */
+  };
+  const gchar *want20[] = {
+    "-@0-49 STOP@50-149",                       /* 30 */
+    "-@0-58 STOP@59-149",                       /* 50 */
+    "-@0-59 STOP@60-149",                       /* 52 */
+    "-@0-60 STOP@61-149",                       /* 53 */
+    "-@0-60 STOP@61-149",                       /* 54 */
+    "-@0-19 E@20-61 STOP@62-149",               /* 55 */
+    "-@0-19 E@20-61 STOP@62-149",               /* 56 */
+    "-@0-19 E@20-62 STOP@63-149",               /* 58 */
+    "-@0-19 E@20-62 STOP@63-149",               /* 60 */
+    "-@0-19 E@20-64 STOP@65-149",               /* 70 */
+    "-@0-19 E@20-66 STOP@67-149",               /* 100 */
+    "-@0-19 E@20-67 -@68-68 STOP@69-149",       /* 200 */
+  };
+
+  jump_at = 5;
+  check_paths (DIR_E, 1920, 1080, 150, jump_path, want5, G_N_ELEMENTS (want5));
+  jump_at = 20;
+  check_paths (DIR_E, 1920, 1080, 150, jump_path, want20, G_N_ELEMENTS (want20));
+}
+
+/* After 60 static frames, a jump of J px east leaves STOPPED 7 frames later at 55 px, at once from 150 px, and
+ * comes back to it 49 frames after the jump less that delay (1920x1080) */
+static const gdouble jumpfine_sizes[] = {
+  55, 56, 57, 58, 59, 60, 62, 64, 66, 68, 70, 73, 76, 80, 85, 90, 95, 100, 110, 120, 135, 150, 175, 200, 250, 300,
+  400, 600, 800, 1000
+};
+
+static gboolean
+jumpfine_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  *cx = 20 + (i % 6) * 20 + (f >= 60 ? jumpfine_sizes[i] : 0);
+  *by = 60 + (i / 6) * 200;
+  return TRUE;
+}
+
+static void
+test_dir_jump_stopped (void)
+{
+  const gchar *want[] = {
+    "-@0-49 STOP@50-66 E@67-101 STOP@102-169", "-@0-49 STOP@50-66 E@67-101 STOP@102-169",
+    "-@0-49 STOP@50-66 E@67-101 STOP@102-169",  /* 55 .. 57 */
+    "-@0-49 STOP@50-65 E@66-102 STOP@103-169", "-@0-49 STOP@50-65 E@66-102 STOP@103-169",
+    "-@0-49 STOP@50-65 E@66-102 STOP@103-169",  /* 58 .. 60 */
+    "-@0-49 STOP@50-64 E@65-103 STOP@104-169", "-@0-49 STOP@50-64 E@65-103 STOP@104-169",
+    "-@0-49 STOP@50-64 E@65-103 STOP@104-169",  /* 62 .. 66 */
+    "-@0-49 STOP@50-63 E@64-104 STOP@105-169", "-@0-49 STOP@50-63 E@64-104 STOP@105-169",
+    "-@0-49 STOP@50-63 E@64-104 STOP@105-169",  /* 68 .. 73 */
+    "-@0-49 STOP@50-62 E@63-105 STOP@106-169", "-@0-49 STOP@50-62 E@63-105 STOP@106-169",   /* 76, 80 */
+    "-@0-49 STOP@50-61 E@62-106 STOP@107-169", "-@0-49 STOP@50-61 E@62-106 STOP@107-169",
+    "-@0-49 STOP@50-61 E@62-106 STOP@107-169", "-@0-49 STOP@50-61 E@62-106 STOP@107-169",   /* 85 .. 100 */
+    "-@0-49 STOP@50-60 E@61-107 STOP@108-169", "-@0-49 STOP@50-60 E@61-107 STOP@108-169",
+    "-@0-49 STOP@50-60 E@61-107 STOP@108-169",  /* 110 .. 135 */
+    "-@0-49 STOP@50-59 E@60-107 -@108-108 STOP@109-169", "-@0-49 STOP@50-59 E@60-107 -@108-108 STOP@109-169",
+    "-@0-49 STOP@50-59 E@60-107 -@108-108 STOP@109-169",    /* 150 .. 200 */
+    "-@0-49 STOP@50-59 E@60-108 STOP@109-169", "-@0-49 STOP@50-59 E@60-108 STOP@109-169",
+    "-@0-49 STOP@50-59 E@60-108 STOP@109-169", "-@0-49 STOP@50-59 E@60-108 STOP@109-169",
+    "-@0-49 STOP@50-59 E@60-108 STOP@109-169", "-@0-49 STOP@50-59 E@60-108 STOP@109-169",   /* 250 .. 1000 */
+  };
+
+  check_paths (DIR_E, 1920, 1080, 170, jumpfine_path, want, G_N_ELEMENTS (want));
+}
+
+/* Steps east at frame 60 of 30..50 px: up to 40 px the object stays STOPPED (sx peaks at J / 2 = 20.0, and the
+ * test is inclusive), from 42 px it leaves it for a while, with no direction (below 55 px) */
+static const gdouble stop_x_sizes[] = { 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 31, 33, 35 };
+
+static gboolean
+stop_x_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  grid8_110 (i, cx, by);
+  if (f >= 60)
+    *cx += stop_x_sizes[i];
+  return TRUE;
+}
+
+static void
+test_dir_stopped_step (void)
+{
+  const gchar *want[] = {
+    "-@0-49 STOP@50-129", "-@0-49 STOP@50-129", "-@0-49 STOP@50-129", "-@0-49 STOP@50-129",
+    "-@0-49 STOP@50-129", "-@0-49 STOP@50-129", /* 30 .. 40 */
+    "-@0-49 STOP@50-76 -@77-91 STOP@92-129",    /* 42 */
+    "-@0-49 STOP@50-73 -@74-94 STOP@95-129",    /* 44 */
+    "-@0-49 STOP@50-71 -@72-96 STOP@97-129",    /* 46 */
+    "-@0-49 STOP@50-70 -@71-97 STOP@98-129",    /* 48 */
+    "-@0-49 STOP@50-69 -@70-98 STOP@99-129",    /* 50 */
+    "-@0-49 STOP@50-129", "-@0-49 STOP@50-129", "-@0-49 STOP@50-129",       /* 31, 33, 35 */
+  };
+
+  /* 1920x1080 frames, the rule in a 1280x720 config space */
+  check_paths (DIR_E, 1920, 1080, 130, stop_x_path, want, G_N_ELEMENTS (want));
+}
+
+/* Moving east at v px/frame for M frames, then stopping: STOPPED this many frames after the stop, whatever M; and
+ * static objects appearing at frames 0, 10 and 30, STOPPED at exactly their observation 50 */
+static const struct
+{
+  gdouble v;
+  guint m;
+} stop_moves[] = {
+  {2, 15}, {2, 25}, {2, 40}, {3, 15}, {3, 25}, {3, 40}, {5, 15}, {5, 25}, {5, 40}, {10, 15}, {10, 25}, {10, 40},
+  {20, 15}, {20, 25}, {20, 40},
+};
+
+static gboolean
+stop_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  static const guint appear[] = { 0, 10, 30 };
+
+  grid8 (i, cx, by);
+  if (i < G_N_ELEMENTS (stop_moves)) {
+    *cx += stop_moves[i].v * MIN (f, stop_moves[i].m);
+    return TRUE;
+  }
+  return f >= appear[i - G_N_ELEMENTS (stop_moves)];
+}
+
+static void
+test_dir_stopped (void)
+{
+  const gchar *want[] = {
+    "-@0-49 STOP@50-149",                       /* 2 px/f for 15 frames */
+    "-@0-49 STOP@50-149",                       /* 2, 25 */
+    "-@0-27 E@28-59 STOP@60-149",               /* 2, 40 */
+    "-@0-49 STOP@50-149",                       /* 3, 15 */
+    "-@0-18 E@19-53 STOP@54-149",               /* 3, 25 */
+    "-@0-18 E@19-68 STOP@69-149",               /* 3, 40 */
+    "-@0-11 E@12-49 STOP@50-149",               /* 5, 15 */
+    "-@0-11 E@12-59 STOP@60-149",               /* 5, 25 */
+    "-@0-11 E@12-74 STOP@75-149",               /* 5, 40 */
+    "-@0-9 E@10-55 STOP@56-149",                /* 10, 15 */
+    "-@0-9 E@10-65 STOP@66-149",                /* 10, 25 */
+    "-@0-9 E@10-80 STOP@81-149",                /* 10, 40 */
+    "-@0-9 E@10-59 STOP@60-149",                /* 20, 15 */
+    "-@0-9 E@10-69 STOP@70-149",                /* 20, 25 */
+    "-@0-9 E@10-84 STOP@85-149",                /* 20, 40 */
+    "-@0-49 STOP@50-149",                       /* static from frame 0 */
+    "-@10-59 STOP@60-149",                      /* from 10 */
+    "-@30-79 STOP@80-149",                      /* from 30 */
+  };
+
+  check_paths (DIR_E, 1920, 1080, 150, stop_path, want, G_N_ELEMENTS (want));
+}
+
+/* Out-and-back spikes and double steps from STOPPED, at frame 60 (1920x1080): a 1- or 2-frame spike of 100 px
+ * gives nothing, a 3-frame one a direction for one frame */
+static gboolean
+spike_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  gdouble dx = 0;
+
+  grid8_110 (i, cx, by);
+  switch (i) {
+    case 0:                    /* a step of 100 */
+      dx = f >= 60 ? 100 : 0;
+      break;
+    case 1: case 2: case 3: case 4: case 5:    /* 100 px for 1, 2, 3, 5, 8 frames */
+    {
+      static const guint len[] = { 1, 2, 3, 5, 8 };
+
+      dx = f >= 60 && f < 60 + len[i - 1] ? 100 : 0;
+      break;
+    }
+    case 6:                    /* 200 px for 1 frame */
+      dx = f == 60 ? 200 : 0;
+      break;
+    case 7:                    /* 30 at 60, 30 more at 61 */
+      dx = (f >= 60 ? 30 : 0) + (f >= 61 ? 30 : 0);
+      break;
+    case 8:                    /* a step of 60 */
+      dx = f >= 60 ? 60 : 0;
+      break;
+    case 9:                    /* 20 at 60, 61 and 62 */
+      dx = 20 * CLAMP ((gint) f - 59, 0, 3);
+      break;
+    case 10:                   /* 40 at 60, 20 more at 61 */
+      dx = (f >= 60 ? 40 : 0) + (f >= 61 ? 20 : 0);
+      break;
+    case 11:                   /* 30 at 60, 30 more at 65 */
+      dx = (f >= 60 ? 30 : 0) + (f >= 65 ? 30 : 0);
+      break;
+    case 12:                   /* 100 at 60, back 50 at 61 */
+      dx = (f >= 60 ? 100 : 0) - (f >= 61 ? 50 : 0);
+      break;
+    default:                   /* steps of 55, 70, 150 */
+    {
+      static const gdouble j[] = { 55, 70, 150 };
+
+      dx = f >= 60 ? j[i - 13] : 0;
+      break;
+    }
+  }
+  *cx += dx;
+  return TRUE;
+}
+
+static void
+test_dir_spikes (void)
+{
+  const gchar *want[] = {
+    "-@0-49 STOP@50-61 E@62-106 STOP@107-129",  /* step 100 */
+    "-@0-49 STOP@50-129",                       /* spike 100 for 1 frame */
+    "-@0-49 STOP@50-129",                       /* for 2 */
+    "-@0-49 STOP@50-61 E@62-62 -@63-109 STOP@110-129",      /* for 3 */
+    "-@0-49 STOP@50-61 E@62-64 -@65-111 STOP@112-129",      /* for 5 */
+    "-@0-49 STOP@50-61 E@62-67 -@68-114 STOP@115-129",      /* for 8 */
+    "-@0-49 STOP@50-59 E@60-60 -@61-109 STOP@110-129",      /* spike 200 for 1 */
+    "-@0-49 STOP@50-66 E@67-102 STOP@103-129",  /* 30 + 30 */
+    "-@0-49 STOP@50-65 E@66-102 STOP@103-129",  /* step 60 */
+    "-@0-49 STOP@50-66 E@67-103 STOP@104-129",  /* 20 x 3 */
+    "-@0-49 STOP@50-66 E@67-102 STOP@103-129",  /* 40 + 20 */
+    "-@0-49 STOP@50-69 E@70-103 STOP@104-129",  /* 30, then 30 at 65 */
+    "-@0-49 STOP@50-64 -@65-101 STOP@102-129",  /* 100, back 50 */
+    "-@0-49 STOP@50-66 E@67-101 STOP@102-129",  /* step 55 */
+    "-@0-49 STOP@50-63 E@64-104 STOP@105-129",  /* step 70 */
+    "-@0-49 STOP@50-59 E@60-107 -@108-108 STOP@109-129",    /* step 150 */
+  };
+
+  check_paths (DIR_E, 1920, 1080, 130, spike_path, want, G_N_ELEMENTS (want));
+}
+
+/* Absences inside the window shift every edge by the absence: the window counts observations, not frames */
+static gboolean
+absent_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  static const struct
+  {
+    gdouble step;               /* px east from frame 60 on; < 0: a ramp of 5 px/f from frame 60 */
+    guint gap_first, gap_end;   /* absent in [first, end) */
+  } p[] = {
+    {200, 0, 0}, {200, 70, 80}, {200, 61, 63}, {55, 0, 0}, {55, 61, 63}, {0, 20, 30}, {0, 55, 57}, {-1, 0, 0},
+    {-1, 63, 65},
+  };
+
+  if (f >= p[i].gap_first && f < p[i].gap_end)
+    return FALSE;
+  grid8_110 (i, cx, by);
+  if (p[i].step < 0)
+    *cx += 5 * MAX (0, (gint) f - 60);
+  else if (f >= 60)
+    *cx += p[i].step;
+  return TRUE;
+}
+
+static void
+test_dir_absences (void)
+{
+  const gchar *want[] = {
+    "-@0-49 STOP@50-59 E@60-107 -@108-108 STOP@109-139",    /* step 200 */
+    "-@0-49 STOP@50-59 E@60-69 E@80-117 -@118-118 STOP@119-139",    /* step 200, absent 70-79 */
+    "-@0-49 STOP@50-59 E@60-60 E@63-109 -@110-110 STOP@111-139",    /* step 200, absent 61-62 */
+    "-@0-49 STOP@50-66 E@67-101 STOP@102-139",  /* step 55 */
+    "-@0-49 STOP@50-60 STOP@63-68 E@69-103 STOP@104-139",   /* step 55, absent 61-62 */
+    "-@0-19 -@30-59 STOP@60-139",               /* static, absent 20-29: STOPPED at its observation 50 */
+    "-@0-49 STOP@50-54 STOP@57-139",            /* static, absent 55-56 */
+    "-@0-49 STOP@50-74 E@75-139",               /* ramp 5 px/f */
+    "-@0-49 STOP@50-62 STOP@65-74 E@75-139",    /* ramp, absent 63-64 */
+  };
+
+  check_paths (DIR_E, 1920, 1080, 140, absent_path, want, G_N_ELEMENTS (want));
+}
+
+/* South steps at frame 60, rule S: 55 px gives a direction and 54 doesn't (|d| >= 55); every step leaves STOPPED
+ * at once, as sy's limit is 0.1 * sqrt (40) = 0.63 px */
+static const gdouble ystep_sizes[] = { 50, 53, 54, 55, 56, 58, 60, 65, 70, 100 };
+
+static gboolean
+ystep_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  grid8_110 (i, cx, by);
+  if (f >= 60)
+    *by += ystep_sizes[i];
+  return TRUE;
+}
+
+static void
+test_dir_threshold (void)
+{
+  const gchar *want[] = {
+    "-@0-49 STOP@50-59 -@60-108 STOP@109-129", "-@0-49 STOP@50-59 -@60-108 STOP@109-129",
+    "-@0-49 STOP@50-59 -@60-108 STOP@109-129",  /* 50, 53, 54 */
+    "-@0-49 STOP@50-59 S@60-105 -@106-108 STOP@109-129",    /* 55 */
+    "-@0-49 STOP@50-59 S@60-105 -@106-108 STOP@109-129", "-@0-49 STOP@50-59 S@60-105 -@106-108 STOP@109-129",
+    "-@0-49 STOP@50-59 S@60-105 -@106-108 STOP@109-129", "-@0-49 STOP@50-59 S@60-105 -@106-108 STOP@109-129",
+    "-@0-49 STOP@50-59 S@60-105 -@106-108 STOP@109-129",    /* 56 .. 70 */
+    "-@0-49 STOP@50-59 S@60-106 -@107-108 STOP@109-129",    /* 100 */
+  };
+
+  check_paths (DIR_S, 1920, 1080, 130, ystep_path, want, G_N_ELEMENTS (want));
+}
+
+/* sy's limit grows with the box height, 0.1 * sqrt (h): steps south of J px at frame 60, for boxes 10 to 200 px
+ * tall (20 wide). sy peaks at J / 2, so 1 px stays STOPPED from h = 40 (limit 0.63) and 2 px from h = 120 (1.10) */
+static const struct
+{
+  gdouble h, j;
+  guint slot;                   /* the position in 8.0's run */
+} ty_steps[] = {
+  {10, 1, 0}, {10, 2, 1}, {20, 2, 7}, {40, 1, 12}, {40, 2, 13}, {80, 1, 18}, {80, 2, 19}, {120, 2, 25}, {120, 3, 26},
+  {200, 2, 31}, {200, 4, 33},
+};
+
+static gboolean
+ty_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h)
+{
+  *cx = 60 + (ty_steps[i].slot % 10) * 185;
+  *by = 220 + (ty_steps[i].slot / 10) * 150 + (f >= 60 ? ty_steps[i].j : 0);
+  *h = ty_steps[i].h;
+  return TRUE;
+}
+
+static void
+test_dir_box_height (void)
+{
+  const gchar *want[] = {
+    "-@0-49 STOP@50-64 -@65-103 STOP@104-129",  /* h 10, 1 px */
+    "-@0-49 STOP@50-60 -@61-107 STOP@108-129",  /* h 10, 2 px */
+    "-@0-49 STOP@50-61 -@62-106 STOP@107-129",  /* h 20, 2 px */
+    "-@0-49 STOP@50-129",                       /* h 40, 1 px */
+    "-@0-49 STOP@50-64 -@65-103 STOP@104-129",  /* h 40, 2 px */
+    "-@0-49 STOP@50-129",                       /* h 80, 1 px */
+    "-@0-49 STOP@50-72 -@73-95 STOP@96-129",    /* h 80, 2 px */
+    "-@0-49 STOP@50-129",                       /* h 120, 2 px */
+    "-@0-49 STOP@50-66 -@67-101 STOP@102-129",  /* h 120, 3 px */
+    "-@0-49 STOP@50-129",                       /* h 200, 2 px */
+    "-@0-49 STOP@50-66 -@67-101 STOP@102-129",  /* h 200, 4 px */
+  };
+
+  check_paths (DIR_E, 1920, 1080, 130, ty_path, want, G_N_ELEMENTS (want));
+}
+
+/* The angle limit is 60 degrees, inclusive, on both sides: 10 px/frame at each angle from east */
+static const gdouble fine_angles[] = { 50, 55, 57, 58, 59, 59.5, 60, 60.5, 61, 62, 63, 65, 70, -55, -59, -60, -61,
+  -65
+};
+
+static gboolean
+angle_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  *cx = 150 + (i % 6) * 180 + 10 * f * cos (RAD (fine_angles[i]));
+  *by = 150 + (i / 6) * 170 + 10 * f * sin (RAD (fine_angles[i]));
+  return TRUE;
+}
+
+static void
+test_dir_angle (void)
+{
+  const gchar *want[] = {
+    "-@0-9 E@10-29", "-@0-9 E@10-29", "-@0-9 E@10-29", "-@0-9 E@10-29", "-@0-9 E@10-29", "-@0-9 E@10-29",
+    "-@0-9 E@10-29",                            /* 50 .. 60 */
+    "-@0-29", "-@0-29", "-@0-29", "-@0-29", "-@0-29", "-@0-29",     /* 60.5 .. 70 */
+    "-@0-9 E@10-29", "-@0-9 E@10-29", "-@0-9 E@10-29",      /* -55 .. -60 */
+    "-@0-29", "-@0-29",                         /* -61, -65 */
+  };
+
+  check_paths (DIR_E, 1280, 720, 30, angle_path, want, G_N_ELEMENTS (want));
+}
+
+/* Every rule within 60 degrees, in config order: 6 px/frame at 0..100 degrees from east (y down), with E, SE and S
+ * written in both orders, and E with a zero vector */
+static gboolean
+multi_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  gdouble a = RAD (i < 5 ? 10.0 * i : i == 5 ? 45.0 : 10.0 * (i - 1));
+
+  *cx = 150 + (i % 6) * 180 + 6 * f * cos (a);
+  *by = 150 + (i / 6) * 170 + 6 * f * sin (a);
+  return TRUE;
+}
+
+static void
+test_dir_multi (void)
+{
+  const gchar *want[] = {
+    "-@0-9 E+SE@10-29", "-@0-9 E+SE@10-29", "-@0-9 E+SE@10-29",     /* 0, 10, 20 */
+    "-@0-9 E+SE+S@10-29", "-@0-9 E+SE+S@10-29", "-@0-9 E+SE+S@10-29", "-@0-9 E+SE+S@10-29",
+    "-@0-9 E+SE+S@10-29",                       /* 30 .. 60 */
+    "-@0-9 SE+S@10-29", "-@0-9 SE+S@10-29", "-@0-9 SE+S@10-29", "-@0-9 SE+S@10-29",       /* 70 .. 100 */
+  };
+  const gchar *want_rev[] = {
+    "-@0-9 SE+E@10-29", "-@0-9 SE+E@10-29", "-@0-9 SE+E@10-29",
+    "-@0-9 S+SE+E@10-29", "-@0-9 S+SE+E@10-29", "-@0-9 S+SE+E@10-29", "-@0-9 S+SE+E@10-29",
+    "-@0-9 S+SE+E@10-29",
+    "-@0-9 S+SE@10-29", "-@0-9 S+SE@10-29", "-@0-9 S+SE@10-29", "-@0-9 S+SE@10-29",
+  };
+  const gchar *want_e[] = {
+    "-@0-9 E@10-29", "-@0-9 E@10-29", "-@0-9 E@10-29", "-@0-9 E@10-29", "-@0-9 E@10-29", "-@0-9 E@10-29",
+    "-@0-9 E@10-29", "-@0-9 E@10-29", "-@0-29", "-@0-29", "-@0-29", "-@0-29",
+  };
+
+  check_paths (PROPERTY "[direction-detection-stream-0]\nenable=1\ndirection-E=400;360;600;360\n"
+      "direction-SE=400;360;541;501\ndirection-S=400;360;400;560\nclass-id=-1\n", 1280, 720, 30, multi_path,
+      want, G_N_ELEMENTS (want));
+  check_paths (PROPERTY "[direction-detection-stream-0]\nenable=1\ndirection-S=400;360;400;560\n"
+      "direction-SE=400;360;541;501\ndirection-E=400;360;600;360\nclass-id=-1\n", 1280, 720, 30, multi_path,
+      want_rev, G_N_ELEMENTS (want_rev));
+  /* a zero vector never matches (DeepStream 8.0 behaviour) */
+  check_paths (PROPERTY "[direction-detection-stream-0]\nenable=1\ndirection-Z=400;360;400;360\n"
+      "direction-E=400;360;600;360\n", 1280, 720, 30, multi_path, want_e, G_N_ELEMENTS (want_e));
+}
+
+/* objStatus: the ROI pieces, then the direction or STOPPED piece; has_info follows */
+static void
+test_dir_obj_status (void)
+{
+  RdsAnalyticsCore *core = core_for (PROPERTY "[roi-filtering-stream-0]\nenable=1\n"
+      "roi-RF=100;100;600;100;600;600;100;600\n"
+      "[direction-detection-stream-0]\nenable=1\ndirection-East=100;650;300;650\n");
+  RdsAnalyticsFrameResult r;
+
+  for (guint f = 0; f <= 50; f++) {
+    /* east 8 px/f in RF, static in RF, static outside it */
+    RdsAnalyticsObject objs[] = { obj_at (1, 0, 110 + 8 * f, 300), obj_at (2, 0, 300, 400),
+      obj_at (3, 0, 900, 400)
+    };
+
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), objs, 3, &r);
+    if (f == 9) {
+      g_assert_cmpstr (r.objects[0].obj_status, ==, " ROI:RF");
+      g_assert_cmpstr (r.objects[0].dir_status, ==, "");
+    }
+    if (f == 10) {
+      g_assert_cmpstr (r.objects[0].obj_status, ==, " ROI:RF DIR:East ");
+      g_assert_cmpstr (r.objects[0].dir_status, ==, " DIR:East ");
+      g_assert_false (r.objects[0].stopped);
+    }
+    if (f < 50) {
+      g_assert_false (r.objects[1].stopped);
+      g_assert_false (r.objects[2].has_info);
+      g_assert_cmpstr (r.objects[2].obj_status, ==, "");
+    }
+  }
+  g_assert_cmpstr (r.objects[0].obj_status, ==, " ROI:RF DIR:East ");
+  g_assert_true (r.objects[1].stopped);
+  g_assert_cmpstr (r.objects[1].obj_status, ==, " ROI:RF STOPPED ");
+  g_assert_cmpstr (r.objects[1].dir_status, ==, "");
+  assert_labels (r.objects[1].roi_labels, r.objects[1].n_roi_labels, "RF");
+  g_assert_true (r.objects[2].stopped);
+  g_assert_cmpstr (r.objects[2].obj_status, ==, " STOPPED ");
+  g_assert_true (r.objects[2].has_info);
+  g_assert_false (r.untracked_warning);
+  rds_analytics_core_free (core);
+}
+
+/* No STOPPED without a direction group, whatever else the stream has: static objects in an ROI, in an overcrowding
+ * ROI and outside, one moving east 1 px/f, one moving down across a line */
+static gboolean
+feat_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  static const gint p[][2] = { {300, 300}, {900, 300}, {300, 680}, {900, 680}, {640, 300} };
+
+  *cx = p[i][0] + (i == 3 ? f : 0);
+  *by = p[i][1] + (i == 4 ? 5 * f : 0);
+  return TRUE;
+}
+
+static void
+test_dir_needs_group (void)
+{
+  const gchar *configs[] = {
+    PROPERTY "[roi-filtering-stream-0]\nenable=1\nroi-RF=100;100;600;100;600;600;100;600\n",
+    PROPERTY "[overcrowding-stream-0]\nenable=1\nroi-OC=700;100;1200;100;1200;600;700;600\nobject-threshold=1\n",
+    PROPERTY "[line-crossing-stream-0]\nenable=1\nline-crossing-Down=640;300;640;500;500;400;800;400\n",
+    PROPERTY "[direction-detection-stream-0]\nenable=0\ndirection-East=100;650;300;650\n",
+  };
+  const gchar *want[] = { "-@0-69", "-@0-69", "-@0-69", "-@0-69", "-@0-69" };
+  const gchar *want_dir[] = {
+    "-@0-49 STOP@50-69", "-@0-49 STOP@50-69", "-@0-49 STOP@50-69", "-@0-49 STOP@50-69", "-@0-69",
+  };
+
+  for (guint c = 0; c < G_N_ELEMENTS (configs); c++)
+    check_paths (configs[c], 1280, 720, 70, feat_path, want, G_N_ELEMENTS (want));
+  check_paths (PROPERTY "[direction-detection-stream-0]\nenable=1\ndirection-East=100;650;300;650\n", 1280, 720,
+      70, feat_path, want_dir, G_N_ELEMENTS (want_dir));
+}
+
+/* Untracked objects get no direction and no STOPPED, and leave the tracked ones alone; the warning comes once per
+ * stream, and only from a stream with a direction group (ours) */
+static void
+test_dir_untracked (void)
+{
+  RdsAnalyticsCore *core = core_for (DIR_E "[direction-detection-stream-1]\nenable=1\n"
+      "direction-E=400;360;600;360\n");
+  RdsAnalyticsFrameResult r;
+
+  for (guint f = 0; f < 60; f++) {
+    RdsAnalyticsObject objs[] = { obj_at (RDS_ANALYTICS_UNTRACKED, 0, 100 + 10 * f, 300),
+      obj_at (1, 0, 100 + 10 * f, 500), obj_at (RDS_ANALYTICS_UNTRACKED, 0, 900, 600)
+    };
+    guint first = f < 3 ? 1 : 0, n = f < 3 ? 1 : 3;     /* the untracked ones join at frame 3 */
+
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), objs + first, n, &r);
+    g_assert_cmpint (r.untracked_warning, ==, f == 3);
+    for (guint k = 0; k < r.n_objects; k++) {
+      const RdsAnalyticsObjectResult *o = &r.objects[k];
+
+      if (objs[first + k].id == RDS_ANALYTICS_UNTRACKED) {
+        g_assert_cmpstr (o->dir_status, ==, "");
+        g_assert_false (o->stopped);
+        g_assert_false (o->has_info);
+      } else {
+        g_assert_cmpstr (o->dir_status, ==, f >= 10 ? " DIR:E " : "");
+      }
+    }
+    /* stream 1 warns on its own first untracked object, at frame 20; stream 2 has no direction group */
+    rds_analytics_core_process_frame (core, 1, FRAME_30FPS (f), f < 20 ? objs + 1 : objs, 1, &r);
+    g_assert_cmpint (r.untracked_warning, ==, f == 20);
+    rds_analytics_core_process_frame (core, 2, FRAME_30FPS (f), objs, 1, &r);
+    g_assert_false (r.untracked_warning);
+    g_assert_false (r.objects[0].has_info);
+  }
+  rds_analytics_core_free (core);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -936,5 +1702,20 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-core/obj-cnt/max-frames", test_obj_cnt_max_frames);
   g_test_add_func ("/cpu/analytics-core/obj-cnt/edges", test_obj_cnt_edges);
   g_test_add_func ("/cpu/analytics-core/streams", test_two_streams);
+  g_test_add_func ("/cpu/analytics-core/direction/ramp", test_dir_ramp);
+  g_test_add_func ("/cpu/analytics-core/direction/onset", test_dir_onset);
+  g_test_add_func ("/cpu/analytics-core/direction/jump-filling", test_dir_jump_filling);
+  g_test_add_func ("/cpu/analytics-core/direction/jump-stopped", test_dir_jump_stopped);
+  g_test_add_func ("/cpu/analytics-core/direction/stopped-step", test_dir_stopped_step);
+  g_test_add_func ("/cpu/analytics-core/direction/stopped", test_dir_stopped);
+  g_test_add_func ("/cpu/analytics-core/direction/spikes", test_dir_spikes);
+  g_test_add_func ("/cpu/analytics-core/direction/absences", test_dir_absences);
+  g_test_add_func ("/cpu/analytics-core/direction/threshold", test_dir_threshold);
+  g_test_add_func ("/cpu/analytics-core/direction/box-height", test_dir_box_height);
+  g_test_add_func ("/cpu/analytics-core/direction/angle", test_dir_angle);
+  g_test_add_func ("/cpu/analytics-core/direction/multi", test_dir_multi);
+  g_test_add_func ("/cpu/analytics-core/direction/obj-status", test_dir_obj_status);
+  g_test_add_func ("/cpu/analytics-core/direction/needs-group", test_dir_needs_group);
+  g_test_add_func ("/cpu/analytics-core/direction/untracked", test_dir_untracked);
   return g_test_run ();
 }

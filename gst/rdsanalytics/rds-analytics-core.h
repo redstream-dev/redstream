@@ -34,7 +34,19 @@ G_GNUC_INTERNAL gboolean rds_analytics_point_in_polygon (RdsAnalyticsPoint p, co
  * ROI filtering (DeepStream 8.0 behaviour): an object passing the group's class-id filter gets the label of every
  * ROI its point is inside, or outside with inverse-roi, and is counted for that label. Overcrowding (DeepStream 8.0
  * behaviour): the same count without inverse, and the status is count >= object-threshold && count > 0, on the
- * frame itself. A group with enable=0 contributes nothing, not even its zero entries (DeepStream 8.0 behaviour). */
+ * frame itself. A group with enable=0 contributes nothing, not even its zero entries (DeepStream 8.0 behaviour).
+ *
+ * History (DeepStream 8.0 behaviour): a stream with a direction or line-crossing group keeps a history per object
+ * id, one point per frame the object is in (the frames it misses don't count), its x clamped at 0. The window is
+ * its last 50 points, and n = observations - 1. The reference is the integer-truncated mean of the window's oldest
+ * 2 points, or its oldest 4 once the window is full.
+ *
+ * Direction (DeepStream 8.0 behaviour):
+ * - From n = 50 on, an object whose window has population standard deviations sx <= 20 and sy <= 0.1 * sqrt (h),
+ *   h the current box height (ours: 8.0's h is undetermined), is STOPPED: " STOPPED " in objStatus, no direction.
+ * - Otherwise, from n = 10 on, with d = newest point - reference and |d| >= 55 px: every direction rule whose vector
+ *   is within 60 degrees of d (cos >= 0.5), in config order.
+ * - Untracked objects get neither (ours: 8.0 turns direction and line crossing off for the stream for good). */
 
 /* The object id of an object no tracker has given an id: DeepStream's UNTRACKED_OBJECT_ID. */
 #define RDS_ANALYTICS_UNTRACKED G_MAXUINT64
@@ -79,9 +91,14 @@ typedef struct
   /* ocStatus: the overcrowding labels the object is in, whatever the status, in config order */
   const gchar *const *oc_labels;
   guint n_oc_labels;
-  /* objStatus: " ROI:<l>" per ROI label, in that order; "" when empty */
+  /* dirStatus: " DIR:<l> " per matching direction rule, in config order; "" when none */
+  const gchar *dir_status;
+  /* the object is STOPPED (dir_status is then "") */
+  gboolean stopped;
+  /* objStatus: " ROI:<l>" per ROI label, then " DIR:<l> " per direction, then " STOPPED "; "" when empty */
   const gchar *obj_status;
-  /* the object has something to report: it gets an object meta (DeepStream 8.0 behaviour) */
+  /* the object has something to report (a label, a direction or STOPPED): it gets an object meta (DeepStream 8.0
+   * behaviour) */
   gboolean has_info;
 } RdsAnalyticsObjectResult;
 
@@ -104,6 +121,9 @@ typedef struct
   /* one per input object, in input order */
   const RdsAnalyticsObjectResult *objects;
   guint n_objects;
+  /* TRUE on the first frame of the stream where direction or line crossing skipped an untracked object, FALSE
+   * after: the element logs it once per stream (ours) */
+  gboolean untracked_warning;
 } RdsAnalyticsFrameResult;
 
 typedef struct _RdsAnalyticsCore RdsAnalyticsCore;

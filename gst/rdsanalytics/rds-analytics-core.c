@@ -1,5 +1,6 @@
 /* Redstream: the rdsanalytics core. Geometry: rule scaling, the reference point of a box and the inside test. The
- * per-stream state and the features: ROI filtering, overcrowding and the object counts.
+ * per-stream state and the features: ROI filtering, overcrowding, the object counts, the per-object histories and
+ * direction with the STOPPED state.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-analytics-core.h"
 
@@ -87,6 +88,18 @@ rds_analytics_point_in_polygon (RdsAnalyticsPoint p, const RdsAnalyticsPoint * p
  * the key goes up to 10^9 ms). The oldest frames leave first. */
 #define OBJ_CNT_MAX_FRAMES 9000
 
+/* History and direction (DeepStream 8.0 behaviour; see rds-analytics-core.h) */
+#define HISTORY_WINDOW 50       /* the window's points */
+#define DIR_MIN_N 10            /* no direction before n = 10 */
+#define DIR_MIN_DIST2 (55.0 * 55.0)     /* |d| >= 55 px, compared squared */
+#define STOPPED_MIN_N 50        /* no STOPPED before n = 50 */
+#define STOPPED_MAX_SX 20.0     /* sx <= 20 px */
+/* sy <= STOPPED_SY_COEF * sqrt (h). Ours: 8.0's limits, measured for box heights 10 to 200, are each within 0.5 %
+ * of 0.1 * sqrt (h), but no single coefficient fits all six. Replayed on 8.0's direction runs, 0.1 misses 4 states
+ * of its box-height run, and the same 4 at another config size (any coefficient from 0.0999 to 0.1002 does as
+ * well); 0.1004 misses 8 of each. */
+#define STOPPED_SY_COEF 0.1
+
 /* One rule, scaled to the mux output. */
 typedef struct
 {
@@ -139,9 +152,20 @@ typedef struct
   RdsAnalyticsClassCount *counts;
 } WindowFrame;
 
+/* One object's history: its last HISTORY_WINDOW points and how many it has had. */
+typedef struct
+{
+  guint64 id;                   /* the hash table's key */
+  RdsAnalyticsPoint win[HISTORY_WINDOW];        /* a ring, the oldest at head */
+  guint head, len;
+  guint64 n_obs;                /* observations so far; n = n_obs - 1 */
+} History;
+
 typedef struct
 {
   const CoreRules *rules;       /* NULL: the stream has no enabled group */
+  GHashTable *histories;        /* guint64 * id -> History *, when the stream has direction or line crossing */
+  gboolean untracked_warned;    /* untracked_warning was given */
   GArray *classes;              /* ClassWindow, sorted by (guint) class_id */
   /* the window's frames: a ring of n_slots slots, the oldest at head, n_frames in use; it grows when full */
   WindowFrame *slots;
@@ -155,7 +179,8 @@ typedef struct
 {
   guint roi_first, n_roi;
   guint oc_first, n_oc;
-  gsize status;
+  gsize status, dir_status;
+  gboolean stopped;
 } ObjectSpans;
 
 struct _RdsAnalyticsCore
@@ -172,6 +197,7 @@ struct _RdsAnalyticsCore
   GArray *spans;                /* ObjectSpans */
   GPtrArray *labels;            /* the objects' labels (the rules' strings) */
   GString *strings;             /* the objects' strings, each NUL-terminated */
+  GString *dir;                 /* one object's dirStatus while it is built */
   GArray *frame_counts;         /* RdsAnalyticsClassCount: this frame's raw counts, in the order first seen */
 };
 
@@ -249,6 +275,7 @@ stream_state_free (StreamState * st)
     g_free (st->slots[i].counts);
   g_free (st->slots);
   g_array_unref (st->classes);
+  g_clear_pointer (&st->histories, g_hash_table_unref);
   g_free (st);
 }
 
@@ -292,6 +319,7 @@ rds_analytics_core_new (const RdsAnalyticsConfig * cfg, guint out_w, guint out_h
   core->spans = g_array_new (FALSE, FALSE, sizeof (ObjectSpans));
   core->labels = g_ptr_array_new ();
   core->strings = g_string_new (NULL);
+  core->dir = g_string_new (NULL);
   core->frame_counts = g_array_new (FALSE, FALSE, sizeof (RdsAnalyticsClassCount));
   return core;
 }
@@ -310,6 +338,7 @@ rds_analytics_core_free (RdsAnalyticsCore * core)
   g_array_unref (core->spans);
   g_ptr_array_unref (core->labels);
   g_string_free (core->strings, TRUE);
+  g_string_free (core->dir, TRUE);
   g_array_unref (core->frame_counts);
   g_free (core);
 }
@@ -325,6 +354,9 @@ get_stream (RdsAnalyticsCore * core, guint pad_index)
     st->classes = g_array_new (FALSE, FALSE, sizeof (ClassWindow));
     g_array_set_clear_func (st->classes, class_window_clear);
     st->last_pts = RDS_ANALYTICS_PTS_NONE;
+    if (st->rules != NULL && (st->rules->groups[RDS_ANALYTICS_DIRECTION] != NULL
+            || st->rules->groups[RDS_ANALYTICS_LINE_CROSSING] != NULL))
+      st->histories = g_hash_table_new_full (g_int64_hash, g_int64_equal, NULL, g_free);
     g_hash_table_insert (core->streams, GUINT_TO_POINTER (pad_index), st);
   }
   return st;
@@ -541,6 +573,143 @@ count_classes (RdsAnalyticsCore * core, const RdsAnalyticsObject * objs, guint n
 }
 
 /* ------------------------------------------------------------------------------------------------------------ */
+/* Histories and direction */
+
+static History *
+history_get (StreamState * st, guint64 id)
+{
+  History *h = g_hash_table_lookup (st->histories, &id);
+
+  if (h == NULL) {
+    h = g_new0 (History, 1);
+    h->id = id;
+    g_hash_table_insert (st->histories, &h->id, h);
+  }
+  return h;
+}
+
+/* The @i-th point of the window, from the oldest */
+static RdsAnalyticsPoint
+history_point (const History * h, guint i)
+{
+  return h->win[(h->head + i) % HISTORY_WINDOW];
+}
+
+/* DeepStream 8.0 behaviour: one point per observation, x clamped at 0. Ours: two objects with the same id in one
+ * frame add a point each. */
+static void
+history_push (History * h, RdsAnalyticsPoint p)
+{
+  p.x = MAX (p.x, 0);
+  if (h->len < HISTORY_WINDOW) {
+    h->win[(h->head + h->len++) % HISTORY_WINDOW] = p;
+  } else {
+    h->win[h->head] = p;
+    h->head = (h->head + 1) % HISTORY_WINDOW;
+  }
+  h->n_obs++;
+}
+
+/* The population standard deviation of the window's x (@axis 0) or y (1) coordinates. DeepStream 8.0 behaviour:
+ * population, over the integer points. Ours: computed in double, the mean first (8.0's precision is unknown; the
+ * observed limits, sx = 20.0 exactly for a 0/40 px step, are exact in double). */
+static gdouble
+history_pstd (const History * h, guint axis)
+{
+  gdouble sum = 0, var = 0, mean;
+
+  for (guint i = 0; i < h->len; i++) {
+    RdsAnalyticsPoint p = history_point (h, i);
+
+    sum += axis == 0 ? p.x : p.y;
+  }
+  mean = sum / h->len;
+  for (guint i = 0; i < h->len; i++) {
+    RdsAnalyticsPoint p = history_point (h, i);
+    gdouble dv = (axis == 0 ? p.x : p.y) - mean;
+
+    var += dv * dv;
+  }
+  return sqrt (var / h->len);
+}
+
+/* DeepStream 8.0 behaviour: from n = 50 on, sx <= 20 and sy <= 0.1 * sqrt (h), both inclusive; h is the current
+ * box height (ours: 8.0's is undetermined; the measured limits don't depend on the box width) */
+static gboolean
+history_stopped (const History * h, gfloat height)
+{
+  if (h->n_obs - 1 < STOPPED_MIN_N)
+    return FALSE;
+  return history_pstd (h, 0) <= STOPPED_MAX_SX
+      && history_pstd (h, 1) <= STOPPED_SY_COEF * sqrt (MAX ((gdouble) height, 0.0));
+}
+
+/* DeepStream 8.0 behaviour: the integer-truncated mean of the window's oldest 2 points while it fills, of its
+ * oldest 4 once it is full. C's integer division truncates toward zero, as 8.0's does. */
+static RdsAnalyticsPoint
+history_reference (const History * h)
+{
+  guint k = h->len < HISTORY_WINDOW ? 2 : 4;
+  gint64 sx = 0, sy = 0;
+  RdsAnalyticsPoint ref;
+
+  for (guint i = 0; i < k; i++) {
+    RdsAnalyticsPoint p = history_point (h, i);
+
+    sx += p.x;
+    sy += p.y;
+  }
+  ref.x = (gint) (sx / (gint64) k);
+  ref.y = (gint) (sy / (gint64) k);
+  return ref;
+}
+
+/* Whether the direction rule's vector is within 60 degrees of (@dx, @dy): cos >= 0.5, inclusive (DeepStream 8.0
+ * behaviour). A zero vector never matches (DeepStream 8.0 behaviour). Ours: the test is dot >= 0 and
+ * 4 dot^2 >= |d|^2 |v|^2, in double from integers, so it is exact while the products stay below 2^53 (coordinates
+ * up to about 2^13); on integer vectors the angle is never exactly 60 degrees, so a cosine in float or double
+ * gives the same answers. */
+static gboolean
+direction_matches (const CoreRule * rule, gdouble dx, gdouble dy)
+{
+  gdouble vx = (gdouble) rule->points[1].x - rule->points[0].x;
+  gdouble vy = (gdouble) rule->points[1].y - rule->points[0].y;
+  gdouble dot = dx * vx + dy * vy;
+
+  if ((vx == 0 && vy == 0) || dot < 0)
+    return FALSE;
+  return 4 * dot * dot >= (dx * dx + dy * dy) * (vx * vx + vy * vy);
+}
+
+/* The direction of an object with history @h and current box height @height: sets @stopped, or appends
+ * " DIR:<l> " to core->dir for each matching rule of @dir, in config order (DeepStream 8.0 behaviour) */
+static void
+direction_eval (RdsAnalyticsCore * core, const CoreGroup * dir, const History * h, gfloat height,
+    gboolean * stopped)
+{
+  RdsAnalyticsPoint ref, cur;
+  gdouble dx, dy;
+
+  *stopped = history_stopped (h, height);
+  if (*stopped || h->n_obs - 1 < DIR_MIN_N)
+    return;
+  ref = history_reference (h);
+  cur = history_point (h, h->len - 1);
+  dx = (gdouble) cur.x - ref.x;
+  dy = (gdouble) cur.y - ref.y;
+  /* |d| >= 55, Euclidean, compared squared: exact on integers */
+  if (dx * dx + dy * dy < DIR_MIN_DIST2)
+    return;
+  for (guint r = 0; r < dir->n_rules; r++) {
+    if (direction_matches (&dir->rules[r], dx, dy)) {
+      g_string_append (core->dir, " DIR:");
+      g_string_append (core->dir, dir->rules[r].label);
+      g_string_append_c (core->dir, ' ');
+    }
+  }
+}
+
+/* ------------------------------------------------------------------------------------------------------------ */
 /* One frame */
 
 void
@@ -548,7 +717,7 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
     const RdsAnalyticsObject * objs, guint n, RdsAnalyticsFrameResult * out)
 {
   StreamState *st;
-  const CoreGroup *roi = NULL, *oc = NULL;
+  const CoreGroup *roi = NULL, *oc = NULL, *dir = NULL;
   guint n_roi_rules = 0;
 
   g_return_if_fail (core != NULL && out != NULL);
@@ -558,7 +727,9 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
   if (st->rules != NULL) {
     roi = st->rules->groups[RDS_ANALYTICS_ROI_FILTERING];
     oc = st->rules->groups[RDS_ANALYTICS_OVERCROWDING];
+    dir = st->rules->groups[RDS_ANALYTICS_DIRECTION];
   }
+  out->untracked_warning = FALSE;
 
   /* objInROIcnt: every ROI, then every overcrowding ROI, from 0 (DeepStream 8.0 behaviour) */
   g_array_set_size (core->roi_counts, 0);
@@ -621,8 +792,33 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
     }
     sp->n_oc = core->labels->len - sp->oc_first;
 
+    /* the history and the direction; untracked objects are skipped (ours) */
+    g_string_truncate (core->dir, 0);
+    sp->stopped = FALSE;
+    if (st->histories != NULL) {
+      if (o->id == RDS_ANALYTICS_UNTRACKED) {
+        if (!st->untracked_warned)
+          st->untracked_warned = out->untracked_warning = TRUE;
+      } else {
+        History *h = history_get (st, o->id);
+
+        history_push (h, p);
+        if (dir != NULL)
+          direction_eval (core, dir, h, o->height, &sp->stopped);
+      }
+    }
+
+    /* objStatus: the ROI pieces, then " DIR:<l> " per direction, then " STOPPED " (DeepStream 8.0 behaviour) */
+    g_string_append_len (core->strings, core->dir->str, core->dir->len);
+    if (sp->stopped)
+      g_string_append (core->strings, " STOPPED ");
     status_len = core->strings->len - sp->status;
     g_string_append_c (core->strings, '\0');
+    /* dirStatus: the same " DIR:<l> " pieces (DeepStream 8.0 behaviour) */
+    sp->dir_status = core->strings->len;
+    g_string_append_len (core->strings, core->dir->str, core->dir->len);
+    g_string_append_c (core->strings, '\0');
+    /* a label, a direction or STOPPED (the last two are in objStatus) */
     g_array_index (core->objects, RdsAnalyticsObjectResult, i).has_info = sp->n_roi > 0 || sp->n_oc > 0
         || status_len > 0;
   }
@@ -638,6 +834,8 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
     r->oc_labels = labels != NULL ? labels + sp->oc_first : NULL;
     r->n_oc_labels = sp->n_oc;
     r->obj_status = core->strings->str + sp->status;
+    r->dir_status = core->strings->str + sp->dir_status;
+    r->stopped = sp->stopped;
   }
 
   /* ocStatus: count >= object-threshold, never at 0, on this frame (DeepStream 8.0 behaviour) */
