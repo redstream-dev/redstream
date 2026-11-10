@@ -1209,7 +1209,11 @@ The object meta fields the tracker writes (`object_id`, `tracker_bbox_info`, `tr
   these are errors (ours, where 8.0 crashes, reads garbage or silently misbehaves): an empty value (except
   `class-id`), a `config-width` or `config-height` of 0, an ROI with an odd count or fewer than 3 points, a line
   crossing without exactly 8 values, a direction without exactly 4, negative or non-integer coordinates (fatal in
-  8.0 too), a label used twice in one group, an empty label and a stream number that is not one.
+  8.0 too), an empty list item (`1;;2`), a label used twice in one group, an empty label, and a stream number that is
+  not one: not a decimal number without leading zeros (`-stream-00`, `-stream-007`), or above 4294967295. So two
+  spellings never name one stream. `class-id=` and `class-id=;` mean every class; `mode=` in a direction group is
+  accepted.
+- Key-file locale suffixes (`roi-A[fr]`) are not read: such a key is an unknown key (ours).
 
 #### rdsanalytics config keys
 
@@ -1227,7 +1231,7 @@ The object meta fields the tracker writes (`object_id`, `tracker_bbox_info`, `tr
 | `inverse-roi` | roi-filtering | bool | `0` |  | supported | 1: the labels go on the objects outside each ROI, and those are counted (DeepStream 8.0 behaviour) |
 | `object-threshold` | overcrowding | uint | `0` | >= 0 | supported | overcrowded when the ROI's count is at least this and above 0 (DeepStream 8.0 behaviour); unset flags from a count of 1, as in 8.0 |
 | `time-threshold` | overcrowding | uint | `0` | >= 0 | accepted no-op | undocumented; accepted with no effect, as in DeepStream 8.0. In the other feature groups it is an unknown key |
-| `mode` | line-crossing | string | `loose` |  | supported | strict, balanced or loose; any other value reads as loose (DeepStream 8.0 behaviour) |
+| `mode` | line-crossing | string | `loose` |  | supported | strict, balanced or loose; any other value reads as loose (DeepStream 8.0 behaviour). Matching is case-sensitive (ours: `Strict` reads as loose; 8.0 not observed) |
 | `mode` | direction-detection | string | none |  | accepted no-op | accepted and ignored, as in DeepStream 8.0 |
 | `extended` | line-crossing | bool | `0` |  | supported | 0: the crossing must hit the segment, 1: the infinite line (DeepStream 8.0 behaviour) |
 | `roi-<label>` | roi-filtering, overcrowding | polygon | none | >= 0 | supported | x1;y1;x2;y2;... in order around the polygon, at least 3 points; integers >= 0. Fewer than 3 points or an odd count is an error (ours): 8.0 accepts them (an ROI that never matches, a missing y read as 0) |

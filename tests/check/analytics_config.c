@@ -17,7 +17,8 @@ tmp_config (const gchar * text)
   gchar *path = g_build_filename (dir, "analytics.txt", NULL);
 
   g_assert_no_error (err);
-  g_assert_true (g_file_set_contents (path, text, -1, NULL));
+  g_assert_true (g_file_set_contents (path, text, -1, &err));
+  g_assert_no_error (err);
   g_free (dir);
   return path;
 }
@@ -308,6 +309,15 @@ test_mode (void)
   capture_stop (NULL);
   g_assert_nonnull (group (cfg, 0, RDS_ANALYTICS_DIRECTION));
   rds_analytics_config_free (cfg);
+  /* empty too: it is a no-op key */
+  capture_start ();
+  cfg = text_ok (PROPERTY "[direction-detection-stream-0]\ndirection-D=0;0;0;10\nmode=\n");
+  capture_stop (NULL);
+  rds_analytics_config_free (cfg);
+  /* matching is case-sensitive (ours) */
+  cfg = text_ok (PROPERTY "[line-crossing-stream-0]\nline-crossing-L=0;0;0;10;0;5;10;5\nmode=Strict\n");
+  g_assert_cmpint (group (cfg, 0, RDS_ANALYTICS_LINE_CROSSING)->mode, ==, RDS_ANALYTICS_MODE_LOOSE);
+  rds_analytics_config_free (cfg);
 }
 
 /* class-id: unset, empty, -1 and a list holding -1 all mean every class; a list keeps its classes. */
@@ -320,7 +330,7 @@ test_class_id (void)
     const gchar *ids;           /* NULL: every class */
   } cases[] = {
     {"", NULL}, {"class-id=\n", NULL}, {"class-id=-1\n", NULL}, {"class-id=-1;1\n", NULL}, {"class-id=1;-1\n", NULL},
-    {"class-id=0;2\n", "0 2"}, {"class-id=7\n", "7"}, {"class-id=3;\n", "3"},
+    {"class-id=0;2\n", "0 2"}, {"class-id=7\n", "7"}, {"class-id=3;\n", "3"}, {"class-id=;\n", NULL},
   };
 
   for (guint i = 0; i < G_N_ELEMENTS (cases); i++) {
@@ -440,6 +450,26 @@ test_errors (void)
       "stream number", NULL);
   text_fails (PROPERTY "[roi-filtering-stream-0]\nroi-=0;0;10;0;10;10\n", INVALID, "[roi-filtering-stream-0] roi-",
       "empty label", NULL);
+  /* ours: stream numbers are written without leading zeros, so two spellings never name one stream */
+  text_fails (PROPERTY "[roi-filtering-stream-00]\nroi-A=0;0;10;0;10;10\n", INVALID, "[roi-filtering-stream-00]",
+      "00: not a stream number", NULL);
+  text_fails (PROPERTY "[roi-filtering-stream-0]\nroi-A=0;0;10;0;10;10\n[roi-filtering-stream-00]\n"
+      "roi-B=0;0;10;0;10;10\n", INVALID, "[roi-filtering-stream-00]", "not a stream number", NULL);
+  text_fails (PROPERTY "[line-crossing-stream-7]\nline-crossing-L=0;0;0;10;0;5;10;5\n[line-crossing-stream-007]\n"
+      "line-crossing-M=0;0;0;10;0;5;10;5\n", INVALID, "[line-crossing-stream-007]", "not a stream number", NULL);
+  text_fails (PROPERTY "[roi-filtering-stream-99999999999]\nroi-A=0;0;10;0;10;10\n", INVALID,
+      "[roi-filtering-stream-99999999999]", "not a stream number", NULL);
+  text_fails (PROPERTY "[roi-filtering-stream-]\nroi-A=0;0;10;0;10;10\n", INVALID, "[roi-filtering-stream-]",
+      "not a stream number", NULL);
+  /* list items, upper bounds */
+  text_fails (PROPERTY "[roi-filtering-stream-0]\nroi-A=0;0;;0;10;10\n", INVALID,
+      "[roi-filtering-stream-0] roi-A: 0;0;;0;10;10: ", "item 3 is empty", NULL);
+  text_fails (PROPERTY "[roi-filtering-stream-0]\nroi-A=0;0;10;0;10;10\nclass-id=1;;2\n", INVALID,
+      "[roi-filtering-stream-0] class-id: 1;;2: ", "item 2 is empty", NULL);
+  text_fails ("[property]\nenable=1\nconfig-width=2147483648\nconfig-height=720\n", INVALID,
+      "[property] config-width: 2147483648: ", "at most 2147483647", NULL);
+  text_fails (PROPERTY "[direction-detection-stream-0]\ndirection-D=0;0;2147483648;0\n", INVALID,
+      "[direction-detection-stream-0] direction-D: 0;0;2147483648;0: ", "2147483648: must be at most 2147483647", NULL);
 }
 
 /* The same label in two features, or in two streams, is fine. */
@@ -506,6 +536,25 @@ test_unknown_keys (void)
   capture_stop ("*[line-crossing-stream-0] roi-A*unknown key*", "*[line-crossing-stream-0] inverse-roi*unknown key*",
       NULL);
   g_assert_cmpuint (group (cfg, 0, RDS_ANALYTICS_LINE_CROSSING)->rules->len, ==, 1);
+  rds_analytics_config_free (cfg);
+
+  /* locale-suffixed keys are unknown keys: logged in feature groups, silent in [property] */
+  capture_start ();
+  cfg = text_ok (PROPERTY "osd-mode[fr]=1\n[roi-filtering-stream-0]\nroi-A=0;0;10;0;10;10\n"
+      "roi-A[fr]=0;0;20;0;20;20\nenable[fr]=0\n");
+  capture_stop ("*[roi-filtering-stream-0] roi-A[fr]*unknown key*", "*[roi-filtering-stream-0] enable[fr]*unknown key*",
+      NULL);
+  g_assert_cmpuint (cfg->osd_mode, ==, 2);
+  g_assert_cmpuint (group (cfg, 0, RDS_ANALYTICS_ROI_FILTERING)->rules->len, ==, 1);
+  assert_rule (rule (group (cfg, 0, RDS_ANALYTICS_ROI_FILTERING), 0), "A", "0,0 10,0 10,10");
+  g_assert_true (group (cfg, 0, RDS_ANALYTICS_ROI_FILTERING)->enable);
+  rds_analytics_config_free (cfg);
+
+  /* a feature name followed by something other than -stream-<n> or -<n> is an unknown group */
+  capture_start ();
+  cfg = text_ok (PROPERTY "[roi-filtering-foo]\nroi-A=0;0;10;0;10;10\n");
+  capture_stop ("*[roi-filtering-foo]*unknown group*", NULL);
+  g_assert_cmpuint (cfg->streams->len, ==, 0);
   rds_analytics_config_free (cfg);
 
   /* a group that is no feature at all (ours: logged too) */

@@ -14,13 +14,13 @@ G_DEFINE_QUARK (rds-analytics-config-error-quark, rds_analytics_config_error)
 /* Group kinds a key is valid in. */
 enum
 {
-  G_PROPERTY = 1 << 0,
-  G_ROI = 1 << 1,
-  G_OC = 1 << 2,
-  G_LC = 1 << 3,
-  G_DIR = 1 << 4,
+  GRP_PROPERTY = 1 << 0,
+  GRP_ROI = 1 << 1,
+  GRP_OC = 1 << 2,
+  GRP_LC = 1 << 3,
+  GRP_DIR = 1 << 4,
 };
-#define G_FEATURES (G_ROI | G_OC | G_LC | G_DIR)
+#define GRP_FEATURES (GRP_ROI | GRP_OC | GRP_LC | GRP_DIR)
 
 static const struct
 {
@@ -28,10 +28,10 @@ static const struct
   guint kind;
   const gchar *rule_key;        /* its rules' key prefix */
 } features[] = {
-  [RDS_ANALYTICS_ROI_FILTERING] = {"roi-filtering", G_ROI, "roi-"},
-  [RDS_ANALYTICS_OVERCROWDING] = {"overcrowding", G_OC, "roi-"},
-  [RDS_ANALYTICS_LINE_CROSSING] = {"line-crossing", G_LC, "line-crossing-"},
-  [RDS_ANALYTICS_DIRECTION] = {"direction-detection", G_DIR, "direction-"},
+  [RDS_ANALYTICS_ROI_FILTERING] = {"roi-filtering", GRP_ROI, "roi-"},
+  [RDS_ANALYTICS_OVERCROWDING] = {"overcrowding", GRP_OC, "roi-"},
+  [RDS_ANALYTICS_LINE_CROSSING] = {"line-crossing", GRP_LC, "line-crossing-"},
+  [RDS_ANALYTICS_DIRECTION] = {"direction-detection", GRP_DIR, "direction-"},
 };
 
 typedef enum
@@ -76,50 +76,50 @@ typedef struct
 /* Ranges and defaults are DeepStream 8.0 behaviour (observed; the docs give no defaults) unless marked ours. */
 static const KeyInfo keys[] = {
   /* [property] */
-  {.name = "enable",.groups = G_PROPERTY,.type = TYPE_BOOL,.status = SUP,.required = TRUE,.field = P (enable),
+  {.name = "enable",.groups = GRP_PROPERTY,.type = TYPE_BOOL,.status = SUP,.required = TRUE,.field = P (enable),
       .note = "0: pass-through, no meta"},
-  {.name = "config-width",.groups = G_PROPERTY,.type = TYPE_UINT,.status = SUP,.required = TRUE,.min = 1,
+  {.name = "config-width",.groups = GRP_PROPERTY,.type = TYPE_UINT,.status = SUP,.required = TRUE,.min = 1,
         .max = G_MAXINT,.field = P (config_width),
       .note = "the frame size the rule coordinates are in; they are scaled to the mux output"},
-  {.name = "config-height",.groups = G_PROPERTY,.type = TYPE_UINT,.status = SUP,.required = TRUE,.min = 1,
+  {.name = "config-height",.groups = GRP_PROPERTY,.type = TYPE_UINT,.status = SUP,.required = TRUE,.min = 1,
       .max = G_MAXINT,.field = P (config_height),.note = "as config-width"},
-  {.name = "osd-mode",.groups = G_PROPERTY,.type = TYPE_UINT,.status = SUP,.min = 0,.max = 2,.def = "2",
+  {.name = "osd-mode",.groups = GRP_PROPERTY,.type = TYPE_UINT,.status = SUP,.min = 0,.max = 2,.def = "2",
       .field = P (osd_mode),.note = "0: no overlay, 1: the rules and their labels, 2: also the counts and statuses"},
   /* ours: no upper bound */
-  {.name = "display-font-size",.groups = G_PROPERTY,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,
+  {.name = "display-font-size",.groups = GRP_PROPERTY,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,
       .def = "12",.field = P (display_font_size),.note = "0 reads as 12"},
-  {.name = "obj-cnt-win-in-ms",.groups = G_PROPERTY,.type = TYPE_UINT,.status = SUP,.min = 1,.max = 1e9,
+  {.name = "obj-cnt-win-in-ms",.groups = GRP_PROPERTY,.type = TYPE_UINT,.status = SUP,.min = 1,.max = 1e9,
         .def = "50",.def_ours = TRUE,.field = P (obj_cnt_win_in_ms),
       .note = "undocumented: the PTS window of objCnt (the per-class count's mode over the window); the default is "
         "ours, within the 33-100 ms measured on DeepStream 8.0"},
-  {.name = "display-obj-cnt",.groups = G_PROPERTY,.type = TYPE_BOOL,.status = SUP,.def = "0",
+  {.name = "display-obj-cnt",.groups = GRP_PROPERTY,.type = TYPE_BOOL,.status = SUP,.def = "0",
       .field = P (display_obj_cnt),.note = "undocumented: 1 draws the per-class object counts, in every osd-mode"},
 
   /* the feature groups */
   /* ours: 8.0 configs always set it */
-  {.name = "enable",.groups = G_FEATURES,.type = TYPE_BOOL,.status = SUP,.def = "1",.def_ours = TRUE,
+  {.name = "enable",.groups = GRP_FEATURES,.type = TYPE_BOOL,.status = SUP,.def = "1",.def_ours = TRUE,
       .field = GF (enable),.note = "0: the feature is off for the stream, and its labels are absent from the metas"},
-  {.name = "class-id",.groups = G_FEATURES,.type = TYPE_INT_LIST,.status = SUP,.min = -1,.max = G_MAXINT,
+  {.name = "class-id",.groups = GRP_FEATURES,.type = TYPE_INT_LIST,.status = SUP,.min = -1,.max = G_MAXINT,
         .field = GF (class_ids),
       .note = "the classes the group's rules apply to; unset, empty or a list holding -1: every class"},
-  {.name = "inverse-roi",.groups = G_ROI,.type = TYPE_BOOL,.status = SUP,.def = "0",.field = GF (inverse_roi),
+  {.name = "inverse-roi",.groups = GRP_ROI,.type = TYPE_BOOL,.status = SUP,.def = "0",.field = GF (inverse_roi),
       .note = "1: the labels go on the objects outside each ROI, and those are counted"},
-  {.name = "object-threshold",.groups = G_OC,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,.def = "0",
+  {.name = "object-threshold",.groups = GRP_OC,.type = TYPE_UINT,.status = SUP,.min = 0,.max = G_MAXINT,.def = "0",
         .field = GF (object_threshold),
       .note = "overcrowded when the ROI's count is at least this and above 0"},
-  {.name = "time-threshold",.groups = G_OC,.type = TYPE_UINT,.status = NOOP,.min = 0,.max = G_MAXINT,.def = "0",
+  {.name = "time-threshold",.groups = GRP_OC,.type = TYPE_UINT,.status = NOOP,.min = 0,.max = G_MAXINT,.def = "0",
       .field = GF (time_threshold),.note = "undocumented; accepted with no effect, as in DeepStream 8.0"},
-  {.name = "mode",.groups = G_LC,.type = TYPE_MODE,.status = SUP,.def = "loose",.field = GF (mode),
+  {.name = "mode",.groups = GRP_LC,.type = TYPE_MODE,.status = SUP,.def = "loose",.field = GF (mode),
       .note = "strict, balanced or loose; any other value reads as loose"},
-  {.name = "mode",.groups = G_DIR,.type = TYPE_STRING,.status = NOOP,
+  {.name = "mode",.groups = GRP_DIR,.type = TYPE_STRING,.status = NOOP,
       .note = "accepted and ignored, as in DeepStream 8.0"},
-  {.name = "extended",.groups = G_LC,.type = TYPE_BOOL,.status = SUP,.def = "0",.field = GF (extended),
+  {.name = "extended",.groups = GRP_LC,.type = TYPE_BOOL,.status = SUP,.def = "0",.field = GF (extended),
       .note = "0: the crossing must hit the segment, 1: the infinite line"},
-  {.name = "roi-<label>",.groups = G_ROI | G_OC,.type = TYPE_POLYGON,.status = SUP, COORD,
+  {.name = "roi-<label>",.groups = GRP_ROI | GRP_OC,.type = TYPE_POLYGON,.status = SUP, COORD,
       .note = "x1;y1;x2;y2;... in order around the polygon, at least 3 points; integers >= 0"},
-  {.name = "line-crossing-<label>",.groups = G_LC,.type = TYPE_LINE,.status = SUP, COORD,
+  {.name = "line-crossing-<label>",.groups = GRP_LC,.type = TYPE_LINE,.status = SUP, COORD,
       .note = "8 integers >= 0: the direction vector (x1;y1;x2;y2), then the line's two ends"},
-  {.name = "direction-<label>",.groups = G_DIR,.type = TYPE_VECTOR,.status = SUP, COORD,
+  {.name = "direction-<label>",.groups = GRP_DIR,.type = TYPE_VECTOR,.status = SUP, COORD,
       .note = "4 integers >= 0: the vector from (x1;y1) to (x2;y2)"},
 };
 
@@ -184,13 +184,19 @@ parse_ints (const KeyInfo * k, const gchar * s, GArray * out, gchar ** reason)
   guint n = g_strv_length (items);
   gboolean ok = TRUE;
 
+  /* "a;b;" is "a;b", and ";" an empty list */
   if (n > 1 && !*g_strstrip (items[n - 1]))
     n--;
+  if (n == 1 && !*g_strstrip (items[0]))
+    n = 0;
   for (guint i = 0; ok && i < n; i++) {
     gchar *item = g_strstrip (items[i]), *why = NULL;
     gdouble v;
 
-    if (!(ok = rds_config_parse_number (item, TRUE, k->min, FALSE, k->max, &v, &why))) {
+    if (!*item) {
+      *reason = g_strdup_printf ("item %u is empty", i + 1);
+      ok = FALSE;
+    } else if (!(ok = rds_config_parse_number (item, TRUE, k->min, FALSE, k->max, &v, &why))) {
       *reason = g_strdup_printf ("%s: %s", item, why);
       g_free (why);
     } else {
@@ -351,6 +357,9 @@ apply_defaults (gpointer base, guint kind)
 static const KeyInfo *
 find_key (guint kind, const gchar * name)
 {
+  /* a locale-suffixed key (KEY[locale]) is no key of ours */
+  if (strchr (name, '['))
+    return NULL;
   for (guint i = 0; i < G_N_ELEMENTS (keys); i++) {
     const KeyInfo *k = &keys[i];
     gsize plen = rule_prefix_len (k);
@@ -381,7 +390,7 @@ parse_property (GKeyFile * kf, const gchar * path, RdsAnalyticsConfig * cfg, GEr
     gchar *raw, *reason = NULL;
     gboolean ok;
 
-    if (!(k->groups & G_PROPERTY))
+    if (!(k->groups & GRP_PROPERTY))
       continue;
     if (!g_key_file_has_key (kf, "property", k->name, NULL)) {
       if (k->required) {
@@ -442,10 +451,10 @@ parse_feature_group (GKeyFile * kf, const gchar * path, const gchar * name, RdsA
       else
         g_ptr_array_add (g->rules, rule);
     } else if (!*raw) {
-      /* an empty class-id means every class */
+      /* an empty class-id means every class; an ignored string (mode in a direction group) may be empty */
       if (k->type == TYPE_INT_LIST)
         g_clear_pointer (&FIELD (GArray *, g, k), g_array_unref);
-      else
+      else if (k->type != TYPE_STRING)
         ok = key_error (error, path, name, names[i], raw, "empty value");
     } else if (!parse_value (k, raw, k->field ? g : NULL, &reason)) {
       ok = key_error (error, path, name, names[i], raw, "%s", reason);
@@ -471,9 +480,21 @@ compare_streams (gconstpointer a, gconstpointer b)
 }
 
 static RdsAnalyticsStream *
+find_stream (const RdsAnalyticsConfig * cfg, guint pad_index)
+{
+  for (guint i = 0; i < cfg->streams->len; i++) {
+    RdsAnalyticsStream *s = g_ptr_array_index (cfg->streams, i);
+
+    if (s->pad_index == pad_index)
+      return s;
+  }
+  return NULL;
+}
+
+static RdsAnalyticsStream *
 get_stream (RdsAnalyticsConfig * cfg, guint pad_index)
 {
-  RdsAnalyticsStream *s = (RdsAnalyticsStream *) rds_analytics_config_get_stream (cfg, pad_index);
+  RdsAnalyticsStream *s = find_stream (cfg, pad_index);
 
   if (!s) {
     s = g_new0 (RdsAnalyticsStream, 1);
@@ -516,16 +537,21 @@ parse_group (GKeyFile * kf, const gchar * path, const gchar * name, RdsAnalytics
     if (!g_str_has_prefix (rest, "stream-"))
       break;
     rest += strlen ("stream-");
-    /* ours: a bad stream number is an error */
-    if (!is_digits (rest) || !g_ascii_string_to_unsigned (rest, 10, 0, G_MAXUINT, &n, NULL))
-      return group_error (error, path, name, "%s: not a stream number (the frame meta's pad_index)", rest);
+    /* ours: a bad stream number is an error. Leading zeros are refused, so each stream has one spelling: GKeyFile
+     * merges repeated headers of one spelling, never "-7" and "-007". */
+    if (!is_digits (rest) || (rest[0] == '0' && rest[1]) || !g_ascii_string_to_unsigned (rest, 10, 0, G_MAXUINT, &n,
+            NULL))
+      return group_error (error, path, name, "%s: not a stream number (the frame meta's pad_index, without leading "
+          "zeros)", rest);
     s = get_stream (cfg, (guint) n);
+    /* cannot happen with one spelling per stream; an error rather than a dropped group if it ever does */
+    if (s->groups[f])
+      return group_error (error, path, name, "a second %s group for stream %u", features[f].name, (guint) n);
     g = g_new0 (RdsAnalyticsGroup, 1);
     g->feature = f;
     g->pad_index = (guint) n;
     g->rules = g_ptr_array_new_with_free_func ((GDestroyNotify) rule_free);
     apply_defaults (g, features[f].kind);
-    /* GKeyFile merges repeated group headers, so a feature has one group per stream */
     s->groups[f] = g;
     return parse_feature_group (kf, path, name, g, error);
   }
@@ -546,7 +572,8 @@ rds_analytics_config_load (const gchar * path, GError ** error)
   g_return_val_if_fail (path != NULL, NULL);
 
   kf = g_key_file_new ();
-  if (!g_key_file_load_from_file (kf, path, G_KEY_FILE_NONE, &err)) {
+  /* with the translations kept, a locale-suffixed key is seen (and logged as unknown), not silently dropped */
+  if (!g_key_file_load_from_file (kf, path, G_KEY_FILE_KEEP_TRANSLATIONS, &err)) {
     g_set_error (error, RDS_ANALYTICS_CONFIG_ERROR, err->domain == G_KEY_FILE_ERROR
         && err->code != G_KEY_FILE_ERROR_NOT_FOUND ? RDS_ANALYTICS_CONFIG_ERROR_PARSE
         : RDS_ANALYTICS_CONFIG_ERROR_FILE, "%s: can't read the config: %s", path, err->message);
@@ -557,7 +584,7 @@ rds_analytics_config_load (const gchar * path, GError ** error)
 
   cfg = g_new0 (RdsAnalyticsConfig, 1);
   cfg->streams = g_ptr_array_new_with_free_func ((GDestroyNotify) stream_free);
-  apply_defaults (cfg, G_PROPERTY);
+  apply_defaults (cfg, GRP_PROPERTY);
   if (!g_key_file_has_group (kf, "property"))
     ok = group_error (error, path, "property", "missing group (the config needs it)");
   else
@@ -591,13 +618,7 @@ rds_analytics_config_get_stream (const RdsAnalyticsConfig * cfg, guint pad_index
 {
   g_return_val_if_fail (cfg != NULL, NULL);
 
-  for (guint i = 0; i < cfg->streams->len; i++) {
-    const RdsAnalyticsStream *s = g_ptr_array_index (cfg->streams, i);
-
-    if (s->pad_index == pad_index)
-      return s;
-  }
-  return NULL;
+  return find_stream (cfg, pad_index);
 }
 
 const gchar *
@@ -612,7 +633,7 @@ groups_text (guint groups)
 {
   GString *str;
 
-  if (groups & G_PROPERTY)
+  if (groups & GRP_PROPERTY)
     return g_strdup ("property");
   str = g_string_new (NULL);
   for (guint f = 0; f < RDS_ANALYTICS_N_FEATURES; f++)
@@ -679,7 +700,7 @@ rds_analytics_config_check_table (GError ** error)
     for (guint j = 0; j < i; j++)
       if ((keys[j].groups & k->groups) && !strcmp (keys[j].name, k->name))
         return table_error (error, k, "listed twice for one group kind");
-    if (!k->groups || ((k->groups & G_PROPERTY) && k->groups != G_PROPERTY))
+    if (!k->groups || ((k->groups & GRP_PROPERTY) && k->groups != GRP_PROPERTY))
       return table_error (error, k, "a key is in [property] or in feature groups, not both");
     if (rule != (rule_prefix_len (k) > 0) || (rule && !g_str_has_suffix (k->name, "<label>")))
       return table_error (error, k, "rule keys, and only they, are named <prefix><label>");
@@ -691,7 +712,7 @@ rds_analytics_config_check_table (GError ** error)
       return table_error (error, k, "strings are not stored");
     if (k->status != RDS_ANALYTICS_KEY_SUPPORTED && !k->note)
       return table_error (error, k, "keys that are not supported need a note");
-    if (k->required && (k->def || k->groups != G_PROPERTY))
+    if (k->required && (k->def || k->groups != GRP_PROPERTY))
       return table_error (error, k, "required keys are [property] keys with no default");
     if (k->def_ours && !k->def)
       return table_error (error, k, "a default marked ours needs a default");
