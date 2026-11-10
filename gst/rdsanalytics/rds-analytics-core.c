@@ -1,6 +1,6 @@
 /* Redstream: the rdsanalytics core. Geometry: rule scaling, the reference point of a box and the inside test. The
- * per-stream state and the features: ROI filtering, overcrowding, the object counts, the per-object histories and
- * direction with the STOPPED state.
+ * per-stream state and the features: ROI filtering, overcrowding, the object counts, the per-object histories,
+ * direction with the STOPPED state, and line crossing.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-analytics-core.h"
 
@@ -152,13 +152,15 @@ typedef struct
   RdsAnalyticsClassCount *counts;
 } WindowFrame;
 
-/* One object's history: its last HISTORY_WINDOW points and how many it has had. */
+/* One object's history: its last HISTORY_WINDOW points and how many it has had, and the lines it has been counted
+ * on. */
 typedef struct
 {
   guint64 id;                   /* the hash table's key */
   RdsAnalyticsPoint win[HISTORY_WINDOW];        /* a ring, the oldest at head */
   guint head, len;
   guint64 n_obs;                /* observations so far; n = n_obs - 1 */
+  gboolean lc_counted[];        /* per line of the stream's line-crossing group: already counted */
 } History;
 
 static void
@@ -171,6 +173,8 @@ typedef struct
 {
   const CoreRules *rules;       /* NULL: the stream has no enabled group */
   GHashTable *histories;        /* guint64 * id -> History *, when the stream has direction or line crossing */
+  guint n_lines;                /* the lines of its line-crossing group; 0 without one */
+  guint64 *lc_cum;              /* objLCCumCnt per line, apart from the histories so that a reset can keep them */
   gboolean untracked_warned;    /* untracked_warning was given */
   GArray *classes;              /* ClassWindow, sorted by (guint) class_id */
   /* the window's frames: a ring of n_slots slots, the oldest at head, n_frames in use; it grows when full */
@@ -185,6 +189,7 @@ typedef struct
 {
   guint roi_first, n_roi;
   guint oc_first, n_oc;
+  guint lc_first, n_lc;
   gsize status, dir_status;
   gboolean stopped;
 } ObjectSpans;
@@ -198,6 +203,7 @@ struct _RdsAnalyticsCore
   /* the frame result, reused */
   GArray *roi_counts;           /* RdsAnalyticsRoiCount */
   GArray *oc;                   /* RdsAnalyticsOcStatus */
+  GArray *lc;                   /* RdsAnalyticsLcCount */
   GArray *obj_cnt;              /* RdsAnalyticsClassCount */
   GArray *objects;              /* RdsAnalyticsObjectResult */
   GArray *spans;                /* ObjectSpans */
@@ -282,6 +288,7 @@ stream_state_free (StreamState * st)
   g_free (st->slots);
   g_array_unref (st->classes);
   g_clear_pointer (&st->histories, g_hash_table_unref);
+  g_free (st->lc_cum);
   g_free (st);
 }
 
@@ -320,6 +327,7 @@ rds_analytics_core_new (const RdsAnalyticsConfig * cfg, guint out_w, guint out_h
 
   core->roi_counts = g_array_new (FALSE, FALSE, sizeof (RdsAnalyticsRoiCount));
   core->oc = g_array_new (FALSE, FALSE, sizeof (RdsAnalyticsOcStatus));
+  core->lc = g_array_new (FALSE, FALSE, sizeof (RdsAnalyticsLcCount));
   core->obj_cnt = g_array_new (FALSE, FALSE, sizeof (RdsAnalyticsClassCount));
   core->objects = g_array_new (FALSE, FALSE, sizeof (RdsAnalyticsObjectResult));
   core->spans = g_array_new (FALSE, FALSE, sizeof (ObjectSpans));
@@ -339,6 +347,7 @@ rds_analytics_core_free (RdsAnalyticsCore * core)
   g_hash_table_unref (core->rules);
   g_array_unref (core->roi_counts);
   g_array_unref (core->oc);
+  g_array_unref (core->lc);
   g_array_unref (core->obj_cnt);
   g_array_unref (core->objects);
   g_array_unref (core->spans);
@@ -363,6 +372,10 @@ get_stream (RdsAnalyticsCore * core, guint pad_index)
     if (st->rules != NULL && (st->rules->groups[RDS_ANALYTICS_DIRECTION] != NULL
             || st->rules->groups[RDS_ANALYTICS_LINE_CROSSING] != NULL))
       st->histories = g_hash_table_new_full (g_int64_hash, g_int64_equal, NULL, (GDestroyNotify) history_free);
+    if (st->rules != NULL && st->rules->groups[RDS_ANALYTICS_LINE_CROSSING] != NULL) {
+      st->n_lines = st->rules->groups[RDS_ANALYTICS_LINE_CROSSING]->n_rules;
+      st->lc_cum = g_new0 (guint64, st->n_lines);
+    }
     g_hash_table_insert (core->streams, GUINT_TO_POINTER (pad_index), st);
   }
   return st;
@@ -587,7 +600,7 @@ history_get (StreamState * st, guint64 id)
   History *h = g_hash_table_lookup (st->histories, &id);
 
   if (h == NULL) {
-    h = g_new0 (History, 1);
+    h = g_malloc0 (sizeof (History) + st->n_lines * sizeof (gboolean));
     h->id = id;
     g_hash_table_insert (st->histories, &h->id, h);
   }
@@ -716,6 +729,114 @@ direction_eval (RdsAnalyticsCore * core, const CoreGroup * dir, const History * 
 }
 
 /* ------------------------------------------------------------------------------------------------------------ */
+/* Line crossing */
+
+/* DeepStream 8.0 behaviour: per mode, the earliest n, the least |d| and the angle limit between d and the rule's
+ * vector: cos > 0 (loose: under 90 degrees), cos > 0.5 (balanced: under 60) or cos > 0.8 (strict: under 36.87),
+ * tested as dot > 0 and dot^2 * cos2_den > cos2_num * |d|^2 |v|^2. Replayed on 8.0's runs:
+ * - loose: 89 degrees counted, 91 not;
+ * - balanced: integer vectors are never exactly 60 degrees apart, so > and >= agree; 8.0's 60 degree path, whose
+ *   integer points stay a little over 60 until frame 54, counts there, as this rule does;
+ * - strict: 8.0 counted a d 36.24 degrees off the vector, and not a 3-4-5 one at exactly cos = 0.8 (36.87). So the
+ *   limit is in [36.24, 36.87) degrees, strict at 0.8 if it is a cosine; a limit of 36 degrees counts two of 8.0's
+ *   crossings late. Ours: cos > 0.8, the one round limit in that range, strict as the other two. */
+typedef struct
+{
+  guint min_n;
+  gdouble min_dist;
+  gdouble cos2_num, cos2_den;
+} LcMode;
+
+static const LcMode lc_modes[] = {
+  [RDS_ANALYTICS_MODE_LOOSE] = {3, 32.0, 0, 1},
+  [RDS_ANALYTICS_MODE_BALANCED] = {10, 55.0, 1, 4},
+  [RDS_ANALYTICS_MODE_STRICT] = {20, 78.0, 16, 25},
+};
+
+/* Which side of the line through @a and @b the point @p is on: the sign of the cross product (b - a) x (p - a),
+ * exact in 64-bit integers for coordinates below 2^30 */
+static gint64
+line_side (RdsAnalyticsPoint a, RdsAnalyticsPoint b, gint64 px, gint64 py)
+{
+  return ((gint64) b.x - a.x) * (py - a.y) - ((gint64) b.y - a.y) * (px - a.x);
+}
+
+/* Whether an object with reference @ref, newest point @cur and current box width @width crosses @rule (the
+ * direction vector d1 -> d2, then the line l1 - l2) under @g's mode and extended (DeepStream 8.0 behaviour; see
+ * rds-analytics-core.h). The caller checks n and the "already counted" flag. */
+static gboolean
+line_crossed (const CoreGroup * g, const CoreRule * rule, RdsAnalyticsPoint ref, RdsAnalyticsPoint cur,
+    gfloat width)
+{
+  const LcMode *mode = &lc_modes[g->mode];
+  RdsAnalyticsPoint d1 = rule->points[0], d2 = rule->points[1], l1 = rule->points[2], l2 = rule->points[3];
+  gdouble vx = (gdouble) d2.x - d1.x, vy = (gdouble) d2.y - d1.y;
+  gdouble dx = (gdouble) cur.x - ref.x, dy = (gdouble) cur.y - ref.y;
+  gdouble dot = dx * vx + dy * vy;
+  /* DeepStream 8.0 behaviour: "past" is the side of the line the vector points to, the sign of (l2 - l1) x v (in
+   * 8.0's runs every vector started before its line and ended past it, so whether its start point matters is not
+   * known). A vector along the line, or a line of one point, has no past side: never counted (ours). The sides are
+   * exact cross products on the integer points (ours): a point exactly on a slanted line is on it. 8.0 counted
+   * such a point at the line's first end but not in its middle or at its second end, one frame later each time,
+   * as a slope rounded to float, y1 + (x - x1) * (float) ((y2 - y1) / (x2 - x1)), would. */
+  gint64 past = ((gint64) l2.x - l1.x) * ((gint64) d2.y - d1.y) - ((gint64) l2.y - l1.y) * ((gint64) d2.x - d1.x);
+  gint64 s_ref = line_side (l1, l2, ref.x, ref.y), s_cur = line_side (l1, l2, cur.x, cur.y);
+
+  if (past == 0)
+    return FALSE;
+  if (past < 0) {
+    s_ref = -s_ref;
+    s_cur = -s_cur;
+  }
+  /* the reference strictly before the line; the newest point on or past it (loose), strictly past it (balanced,
+   * strict) */
+  if (s_ref >= 0 || s_cur < 0 || (s_cur == 0 && g->mode != RDS_ANALYTICS_MODE_LOOSE))
+    return FALSE;
+  /* |d| >= the mode's least displacement, compared squared: exact on integers */
+  if (dx * dx + dy * dy < mode->min_dist * mode->min_dist)
+    return FALSE;
+  /* the angle, as for direction: squared, in double from integers, so exact while the products stay below 2^53
+   * (coordinates up to about 2^12) */
+  if (dot <= 0 || mode->cos2_den * dot * dot <= mode->cos2_num * (dx * dx + dy * dy) * (vx * vx + vy * vy))
+    return FALSE;
+  if (!g->extended) {
+    /* DeepStream 8.0 behaviour: the crossing must hit the segment, lengthened by half the box width at each end,
+     * strictly (a 20 px box counts from 9 px before an end, not from 10). 8.0's runs crossed horizontal segments
+     * straight down, where every reading agrees; ours: the point where ref -> cur meets the line, projected on the
+     * segment, the current box's width, in double. */
+    gdouble lx = (gdouble) l2.x - l1.x, ly = (gdouble) l2.y - l1.y, len = sqrt (lx * lx + ly * ly);
+    gdouble u = (gdouble) s_ref / (gdouble) (s_ref - s_cur);    /* s_ref < 0 <= s_cur */
+    gdouble cx = ref.x + u * dx, cy = ref.y + u * dy;
+    gdouble t = ((cx - l1.x) * lx + (cy - l1.y) * ly) / len, tol = MAX ((gdouble) width, 0.0) / 2;
+
+    if (!(t > -tol && t < len + tol))
+      return FALSE;
+  }
+  return TRUE;
+}
+
+/* Counts the object of history @h and box width @width on every line of @lc it newly crosses (DeepStream 8.0
+ * behaviour): adds their labels to core->labels, their counts to core->lc and st->lc_cum, and marks them counted */
+static void
+line_crossing_eval (RdsAnalyticsCore * core, StreamState * st, const CoreGroup * lc, History * h, gfloat width)
+{
+  RdsAnalyticsPoint ref, cur;
+
+  if (h->n_obs - 1 < lc_modes[lc->mode].min_n)
+    return;
+  ref = history_reference (h);
+  cur = history_point (h, h->len - 1);
+  for (guint r = 0; r < lc->n_rules; r++) {
+    if (h->lc_counted[r] || !line_crossed (lc, &lc->rules[r], ref, cur, width))
+      continue;
+    h->lc_counted[r] = TRUE;
+    g_array_index (core->lc, RdsAnalyticsLcCount, r).current++;
+    st->lc_cum[r]++;
+    g_ptr_array_add (core->labels, lc->rules[r].label);
+  }
+}
+
+/* ------------------------------------------------------------------------------------------------------------ */
 /* One frame */
 
 void
@@ -723,7 +844,7 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
     const RdsAnalyticsObject * objs, guint n, RdsAnalyticsFrameResult * out)
 {
   StreamState *st;
-  const CoreGroup *roi = NULL, *oc = NULL, *dir = NULL;
+  const CoreGroup *roi = NULL, *oc = NULL, *dir = NULL, *lc = NULL;
   guint n_roi_rules = 0;
 
   g_return_if_fail (core != NULL && out != NULL);
@@ -734,6 +855,7 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
     roi = st->rules->groups[RDS_ANALYTICS_ROI_FILTERING];
     oc = st->rules->groups[RDS_ANALYTICS_OVERCROWDING];
     dir = st->rules->groups[RDS_ANALYTICS_DIRECTION];
+    lc = st->rules->groups[RDS_ANALYTICS_LINE_CROSSING];
   }
   out->untracked_warning = FALSE;
 
@@ -753,6 +875,14 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
 
       g_array_append_val (core->roi_counts, c);
     }
+  }
+
+  /* objLCCurrCnt: every line, from 0 */
+  g_array_set_size (core->lc, 0);
+  for (guint i = 0; lc != NULL && i < lc->n_rules; i++) {
+    RdsAnalyticsLcCount c = { lc->rules[i].label, 0, 0 };
+
+    g_array_append_val (core->lc, c);
   }
 
   g_array_set_size (core->objects, n);
@@ -798,9 +928,10 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
     }
     sp->n_oc = core->labels->len - sp->oc_first;
 
-    /* the history and the direction; untracked objects are skipped (ours) */
+    /* the history, the direction and the line crossings; untracked objects are skipped (ours) */
     g_string_truncate (core->dir, 0);
     sp->stopped = FALSE;
+    sp->lc_first = core->labels->len;
     if (st->histories != NULL) {
       if (o->id == RDS_ANALYTICS_UNTRACKED) {
         if (!st->untracked_warned)
@@ -813,11 +944,21 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
         /* direction and STOPPED only for the classes of the group's class-id (DeepStream 8.0 behaviour) */
         if (dir != NULL && class_passes (dir, o->class_id))
           direction_eval (core, dir, h, o->height, &sp->stopped);
+        /* line crossing only for the classes of the group's class-id; no STOPPED gate (DeepStream 8.0 behaviour) */
+        if (lc != NULL && class_passes (lc, o->class_id))
+          line_crossing_eval (core, st, lc, h, o->width);
       }
     }
+    sp->n_lc = core->labels->len - sp->lc_first;
 
-    /* objStatus: the ROI pieces, then " DIR:<l> " per direction, then " STOPPED " (DeepStream 8.0 behaviour) */
+    /* objStatus: the ROI pieces, then " DIR:<l> " per direction, then " LC:<l> " per line counted on this frame,
+     * then " STOPPED " (DeepStream 8.0 behaviour) */
     g_string_append_len (core->strings, core->dir->str, core->dir->len);
+    for (guint k = 0; k < sp->n_lc; k++) {
+      g_string_append (core->strings, " LC:");
+      g_string_append (core->strings, g_ptr_array_index (core->labels, sp->lc_first + k));
+      g_string_append_c (core->strings, ' ');
+    }
     if (sp->stopped)
       g_string_append (core->strings, " STOPPED ");
     status_len = core->strings->len - sp->status;
@@ -826,7 +967,7 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
     sp->dir_status = core->strings->len;
     g_string_append_len (core->strings, core->dir->str, core->dir->len);
     g_string_append_c (core->strings, '\0');
-    /* a label, a direction or STOPPED (the last two are in objStatus) */
+    /* a label, a direction, a line crossing or STOPPED (the last three are in objStatus) */
     g_array_index (core->objects, RdsAnalyticsObjectResult, i).has_info = sp->n_roi > 0 || sp->n_oc > 0
         || status_len > 0;
   }
@@ -841,6 +982,8 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
     r->n_roi_labels = sp->n_roi;
     r->oc_labels = labels != NULL ? labels + sp->oc_first : NULL;
     r->n_oc_labels = sp->n_oc;
+    r->lc_labels = labels != NULL ? labels + sp->lc_first : NULL;
+    r->n_lc_labels = sp->n_lc;
     r->obj_status = core->strings->str + sp->status;
     r->dir_status = core->strings->str + sp->dir_status;
     r->stopped = sp->stopped;
@@ -856,6 +999,10 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
       g_array_append_val (core->oc, s);
     }
   }
+
+  /* objLCCumCnt */
+  for (guint i = 0; i < core->lc->len; i++)
+    g_array_index (core->lc, RdsAnalyticsLcCount, i).cumulative = st->lc_cum[i];
 
   /* objCnt */
   count_classes (core, objs, n);
@@ -873,6 +1020,8 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
   out->n_roi_counts = core->roi_counts->len;
   out->oc = (const RdsAnalyticsOcStatus *) core->oc->data;
   out->n_oc = core->oc->len;
+  out->lc = (const RdsAnalyticsLcCount *) core->lc->data;
+  out->n_lc = core->lc->len;
   out->obj_cnt = (const RdsAnalyticsClassCount *) core->obj_cnt->data;
   out->n_obj_cnt = core->obj_cnt->len;
   out->objects = (const RdsAnalyticsObjectResult *) core->objects->data;

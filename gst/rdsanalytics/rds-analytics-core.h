@@ -46,7 +46,20 @@ G_GNUC_INTERNAL gboolean rds_analytics_point_in_polygon (RdsAnalyticsPoint p, co
  *   h the current box height (ours: 8.0's h is undetermined), is STOPPED: " STOPPED " in objStatus, no direction.
  * - Otherwise, from n = 10 on, with d = newest point - reference and |d| >= 55 px: every direction rule whose vector
  *   is within 60 degrees of d (cos >= 0.5), in config order.
- * - Untracked objects get neither (ours: 8.0 turns direction and line crossing off for the stream for good). */
+ * - Untracked objects get neither (ours: 8.0 turns direction and line crossing off for the stream for good).
+ *
+ * Line crossing (DeepStream 8.0 behaviour), per line rule (the direction vector d1 -> d2, then the line l1 - l2) and
+ * per object passing the group's class-id filter, until the object has been counted on that line:
+ * - "past" is the side of the line the vector points to, "before" the other one; the sides are exact on the integer
+ *   points, so a point on a slanted line is on it (ours; see line_crossed);
+ * - from n = 3 (loose), 10 (balanced) or 20 (strict) on, with ref the history's reference and d = newest - ref:
+ *   ref strictly before the line, the newest point on or past it (loose) or strictly past it (balanced, strict);
+ * - the angle between d and the vector under 90 degrees (loose), under 60 (balanced) or under 36.87, cos > 0.8
+ *   (strict; ours within 8.0's measured range), and |d| >= 32, 55 or 78 px;
+ * - with extended=0, the crossing hits the segment l1 - l2 lengthened by half the current box width at each end,
+ *   strictly; with extended=1, anywhere on the infinite line.
+ * The object is then counted once on that line: lcStatus and the " LC:<l> " piece on that frame only, and the line's
+ * counts. There is no STOPPED gate. Untracked objects are skipped (ours). */
 
 /* The object id of an object no tracker has given an id: DeepStream's UNTRACKED_OBJECT_ID. */
 #define RDS_ANALYTICS_UNTRACKED G_MAXUINT64
@@ -76,6 +89,14 @@ typedef struct
   gboolean status;
 } RdsAnalyticsOcStatus;
 
+/* One line's objLCCurrCnt and objLCCumCnt entries. */
+typedef struct
+{
+  const gchar *label;
+  guint64 current;              /* the objects counted on this frame */
+  guint64 cumulative;           /* the objects counted on this stream so far (kept by a stream reset: ours) */
+} RdsAnalyticsLcCount;
+
 /* One objCnt entry. */
 typedef struct
 {
@@ -91,13 +112,17 @@ typedef struct
   /* ocStatus: the overcrowding labels the object is in, whatever the status, in config order */
   const gchar *const *oc_labels;
   guint n_oc_labels;
+  /* lcStatus: the lines the object is counted on, on this frame only, in config order */
+  const gchar *const *lc_labels;
+  guint n_lc_labels;
   /* dirStatus: " DIR:<l> " per matching direction rule, in config order; "" when none */
   const gchar *dir_status;
   /* the object is STOPPED (dir_status is then "") */
   gboolean stopped;
-  /* objStatus: " ROI:<l>" per ROI label, then " DIR:<l> " per direction, then " STOPPED "; "" when empty */
+  /* objStatus: " ROI:<l>" per ROI label, then " DIR:<l> " per direction, then " LC:<l> " per line counted on this
+   * frame, then " STOPPED " (DeepStream 8.0 behaviour); "" when empty */
   const gchar *obj_status;
-  /* the object has something to report (a label, a direction or STOPPED): it gets an object meta (DeepStream 8.0
+  /* the object has something to report (a label, a direction, a line crossing or STOPPED): it gets an object meta (DeepStream 8.0
    * behaviour) */
   gboolean has_info;
 } RdsAnalyticsObjectResult;
@@ -114,6 +139,9 @@ typedef struct
   /* ocStatus: every enabled overcrowding label */
   const RdsAnalyticsOcStatus *oc;
   guint n_oc;
+  /* objLCCurrCnt and objLCCumCnt: every enabled line, zeros included */
+  const RdsAnalyticsLcCount *lc;
+  guint n_lc;
   /* objCnt: every class seen on the stream so far, sorted by the class id as unsigned, so -1 comes last (DeepStream
    * 8.0 behaviour: the order of its display-obj-cnt text); see rds_analytics_core_new */
   const RdsAnalyticsClassCount *obj_cnt;

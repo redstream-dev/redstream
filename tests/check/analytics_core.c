@@ -1748,6 +1748,613 @@ test_dir_untracked (void)
   rds_analytics_core_free (core);
 }
 
+/* ------------------------------------------------------------------------------------------------------------ */
+/* Line crossing. As for direction, the scenarios are the ones DeepStream 8.0 was run on, and the expected strings
+ * its observed crossings, object by object: "<label>@<frame>" for each frame the object got that lcStatus label. */
+
+#define LC_RULE_DN "line-crossing-Dn=640;300;640;500;40;400;1240;400\n"
+#define LC_GROUP "[line-crossing-stream-0]\nenable=1\n"
+#define LC_DN(mode) PROPERTY LC_GROUP LC_RULE_DN "class-id=-1\nextended=0\n" mode
+#define LC_LOOSE LC_DN ("mode=loose\n")
+#define LC_BALANCED LC_DN ("mode=balanced\n")
+#define LC_STRICT LC_DN ("mode=strict\n")
+
+/* Runs @n_objs objects with ids 1..@n_objs, @bw x 40 boxes at the bottom centres @fn gives, for @n_frames frames of
+ * stream 0 through @core. Returns each object's crossings, "<label>@<frame>" space-separated, as a NULL-terminated
+ * array. Checks every frame that each line's objLCCurrCnt is the number of objects with its label, objLCCumCnt the
+ * sum of those so far, and that objStatus ends with the " LC:<l> " pieces. */
+static gchar **
+run_lc (RdsAnalyticsCore * core, guint n_objs, guint n_frames, gdouble bw, PathFunc fn)
+{
+  RdsAnalyticsObject *objs = g_new (RdsAnalyticsObject, n_objs);
+  guint *index = g_new (guint, n_objs);
+  GString **runs = g_new (GString *, n_objs);
+  gchar **out = g_new0 (gchar *, n_objs + 1);
+  GHashTable *cum = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+
+  for (guint i = 0; i < n_objs; i++)
+    runs[i] = g_string_new (NULL);
+  for (guint f = 0; f < n_frames; f++) {
+    RdsAnalyticsFrameResult r;
+    guint n = 0;
+
+    for (guint i = 0; i < n_objs; i++) {
+      gdouble cx, by, h = 40;
+
+      if (!fn (i, f, &cx, &by, &h))
+        continue;
+      objs[n] = (RdsAnalyticsObject) { i + 1, 0, (gfloat) (cx - bw / 2), (gfloat) (by - h), (gfloat) bw,
+        (gfloat) h };
+      index[n++] = i;
+    }
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), objs, n, &r);
+    g_assert_cmpuint (r.n_objects, ==, n);
+    for (guint l = 0; l < r.n_lc; l++) {
+      guint64 counted = 0, *c = g_hash_table_lookup (cum, r.lc[l].label);
+
+      for (guint k = 0; k < n; k++)
+        for (guint j = 0; j < r.objects[k].n_lc_labels; j++)
+          counted += g_str_equal (r.objects[k].lc_labels[j], r.lc[l].label);
+      if (c == NULL) {
+        c = g_new0 (guint64, 1);
+        g_hash_table_insert (cum, g_strdup (r.lc[l].label), c);
+      }
+      *c += counted;
+      g_assert_cmpuint (r.lc[l].current, ==, counted);
+      g_assert_cmpuint (r.lc[l].cumulative, ==, *c);
+    }
+    for (guint k = 0; k < n; k++) {
+      const RdsAnalyticsObjectResult *o = &r.objects[k];
+      GString *pieces = g_string_new (NULL);
+
+      for (guint j = 0; j < o->n_lc_labels; j++) {
+        g_string_append_printf (runs[index[k]], "%s%s@%u", runs[index[k]]->len ? " " : "", o->lc_labels[j], f);
+        g_string_append_printf (pieces, " LC:%s ", o->lc_labels[j]);
+      }
+      g_assert_true (g_str_has_suffix (o->obj_status, pieces->str));
+      if (o->n_lc_labels > 0)
+        g_assert_true (o->has_info);
+      g_string_free (pieces, TRUE);
+    }
+  }
+  for (guint i = 0; i < n_objs; i++)
+    out[i] = g_string_free (runs[i], FALSE);
+  g_hash_table_unref (cum);
+  g_free (objs);
+  g_free (index);
+  g_free (runs);
+  return out;
+}
+
+static void
+check_lc (const gchar * config, guint n_frames, gdouble bw, PathFunc fn, const gchar * const *want, guint n_objs)
+{
+  RdsAnalyticsCore *core = core_for_size (config, 1280, 720);
+
+  assert_runs (run_lc (core, n_objs, n_frames, bw, fn), want, n_objs);
+  rds_analytics_core_free (core);
+}
+
+/* Objects crossing y = 400 at 8 px/frame, at a degrees from straight down, from 120 px above */
+static const gdouble lc_sweep_angles[] = { 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 87,
+  89
+};
+
+static gboolean
+lc_sweep_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  gdouble a = RAD (lc_sweep_angles[i]);
+
+  *cx = 80 + i * 55 + 8 * sin (a) * f;
+  *by = 280 + 8 * cos (a) * f;
+  return TRUE;
+}
+
+/* The crossing comes once |d| reaches the mode's displacement within its angle; a mode unset is loose */
+static void
+test_lc_angle_sweep (void)
+{
+  const gchar *loose[] = {
+    "Dn@15", "Dn@16", "Dn@16", "Dn@16", "Dn@16", "Dn@17", "Dn@18", "Dn@19", "Dn@20", "Dn@22", "Dn@24", "Dn@27",
+    "Dn@30", "Dn@36", "Dn@44", "", "", "", "", "",      /* 75 .. 89: past the line's end at x 1240 first */
+  };
+  const gchar *balanced[] = {
+    "Dn@16", "Dn@16", "Dn@16", "Dn@16", "Dn@17", "Dn@17", "Dn@18", "Dn@19", "Dn@20", "Dn@22", "Dn@24", "Dn@27",
+    "Dn@31", "", "", "", "", "", "", "",
+  };
+  const gchar *strict[] = {
+    "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "", "", "", "", "", "", "", "", "", "",
+    "", "",
+  };
+
+  check_lc (LC_DN (""), 60, 20, lc_sweep_path, loose, G_N_ELEMENTS (loose));
+  check_lc (LC_LOOSE, 60, 20, lc_sweep_path, loose, G_N_ELEMENTS (loose));
+  check_lc (LC_BALANCED, 60, 20, lc_sweep_path, balanced, G_N_ELEMENTS (balanced));
+  check_lc (LC_STRICT, 60, 20, lc_sweep_path, strict, G_N_ELEMENTS (strict));
+}
+
+/* Objects at a degrees from straight down, @lc_angle_speed px/frame, their bottom centre on y = 400 at frame
+ * @lc_angle_tcross, spread along the line */
+static const gdouble *lc_angles;
+static guint lc_n_angles;
+static gdouble lc_angle_speed, lc_angle_tcross;
+
+static gboolean
+lc_angle_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  gdouble a = RAD (lc_angles[i]), vx = lc_angle_speed * sin (a), vy = lc_angle_speed * cos (a);
+
+  *cx = 60 + i * (1160.0 / MAX (1, lc_n_angles - 1)) - vx * lc_angle_tcross + vx * f;
+  *by = 400 - vy * lc_angle_tcross + vy * f;
+  return TRUE;
+}
+
+static void
+check_lc_angles (const gchar * config, const gdouble * angles, guint n, gdouble speed, gdouble tcross,
+    guint n_frames, const gchar * const *want)
+{
+  lc_angles = angles;
+  lc_n_angles = n;
+  lc_angle_speed = speed;
+  lc_angle_tcross = tcross;
+  check_lc (config, n_frames, 20, lc_angle_path, want, n);
+}
+
+/* The angle limits, on both sides: loose under 90 degrees, balanced under 60, strict under 36.87 (cos > 0.8);
+ * 8 px/frame, crossing at frame 30.5 */
+static void
+test_lc_angle_limits (void)
+{
+  static const gdouble loose_a[] = { 75, 78, 80, 82, 84, 85, 86, 88, 89, -80, -85, -88 };
+  static const gdouble balanced_a[] = { 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, -58, -60, -62 };
+  static const gdouble strict_a[] = { 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, -33, -35, -37 };
+  const gchar *loose[] = {
+    "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31",
+  };
+  const gchar *balanced[] = {
+    "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31",
+    "Dn@54",                                    /* 60: the integer points make d a little wider than 60 until then */
+    "", "", "", "", "", "Dn@31", "Dn@31", "",
+  };
+  /* 36 degrees counts (its d is 36.24 degrees off at frame 31); -37 never does, though its d is exactly 3-4-5
+   * (cos = 0.8) at frame 50: the limit is strict */
+  const gchar *strict[] = {
+    "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31", "Dn@31", "", "", "", "", "Dn@31", "Dn@31", "",
+  };
+
+  check_lc_angles (LC_LOOSE, loose_a, G_N_ELEMENTS (loose_a), 8, 30.5, 60, loose);
+  check_lc_angles (LC_BALANCED, balanced_a, G_N_ELEMENTS (balanced_a), 8, 30.5, 60, balanced);
+  check_lc_angles (LC_STRICT, strict_a, G_N_ELEMENTS (strict_a), 8, 30.5, 60, strict);
+}
+
+/* A crossing against the direction never counts: 8 px/frame upwards across the line, at 91 to 180 degrees from
+ * the rule's direction */
+static void
+test_lc_wrong_way (void)
+{
+  static const gdouble up_a[] = { 91, 95, 100, 120, 150, 180, -95, -120 };
+  const gchar *want[] = { "", "", "", "", "", "", "", "" };
+
+  check_lc_angles (LC_LOOSE, up_a, G_N_ELEMENTS (up_a), 8, 30.5, 60, want);
+  check_lc_angles (LC_BALANCED, up_a, G_N_ELEMENTS (up_a), 8, 30.5, 60, want);
+  check_lc_angles (LC_STRICT, up_a, G_N_ELEMENTS (up_a), 8, 30.5, 60, want);
+}
+
+/* Static 2 px above the line, then a jump of J px down at frame 20 */
+static const gdouble *lc_jumps;
+static guint lc_n_jumps;
+
+static gboolean
+lc_jump_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  *cx = 40 + i * (1200.0 / lc_n_jumps);
+  *by = 398 + (f >= 20 ? lc_jumps[i] : 0);
+  return TRUE;
+}
+
+/* The displacement limits: |d| >= 32 (loose), 55 (balanced), 78 (strict), inclusive */
+static void
+test_lc_displacement (void)
+{
+  static const gdouble modes_j[] = { 20, 31, 32, 40, 50, 54, 55, 56, 60, 70, 78, 79, 80, 81, 85, 100 };
+  static const gdouble fine_j[] = { 31.5, 31.6, 31.65, 31.7, 31.75, 31.8, 31.9, 32 };
+  static const gdouble strict_j[] = { 70, 71, 72, 73, 74, 75, 76, 77, 77.5, 78 };
+  const gchar *loose[] = {
+    "", "", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20",
+    "Dn@20", "Dn@20", "Dn@20",
+  };
+  const gchar *balanced[] = {
+    "", "", "", "", "", "", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20",
+  };
+  const gchar *strict[] = {
+    "", "", "", "", "", "", "", "", "", "", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20", "Dn@20",
+  };
+  const gchar *fine[] = { "", "", "", "", "", "", "", "Dn@20" };
+  const gchar *strict_fine[] = { "", "", "", "", "", "", "", "", "", "Dn@20" };
+
+  lc_jumps = modes_j;
+  lc_n_jumps = G_N_ELEMENTS (modes_j);
+  check_lc (LC_LOOSE, 40, 20, lc_jump_path, loose, G_N_ELEMENTS (loose));
+  check_lc (LC_BALANCED, 40, 20, lc_jump_path, balanced, G_N_ELEMENTS (balanced));
+  check_lc (LC_STRICT, 40, 20, lc_jump_path, strict, G_N_ELEMENTS (strict));
+  lc_jumps = fine_j;
+  lc_n_jumps = G_N_ELEMENTS (fine_j);
+  check_lc (LC_LOOSE, 30, 20, lc_jump_path, fine, G_N_ELEMENTS (fine));
+  lc_jumps = strict_j;
+  lc_n_jumps = G_N_ELEMENTS (strict_j);
+  check_lc (LC_STRICT, 30, 20, lc_jump_path, strict_fine, G_N_ELEMENTS (strict_fine));
+}
+
+/* Straight down at v px/frame from dist px above the line (plus half a pixel), and one moving up across it */
+static const gdouble lc_speeds[][2] = {
+  {1, 30}, {1, 60}, {2, 30}, {2, 60}, {5, 30}, {5, 100}, {20, 30}, {20, 100}, {60, 30}, {200, 150}, {0.5, 5}, {3, 3},
+};
+
+static gboolean
+lc_speed_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  if (i == G_N_ELEMENTS (lc_speeds)) {
+    *cx = 1180;
+    *by = 500 - 5.0 * f;
+    return TRUE;
+  }
+  *cx = 80 + i * 90;
+  *by = 400 - lc_speeds[i][1] + 0.5 + lc_speeds[i][0] * f;
+  return TRUE;
+}
+
+/* The earliest observation: 3 (loose), 10 (balanced), 20 (strict); an earlier crossing counts then, when the rest
+ * holds. 60 px/f from 30 px above is past the line at observation 1, so its reference is too: never counted. */
+static void
+test_lc_earliest (void)
+{
+  const gchar *loose[] = {
+    "Dn@32", "Dn@60", "Dn@17", "Dn@30", "Dn@7", "Dn@20", "Dn@3", "Dn@5", "", "Dn@3", "", "Dn@11", "",
+  };
+  const gchar *balanced[] = {
+    "", "", "Dn@28", "Dn@31", "Dn@12", "Dn@21", "Dn@10", "Dn@10", "", "Dn@10", "", "Dn@19", "",
+  };
+  const gchar *strict[] = {
+    "", "", "Dn@40", "Dn@40", "Dn@20", "Dn@21", "Dn@20", "Dn@20", "", "Dn@20", "", "Dn@27", "",
+  };
+
+  check_lc (LC_LOOSE, 80, 20, lc_speed_path, loose, G_N_ELEMENTS (loose));
+  check_lc (LC_BALANCED, 80, 20, lc_speed_path, balanced, G_N_ELEMENTS (balanced));
+  check_lc (LC_STRICT, 80, 20, lc_speed_path, strict, G_N_ELEMENTS (strict));
+}
+
+/* At y 350, then 450 from frame k (k = 1..5); then four objects at 380 at frame 0 and y1 = 419, 420, 421, 440 at
+ * frame 1, moving down 2 px/f */
+static gboolean
+lc_early_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  static const gdouble y1[] = { 419, 420, 421, 440 };
+
+  *cx = 80 + i * 100;
+  if (i < 5)
+    *by = f < i + 1 ? 350 : 450;
+  else
+    *by = f == 0 ? 380 : y1[i - 5] + 2.0 * (f - 1);
+  return TRUE;
+}
+
+/* Already past the line at observation 1 never counts: the reference, the mean of the first two points, is on the
+ * line or past it */
+static void
+test_lc_past_at_start (void)
+{
+  const gchar *want[] = {
+    "",                                         /* jump at frame 1: reference (350 + 450) / 2 = 400, on the line */
+    "Dn@3", "Dn@3", "Dn@4", "Dn@5",             /* jumps at frames 2..5: counted from observation 3 */
+    "Dn@7",                                     /* 380, 419: reference 399 */
+    "", "", "",                                 /* 380, 420 / 421 / 440: reference 400 or more */
+  };
+
+  check_lc (LC_LOOSE, 40, 20, lc_early_path, want, G_N_ELEMENTS (want));
+}
+
+/* Down across a segment x 500..800 at 5 px/frame, at bottom-centre x */
+static const gdouble *lc_seg_xs;
+
+static gboolean
+lc_seg_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  *cx = lc_seg_xs[i];
+  *by = 300 + 5.0 * f;
+  return TRUE;
+}
+
+#define LC_SEG(ext) PROPERTY LC_GROUP "line-crossing-S=650;300;650;500;500;400;800;400\nclass-id=-1\nextended=" ext \
+  "\nmode=loose\n"
+
+/* The segment test: the bottom centre within half the box width of the segment, strictly (a 20 px box counts from
+ * x 491 to 809, not at 490 or 810); extended=1 counts the infinite line, a slanted one too */
+static void
+test_lc_segment (void)
+{
+  static const gdouble edge_xs[] = { 480, 485, 488, 489, 490, 491, 492, 495, 505, 795, 805, 808, 809, 810, 811, 812,
+    815, 820
+  };
+  static const gdouble xs[] = { 100, 300, 499, 499.5, 500, 500.5, 650, 799.5, 800, 800.5, 801, 900, 1200 };
+  const gchar *w20[] = {
+    "", "", "", "", "", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "", "", "", "", "",
+  };
+  const gchar *w60[] = {
+    "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20",
+    "S@20", "S@20", "S@20", "S@20",
+  };
+  const gchar *seg[] = {
+    "", "", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "", "",
+  };
+  const gchar *ext[] = {
+    "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20",
+  };
+  /* the line from (500, 380) to (800, 420), extended. Ours: x 650 and 800 reach the line exactly at frames 20 and
+   * 24, and loose counts a point on the line; 8.0 counted them one frame later, as a float slope would (x 500, on
+   * the line's first end at frame 16, it counted at once) */
+  const gchar *slant[] = {
+    "S@7", "S@11", "S@16", "S@16", "S@16", "S@16", "S@20", "S@24", "S@24", "S@24", "S@25", "S@27", "S@35",
+  };
+
+  lc_seg_xs = edge_xs;
+  check_lc (LC_SEG ("0"), 60, 20, lc_seg_path, w20, G_N_ELEMENTS (w20));
+  check_lc (LC_SEG ("0"), 60, 60, lc_seg_path, w60, G_N_ELEMENTS (w60));
+  lc_seg_xs = xs;
+  check_lc (LC_SEG ("0"), 60, 20, lc_seg_path, seg, G_N_ELEMENTS (seg));
+  check_lc (LC_SEG ("1"), 60, 20, lc_seg_path, ext, G_N_ELEMENTS (ext));
+  check_lc (PROPERTY LC_GROUP "line-crossing-S=650;300;650;500;500;380;800;420\nclass-id=-1\nextended=1\n"
+      "mode=loose\n", 60, 20, lc_seg_path, slant, G_N_ELEMENTS (slant));
+}
+
+/* Behaviours on the line y = 400 (Dn), with its reverse Up and a second line Dn2 at y = 550 */
+static gboolean
+lc_behav_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  *cx = 80 + i * 100;
+  switch (i) {
+    case 0:                    /* down and up between 300 and 500 at 5 px/f, 40-frame legs */
+      *by = (f / 40) % 2 == 0 ? 300 + 5.0 * (f % 40) : 500 - 5.0 * (f % 40);
+      break;
+    case 1:                    /* jitter 398 / 402 from frame 19 to 59, then down */
+      *by = f < 19 ? 300 + 5.0 * f : f < 60 ? (f % 2 ? 398 : 402) : 402 + 5.0 * (f - 60);
+      break;
+    case 2:                    /* lost for frames 18..27 (y 390 -> 440 in the gap) */
+      if (f >= 18 && f < 28)
+        return FALSE;
+      *by = 300 + 5.0 * f;
+      break;
+    case 3:                    /* lost at frame 18 for good */
+    case 4:
+      if (f >= 18)
+        return FALSE;
+      *by = 300 + 5.0 * f;
+      break;
+    case 5:                    /* stops at 395 for frames 19..29, then crosses */
+      *by = 300 + 5.0 * MIN (f, 19) + (f >= 30 ? 5.0 * (f - 30) : 0);
+      break;
+    case 6:                    /* on the line exactly from frame 1 to 29, then down */
+      *by = f < 1 ? 395 : f < 30 ? 400 : 400 + 5.0 * (f - 29);
+      break;
+    case 7:                    /* down across, then back up once */
+      *by = f < 30 ? 300 + 5.0 * f : 450 - 5.0 * (f - 30);
+      break;
+    default:                   /* 20 px/f, on the line exactly at frame 10 */
+      *by = f < 10 ? 200 + 20.0 * f : 400 + 20.0 * (f - 10);
+      break;
+  }
+  return TRUE;
+}
+
+/* Counted once per object and line: back and forth, jitter around the line, a gap, a stop before the line, a point
+ * exactly on it (loose counts it), a way back that the reverse rule counts once the reference has slid past the
+ * line */
+static void
+test_lc_once (void)
+{
+  const gchar *want[] = {
+    "Dn@20 Up@68", "Dn@20 Dn2@90", "Dn@28 Dn2@50", "", "", "Dn@31 Dn2@61", "Dn@35 Dn2@59", "Dn@20 Up@68",
+    "Dn@10 Dn2@18",
+  };
+  const gchar *want_dn[] = {
+    "Dn@20", "Dn@20", "Dn@28", "", "", "Dn@31", "Dn@35", "Dn@20", "Dn@10",
+  };
+
+  check_lc (PROPERTY LC_GROUP LC_RULE_DN "line-crossing-Up=640;500;640;300;40;400;1240;400\n"
+      "line-crossing-Dn2=640;450;640;650;40;550;1240;550\nclass-id=-1\nextended=0\nmode=loose\n", 120, 20,
+      lc_behav_path, want, G_N_ELEMENTS (want));
+  check_lc (LC_LOOSE, 120, 20, lc_behav_path, want_dn, G_N_ELEMENTS (want_dn));
+}
+
+/* Re-crossing inside the window: down across, back above, down again */
+static gboolean
+lc_recross_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  if (i == 0) {
+    *cx = 300;
+    *by = f >= 30 ? 420 + 4.0 * (f - 30) : f < 10 ? 380 + 4.0 * f : f < 20 ? 420 - 4.0 * (f - 10) :
+        380 + 4.0 * (f - 20);
+  } else {
+    *cx = 600;
+    *by = f < 20 ? 300 + 8.0 * f : f < 40 ? 460 - 8.0 * (f - 20) : 300 + 8.0 * (f - 40);
+  }
+  return TRUE;
+}
+
+static void
+test_lc_recross (void)
+{
+  const gchar *want[] = { "Dn@9", "Dn@13" };
+
+  check_lc (LC_LOOSE, 80, 20, lc_recross_path, want, G_N_ELEMENTS (want));
+}
+
+/* After 60 observations at rest (a full window), crossings count on the frame |d| reaches the mode's displacement:
+ * no STOPPED gate. Seven objects at y 380 moving down from frame 60 at v px/frame, then twelve at y 398
+ * jumping J px at frame 60. */
+static const gdouble lc_wait_speeds[] = { 1, 2, 3, 5, 10, 20, 50 };
+static const gdouble lc_wait_jumps[] = { 25, 31, 32, 40, 54, 55, 60, 77, 78, 80, 100, 150 };
+
+static gboolean
+lc_wait_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  *cx = 60 + i * 61;
+  if (i < G_N_ELEMENTS (lc_wait_speeds))
+    *by = 380 + lc_wait_speeds[i] * MAX (0, (gint) f - 60);
+  else
+    *by = 398 + (f >= 60 ? lc_wait_jumps[i - G_N_ELEMENTS (lc_wait_speeds)] : 0);
+  return TRUE;
+}
+
+static void
+test_lc_after_wait (void)
+{
+  const gchar *loose[] = {
+    "Dn@92", "Dn@76", "Dn@71", "Dn@67", "Dn@64", "Dn@62", "Dn@61",
+    "", "", "Dn@60", "Dn@60", "Dn@60", "Dn@60", "Dn@60", "Dn@60", "Dn@60", "Dn@60", "Dn@60", "Dn@60",
+  };
+  const gchar *balanced[] = {
+    "", "Dn@88", "Dn@79", "Dn@71", "Dn@66", "Dn@63", "Dn@62",
+    "", "", "", "", "", "Dn@60", "Dn@60", "Dn@60", "Dn@60", "Dn@60", "Dn@60", "Dn@60",
+  };
+  const gchar *strict[] = {
+    "", "Dn@99", "Dn@86", "Dn@76", "Dn@68", "Dn@64", "Dn@62",
+    "", "", "", "", "", "", "", "", "Dn@60", "Dn@60", "Dn@60", "Dn@60",
+  };
+
+  check_lc (LC_LOOSE, 140, 20, lc_wait_path, loose, G_N_ELEMENTS (loose));
+  check_lc (LC_BALANCED, 140, 20, lc_wait_path, balanced, G_N_ELEMENTS (balanced));
+  check_lc (LC_STRICT, 140, 20, lc_wait_path, strict, G_N_ELEMENTS (strict));
+  /* with a direction group too, where the objects are STOPPED from observation 50 */
+  check_lc (LC_LOOSE "[direction-detection-stream-0]\nenable=1\ndirection-S=400;360;400;560\n", 140, 20,
+      lc_wait_path, loose, G_N_ELEMENTS (loose));
+}
+
+/* Untracked objects are skipped (ours) and leave the tracked ones counting; the group's class-id filter applies
+ * to every line; the counts are per line, in config order, and per stream, cumulative over the objects. Everything
+ * moves down 10 px/frame from y 300: on Dn (y 400, loose counts a point on the line) at frame 10, on Far (y 600) at
+ * frame 30. Objects: an untracked class 0, id 1 class 0, id 2 class 1, id 3 class 2, then ids 10..13 of class 0
+ * starting at frames 0, 5, 10, 15. */
+static guint
+lc_counts_frame (guint f, RdsAnalyticsObject * objs)
+{
+  guint n = 0;
+
+  objs[n++] = obj_at (RDS_ANALYTICS_UNTRACKED, 0, 100, 300 + 10 * f);
+  objs[n++] = obj_at (1, 0, 200, 300 + 10 * f);
+  objs[n++] = obj_at (2, 1, 300, 300 + 10 * f);
+  objs[n++] = obj_at (3, 2, 400, 300 + 10 * f);
+  for (guint k = 0; k < 4; k++)
+    if (f >= 5 * k)
+      objs[n++] = obj_at (10 + k, 0, 500 + 100 * k, 300 + 10 * (f - 5 * k));
+  return n;
+}
+
+static void
+test_lc_counts (void)
+{
+  RdsAnalyticsCore *core = core_for (PROPERTY LC_GROUP LC_RULE_DN
+      "line-crossing-Far=640;300;640;500;40;600;1240;600\nclass-id=0;2\n"
+      "[line-crossing-stream-1]\nenable=1\n" LC_RULE_DN);
+  RdsAnalyticsFrameResult r;
+  guint64 cum_dn = 0, cum_far = 0;
+
+  for (guint f = 0; f < 40; f++) {
+    RdsAnalyticsObject objs[8];
+    guint n = lc_counts_frame (f, objs);
+    /* the object indices counted on this frame, per line */
+    const gchar *dn = f == 10 ? "1,3,4" : f == 15 ? "5" : f == 20 ? "6" : f == 25 ? "7" : "";
+    const gchar *far = f == 30 ? "1,3,4" : f == 35 ? "5" : "";
+    GString *got_dn = g_string_new (NULL), *got_far = g_string_new (NULL);
+
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), objs, n, &r);
+    g_assert_cmpint (r.untracked_warning, ==, f == 0);
+    g_assert_cmpuint (r.n_lc, ==, 2);
+    g_assert_cmpstr (r.lc[0].label, ==, "Dn");
+    g_assert_cmpstr (r.lc[1].label, ==, "Far");
+    for (guint k = 0; k < n; k++) {
+      const RdsAnalyticsObjectResult *o = &r.objects[k];
+
+      for (guint j = 0; j < o->n_lc_labels; j++) {
+        GString *g = g_str_equal (o->lc_labels[j], "Dn") ? got_dn : got_far;
+
+        g_string_append_printf (g, "%s%u", g->len ? "," : "", k);
+      }
+      g_assert_cmpint (o->has_info, ==, o->n_lc_labels > 0);
+    }
+    g_assert_cmpstr (got_dn->str, ==, dn);
+    g_assert_cmpstr (got_far->str, ==, far);
+    g_string_free (got_dn, TRUE);
+    g_string_free (got_far, TRUE);
+    if (f == 10)
+      g_assert_cmpstr (r.objects[1].obj_status, ==, " LC:Dn ");
+    cum_dn += f == 10 ? 3 : (f == 15 || f == 20 || f == 25) ? 1 : 0;
+    cum_far += f == 30 ? 3 : f == 35 ? 1 : 0;
+    g_assert_cmpuint (r.lc[0].current, ==, f == 10 ? 3 : (f == 15 || f == 20 || f == 25) ? 1 : 0);
+    g_assert_cmpuint (r.lc[0].cumulative, ==, cum_dn);
+    g_assert_cmpuint (r.lc[1].current, ==, f == 30 ? 3 : f == 35 ? 1 : 0);
+    g_assert_cmpuint (r.lc[1].cumulative, ==, cum_far);
+
+    /* stream 1, no class filter: the same objects until frame 20, then only the first two; its own histories and
+     * counts (ids 1, 2, 3 and 10 at frame 10, 11 at 15; 12 is gone before it reaches the line) */
+    rds_analytics_core_process_frame (core, 1, FRAME_30FPS (f), objs, f < 20 ? n : 2, &r);
+    g_assert_cmpint (r.untracked_warning, ==, f == 0);
+    g_assert_cmpuint (r.n_lc, ==, 1);
+    g_assert_cmpuint (r.lc[0].current, ==, f == 10 ? 4 : f == 15 ? 1 : 0);
+    g_assert_cmpuint (r.lc[0].cumulative, ==, f < 10 ? 0 : f < 15 ? 4 : 5);
+  }
+  g_assert_cmpuint (cum_dn, ==, 6);
+  g_assert_cmpuint (cum_far, ==, 4);
+  rds_analytics_core_free (core);
+}
+
+/* A stream with only other groups has no line counts; a line-crossing group with enable=0 none either */
+static void
+test_lc_no_group (void)
+{
+  RdsAnalyticsCore *core = core_for (PROPERTY "[roi-filtering-stream-0]\nenable=1\n"
+      "roi-RF=0;0;1280;0;1280;720;0;720\n" "[line-crossing-stream-1]\nenable=0\n" LC_RULE_DN);
+  RdsAnalyticsFrameResult r;
+
+  for (guint f = 0; f < 20; f++) {
+    RdsAnalyticsObject o = obj_at (1, 0, 200, 300 + 10 * f);
+
+    for (guint pad = 0; pad < 3; pad++) {
+      rds_analytics_core_process_frame (core, pad, FRAME_30FPS (f), &o, 1, &r);
+      g_assert_cmpuint (r.n_lc, ==, 0);
+      g_assert_cmpuint (r.objects[0].n_lc_labels, ==, 0);
+      g_assert_cmpstr (r.objects[0].obj_status, ==, pad == 0 ? " ROI:RF" : "");
+    }
+  }
+  rds_analytics_core_free (core);
+}
+
+/* objStatus order: ROI, DIR, LC, STOPPED (DeepStream 8.0 behaviour) */
+static void
+test_lc_obj_status (void)
+{
+  RdsAnalyticsCore *core = core_for (PROPERTY "[roi-filtering-stream-0]\nenable=1\n"
+      "roi-RF=0;0;1280;0;1280;720;0;720\n" LC_GROUP LC_RULE_DN "line-crossing-E=600;300;800;300;700;100;700;600\n"
+      "[direction-detection-stream-0]\nenable=1\ndirection-S=400;360;400;560\n");
+  RdsAnalyticsFrameResult r;
+
+  for (guint f = 0; f < 70; f++) {
+    /* down 10 px/f, on Dn at frame 10; static 10 px before E (x 700) for 60 frames, then 40 px east across it: too
+     * small a step to leave STOPPED */
+    RdsAnalyticsObject objs[] = { obj_at (1, 0, 200, 300 + 10 * f), obj_at (2, 0, f < 60 ? 690 : 730, 400) };
+
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), objs, 2, &r);
+    if (f == 10)
+      g_assert_cmpstr (r.objects[0].obj_status, ==, " ROI:RF DIR:S  LC:Dn ");
+    if (f == 11)
+      g_assert_cmpstr (r.objects[0].obj_status, ==, " ROI:RF DIR:S ");
+    if (f == 60)
+      g_assert_cmpstr (r.objects[1].obj_status, ==, " ROI:RF LC:E  STOPPED ");
+    if (f == 61)
+      g_assert_cmpstr (r.objects[1].obj_status, ==, " ROI:RF STOPPED ");
+  }
+  rds_analytics_core_free (core);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1794,5 +2401,18 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-core/direction/obj-status", test_dir_obj_status);
   g_test_add_func ("/cpu/analytics-core/direction/needs-group", test_dir_needs_group);
   g_test_add_func ("/cpu/analytics-core/direction/untracked", test_dir_untracked);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/angle-sweep", test_lc_angle_sweep);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/angle-limits", test_lc_angle_limits);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/wrong-way", test_lc_wrong_way);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/displacement", test_lc_displacement);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/earliest", test_lc_earliest);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/past-at-start", test_lc_past_at_start);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/segment", test_lc_segment);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/once", test_lc_once);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/recross", test_lc_recross);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/after-wait", test_lc_after_wait);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/counts", test_lc_counts);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/no-group", test_lc_no_group);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/obj-status", test_lc_obj_status);
   return g_test_run ();
 }
