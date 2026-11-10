@@ -335,6 +335,16 @@ test('analytics_config', executable('analytics_config', 'check' / 'analytics_con
 test('analytics_core', executable('analytics_core', 'check' / 'analytics_core.c',
     dependencies : [rdsanalytics_core_dep]),
   suite : 'cpu', env : internal_test_env, protocol : 'tap')
+# The analytics metas (libgstrds-analytics) through their C API: attach, read back, deep copies, release (leaks and
+# double frees show under ASan).
+test('analytics_meta', executable('analytics_meta', 'check' / 'analytics_meta.c',
+    dependencies : [rds_analytics_dep]),
+  suite : 'cpu', env : test_env, protocol : 'tap')
+# DeepStream-style C++ reading the metas through the compat names; it includes only rds/rds_compat.h and
+# rds/rds-analytics-meta.h.
+test('analytics_meta_compat', executable('analytics_meta_compat', 'check' / 'analytics_meta_compat.cpp',
+    dependencies : [rds_analytics_dep]),
+  suite : 'cpu', env : test_env, protocol : 'tap')
 
 if rds_tracker_enabled and rds_infer_enabled
   # rdstracker end to end on a public street clip with YOLO11n (pipeline_tracker; skipped until

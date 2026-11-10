@@ -1,6 +1,8 @@
 /* Compile-time coverage of every alias in rds/rds-compat-aliases.h: each type, function and constant is used once.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <rds/rds_compat.h>
+/* the Redstream names of the analytics metas (the NvDs aliases need only rds_compat.h) */
+#include <rds/rds-analytics-meta.h>
 
 /* The unprefixed nvinfer data-type names (FLOAT, HALF, ...) are C++ only: in C they stay free. */
 static const int FLOAT = 0, HALF = 1, INT8 = 2, INT32 = 3, INT64 = 4;
@@ -70,6 +72,9 @@ test_types (void)
   { RdsInferObjectDetectionInfo *r = NULL; NvDsInferObjectDetectionInfo *n = r; g_assert_null (n); }
   { RdsInferObjectDetectionInfo *r = NULL; NvDsInferParseObjectInfo *n = r; g_assert_null (n); }
   { RdsInferTensorMeta *r = NULL; NvDsInferTensorMeta *n = r; g_assert_null (n); }
+  /* C++ structs (rds/rds-analytics-meta.h): opaque in C, but the names are there */
+  { RdsAnalyticsFrameMeta *r = NULL; NvDsAnalyticsFrameMeta *n = r; g_assert_null (n); }
+  { RdsAnalyticsObjInfo *r = NULL; NvDsAnalyticsObjInfo *n = r; g_assert_null (n); }
   { RdsTrackerState *r = NULL; TRACKER_STATE *n = r; g_assert_null (n); }
 }
 
@@ -321,6 +326,13 @@ test_constants (void)
   g_assert_true ((gint64) NVDSINFER_TENSOR_OUTPUT_META == (gint64) RDS_INFER_TENSOR_OUTPUT_META);
   /* the documented position in NvDsMetaType */
   g_assert_cmpint (RDS_INFER_TENSOR_OUTPUT_META, ==, 12);
+  g_assert_true ((gint64) NVDS_FRAME_META_NVDSANALYTICS == (gint64) RDS_FRAME_META_ANALYTICS);
+  g_assert_true ((gint64) NVDS_OBJ_META_NVDSANALYTICS == (gint64) RDS_OBJ_META_ANALYTICS);
+  /* DeepStream 8.0: the user meta types are the enum values */
+  g_assert_true ((gint64) NVDS_USER_FRAME_META_NVDSANALYTICS == (gint64) RDS_FRAME_META_ANALYTICS);
+  g_assert_true ((gint64) NVDS_USER_OBJ_META_NVDSANALYTICS == (gint64) RDS_OBJ_META_ANALYTICS);
+  g_assert_cmpint (RDS_FRAME_META_ANALYTICS, ==, 32);
+  g_assert_cmpint (RDS_OBJ_META_ANALYTICS, ==, 33);
   g_assert_true ((gint64) NVDS_TRACKER_PAST_FRAME_META == (gint64) RDS_TRACKER_PAST_FRAME_META);
   g_assert_true ((gint64) NVDS_TRACKER_BATCH_REID_META == (gint64) RDS_TRACKER_BATCH_REID_META);
   g_assert_true ((gint64) NVDS_TRACKER_OBJ_REID_META == (gint64) RDS_TRACKER_OBJ_REID_META);

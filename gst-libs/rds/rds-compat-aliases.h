@@ -173,6 +173,8 @@ typedef RdsMeta NvDsMeta;
 #define NVDS_OBJ_IMAGE_FOOT_LOCATION RDS_OBJ_IMAGE_FOOT_LOCATION
 #define NVDS_OBJ_WORLD_FOOT_LOCATION RDS_OBJ_WORLD_FOOT_LOCATION
 #define NVDS_OBJ_IMAGE_CONVEX_HULL RDS_OBJ_IMAGE_CONVEX_HULL
+#define NVDS_FRAME_META_NVDSANALYTICS RDS_FRAME_META_ANALYTICS
+#define NVDS_OBJ_META_NVDSANALYTICS RDS_OBJ_META_ANALYTICS
 #define NVDS_RESERVED_META RDS_RESERVED_META
 #define NVDS_GST_CUSTOM_META RDS_GST_CUSTOM_META
 #define NVDS_BATCH_GST_META RDS_BATCH_GST_META
@@ -274,6 +276,15 @@ typedef RdsInferParseObjectInfo NvDsInferParseObjectInfo;
 
 /* ---- nvinfer tensor output meta (gstnvdsinfer.h) ---- */
 typedef RdsInferTensorMeta NvDsInferTensorMeta;
+
+/* ---- nvdsanalytics metas (nvds_analytics_meta.h; ours: rds/rds-analytics-meta.h, libgstrds-analytics) ---- */
+/* By struct tag, so this header needs neither the C++ definitions nor the analytics header: C++ code that reads the
+ * fields includes rds/rds-analytics-meta.h too, where DeepStream code includes nvds_analytics_meta.h. */
+typedef struct RdsAnalyticsFrameMeta NvDsAnalyticsFrameMeta;
+typedef struct RdsAnalyticsObjInfo NvDsAnalyticsObjInfo;
+/* DeepStream 8.0: the user meta types are the enum values (before 8.0 they were registered by name). */
+#define NVDS_USER_FRAME_META_NVDSANALYTICS RDS_FRAME_META_ANALYTICS
+#define NVDS_USER_OBJ_META_NVDSANALYTICS RDS_OBJ_META_ANALYTICS
 
 /* The custom bbox parser ABI aliases (nvdsinfer_custom_impl.h) are C++ and live in rds/rds_compat_infer.h. */
 

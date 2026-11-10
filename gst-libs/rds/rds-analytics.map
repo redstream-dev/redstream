@@ -1,0 +1,9 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/* libgstrds-analytics exports its C API only: the C++ standard library's template instantiations (default
+ * visibility in libstdc++'s headers) stay local. */
+{
+  global:
+    rds_analytics_*;
+  local:
+    *;
+};

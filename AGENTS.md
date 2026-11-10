@@ -228,6 +228,9 @@ gst-libs/rds/      libgstrds-1.0 (umbrella header rds.h):
                      (C++) adds the custom parser ABI names, for parser libraries only
   rds-infer*.h       rdsinfer types (C), its tensor output meta (rds-infer-meta.h) and the custom bbox and classifier
                      parser ABI (rds-infer-custom-impl.h, C++); headers only
+  rds-analytics-meta rdsanalytics' frame and object metas: C++ structs with DeepStream's fields, their copy and
+                     release, and a C API over them, in the separate C++ library libgstrds-analytics-1.0
+                     (pkg-config redstream-analytics-1.0; exports only rds_analytics_*, rds-analytics.map)
   rds-transform      rds_buf_surf_transform: batched crop/scale/colour conversion (NvBufSurfTransform-shaped), and
                      rds_buf_surf_transform_composite (many surfaces into one, NvBufSurfTransformComposite-shaped)
   rds-transform-kernels.hip  its HIP kernels (amdclang++, linked in as an object); their device helpers
@@ -405,9 +408,10 @@ meson test -C build-rel --print-errorlogs
   library register the same GTypes twice. They run with `internal_test_env`: no plugin paths and their own
   registry, so even an in-process scan loads no plugin.
 - Library symbols are hidden by default. Mark public API with `RDS_API` (from `rds/rds-prelude.h`).
-- **C++** is used only where MIGraphX and the parser ABI need it (`rds-infer-engine.cpp`, `rds-infer-parse.cpp`), in
-  the same layout as the C code. No exception crosses into C: every C-callable function catches at its boundary and
-  turns the exception into a `GError` (or a failed parse), and calls into user parser libraries are wrapped in
+- **C++** is used only where MIGraphX, the parser ABI and the analytics metas need it (`rds-infer-engine.cpp`,
+  `rds-infer-parse.cpp`, `rds-analytics-meta.cpp`), in the same layout as the C code. No exception crosses into C:
+  every C-callable function catches at its boundary and turns the exception into a `GError`, a failed parse, or a
+  critical and a NULL/FALSE result (the analytics metas), and calls into user parser libraries are wrapped in
   try/catch. Executables that link `rdsinfer-core` need `link_language : 'cpp'`.
 - **Test models.** The committed `tests/models/*.onnx` are our own tiny models (`make-test-models.py`), so the
   element tests run offline and compile in seconds: `scale2` (output = 2 x input), the classifiers `meancls` and

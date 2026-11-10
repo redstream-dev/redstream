@@ -65,6 +65,10 @@ typedef enum
   RDS_OBJ_IMAGE_FOOT_LOCATION,
   RDS_OBJ_WORLD_FOOT_LOCATION,
   RDS_OBJ_IMAGE_CONVEX_HULL,
+  /* rdsanalytics' user metas (rds-analytics-meta.h): 32 and 33 are DeepStream 8.0's numbers for its analytics
+   * frame and object metas, which 8.0 also uses as their user meta types. */
+  RDS_FRAME_META_ANALYTICS = 32,                    /* RdsAnalyticsFrameMeta in a frame user meta */
+  RDS_OBJ_META_ANALYTICS = 33,                      /* RdsAnalyticsObjInfo in an object user meta */
   RDS_RESERVED_META = 4095,
   RDS_GST_CUSTOM_META = 4096,
   RDS_BATCH_GST_META,                               /* RdsMeta wrapping an RdsBatchMeta (rds-gst-meta.h) */

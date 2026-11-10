@@ -2,7 +2,7 @@
 rds_headers = files('rds-prelude.h', 'rds-compat-remap.h', 'rds_compat.h', 'rds-buf-surface.h',
   'rds-memory.h', 'rds-buffer-pool.h', 'rds-osd-types.h', 'rds-meta.h',
   'rds-gst-meta.h', 'rds-event.h', 'rds-transform.h', 'rds.h', 'rds-compat-aliases.h',
-  'rds-infer.h', 'rds-infer-meta.h', 'rds-infer-custom-impl.h', 'rds_compat_infer.h')
+  'rds-infer.h', 'rds-infer-meta.h', 'rds-infer-custom-impl.h', 'rds_compat_infer.h', 'rds-analytics-meta.h')
 install_headers(rds_headers, subdir : 'redstream-' + api_version / 'rds')
 
 hip_arch_args = []
@@ -74,3 +74,28 @@ import('pkgconfig').generate(librds,
   description : 'Redstream: DeepStream-compatible video analytics on AMD ROCm',
   subdirs : 'redstream-' + api_version,
   requires : ['gstreamer-1.0 >= 1.28', 'gstreamer-video-1.0 >= 1.28'])
+
+# libgstrds-analytics: rdsanalytics' metas (C++ structs, DeepStream-shaped) with their create, copy and release
+# functions and the C API over them. A small C++ library of its own, so libgstrds stays C.
+librds_analytics = library('gstrds-analytics-' + api_version,
+  'rds-analytics-meta.cpp',
+  cpp_args : ['-DG_LOG_DOMAIN="rds"', '-DBUILDING_RDS'],
+  include_directories : include_directories('..'),
+  dependencies : [rds_dep],
+  gnu_symbol_visibility : 'hidden',
+  link_args : ['-Wl,--version-script=' + meson.current_source_dir() / 'rds-analytics.map'],
+  link_depends : 'rds-analytics.map',
+  version : meson.project_version(),
+  install_rpath : rds_install_rpath,
+  install : true)
+
+rds_analytics_dep = declare_dependency(link_with : librds_analytics,
+  include_directories : include_directories('..'),
+  dependencies : [rds_dep])
+
+import('pkgconfig').generate(librds_analytics,
+  name : 'redstream-analytics-' + api_version,
+  filebase : 'redstream-analytics-' + api_version,
+  description : 'Redstream: the rdsanalytics metadata (C++ structs and their C API)',
+  subdirs : 'redstream-' + api_version,
+  requires : ['redstream-' + api_version])

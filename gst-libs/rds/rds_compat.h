@@ -3,7 +3,9 @@
  * NvBufSurfTransform*, NvDs*, NvOSD_*, gst_nvevent_*, and the NvDsInfer* types) over the Redstream API; see
  * docs/compat-matrix.md for what is covered. The custom bbox parser ABI (nvdsinfer_custom_impl.h:
  * NvDsInferParseCustomFunc, CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE, the unprefixed FLOAT, ...) is not here but in
- * rds/rds_compat_infer.h (C++), which parsers include in its place.
+ * rds/rds_compat_infer.h (C++), which parsers include in its place. The analytics metas (NvDsAnalyticsFrameMeta,
+ * NvDsAnalyticsObjInfo) are named here by struct tag; their C++ fields come with rds/rds-analytics-meta.h, the
+ * replacement for nvds_analytics_meta.h (library redstream-analytics-1.0).
  *
  *   #ifdef USE_REDSTREAM
  *   #include <rds/rds_compat.h>

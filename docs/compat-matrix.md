@@ -1550,6 +1550,10 @@ matches observed DeepStream 8.0 behaviour; rows marked "ours" are Redstream's ow
 | `NVDS_LABEL_INFO_META` | `RDS_LABEL_INFO_META` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `NVDS_USER_META` | `RDS_USER_META` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `NVDSINFER_TENSOR_OUTPUT_META` | `RDS_INFER_TENSOR_OUTPUT_META` | supported | 12, its documented position in the enum | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
+| `NVDS_FRAME_META_NVDSANALYTICS` | `RDS_FRAME_META_ANALYTICS` | supported | 32, DeepStream 8.0's number (its position in 8.0's enum): the type of rdsanalytics' frame user meta | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvdsmeta_8h.html) |
+| `NVDS_OBJ_META_NVDSANALYTICS` | `RDS_OBJ_META_ANALYTICS` | supported | 33, DeepStream 8.0's number: the type of rdsanalytics' object user meta | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvdsmeta_8h.html) |
+| `NVDS_USER_FRAME_META_NVDSANALYTICS` | `RDS_FRAME_META_ANALYTICS` | supported | the enum value, as in DeepStream 8.0. Before 8.0 it was the type registered as `NVIDIA.DSANALYTICSFRAME.USER_META`; that lookup (`nvds_get_user_meta_type`) gives another type, which rdsanalytics never attaches | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvds__analytics__meta_8h.html) |
+| `NVDS_USER_OBJ_META_NVDSANALYTICS` | `RDS_OBJ_META_ANALYTICS` | supported | as the frame one (`NVIDIA.DSANALYTICSOBJ.USER_META` before 8.0) | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/nvds__analytics__meta_8h.html) |
 | `NVDS_RESERVED_META` | `RDS_RESERVED_META` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2nvdsmeta_8h.html) |
 | `NVDS_GST_CUSTOM_META` | `RDS_GST_CUSTOM_META` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2gstnvdsmeta_8h.html) |
 | `NVDS_BATCH_GST_META` | `RDS_BATCH_GST_META` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2gstnvdsmeta_8h.html) |
@@ -1591,10 +1595,12 @@ matches observed DeepStream 8.0 behaviour; rows marked "ours" are Redstream's ow
 | `nvds_copy_display_meta_list` | `rds_copy_display_meta_list` | supported | appends deep copies to the frame | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsmeta_8h.html) |
 | `gst_buffer_get_nvds_batch_meta` | `gst_buffer_get_rds_batch_meta` | supported |  | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2gstnvdsmeta_8h.html) |
 | `NvDsInferTensorMeta` | `RdsInferTensorMeta` | supported | `rds/rds-infer-meta.h`; the documented fields in order; `priv_data` is rdsinfer's (it keeps the buffers alive). See the `rdsinfer` section | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferTensorMeta.html) |
+| `NvDsAnalyticsFrameMeta` | `RdsAnalyticsFrameMeta` | supported | C++ struct in `rds/rds-analytics-meta.h` (for `nvds_analytics_meta.h`; library `libgstrds-analytics-1.0`, pkg-config `redstream-analytics-1.0`): `ocStatus`, `objInROIcnt`, `objLCCurrCnt`, `objLCCumCnt`, `unique_id`, `objCnt` with the documented types, in the documented order. `rds_compat.h` names it by struct tag, so it is opaque until that header is included. Ours: a C API over it (`rds_analytics_frame_meta_*`: attach, setters, getters by key, foreach). Deep-copied by `rds_batch_meta_copy`, freed with its user meta | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/structNvDsAnalyticsFrameMeta.html) |
+| `NvDsAnalyticsObjInfo` | `RdsAnalyticsObjInfo` | supported | C++ struct in `rds/rds-analytics-meta.h`: `roiStatus`, `ocStatus`, `lcStatus`, `dirStatus`, `unique_id`, `objStatus` with the documented types, in the documented order. Ours: a C API over it (`rds_analytics_obj_info_*`: attach, setters, counts and indexed access) | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/8.0/sdk-api/structNvDsAnalyticsObjInfo.html) |
 
 Not aliased: `gst_buffer_add_nvds_meta` (Redstream attaches the batch with `rds_buffer_add_batch_meta`;
 [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2includes_2gstnvdsmeta_8h.html)), and
-NvDs metadata types and functions Redstream doesn't implement yet (segmentation, analytics, event message, audio).
+NvDs metadata types and functions Redstream doesn't implement yet (segmentation, event message, audio).
 
 ## Stream events (gst-nvevent)
 
