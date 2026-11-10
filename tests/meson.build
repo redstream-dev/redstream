@@ -330,6 +330,11 @@ test('analytics_config', executable('analytics_config', 'check' / 'analytics_con
     dependencies : [rdsanalytics_core_dep],
     c_args : ['-DRDS_COMPAT_MATRIX="@0@"'.format(meson.project_source_root() / 'docs' / 'compat-matrix.md')]),
   suite : 'cpu', env : internal_test_env, protocol : 'tap')
+# The analytics core on scripted objects: rule scaling, the reference point and the inside test (with DeepStream
+# 8.0's observed results on the probe boxes).
+test('analytics_core', executable('analytics_core', 'check' / 'analytics_core.c',
+    dependencies : [rdsanalytics_core_dep]),
+  suite : 'cpu', env : internal_test_env, protocol : 'tap')
 
 if rds_tracker_enabled and rds_infer_enabled
   # rdstracker end to end on a public street clip with YOLO11n (pipeline_tracker; skipped until
