@@ -70,10 +70,14 @@ G_GNUC_INTERNAL gboolean rds_analytics_point_in_polygon (RdsAnalyticsPoint p, co
  * The stream state life cycle:
  * - Eviction (ours: 8.0's limit is unknown, and it kept a history across a 30-frame absence, as this does): a history
  *   unseen for more than 30 s of PTS is dropped, so an id coming back later starts a fresh history and can be
- *   counted again. Without PTS (a frame without one, or a PTS gone back before the history's last sighting) the
- *   age is in the stream's frames instead: more than 900. The histories are swept at most once per second of
- *   stream PTS, or every 30 frames without PTS, so a history can outlive its age by up to that much.
- * - Stream reset (ours): rds_analytics_core_reset_stream.
+ *   counted again. A forward PTS jump of more than 30 s between consecutive frames (a seek or an outage) so drops
+ *   every history. When PTS can't tell (the current frame has none, the history was last seen on a frame without
+ *   one or before the stream's first PTS, or the PTS has gone back before its last sighting) the age is in the
+ *   stream's frames instead: more than 900. Whatever the PTS, a history unseen for more than 7200 frames (30 s at
+ *   240 fps) is dropped too, so a frozen PTS still evicts. The histories are swept on the first frame with a PTS,
+ *   when the PTS goes back, once a second of PTS has passed since the last sweep, and every 30 frames, so a history
+ *   can outlive its age by up to that much.
+ * - Stream reset (ours): rds_analytics_core_reset_stream. Stream removal (ours): rds_analytics_core_remove_stream.
  * - Config reload (DeepStream 8.0 behaviour): everything resets. The caller frees the core
  *   (rds_analytics_core_free) and makes a new one from the new config; no state carries over, the cumulative
  *   counts included. */
@@ -194,6 +198,11 @@ G_GNUC_INTERNAL void rds_analytics_core_process_frame (RdsAnalyticsCore * core, 
  * counted" flags, its untracked-object warning, and its objCnt window and classes. The cumulative line-crossing
  * counts are kept. A pad without state is left alone. */
 G_GNUC_INTERNAL void rds_analytics_core_reset_stream (RdsAnalyticsCore * core, guint pad_index);
+
+/* Frees the state of stream @pad_index, as when its source is removed (ours), but keeps its cumulative
+ * line-crossing counts: a source re-added on the same pad starts fresh and continues them. A pad without state is
+ * left alone. */
+G_GNUC_INTERNAL void rds_analytics_core_remove_stream (RdsAnalyticsCore * core, guint pad_index);
 
 G_END_DECLS
 

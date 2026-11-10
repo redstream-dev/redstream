@@ -2643,6 +2643,138 @@ test_life_absence (void)
   rds_analytics_core_free (core);
 }
 
+/* An object in view through a stretch without PTS is not evicted when PTS comes back (no double count): PTS 0 to
+ * 10 s at 30 fps, id 1 down across Dn at frame 10 and on to y 420; then 1100 frames without PTS, the id back up to
+ * y 300; then PTS from 47 s, the id down across Dn again: its history still has it counted */
+static void
+test_life_no_pts_stretch (void)
+{
+  RdsAnalyticsCore *core = core_for (LC_LOOSE);
+  RdsAnalyticsFrameResult r;
+
+  for (guint f = 0; f < 1421; f++) {
+    guint64 pts = f <= 300 ? FRAME_30FPS (f) : f <= 1400 ? RDS_ANALYTICS_PTS_NONE : SECONDS (47) +
+        FRAME_30FPS (f - 1401);
+    gint y = f <= 300 ? MIN (300 + 10 * (gint) f, 420) : f <= 1400 ? MAX (420 - (gint) (f - 300), 300) :
+        300 + 10 * (gint) (f - 1401);
+
+    g_assert_cmpuint (lc_step (core, 0, pts, 1, 0, y, &r), ==, f == 10);
+    g_assert_cmpuint (r.lc[0].cumulative, ==, f >= 10);
+  }
+  rds_analytics_core_free (core);
+}
+
+static guint64
+pts_frozen (guint f G_GNUC_UNUSED)
+{
+  return SECONDS (5);
+}
+
+/* no PTS until frame 12, then 30 fps */
+static guint64
+pts_late (guint f)
+{
+  return f <= 12 ? RDS_ANALYTICS_PTS_NONE : FRAME_30FPS (f);
+}
+
+/* 100 s on, then back to 0 at frame 13 */
+static guint64
+pts_back (guint f)
+{
+  return f <= 12 ? SECONDS (100) + FRAME_30FPS (f) : FRAME_30FPS (f - 13);
+}
+
+/* The sweep's overshoot and the fallbacks, pinned (ours): last seen at frame 12 */
+static void
+test_life_evict_edges (void)
+{
+  /* 30 fps, swept on frames 0, 30, 60...: unseen for more than 30 s from frame 913, dropped by the sweep at 930 */
+  g_assert_cmpuint (evict_run (929, pts_30fps), ==, 0);
+  g_assert_cmpuint (evict_run (930, pts_30fps), ==, 940);
+  /* frozen PTS: the frame-age backstop, more than 7200 frames, swept every 30 frames (at 7230) */
+  g_assert_cmpuint (evict_run (7229, pts_frozen), ==, 0);
+  g_assert_cmpuint (evict_run (7230, pts_frozen), ==, 7240);
+  /* seen before the stream's first PTS: aged in frames, more than 900; swept from frame 13 (the first PTS) every
+   * 30 frames, so at 913 */
+  g_assert_cmpuint (evict_run (912, pts_late), ==, 0);
+  g_assert_cmpuint (evict_run (913, pts_late), ==, 923);
+  /* a PTS gone back before its last sighting: aged in frames too; the backward PTS sweeps at once (frame 13) */
+  g_assert_cmpuint (evict_run (912, pts_back), ==, 0);
+  g_assert_cmpuint (evict_run (913, pts_back), ==, 923);
+}
+
+/* A reset clears STOPPED: a static object is STOPPED from frame 50, reset at 60, STOPPED again 50 frames on */
+static void
+test_life_reset_stopped (void)
+{
+  RdsAnalyticsCore *core = core_for (DIR_E);
+  RdsAnalyticsFrameResult r;
+
+  for (guint f = 0; f < 120; f++) {
+    RdsAnalyticsObject o = obj_at (1, 0, 640, 300);
+
+    if (f == 60)
+      rds_analytics_core_reset_stream (core, 0);
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), &o, 1, &r);
+    g_assert_cmpint (r.objects[0].stopped, ==, (f >= 50 && f < 60) || f >= 110);
+  }
+  rds_analytics_core_free (core);
+}
+
+/* A reset on a stream without histories (no direction or line crossing) clears its objCnt */
+static void
+test_life_reset_no_histories (void)
+{
+  RdsAnalyticsCore *core = core_for (PROPERTY "[roi-filtering-stream-0]\nenable=1\n"
+      "roi-RF=0;0;1280;0;1280;720;0;720\n");
+  RdsAnalyticsFrameResult r;
+
+  feed_counts (core, 0, FRAME_30FPS (0), 3, 2, &r);
+  g_assert_cmpint (obj_cnt (&r, 3), ==, 2);
+  rds_analytics_core_reset_stream (core, 0);
+  feed_counts (core, 0, FRAME_30FPS (1), 4, 1, &r);
+  g_assert_cmpint (obj_cnt (&r, 3), ==, -1);
+  g_assert_cmpint (obj_cnt (&r, 4), ==, 1);
+  g_assert_cmpuint (roi_count (&r, "RF")->count, ==, 1);
+  rds_analytics_core_free (core);
+}
+
+/* A removed stream's state is freed; re-added on the same pad it starts fresh but continues its cumulative
+ * line-crossing counts (ours). Pads 1 (no groups) and 7 (never seen) are removed too; pad 2 is removed and never
+ * re-added, its kept counts freed with the core. */
+static void
+test_life_remove (void)
+{
+  RdsAnalyticsCore *core = core_for (LC_LOOSE "[line-crossing-stream-2]\nenable=1\n" LC_RULE_DN);
+  RdsAnalyticsFrameResult r;
+  guint f = 0;
+
+  rds_analytics_core_remove_stream (core, 7);
+  for (guint round = 0; round < 3; round++) {
+    for (guint k = 0; k < 15; k++, f++) {
+      RdsAnalyticsObject objs[2] = { obj_at (1, (gint) round, 640, 300 + 10 * k),
+        obj_at (RDS_ANALYTICS_UNTRACKED, (gint) round, 300, 100)
+      };
+
+      rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), objs, 2, &r);
+      g_assert_cmpuint (r.lc[0].current, ==, k == 10);
+      g_assert_cmpuint (r.lc[0].cumulative, ==, round + (k >= 10));
+      g_assert_cmpint (r.untracked_warning, ==, k == 0);
+      /* objCnt fresh: the previous round's class is gone */
+      g_assert_cmpuint (r.n_obj_cnt, ==, 1);
+      g_assert_cmpint (obj_cnt (&r, (gint) round), ==, 2);
+      rds_analytics_core_process_frame (core, 1, FRAME_30FPS (f), objs, 2, &r);
+      g_assert_cmpuint (r.n_lc, ==, 0);
+      rds_analytics_core_process_frame (core, 2, FRAME_30FPS (f), objs, 2, &r);
+    }
+    rds_analytics_core_remove_stream (core, 0);
+    rds_analytics_core_remove_stream (core, 1);
+    rds_analytics_core_remove_stream (core, 7);
+  }
+  rds_analytics_core_remove_stream (core, 2);
+  rds_analytics_core_free (core);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -2711,5 +2843,10 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-core/life-cycle/evict-no-pts", test_life_evict_no_pts);
   g_test_add_func ("/cpu/analytics-core/life-cycle/evict-keeps-seen", test_life_evict_keeps_seen);
   g_test_add_func ("/cpu/analytics-core/life-cycle/absence", test_life_absence);
+  g_test_add_func ("/cpu/analytics-core/life-cycle/no-pts-stretch", test_life_no_pts_stretch);
+  g_test_add_func ("/cpu/analytics-core/life-cycle/evict-edges", test_life_evict_edges);
+  g_test_add_func ("/cpu/analytics-core/life-cycle/reset-stopped", test_life_reset_stopped);
+  g_test_add_func ("/cpu/analytics-core/life-cycle/reset-no-histories", test_life_reset_no_histories);
+  g_test_add_func ("/cpu/analytics-core/life-cycle/remove", test_life_remove);
   return g_test_run ();
 }

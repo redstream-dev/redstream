@@ -100,14 +100,17 @@ rds_analytics_point_in_polygon (RdsAnalyticsPoint p, const RdsAnalyticsPoint * p
  * well); 0.1004 misses 8 of each. */
 #define STOPPED_SY_COEF 0.1
 
-/* Eviction (ours: 8.0's limit is unknown; it kept a history across a 30-frame absence). A history unseen for more
- * than EVICT_AGE_NS of PTS is dropped, or, when PTS can't tell (a frame without PTS, a history seen before the
- * stream's first PTS, or a PTS gone back before its last sighting), for more than EVICT_AGE_FRAMES frames of its
- * stream. A history seen on a frame without PTS is stamped with the stream's last valid PTS. The histories are
- * swept at most once per EVICT_SWEEP_NS of stream PTS, or every EVICT_SWEEP_FRAMES frames without PTS, not on every
- * frame. */
+/* Eviction (ours: 8.0's limit is unknown; it kept a history across a 30-frame absence). A history is stamped with
+ * the PTS of the frame it was last seen on (none on a frame without PTS) and that frame's number. It is dropped:
+ * - when the current frame and its stamp both have a PTS, the current one not earlier: unseen for more than
+ *   EVICT_AGE_NS of PTS, or for more than EVICT_BACKSTOP_FRAMES frames (a frozen PTS);
+ * - otherwise (a frame without PTS, a history seen on one or before the stream's first PTS, or a PTS gone back
+ *   before its last sighting): unseen for more than EVICT_AGE_FRAMES frames of its stream.
+ * The histories are swept, not checked on every frame: on the first frame with a PTS, when the PTS goes back, once
+ * EVICT_SWEEP_NS of PTS has passed since the last sweep, and every EVICT_SWEEP_FRAMES frames whatever the PTS. */
 #define EVICT_AGE_NS (G_GUINT64_CONSTANT (30) * G_GUINT64_CONSTANT (1000000000))
 #define EVICT_AGE_FRAMES 900    /* 30 s at 30 fps */
+#define EVICT_BACKSTOP_FRAMES 7200      /* 30 s at 240 fps */
 #define EVICT_SWEEP_NS G_GUINT64_CONSTANT (1000000000)
 #define EVICT_SWEEP_FRAMES 30
 
@@ -171,7 +174,7 @@ typedef struct
   RdsAnalyticsPoint win[HISTORY_WINDOW];        /* a ring, the oldest at head */
   guint head, len;
   guint64 n_obs;                /* observations so far; n = n_obs - 1 */
-  guint64 last_pts;             /* the PTS it was last seen at, or RDS_ANALYTICS_PTS_NONE */
+  guint64 last_pts;             /* the PTS of the frame it was last seen on: RDS_ANALYTICS_PTS_NONE if it had none */
   guint64 last_frame;           /* the stream's frame number it was last seen at */
   gboolean lc_counted[];        /* per line of the stream's line-crossing group: already counted */
 } History;
@@ -195,12 +198,12 @@ typedef struct
   guint n_slots, head, n_frames;
   guint64 seq;
   guint64 last_pts;             /* RDS_ANALYTICS_PTS_NONE: none, or the last frame had none */
-  /* eviction (ours): the stream's frames so far, its clock (the last valid PTS; RDS_ANALYTICS_PTS_NONE: none yet),
-   * and the PTS and frame number of the last sweep. Apart from last_pts, whose RDS_ANALYTICS_PTS_NONE restarts
-   * objCnt. */
+  /* eviction (ours), apart from last_pts (whose RDS_ANALYTICS_PTS_NONE restarts objCnt): the frames of the stream so
+   * far, which number them, and the last sweep's frame number and PTS (RDS_ANALYTICS_PTS_NONE: no sweep on a frame
+   * with a PTS yet) */
   guint64 frames;
-  guint64 clock;
-  guint64 sweep_pts, sweep_frame;
+  guint64 sweep_frame;
+  guint64 sweep_pts;
 } StreamState;
 
 /* Where an object's results are in the frame's pools while they grow. */
@@ -218,6 +221,7 @@ struct _RdsAnalyticsCore
   guint64 window_ns;
   GHashTable *rules;            /* pad_index -> CoreRules * */
   GHashTable *streams;          /* pad_index -> StreamState * */
+  GHashTable *kept_lc_cum;      /* pad_index -> guint64 * lc_cum: the counts of removed streams (ours) */
 
   /* the frame result, reused */
   GArray *roi_counts;           /* RdsAnalyticsRoiCount */
@@ -324,6 +328,7 @@ rds_analytics_core_new (const RdsAnalyticsConfig * cfg, guint out_w, guint out_h
   core->window_ns = (guint64) cfg->obj_cnt_win_in_ms * G_GUINT64_CONSTANT (1000000);
   core->rules = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, (GDestroyNotify) core_rules_free);
   core->streams = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, (GDestroyNotify) stream_state_free);
+  core->kept_lc_cum = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, g_free);
   for (guint i = 0; cfg->streams != NULL && i < cfg->streams->len; i++) {
     const RdsAnalyticsStream *s = g_ptr_array_index (cfg->streams, i);
     CoreRules *r = g_new0 (CoreRules, 1);
@@ -363,6 +368,7 @@ rds_analytics_core_free (RdsAnalyticsCore * core)
   if (core == NULL)
     return;
   g_hash_table_unref (core->streams);
+  g_hash_table_unref (core->kept_lc_cum);
   g_hash_table_unref (core->rules);
   g_array_unref (core->roi_counts);
   g_array_unref (core->oc);
@@ -388,13 +394,16 @@ get_stream (RdsAnalyticsCore * core, guint pad_index)
     st->classes = g_array_new (FALSE, FALSE, sizeof (ClassWindow));
     g_array_set_clear_func (st->classes, class_window_clear);
     st->last_pts = RDS_ANALYTICS_PTS_NONE;
-    st->clock = st->sweep_pts = RDS_ANALYTICS_PTS_NONE;
+    st->sweep_pts = RDS_ANALYTICS_PTS_NONE;
     if (st->rules != NULL && (st->rules->groups[RDS_ANALYTICS_DIRECTION] != NULL
             || st->rules->groups[RDS_ANALYTICS_LINE_CROSSING] != NULL))
       st->histories = g_hash_table_new_full (g_int64_hash, g_int64_equal, NULL, (GDestroyNotify) history_free);
     if (st->rules != NULL && st->rules->groups[RDS_ANALYTICS_LINE_CROSSING] != NULL) {
       st->n_lines = st->rules->groups[RDS_ANALYTICS_LINE_CROSSING]->n_rules;
-      st->lc_cum = g_new0 (guint64, st->n_lines);
+      /* a pad removed and re-added continues its cumulative counts (ours) */
+      if (!g_hash_table_steal_extended (core->kept_lc_cum, GUINT_TO_POINTER (pad_index), NULL,
+              (gpointer *) & st->lc_cum))
+        st->lc_cum = g_new0 (guint64, st->n_lines);
     }
     g_hash_table_insert (core->streams, GUINT_TO_POINTER (pad_index), st);
   }
@@ -880,25 +889,24 @@ history_stale (gpointer key G_GNUC_UNUSED, gpointer value, gpointer user_data)
   const History *h = value;
   const SweepNow *now = user_data;
 
+  guint64 age_frames = now->frames - h->last_frame;
+
   if (now->pts != RDS_ANALYTICS_PTS_NONE && h->last_pts != RDS_ANALYTICS_PTS_NONE && now->pts >= h->last_pts)
-    return now->pts - h->last_pts > EVICT_AGE_NS;
-  return now->frames - h->last_frame > EVICT_AGE_FRAMES;
+    return now->pts - h->last_pts > EVICT_AGE_NS || age_frames > EVICT_BACKSTOP_FRAMES;
+  return age_frames > EVICT_AGE_FRAMES;
 }
 
-/* Called at the start of each frame of @st, @pts its PTS: advances the stream's clock and, when a sweep is due,
- * drops the stale histories. A PTS going backwards (a seek or a loop) makes a sweep due at once. */
+/* Called at the start of each frame of @st, @pts its PTS: when a sweep is due, drops the stale histories. A PTS
+ * going backwards (a seek or a loop) makes a sweep due at once. */
 static void
 evict_histories (StreamState * st, guint64 pts)
 {
   SweepNow now = { pts, st->frames };
-  gboolean due;
+  gboolean due = st->frames - st->sweep_frame >= EVICT_SWEEP_FRAMES;
 
-  if (pts != RDS_ANALYTICS_PTS_NONE) {
-    st->clock = pts;
-    due = st->sweep_pts == RDS_ANALYTICS_PTS_NONE || pts < st->sweep_pts || pts - st->sweep_pts >= EVICT_SWEEP_NS;
-  } else {
-    due = st->frames - st->sweep_frame >= EVICT_SWEEP_FRAMES;
-  }
+  if (pts != RDS_ANALYTICS_PTS_NONE)
+    due = due || st->sweep_pts == RDS_ANALYTICS_PTS_NONE || pts < st->sweep_pts
+        || pts - st->sweep_pts >= EVICT_SWEEP_NS;
   if (!due)
     return;
   if (pts != RDS_ANALYTICS_PTS_NONE)
@@ -926,7 +934,25 @@ rds_analytics_core_reset_stream (RdsAnalyticsCore * core, guint pad_index)
   g_array_set_size (st->classes, 0);
   st->last_pts = RDS_ANALYTICS_PTS_NONE;
   st->frames = st->sweep_frame = 0;
-  st->clock = st->sweep_pts = RDS_ANALYTICS_PTS_NONE;
+  st->sweep_pts = RDS_ANALYTICS_PTS_NONE;
+}
+
+void
+rds_analytics_core_remove_stream (RdsAnalyticsCore * core, guint pad_index)
+{
+  StreamState *st;
+
+  g_return_if_fail (core != NULL);
+
+  st = g_hash_table_lookup (core->streams, GUINT_TO_POINTER (pad_index));
+  if (st == NULL)
+    return;
+  /* only the cumulative counts outlive the stream (ours); the rest is freed with it */
+  if (st->lc_cum != NULL) {
+    g_hash_table_insert (core->kept_lc_cum, GUINT_TO_POINTER (pad_index), st->lc_cum);
+    st->lc_cum = NULL;
+  }
+  g_hash_table_remove (core->streams, GUINT_TO_POINTER (pad_index));
 }
 
 /* ------------------------------------------------------------------------------------------------------------ */
@@ -1037,8 +1063,8 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
 
         /* every tracked object builds its history, whatever the class filters: line crossing shares it (ours) */
         history_push (h, p);
-        /* seen on a frame without PTS: at the stream's last valid PTS, if any */
-        h->last_pts = st->clock;
+        /* on a frame without PTS, no PTS stamp: the frame age applies */
+        h->last_pts = pts;
         h->last_frame = st->frames;
         /* direction and STOPPED only for the classes of the group's class-id (DeepStream 8.0 behaviour) */
         if (dir != NULL && class_passes (dir, o->class_id))
