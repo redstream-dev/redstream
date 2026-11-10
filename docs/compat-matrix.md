@@ -1194,7 +1194,7 @@ Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream
 
 | Property | Type | Default | Status | Notes |
 |---|---|---|---|---|
-| `config-file` | string | NULL | supported | required, also with `enable=FALSE`: without one, or with a file that fails, the start fails with an ERROR naming the property, the file or the key (DeepStream 8.0 fails the state change too, but posts no ERROR). Settable in any state (DeepStream 8.0 behaviour): set while started, the file is loaded and checked at once and applies from the next buffer, with every stream's state reset, the cumulative counts included (DeepStream 8.0 behaviour); a file that fails then posts an ERROR, and the old config, its state and the property's old value stay (ours) |
+| `config-file` | string | NULL | supported | required, also with `enable=FALSE`: without one, or with a file that fails, the start fails with an ERROR naming the property, the file or the key (ours: DeepStream 8.0 fails the state change too, but posts no ERROR). Settable in any state (DeepStream 8.0 behaviour): set while started, the file is loaded and checked at once and applies from the next buffer, with every stream's state reset, the cumulative counts included (DeepStream 8.0 behaviour); a file that fails then posts an ERROR, and the old config, its state and the property's old value stay (ours) |
 | `enable` | boolean | `TRUE` | supported | NULL/READY only (DeepStream 8.0 behaviour). `FALSE`: pass-through with no meta at all, as `[property] enable=0` (DeepStream 8.0 behaviour) |
 | `unique-id` | uint 0..4294967295 | `17` | supported | written to the `unique_id` of both metas; read per batch |
 | `qos` | boolean | `FALSE` | accepted | GstBaseTransform's; the element never drops buffers |
@@ -1208,14 +1208,12 @@ or is clearly broken).
 |---|---|---|
 | Streams | DeepStream 8.0 behaviour | keyed by the frame meta's `pad_index`, not `source_id`; a new `pad_index` gets fresh state. `rdsstreammux` writes the sink pad's number to both, and its stream events carry the same number, so an event's id is the `pad_index` |
 | Frames | DeepStream 8.0 behaviour | every frame meta of a batch is processed in batch order, partial batches and two frames of one stream included; every frame gets a frame meta, also on a stream without groups (empty maps, `objCnt` filled) |
-| Object info | DeepStream 8.0 behaviour | only on objects with something to report (an ROI, overcrowding or line label, a direction or STOPPED); the object's box is its `rect_params` |
+| Object info | DeepStream 8.0 behaviour | only on objects with something to report (an ROI, overcrowding or line label, a direction or STOPPED) |
+| Object box | ours (8.0 undetermined: the observed runs set both boxes equal) | the analytics use the object's `rect_params`, not `detector_bbox_info` |
 | Frame size | DeepStream 8.0 behaviour | the rules are scaled from `config-width` x `config-height` to the batch surface's size, the mux output. Ours: when that size changes, the rules are scaled again and every stream's state resets, with a warning |
 | `rds-stream-reset` | ours | clears the stream's histories, STOPPED state, "already counted" flags, objCnt window and untracked warning; its cumulative line-crossing counts stay. DeepStream 8.0 ignores the event |
 | `rds-pad-deleted` | ours | frees the stream's state but keeps its cumulative line-crossing counts, so a source added later on that pad starts fresh and continues them. `rds-stream-eos` alone changes nothing (a stream that restarts on its pad comes with a stream reset). DeepStream 8.0 ignores these events |
 | Untracked objects | ours | counted for the ROIs, overcrowding and `objCnt`; skipped by direction and line crossing, with one warning (debug log) per stream, again after a stream reset. DeepStream 8.0 turns direction and line crossing off for the stream for good |
-
-### `rdsanalytics` config
-
 
 #### Analytics config files
 

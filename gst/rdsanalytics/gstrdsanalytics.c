@@ -51,14 +51,15 @@ struct _GstRdsAnalytics
 {
   GstBaseTransform parent;
 
-  /* properties and started (object lock) */
-  gchar *config_file;
+  /* properties (object lock) */
   gboolean enable;
   guint unique_id;
-  gboolean started;             /* between start and stop: config-file loads at once */
 
-  /* streaming state (core_lock) */
+  /* core_lock: config-file, the started flag and the configs together, so a config-file set can't race start or
+   * stop (see gst_rds_analytics_start); and the streaming state */
   GMutex core_lock;
+  gchar *config_file;
+  gboolean started;             /* between start and stop: config-file loads at once */
   RdsAnalyticsConfig *cfg;      /* the config in use */
   RdsAnalyticsConfig *pending;  /* loaded while started, swapped in on the next buffer */
   RdsAnalyticsCore *core;       /* NULL until the first batch, and after a swap */
@@ -108,22 +109,37 @@ load_config (GstRdsAnalytics * self, const gchar * path)
   return cfg;
 }
 
-/* config-file set while started: load and validate it now, swap it in on the next buffer. */
+/* config-file set: stored when stopped (start loads it); while started, loaded and validated now and swapped in on
+ * the next buffer. The load runs without the lock (posting an ERROR takes the object lock, and a batch may hold
+ * core_lock); the path and the pending config are then published together under core_lock. If the element stopped
+ * meanwhile, only the path is kept: the next start loads it, and nothing stale is left pending. */
 static void
-reload_config (GstRdsAnalytics * self, const gchar * path)
+set_config_file (GstRdsAnalytics * self, const gchar * path)
 {
-  RdsAnalyticsConfig *cfg = load_config (self, path);
+  RdsAnalyticsConfig *cfg;
+  gboolean started;
 
-  if (!cfg)
+  g_mutex_lock (&self->core_lock);
+  started = self->started;
+  if (!started) {
+    g_free (self->config_file);
+    self->config_file = g_strdup (path);
+  }
+  g_mutex_unlock (&self->core_lock);
+  if (!started)
+    return;
+
+  if (!(cfg = load_config (self, path)))
     return;                     /* the old config and property value stay (ours) */
   g_mutex_lock (&self->core_lock);
-  g_clear_pointer (&self->pending, rds_analytics_config_free);
-  self->pending = cfg;
-  g_mutex_unlock (&self->core_lock);
-  GST_OBJECT_LOCK (self);
   g_free (self->config_file);
   self->config_file = g_strdup (path);
-  GST_OBJECT_UNLOCK (self);
+  if (self->started) {
+    g_clear_pointer (&self->pending, rds_analytics_config_free);
+    self->pending = g_steal_pointer (&cfg);
+  }
+  g_mutex_unlock (&self->core_lock);
+  g_clear_pointer (&cfg, rds_analytics_config_free);
 }
 
 /* ---- start / stop ---- */
@@ -132,25 +148,37 @@ static gboolean
 gst_rds_analytics_start (GstBaseTransform * trans)
 {
   GstRdsAnalytics *self = GST_RDS_ANALYTICS (trans);
-  RdsAnalyticsConfig *cfg;
-  gchar *path;
+  /* The file is loaded without core_lock, so a config-file set may land meanwhile; not yet started, it only stores
+   * its path. So the config is installed, and started set, only if the path is still the one loaded, in the same
+   * critical section; otherwise the newer path is loaded instead. Once started is set, sets load and go to pending,
+   * which stop clears with started. */
+  for (;;) {
+    RdsAnalyticsConfig *cfg;
+    gchar *path;
+    gboolean current;
 
-  GST_OBJECT_LOCK (self);
-  path = g_strdup (self->config_file);
-  GST_OBJECT_UNLOCK (self);
-
-  /* required whatever enable says (DeepStream 8.0 behaviour) */
-  cfg = load_config (self, path);
-  g_free (path);
-  if (!cfg)
-    return FALSE;
-  g_mutex_lock (&self->core_lock);
-  self->cfg = cfg;
-  g_mutex_unlock (&self->core_lock);
-  GST_OBJECT_LOCK (self);
-  self->started = TRUE;
-  GST_OBJECT_UNLOCK (self);
-  return TRUE;
+    g_mutex_lock (&self->core_lock);
+    path = g_strdup (self->config_file);
+    g_mutex_unlock (&self->core_lock);
+    /* required whatever enable says (DeepStream 8.0 behaviour) */
+    cfg = load_config (self, path);
+    if (!cfg) {
+      g_free (path);
+      return FALSE;
+    }
+    g_mutex_lock (&self->core_lock);
+    current = g_strcmp0 (path, self->config_file) == 0;
+    if (current) {
+      g_clear_pointer (&self->pending, rds_analytics_config_free);
+      self->cfg = g_steal_pointer (&cfg);
+      self->started = TRUE;
+    }
+    g_mutex_unlock (&self->core_lock);
+    g_free (path);
+    if (current)
+      return TRUE;
+    rds_analytics_config_free (cfg);
+  }
 }
 
 static gboolean
@@ -158,10 +186,8 @@ gst_rds_analytics_stop (GstBaseTransform * trans)
 {
   GstRdsAnalytics *self = GST_RDS_ANALYTICS (trans);
 
-  GST_OBJECT_LOCK (self);
-  self->started = FALSE;
-  GST_OBJECT_UNLOCK (self);
   g_mutex_lock (&self->core_lock);
+  self->started = FALSE;
   g_clear_pointer (&self->core, rds_analytics_core_free);
   g_clear_pointer (&self->cfg, rds_analytics_config_free);
   g_clear_pointer (&self->pending, rds_analytics_config_free);
@@ -180,7 +206,8 @@ gst_rds_analytics_stop (GstBaseTransform * trans)
  * (release_pad): it frees the stream's state (ours). rds-stream-eos alone changes nothing: a stream that ends and
  * stays on its pad (a looping or reconnecting source, a flush) is not removed, and its restart comes with an
  * rds-stream-reset (the mux sends one on the pad's first data after a flush). FLUSH_STOP needs nothing for that
- * reason. The core lock keeps events off a batch in progress. */
+ * reason. The core lock keeps events off a batch in progress, and it is needed: rds-pad-deleted is sent from
+ * release_pad, so it can arrive on the application's thread, not the streaming one. */
 static gboolean
 gst_rds_analytics_sink_event (GstBaseTransform * trans, GstEvent * event)
 {
@@ -332,6 +359,7 @@ gst_rds_analytics_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     GST_INFO_OBJECT (self, "new config applied: every stream's state reset");
   }
   if (!self->cfg) {
+    /* stopped (or stopping) while this buffer was on its way: start always installs a config */
     g_mutex_unlock (&self->core_lock);
     return GST_FLOW_FLUSHING;
   }
@@ -384,21 +412,9 @@ gst_rds_analytics_set_property (GObject * object, guint prop_id, const GValue * 
   GstRdsAnalytics *self = GST_RDS_ANALYTICS (object);
 
   switch (prop_id) {
-    case PROP_CONFIG_FILE:{
-      const gchar *path = g_value_get_string (value);
-
-      GST_OBJECT_LOCK (self);
-      if (!self->started) {
-        g_free (self->config_file);
-        self->config_file = g_strdup (path);
-        GST_OBJECT_UNLOCK (self);
-        break;
-      }
-      GST_OBJECT_UNLOCK (self);
-      /* outside the object lock: posting an ERROR takes it */
-      reload_config (self, path);
+    case PROP_CONFIG_FILE:
+      set_config_file (self, g_value_get_string (value));
       break;
-    }
     case PROP_ENABLE:
       GST_OBJECT_LOCK (self);
       if (check_mutable (self, pspec))
@@ -421,11 +437,14 @@ gst_rds_analytics_get_property (GObject * object, guint prop_id, GValue * value,
 {
   GstRdsAnalytics *self = GST_RDS_ANALYTICS (object);
 
+  if (prop_id == PROP_CONFIG_FILE) {
+    g_mutex_lock (&self->core_lock);
+    g_value_set_string (value, self->config_file);
+    g_mutex_unlock (&self->core_lock);
+    return;
+  }
   GST_OBJECT_LOCK (self);
   switch (prop_id) {
-    case PROP_CONFIG_FILE:
-      g_value_set_string (value, self->config_file);
-      break;
     case PROP_ENABLE:
       g_value_set_boolean (value, self->enable);
       break;

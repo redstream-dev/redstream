@@ -124,6 +124,7 @@ static void
 test_parse_launch_error_names_rds (void)
 {
   GError *err = NULL;
+  /* any remapped element not yet built */
   GstElement *pipeline = rds_compat_parse_launch ("nvv4l2h264enc ! fakesink", &err);
 
   /* gst_parse_launch may return a partial pipeline even when it sets an error. */

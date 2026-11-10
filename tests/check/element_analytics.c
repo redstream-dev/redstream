@@ -472,13 +472,13 @@ assert_no_meta (GstBuffer * buf)
 static void
 test_passthrough (void)
 {
+  RDS_TEST_REQUIRE_GPU ();
   for (guint i = 0; i < 2; i++) {
     GstElement *e = new_analytics (i == 0 ? CONFIG : "[property]\nenable=0\nconfig-width=640\nconfig-height=480\n"
         "[roi-filtering-stream-0]\nroi-RF=0;0;320;0;320;480;0;480\n");
     GstHarness *h;
     GstBuffer *buf;
 
-    RDS_TEST_REQUIRE_GPU ();
     if (i == 0)
       g_object_set (e, "enable", FALSE, NULL);
     h = harness_for (e, NULL);
@@ -574,6 +574,14 @@ test_metas (void)
   g_assert_null (obj_info (other));
   gst_buffer_unref (buf);
 
+  /* a frame without objects still gets its frame meta, with the zero entries */
+  buf = run (h, new_batch (1, NULL));
+  m = frame_meta (nth_frame (buf, 0));
+  g_assert_true (rds_analytics_frame_meta_get_roi_count (m, "RF", &v));
+  g_assert_cmpuint (v, ==, 0);
+  g_assert_cmpuint (lc_cum (m, "Down"), ==, 0);
+  gst_buffer_unref (buf);
+
   /* unique-id changes from the next batch */
   g_object_set (h->element, "unique-id", 9u, NULL);
   buf = new_batch (1, NULL);
@@ -642,8 +650,9 @@ test_stream_reset (void)
   push_event_through (h, rds_event_new_stream_eos (0));
   g_assert_cmpint (walk (h, 0, 5, 6, "Down", &cum), ==, -1);
   g_assert_cmpuint (cum, ==, 1);
-  /* another stream's reset leaves stream 0 alone */
+  /* another stream's reset, or the removal of a pad never seen, leaves stream 0 alone */
   push_event_through (h, rds_event_new_stream_reset (1));
+  push_event_through (h, rds_event_new_pad_deleted (7));
   g_assert_cmpint (walk (h, 0, 5, 6, "Down", &cum), ==, -1);
   push_event_through (h, rds_event_new_stream_reset (0));
   g_assert_cmpint (walk (h, 0, 5, 6, "Down", &cum), ==, 3);
@@ -659,7 +668,10 @@ test_runtime_source (void)
   static const guint pad2 = 2;
   GstHarness *h;
   GstBuffer *buf;
+  RdsObjectMeta *om;
+  RdsAnalyticsFrameMeta *m;
   guint64 cum = 0;
+  guint32 v = 0;
   guint n = 0;
 
   RDS_TEST_REQUIRE_GPU ();
@@ -672,12 +684,23 @@ test_runtime_source (void)
   g_assert_cmpint (walk (h, 0, 5, 6, "Down", &cum), ==, 3);
   g_assert_cmpuint (cum, ==, 2);
 
+  /* pad 2, added at runtime, has no groups: no label entries, objCnt only, no object info */
   push_event_through (h, rds_event_new_pad_added (2));
   buf = new_batch (1, &pad2);
-  add_obj (buf, 0, 1, 4, 100, 300);
+  om = add_obj (buf, 0, 1, 4, 100, 300);
   buf = run (h, buf);
-  rds_analytics_frame_meta_foreach_obj_count (frame_meta (nth_frame (buf, 0)), count_class, &n);
+  m = frame_meta (nth_frame (buf, 0));
+  rds_analytics_frame_meta_foreach_obj_count (m, count_class, &n);
   g_assert_cmpuint (n, ==, 1);
+  g_assert_true (rds_analytics_frame_meta_get_obj_count (m, 4, &v));
+  g_assert_cmpuint (v, ==, 1);
+  n = 0;
+  rds_analytics_frame_meta_foreach_roi_count (m, count_entry, &n);
+  rds_analytics_frame_meta_foreach_lc_count (m, count_entry, &n);
+  rds_analytics_frame_meta_foreach_lc_cum_count (m, count_entry, &n);
+  rds_analytics_frame_meta_foreach_oc_status (m, count_status, &n);
+  g_assert_cmpuint (n, ==, 0);
+  g_assert_null (obj_info (om));
   gst_buffer_unref (buf);
   gst_harness_teardown (h);
 }
@@ -727,7 +750,7 @@ test_reload (void)
   GstBus *bus;
   GstHarness *h;
   GstElement *e;
-  gchar *path, *other, *bad, *got = NULL, *texts = NULL;
+  gchar *path, *other, *bad, *off, *got = NULL, *texts = NULL;
   GstBuffer *buf;
   RdsAnalyticsFrameMeta *m;
   guint64 cum = 0, v = 0;
@@ -736,6 +759,7 @@ test_reload (void)
   path = write_config ("reload.txt", CONFIG);
   other = write_config ("other.txt", CONFIG_OTHER);
   bad = write_config ("bad.txt", "[property]\nenable=1\nconfig-width=640\n");
+  off = write_config ("off.txt", "[property]\nenable=0\nconfig-width=640\nconfig-height=480\n");
   bus = gst_bus_new ();
   e = gst_element_factory_make ("rdsanalytics", NULL);
   g_object_set (e, "config-file", path, NULL);
@@ -771,10 +795,66 @@ test_reload (void)
   gst_buffer_unref (buf);
   g_assert_cmpuint (pop_errors (bus, NULL), ==, 0);
 
+  /* a config with [property] enable=0: pass-through from the next buffer */
+  g_object_set (h->element, "config-file", off, NULL);
+  buf = new_batch (1, NULL);
+  add_obj (buf, 0, 5, 0, 100, 300);
+  buf = run (h, buf);
+  assert_no_meta (buf);
+  gst_buffer_unref (buf);
+  g_assert_cmpuint (pop_errors (bus, NULL), ==, 0);
+
   harness_teardown_with_bus (h, bus);
   g_free (path);
   g_free (other);
   g_free (bad);
+  g_free (off);
+}
+
+/* A stop/start cycle with buffers on both sides: the restart loads config-file again, every stream's state starts
+ * afresh, and a config still pending at the stop is dropped. */
+static void
+test_restart (void)
+{
+  GstHarness *h;
+  GstElement *e;
+  GstBuffer *buf;
+  RdsAnalyticsFrameMeta *m;
+  gchar *path, *other;
+  guint64 cum = 0;
+
+  RDS_TEST_REQUIRE_GPU ();
+  path = write_config ("restart.txt", CONFIG);
+  other = write_config ("restart-other.txt", CONFIG_OTHER);
+  e = gst_element_factory_make ("rdsanalytics", NULL);
+  g_object_set (e, "config-file", path, NULL);
+  h = harness_for (e, NULL);
+  g_assert_cmpint (walk (h, 0, 5, 6, "Down", &cum), ==, 3);
+  g_assert_cmpuint (cum, ==, 1);
+
+  /* pending at the stop, then replaced while stopped */
+  g_object_set (h->element, "config-file", other, NULL);
+  g_assert_cmpint (gst_element_set_state (h->element, GST_STATE_NULL), ==, GST_STATE_CHANGE_SUCCESS);
+  g_object_set (h->element, "config-file", path, NULL);
+  g_assert_cmpint (gst_element_set_state (h->element, GST_STATE_PLAYING), ==, GST_STATE_CHANGE_SUCCESS);
+  /* the element's pads lost their sticky events */
+  g_assert_true (gst_harness_push_event (h, gst_event_new_stream_start ("restart")));
+  gst_harness_set_caps_str (h, IN_CAPS, IN_CAPS);
+  drain_events (h);
+
+  buf = new_batch (1, NULL);
+  add_obj (buf, 0, 9, 0, 100, 300);
+  buf = run (h, buf);
+  m = frame_meta (nth_frame (buf, 0));
+  g_assert_false (rds_analytics_frame_meta_get_lc_cum_count (m, "Exit", NULL));
+  g_assert_cmpuint (lc_cum (m, "Down"), ==, 0);
+  gst_buffer_unref (buf);
+  /* the same id is counted again: fresh state */
+  g_assert_cmpint (walk (h, 0, 5, 6, "Down", &cum), ==, 3);
+  g_assert_cmpuint (cum, ==, 1);
+  gst_harness_teardown (h);
+  g_free (path);
+  g_free (other);
 }
 
 static guint n_untracked_warnings;
@@ -824,6 +904,7 @@ test_untracked_warning (void)
   g_assert_cmpuint (g_atomic_int_get (&n_untracked_warnings), ==, 3);
   gst_harness_teardown (h);
   gst_debug_remove_log_function (count_untracked);
+  gst_debug_unset_threshold_for_name ("rdsanalytics");
 }
 
 /* The rules are scaled to the batch surface's size, the mux output; a new size rebuilds the analytics, resetting
@@ -893,6 +974,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/analytics/runtime-source", test_runtime_source);
   g_test_add_func ("/gpu/analytics/partial-batch", test_partial_batch);
   g_test_add_func ("/gpu/analytics/reload", test_reload);
+  g_test_add_func ("/gpu/analytics/restart", test_restart);
   g_test_add_func ("/gpu/analytics/untracked-warning", test_untracked_warning);
   g_test_add_func ("/gpu/analytics/out-size", test_out_size);
   /* gst_deinit stops GStreamer's task-pool threads before exit (see AGENTS.md) */
