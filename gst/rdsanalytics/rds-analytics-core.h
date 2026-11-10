@@ -9,7 +9,7 @@
 #ifndef RDS_ANALYTICS_CORE_H
 #define RDS_ANALYTICS_CORE_H
 
-#include "rds-analytics-types.h"
+#include "rds-analytics-config.h"
 
 G_BEGIN_DECLS
 
@@ -27,6 +27,100 @@ G_GNUC_INTERNAL RdsAnalyticsPoint rds_analytics_ref_point (gfloat left, gfloat t
  * vertices contain nothing. */
 G_GNUC_INTERNAL gboolean rds_analytics_point_in_polygon (RdsAnalyticsPoint p, const RdsAnalyticsPoint * poly,
     guint n);
+
+/* ------------------------------------------------------------------------------------------------------------ */
+/* The analytics core: per-stream state keyed by the frame meta's pad_index, fed one frame at a time.
+ *
+ * ROI filtering (DeepStream 8.0 behaviour): an object passing the group's class-id filter gets the label of every
+ * ROI its point is inside, or outside with inverse-roi, and is counted for that label. Overcrowding (DeepStream 8.0
+ * behaviour): the same count without inverse, and the status is count >= object-threshold && count > 0, on the
+ * frame itself. A group with enable=0 contributes nothing, not even its zero entries (DeepStream 8.0 behaviour). */
+
+/* The object id of an object no tracker has given an id: DeepStream's UNTRACKED_OBJECT_ID. */
+#define RDS_ANALYTICS_UNTRACKED G_MAXUINT64
+/* A frame without a PTS (GStreamer's GST_CLOCK_TIME_NONE). */
+#define RDS_ANALYTICS_PTS_NONE G_MAXUINT64
+
+typedef struct
+{
+  guint64 id;                   /* the tracking id, or RDS_ANALYTICS_UNTRACKED */
+  gint class_id;
+  gfloat left, top, width, height;      /* frame pixels, the mux output's */
+} RdsAnalyticsObject;
+
+/* One objInROIcnt entry. */
+typedef struct
+{
+  const gchar *label;
+  RdsAnalyticsFeature feature;  /* RDS_ANALYTICS_ROI_FILTERING or RDS_ANALYTICS_OVERCROWDING */
+  guint count;
+} RdsAnalyticsRoiCount;
+
+/* One ocStatus entry. */
+typedef struct
+{
+  const gchar *label;
+  guint count;
+  gboolean status;
+} RdsAnalyticsOcStatus;
+
+/* One objCnt entry. */
+typedef struct
+{
+  gint class_id;
+  guint count;
+} RdsAnalyticsClassCount;
+
+typedef struct
+{
+  /* roiStatus: the ROI-filtering labels, in config order */
+  const gchar *const *roi_labels;
+  guint n_roi_labels;
+  /* ocStatus: the overcrowding labels the object is in, whatever the status, in config order */
+  const gchar *const *oc_labels;
+  guint n_oc_labels;
+  /* objStatus: " ROI:<l>" per ROI label, in that order; "" when empty */
+  const gchar *obj_status;
+  /* the object has something to report: it gets an object meta (DeepStream 8.0 behaviour) */
+  gboolean has_info;
+} RdsAnalyticsObjectResult;
+
+/* Owned by the core: valid until the next rds_analytics_core_process_frame or rds_analytics_core_free. Labels are
+ * the core's copies. Every array is in config order: groups in the order of RdsAnalyticsFeature, rules in the
+ * order of their keys. */
+typedef struct
+{
+  /* objInROIcnt: every enabled ROI-filtering label, then every enabled overcrowding label, zeros included */
+  const RdsAnalyticsRoiCount *roi_counts;
+  guint n_roi_counts;
+  /* ocStatus: every enabled overcrowding label */
+  const RdsAnalyticsOcStatus *oc;
+  guint n_oc;
+  /* objCnt: every class seen on the stream so far, in the order first seen; see rds_analytics_core_new */
+  const RdsAnalyticsClassCount *obj_cnt;
+  guint n_obj_cnt;
+  /* one per input object, in input order */
+  const RdsAnalyticsObjectResult *objects;
+  guint n_objects;
+} RdsAnalyticsFrameResult;
+
+typedef struct _RdsAnalyticsCore RdsAnalyticsCore;
+
+/* Copies what it needs from @cfg, the rules scaled to @out_w x @out_h, the mux output.
+ *
+ * objCnt is, per class, the mode of the class's per-frame object counts over the frames of the stream whose PTS is
+ * within cfg->obj_cnt_win_in_ms of the current one, both ends included (DeepStream 8.0 behaviour), counting every
+ * object whatever the groups and filters. A frame where a seen class is absent counts 0 for it; frames before a
+ * class was first seen count 0 too (ours). Ties go to the value seen most recently (ours). The window holds at most
+ * 9000 frames, and a PTS going backwards or missing restarts it (ours). */
+G_GNUC_INTERNAL RdsAnalyticsCore *rds_analytics_core_new (const RdsAnalyticsConfig * cfg, guint out_w,
+    guint out_h);
+G_GNUC_INTERNAL void rds_analytics_core_free (RdsAnalyticsCore * core);
+
+/* Runs the analytics on one frame of stream @pad_index, with PTS @pts in nanoseconds (or RDS_ANALYTICS_PTS_NONE),
+ * and fills @out. A new pad_index gets fresh state. A stream without groups still gets objCnt. */
+G_GNUC_INTERNAL void rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guint64 pts,
+    const RdsAnalyticsObject * objs, guint n, RdsAnalyticsFrameResult * out);
 
 G_END_DECLS
 

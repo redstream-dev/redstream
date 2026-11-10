@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 # Plugin-private code shared by the plugin and the tests: the config parser (a GLib key file, read from one key
-# table) and the analytics core (geometry). GLib only, always built.
+# table) and the analytics core (geometry, per-stream state, the features). GLib only, always built.
 rdsanalytics_core_sources = files('rds-analytics-config.c', 'rds-analytics-core.c')
 rdsanalytics_libm = cc.find_library('m', required : false)
 rdsanalytics_core = static_library('rdsanalytics-core',
