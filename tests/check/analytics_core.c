@@ -1,5 +1,5 @@
 /* rdsanalytics core: rule scaling, the reference point and the inside test, against DeepStream 8.0's observed
- * results (the probe boxes below: left, top, width, height in frame pixels, and the ROIs 8.0 reported them in).
+ * results (the observed boxes below: left, top, width, height in frame pixels, and the ROIs 8.0 reported them in).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-analytics-core.h"
 
@@ -40,7 +40,7 @@ test_scale (void)
   g_assert_cmpint (sq[1].x, ==, 625);
   g_assert_cmpint (sq[2].y, ==, 694);        /* 694.44 */
 
-  /* 1280x720 into 1920x1200 (s_1920x1200): y 200 -> 333.33 -> 333 */
+  /* 1280x720 into 1920x1200: y 200 -> 333.33 -> 333 */
   {
     RdsAnalyticsPoint p = { 400, 200 }, q;
 
@@ -147,7 +147,8 @@ test_bow_tie (void)
   g_assert_true (inside (200, 625, BOW_PTS, 4));    /* the crossing point */
 }
 
-/* the vertex order doesn't matter: every rotation and its reverse agree on a grid around each polygon */
+/* the vertex order doesn't matter: every rotation and its reverse agree on every pixel around the polygons, edge
+ * lines included */
 static void
 test_orientation (void)
 {
@@ -165,8 +166,8 @@ test_orientation (void)
       for (guint rev = 0; rev < 2; rev++) {
         for (guint i = 0; i < n; i++)
           var[i] = polys[k].pts[rev ? (rot + n - i) % n : (rot + i) % n];
-        for (gint y = 80; y <= 720; y += 3)
-          for (gint x = 80; x <= 1220; x += 3)
+        for (gint y = 80; y <= 720; y++)
+          for (gint x = 80; x <= 1220; x++)
             g_assert_cmpint (inside (x, y, var, n), ==, inside (x, y, polys[k].pts, n));
       }
     }
@@ -184,7 +185,7 @@ test_degenerate (void)
 }
 
 /* ------------------------------------------------------------------------------------------------------------ */
-/* The probe runs: every box through the reference point and the inside test */
+/* DeepStream 8.0's observed results: every box through the reference point and the inside test */
 
 enum
 {
@@ -199,16 +200,18 @@ typedef struct
 {
   gfloat left, top, width, height;
   guint rois;                   /* the ROIs DeepStream 8.0 put the box in */
-} ProbeBox;
+} ObservedBox;
 
 typedef struct
 {
   guint flag;
   const RdsAnalyticsPoint *pts;
   guint n;
-} ProbeRoi;
+} ObservedRoi;
 
-static const ProbeBox r_pts_boxes[] = {
+/* 10x20 boxes on the square's edges and corners, inside and outside the triangle and the bow-tie's lobes, gap
+ * and crossing; 1280x720 */
+static const ObservedBox shape_boxes[] = {
   {595, 330, 10, 20, SQ | SQCCW}, {395, 330, 10, 20, SQ | SQCCW}, {394.9, 330, 10, 20, 0},
   {395.1, 330, 10, 20, SQ | SQCCW}, {394.5, 330, 10, 20, 0}, {395.5, 330, 10, 20, SQ | SQCCW}, {795, 330, 10, 20, 0},
   {795.1, 330, 10, 20, 0}, {794.9, 330, 10, 20, SQ | SQCCW}, {595, 180, 10, 20, SQ | SQCCW}, {595, 179.9, 10, 20, 0},
@@ -220,7 +223,9 @@ static const ProbeBox r_pts_boxes[] = {
   {995, 630, 10, 20, 0}, {905, 440, 10, 20, 0}, {1185, 670, 10, 20, 0}
 };
 
-static const ProbeBox p2_pip_boxes[] = {
+/* 4x8 boxes a fraction of a pixel apart: the triangle's apex rows, its slanted and top edges, the square's corners and
+ * the nearly horizontal top edge of SL; 1280x720 */
+static const ObservedBox apex_edge_boxes[] = {
   {1046.6, 389, 4, 8, TRI}, {1047, 389, 4, 8, TRI}, {1047.3, 389, 4, 8, TRI}, {1047.6, 389, 4, 8, TRI},
   {1048, 389, 4, 8, TRI}, {1048.3, 389, 4, 8, TRI}, {1048.6, 389, 4, 8, TRI}, {1049, 389, 4, 8, 0},
   {1046.6, 389.5, 4, 8, TRI}, {1047, 389.5, 4, 8, TRI}, {1047.3, 389.5, 4, 8, TRI}, {1047.6, 389.5, 4, 8, TRI},
@@ -252,7 +257,8 @@ static const ProbeBox p2_pip_boxes[] = {
   {323, 546.4, 4, 8, 0}, {347.5, 547, 4, 8, SL}
 };
 
-static const ProbeBox p2_pip_1000_boxes[] = {
+/* the square's scaled top, bottom, left and right edges at 1000x1000 */
+static const ObservedBox edge_boxes_1000[] = {
   {498, 269, 4, 8, SQ}, {498, 269.4, 4, 8, SQ}, {498, 269.5, 4, 8, SQ}, {498, 269.6, 4, 8, SQ},
   {498, 269.8, 4, 8, SQ}, {498, 269.9, 4, 8, SQ}, {498, 270, 4, 8, SQ}, {498, 686, 4, 8, 0}, {498, 686.3, 4, 8, 0},
   {498, 686.4, 4, 8, 0}, {498, 686.5, 4, 8, 0}, {498, 686.6, 4, 8, 0}, {310, 392, 4, 8, SQ}, {310.4, 392, 4, 8, SQ},
@@ -262,7 +268,8 @@ static const ProbeBox p2_pip_1000_boxes[] = {
 
 /* The ROIs, in a 1280x720 config space, are scaled to the @out_w x @out_h mux. */
 static void
-check_probe (const ProbeBox * boxes, guint n_boxes, const ProbeRoi * rois, guint n_rois, guint out_w, guint out_h)
+check_observed (const ObservedBox * boxes, guint n_boxes, const ObservedRoi * rois, guint n_rois, guint out_w,
+    guint out_h)
 {
   for (guint r = 0; r < n_rois; r++) {
     RdsAnalyticsPoint scaled[4];
@@ -270,7 +277,7 @@ check_probe (const ProbeBox * boxes, guint n_boxes, const ProbeRoi * rois, guint
     g_assert_cmpuint (rois[r].n, <=, G_N_ELEMENTS (scaled));
     rds_analytics_scale_points (rois[r].pts, rois[r].n, 1280, 720, out_w, out_h, scaled);
     for (guint i = 0; i < n_boxes; i++) {
-      const ProbeBox *b = &boxes[i];
+      const ObservedBox *b = &boxes[i];
       RdsAnalyticsPoint p = rds_analytics_ref_point (b->left, b->top, b->width, b->height);
       gboolean want = (b->rois & rois[r].flag) != 0;
 
@@ -282,21 +289,21 @@ check_probe (const ProbeBox * boxes, guint n_boxes, const ProbeRoi * rois, guint
 }
 
 static void
-test_probe_r_pts (void)
+test_observed_shapes (void)
 {
-  const ProbeRoi rois[] = { {SQ, SQ_CW, 4}, {SQCCW, SQ_CCW, 4}, {TRI, TRI_PTS, 3}, {BOW, BOW_PTS, 4} };
+  const ObservedRoi rois[] = { {SQ, SQ_CW, 4}, {SQCCW, SQ_CCW, 4}, {TRI, TRI_PTS, 3}, {BOW, BOW_PTS, 4} };
 
-  check_probe (r_pts_boxes, G_N_ELEMENTS (r_pts_boxes), rois, G_N_ELEMENTS (rois), 1280, 720);
+  check_observed (shape_boxes, G_N_ELEMENTS (shape_boxes), rois, G_N_ELEMENTS (rois), 1280, 720);
 }
 
 static void
-test_probe_pip (void)
+test_observed_edges (void)
 {
-  const ProbeRoi rois[] = { {TRI, TRI_PTS, 3}, {SQ, SQ_CW, 4}, {SL, SL_PTS, 4} };
+  const ObservedRoi rois[] = { {TRI, TRI_PTS, 3}, {SQ, SQ_CW, 4}, {SL, SL_PTS, 4} };
 
-  check_probe (p2_pip_boxes, G_N_ELEMENTS (p2_pip_boxes), rois, G_N_ELEMENTS (rois), 1280, 720);
+  check_observed (apex_edge_boxes, G_N_ELEMENTS (apex_edge_boxes), rois, G_N_ELEMENTS (rois), 1280, 720);
   /* non-integer scaling */
-  check_probe (p2_pip_1000_boxes, G_N_ELEMENTS (p2_pip_1000_boxes), rois, G_N_ELEMENTS (rois), 1000, 1000);
+  check_observed (edge_boxes_1000, G_N_ELEMENTS (edge_boxes_1000), rois, G_N_ELEMENTS (rois), 1000, 1000);
 }
 
 int
@@ -310,7 +317,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-core/geometry/bow-tie", test_bow_tie);
   g_test_add_func ("/cpu/analytics-core/geometry/orientation", test_orientation);
   g_test_add_func ("/cpu/analytics-core/geometry/degenerate", test_degenerate);
-  g_test_add_func ("/cpu/analytics-core/geometry/probe-r-pts", test_probe_r_pts);
-  g_test_add_func ("/cpu/analytics-core/geometry/probe-pip", test_probe_pip);
+  g_test_add_func ("/cpu/analytics-core/geometry/observed-shapes", test_observed_shapes);
+  g_test_add_func ("/cpu/analytics-core/geometry/observed-edges", test_observed_edges);
   return g_test_run ();
 }

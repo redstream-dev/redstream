@@ -14,7 +14,8 @@
 G_BEGIN_DECLS
 
 /* Scales @n points from the config space (@cfg_w x @cfg_h, both > 0) to the mux output (@out_w x @out_h): each
- * coordinate becomes (int)(v * out / cfg), per axis. @out may be @in. */
+ * coordinate becomes (int)(v * out / cfg), per axis. In practice v >= 0: the config parser rejects negative
+ * coordinates. @out may be @in. */
 G_GNUC_INTERNAL void rds_analytics_scale_points (const RdsAnalyticsPoint * in, guint n, guint cfg_w, guint cfg_h,
     guint out_w, guint out_h, RdsAnalyticsPoint * out);
 

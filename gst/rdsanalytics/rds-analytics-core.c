@@ -13,8 +13,9 @@ to_int (gdouble v)
   return (gint) CLAMP (v, (gdouble) G_MININT, (gdouble) G_MAXINT);
 }
 
-/* DeepStream 8.0 behaviour: each vertex is scaled per axis and truncated, (int)(v * out / cfg). In 64-bit integers
- * the quotient truncates toward zero exactly as the cast does, without float rounding (ours: overflow-free). */
+/* DeepStream 8.0 behaviour: each vertex is scaled per axis and truncated to an int. The arithmetic is ours: 64-bit
+ * integers, (int)(v * out / cfg), whose quotient truncates toward zero as the cast does, with no rounding or
+ * overflow. It equals 8.0's float v * out / cfg while v * out < 2^24; whether 8.0 divides first is not known. */
 static gint
 scale_coord (gint v, guint cfg, guint out)
 {
@@ -39,7 +40,7 @@ rds_analytics_scale_points (const RdsAnalyticsPoint * in, guint n, guint cfg_w, 
 }
 
 /* DeepStream 8.0 behaviour: the bottom centre, floored to integers. The sums are in float, the box meta's type
- * (ours: 8.0's precision is unknown; the probe's boxes give the same points either way). */
+ * (ours: 8.0's precision is unknown; DeepStream 8.0's observed boxes give the same points either way). */
 RdsAnalyticsPoint
 rds_analytics_ref_point (gfloat left, gfloat top, gfloat width, gfloat height)
 {
@@ -53,8 +54,9 @@ rds_analytics_ref_point (gfloat left, gfloat top, gfloat width, gfloat height)
 /* DeepStream 8.0 behaviour: the crossing number on integer coordinates. An edge (i, j) toggles when it straddles
  * the point's row, (yi > Py) != (yj > Py), and the point is left of the crossing x truncated to an int,
  * Px < (int) xc. The y test makes the bottom edge (and vertices) half-open and the truncated crossing makes the
- * right edge exclusive, so a triangle's apex row has no inside pixel. The crossing is computed in double from
- * integers: an exact integer crossing stays exact, so the vertex order can't change the result. */
+ * right edge exclusive, so a triangle's apex row has no inside pixel. The crossing's precision is ours: it is
+ * computed in double from integers, so an exact integer crossing stays exact and the vertex order can't change the
+ * result. 8.0's precision is unknown; float gives the same crossings for coordinates up to 4K. */
 gboolean
 rds_analytics_point_in_polygon (RdsAnalyticsPoint p, const RdsAnalyticsPoint * poly, guint n)
 {
