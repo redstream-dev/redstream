@@ -100,6 +100,17 @@ rds_analytics_point_in_polygon (RdsAnalyticsPoint p, const RdsAnalyticsPoint * p
  * well); 0.1004 misses 8 of each. */
 #define STOPPED_SY_COEF 0.1
 
+/* Eviction (ours: 8.0's limit is unknown; it kept a history across a 30-frame absence). A history unseen for more
+ * than EVICT_AGE_NS of PTS is dropped, or, when PTS can't tell (a frame without PTS, a history seen before the
+ * stream's first PTS, or a PTS gone back before its last sighting), for more than EVICT_AGE_FRAMES frames of its
+ * stream. A history seen on a frame without PTS is stamped with the stream's last valid PTS. The histories are
+ * swept at most once per EVICT_SWEEP_NS of stream PTS, or every EVICT_SWEEP_FRAMES frames without PTS, not on every
+ * frame. */
+#define EVICT_AGE_NS (G_GUINT64_CONSTANT (30) * G_GUINT64_CONSTANT (1000000000))
+#define EVICT_AGE_FRAMES 900    /* 30 s at 30 fps */
+#define EVICT_SWEEP_NS G_GUINT64_CONSTANT (1000000000)
+#define EVICT_SWEEP_FRAMES 30
+
 /* One rule, scaled to the mux output. */
 typedef struct
 {
@@ -160,6 +171,8 @@ typedef struct
   RdsAnalyticsPoint win[HISTORY_WINDOW];        /* a ring, the oldest at head */
   guint head, len;
   guint64 n_obs;                /* observations so far; n = n_obs - 1 */
+  guint64 last_pts;             /* the PTS it was last seen at, or RDS_ANALYTICS_PTS_NONE */
+  guint64 last_frame;           /* the stream's frame number it was last seen at */
   gboolean lc_counted[];        /* per line of the stream's line-crossing group: already counted */
 } History;
 
@@ -182,6 +195,12 @@ typedef struct
   guint n_slots, head, n_frames;
   guint64 seq;
   guint64 last_pts;             /* RDS_ANALYTICS_PTS_NONE: none, or the last frame had none */
+  /* eviction (ours): the stream's frames so far, its clock (the last valid PTS; RDS_ANALYTICS_PTS_NONE: none yet),
+   * and the PTS and frame number of the last sweep. Apart from last_pts, whose RDS_ANALYTICS_PTS_NONE restarts
+   * objCnt. */
+  guint64 frames;
+  guint64 clock;
+  guint64 sweep_pts, sweep_frame;
 } StreamState;
 
 /* Where an object's results are in the frame's pools while they grow. */
@@ -369,6 +388,7 @@ get_stream (RdsAnalyticsCore * core, guint pad_index)
     st->classes = g_array_new (FALSE, FALSE, sizeof (ClassWindow));
     g_array_set_clear_func (st->classes, class_window_clear);
     st->last_pts = RDS_ANALYTICS_PTS_NONE;
+    st->clock = st->sweep_pts = RDS_ANALYTICS_PTS_NONE;
     if (st->rules != NULL && (st->rules->groups[RDS_ANALYTICS_DIRECTION] != NULL
             || st->rules->groups[RDS_ANALYTICS_LINE_CROSSING] != NULL))
       st->histories = g_hash_table_new_full (g_int64_hash, g_int64_equal, NULL, (GDestroyNotify) history_free);
@@ -846,6 +866,70 @@ line_crossing_eval (RdsAnalyticsCore * core, StreamState * st, const CoreGroup *
 }
 
 /* ------------------------------------------------------------------------------------------------------------ */
+/* The stream state life cycle (ours) */
+
+typedef struct
+{
+  guint64 pts;                  /* the current frame's */
+  guint64 frames;               /* the current frame's number */
+} SweepNow;
+
+static gboolean
+history_stale (gpointer key G_GNUC_UNUSED, gpointer value, gpointer user_data)
+{
+  const History *h = value;
+  const SweepNow *now = user_data;
+
+  if (now->pts != RDS_ANALYTICS_PTS_NONE && h->last_pts != RDS_ANALYTICS_PTS_NONE && now->pts >= h->last_pts)
+    return now->pts - h->last_pts > EVICT_AGE_NS;
+  return now->frames - h->last_frame > EVICT_AGE_FRAMES;
+}
+
+/* Called at the start of each frame of @st, @pts its PTS: advances the stream's clock and, when a sweep is due,
+ * drops the stale histories. A PTS going backwards (a seek or a loop) makes a sweep due at once. */
+static void
+evict_histories (StreamState * st, guint64 pts)
+{
+  SweepNow now = { pts, st->frames };
+  gboolean due;
+
+  if (pts != RDS_ANALYTICS_PTS_NONE) {
+    st->clock = pts;
+    due = st->sweep_pts == RDS_ANALYTICS_PTS_NONE || pts < st->sweep_pts || pts - st->sweep_pts >= EVICT_SWEEP_NS;
+  } else {
+    due = st->frames - st->sweep_frame >= EVICT_SWEEP_FRAMES;
+  }
+  if (!due)
+    return;
+  if (pts != RDS_ANALYTICS_PTS_NONE)
+    st->sweep_pts = pts;
+  st->sweep_frame = st->frames;
+  g_hash_table_foreach_remove (st->histories, history_stale, &now);
+}
+
+void
+rds_analytics_core_reset_stream (RdsAnalyticsCore * core, guint pad_index)
+{
+  StreamState *st;
+
+  g_return_if_fail (core != NULL);
+
+  st = g_hash_table_lookup (core->streams, GUINT_TO_POINTER (pad_index));
+  if (st == NULL)
+    return;
+  /* the histories take their "already counted" flags and STOPPED with them; lc_cum stays */
+  if (st->histories != NULL)
+    g_hash_table_remove_all (st->histories);
+  st->untracked_warned = FALSE;
+  /* objCnt: a new source is a new stream, so its window and its classes go */
+  window_clear (st);
+  g_array_set_size (st->classes, 0);
+  st->last_pts = RDS_ANALYTICS_PTS_NONE;
+  st->frames = st->sweep_frame = 0;
+  st->clock = st->sweep_pts = RDS_ANALYTICS_PTS_NONE;
+}
+
+/* ------------------------------------------------------------------------------------------------------------ */
 /* One frame */
 
 void
@@ -867,6 +951,9 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
     lc = st->rules->groups[RDS_ANALYTICS_LINE_CROSSING];
   }
   out->untracked_warning = FALSE;
+  /* before the objects: an id back after more than the eviction age starts a fresh history (ours) */
+  if (st->histories != NULL)
+    evict_histories (st, pts);
 
   /* objInROIcnt: every ROI, then every overcrowding ROI, from 0 (DeepStream 8.0 behaviour) */
   g_array_set_size (core->roi_counts, 0);
@@ -950,6 +1037,9 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
 
         /* every tracked object builds its history, whatever the class filters: line crossing shares it (ours) */
         history_push (h, p);
+        /* seen on a frame without PTS: at the stream's last valid PTS, if any */
+        h->last_pts = st->clock;
+        h->last_frame = st->frames;
         /* direction and STOPPED only for the classes of the group's class-id (DeepStream 8.0 behaviour) */
         if (dir != NULL && class_passes (dir, o->class_id))
           direction_eval (core, dir, h, o->height, &sp->stopped);
@@ -1035,4 +1125,5 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
   out->n_obj_cnt = core->obj_cnt->len;
   out->objects = (const RdsAnalyticsObjectResult *) core->objects->data;
   out->n_objects = n;
+  st->frames++;
 }

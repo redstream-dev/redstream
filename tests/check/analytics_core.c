@@ -1,7 +1,8 @@
 /* rdsanalytics core: rule scaling, the reference point and the inside test, against DeepStream 8.0's observed
  * results (the observed boxes below: left, top, width, height in frame pixels, and the ROIs 8.0 reported them in);
  * ROI filtering, overcrowding and the object counts on scripted frames; direction and STOPPED on the scenarios
- * 8.0 was observed on, against its states frame by frame.
+ * 8.0 was observed on, against its states frame by frame; line crossing; the stream state life cycle (resets and
+ * eviction).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-analytics-core.h"
 
@@ -2478,6 +2479,170 @@ test_lc_obj_status (void)
   rds_analytics_core_free (core);
 }
 
+/* ------------------------------------------------------------------------------------------------------------ */
+/* The stream state life cycle: resets and eviction (ours), on line LC_LOOSE's Dn (y 400, counting down) */
+
+#define SECONDS(s) ((guint64) (s) * G_GUINT64_CONSTANT (1000000000))
+
+/* One frame of stream @pad_index with id @id at (640, @y) when @y >= 0, nothing otherwise; returns the objects
+ * counted on Dn on this frame */
+static guint
+lc_step (RdsAnalyticsCore * core, guint pad_index, guint64 pts, guint64 id, gint class_id, gint y,
+    RdsAnalyticsFrameResult * r)
+{
+  RdsAnalyticsObject o = obj_at (id, class_id, 640, y);
+
+  rds_analytics_core_process_frame (core, pad_index, pts, &o, y >= 0 ? 1 : 0, r);
+  g_assert_cmpuint (r->n_lc, ==, 1);
+  return (guint) r->lc[0].current;
+}
+
+/* A reset clears the histories and their "already counted" flags, the untracked warning and objCnt, and keeps the
+ * cumulative counts (ours); it leaves the other streams alone, and an unknown pad is a no-op */
+static void
+test_life_reset (void)
+{
+  RdsAnalyticsCore *core = core_for (LC_LOOSE "[line-crossing-stream-1]\nenable=1\n" LC_RULE_DN);
+  RdsAnalyticsFrameResult r;
+  guint f = 0;
+
+  rds_analytics_core_reset_stream (core, 7);
+  /* id 1 (class 5) and an untracked object down across Dn: counted at frame 10 on both streams */
+  for (; f < 15; f++) {
+    RdsAnalyticsObject objs[2] = { obj_at (1, 5, 640, 300 + 10 * f), obj_at (RDS_ANALYTICS_UNTRACKED, 5, 300, 100) };
+
+    for (guint s = 0; s < 2; s++) {
+      rds_analytics_core_process_frame (core, s, FRAME_30FPS (f), objs, 2, &r);
+      g_assert_cmpuint (r.lc[0].current, ==, f == 10);
+      g_assert_cmpint (r.untracked_warning, ==, f == 0);
+      g_assert_cmpint (obj_cnt (&r, 5), ==, 2);
+    }
+  }
+  rds_analytics_core_reset_stream (core, 0);
+  rds_analytics_core_reset_stream (core, 7);
+  /* id 1 again from y 300, now class 0: stream 0 counts it again 10 frames on, stream 1 still has it counted */
+  for (guint k = 0; k < 15; k++, f++) {
+    RdsAnalyticsObject objs[2] = { obj_at (1, 0, 640, 300 + 10 * k), obj_at (RDS_ANALYTICS_UNTRACKED, 0, 300, 100) };
+
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), objs, 2, &r);
+    g_assert_cmpuint (r.lc[0].current, ==, k == 10);
+    g_assert_cmpuint (r.lc[0].cumulative, ==, k < 10 ? 1 : 2);
+    /* the warning is given again, and objCnt starts fresh: class 5 is gone */
+    g_assert_cmpint (r.untracked_warning, ==, k == 0);
+    g_assert_cmpint (obj_cnt (&r, 5), ==, -1);
+    g_assert_cmpint (obj_cnt (&r, 0), ==, 2);
+    g_assert_cmpuint (r.n_obj_cnt, ==, 1);
+
+    rds_analytics_core_process_frame (core, 1, FRAME_30FPS (f), objs, 2, &r);
+    g_assert_cmpuint (r.lc[0].current, ==, 0);
+    g_assert_cmpuint (r.lc[0].cumulative, ==, 1);
+    g_assert_false (r.untracked_warning);
+    /* class 5 is still seen there: 0 (on the tie at k = 0, the newest value) */
+    g_assert_cmpint (obj_cnt (&r, 5), ==, 0);
+  }
+  rds_analytics_core_free (core);
+}
+
+/* id 1 down across Dn from y 300, counted at frame 10, seen until frame 12, then absent until frame @back, at
+ * @pts (frame) each; then down again from y 300 for 20 frames. Returns the frame of its second count, or 0. */
+static guint
+evict_run (guint back, guint64 (*pts) (guint))
+{
+  RdsAnalyticsCore *core = core_for (LC_LOOSE);
+  RdsAnalyticsFrameResult r;
+  guint second = 0;
+
+  for (guint f = 0; f < back + 20; f++) {
+    gint y = f <= 12 ? 300 + 10 * (gint) f : f >= back ? 300 + 10 * (gint) (f - back) : -1;
+    guint n = lc_step (core, 0, pts (f), 1, 0, y, &r);
+
+    if (f < back)
+      g_assert_cmpuint (n, ==, f == 10);
+    else if (n > 0) {
+      g_assert_cmpuint (second, ==, 0);
+      second = f;
+    }
+    g_assert_cmpuint (r.lc[0].cumulative, ==, f < 10 ? 0 : second ? 2 : 1);
+  }
+  rds_analytics_core_free (core);
+  return second;
+}
+
+static guint64
+pts_1fps (guint f)
+{
+  return SECONDS (f);
+}
+
+static guint64
+pts_30fps (guint f)
+{
+  return FRAME_30FPS (f);
+}
+
+static guint64
+pts_none (guint f G_GNUC_UNUSED)
+{
+  return RDS_ANALYTICS_PTS_NONE;
+}
+
+/* A history unseen for more than 30 s of PTS is dropped (ours): its id comes back fresh and counts again; one
+ * seen 30 s ago is kept, and keeps its "already counted" flag */
+static void
+test_life_evict (void)
+{
+  /* 1 fps: last seen at 12 s, back at 42 s (30 s unseen: kept) or 43 s (31 s: dropped) */
+  g_assert_cmpuint (evict_run (42, pts_1fps), ==, 0);
+  g_assert_cmpuint (evict_run (43, pts_1fps), ==, 53);
+  /* 30 fps, swept at most once a second: last seen at 0.4 s; back at 30.4 s kept, at 31.5 s dropped */
+  g_assert_cmpuint (evict_run (12 + 900, pts_30fps), ==, 0);
+  g_assert_cmpuint (evict_run (12 + 933, pts_30fps), ==, 12 + 933 + 10);
+}
+
+/* Without PTS, a history unseen for more than 900 frames is dropped (ours), swept every 30 frames */
+static void
+test_life_evict_no_pts (void)
+{
+  g_assert_cmpuint (evict_run (12 + 900, pts_none), ==, 0);
+  g_assert_cmpuint (evict_run (12 + 931, pts_none), ==, 12 + 931 + 10);
+}
+
+/* A sweep keeps the ids seen within 30 s: at 1 fps, id 2 seen every frame, id 1 every 20 s */
+static void
+test_life_evict_keeps_seen (void)
+{
+  RdsAnalyticsCore *core = core_for (LC_LOOSE);
+  RdsAnalyticsFrameResult r;
+
+  for (guint f = 0; f <= 200; f++) {
+    /* id 2 down across Dn at frame 10; id 1 down 10 px per sighting, across on its 11th, at frame 200 */
+    RdsAnalyticsObject objs[2] = { obj_at (2, 0, 200, 300 + 10 * MIN (f, 20)),
+      obj_at (1, 0, 640, 300 + 10 * (f / 20))
+    };
+
+    rds_analytics_core_process_frame (core, 0, SECONDS (f), objs, f % 20 == 0 ? 2 : 1, &r);
+    g_assert_cmpuint (r.lc[0].current, ==, (f == 10) + (f == 200));
+  }
+  g_assert_cmpuint (r.lc[0].cumulative, ==, 2);
+  rds_analytics_core_free (core);
+}
+
+/* DeepStream 8.0 behaviour: a history is kept across a 30-frame absence. id 1 at y 300, 310, 320 (frames 0-2),
+ * absent 30 frames, back at y 420: its 4th observation, ref 305, so it counts at once */
+static void
+test_life_absence (void)
+{
+  RdsAnalyticsCore *core = core_for (LC_LOOSE);
+  RdsAnalyticsFrameResult r;
+
+  for (guint f = 0; f < 34; f++) {
+    gint y = f < 3 ? 300 + 10 * (gint) f : f == 33 ? 420 : -1;
+
+    g_assert_cmpuint (lc_step (core, 0, FRAME_30FPS (f), 1, 0, y, &r), ==, f == 33);
+  }
+  rds_analytics_core_free (core);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -2541,5 +2706,10 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-core/line-crossing/degenerate", test_lc_degenerate);
   g_test_add_func ("/cpu/analytics-core/line-crossing/duplicate-ids", test_lc_duplicate_ids);
   g_test_add_func ("/cpu/analytics-core/line-crossing/extreme", test_lc_extreme);
+  g_test_add_func ("/cpu/analytics-core/life-cycle/reset", test_life_reset);
+  g_test_add_func ("/cpu/analytics-core/life-cycle/evict", test_life_evict);
+  g_test_add_func ("/cpu/analytics-core/life-cycle/evict-no-pts", test_life_evict_no_pts);
+  g_test_add_func ("/cpu/analytics-core/life-cycle/evict-keeps-seen", test_life_evict_keeps_seen);
+  g_test_add_func ("/cpu/analytics-core/life-cycle/absence", test_life_absence);
   return g_test_run ();
 }

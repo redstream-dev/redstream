@@ -65,7 +65,18 @@ G_GNUC_INTERNAL gboolean rds_analytics_point_in_polygon (RdsAnalyticsPoint p, co
  *   meets the line, projected on it (ours: 8.0's runs only crossed horizontal segments straight down); with
  *   extended=1, anywhere on the infinite line.
  * The object is then counted once on that line: lcStatus and the " LC:<l> " piece on that frame only, and the line's
- * counts. There is no STOPPED gate. Untracked objects are skipped (ours). */
+ * counts. There is no STOPPED gate. Untracked objects are skipped (ours).
+ *
+ * The stream state life cycle:
+ * - Eviction (ours: 8.0's limit is unknown, and it kept a history across a 30-frame absence, as this does): a history
+ *   unseen for more than 30 s of PTS is dropped, so an id coming back later starts a fresh history and can be
+ *   counted again. Without PTS (a frame without one, or a PTS gone back before the history's last sighting) the
+ *   age is in the stream's frames instead: more than 900. The histories are swept at most once per second of
+ *   stream PTS, or every 30 frames without PTS, so a history can outlive its age by up to that much.
+ * - Stream reset (ours): rds_analytics_core_reset_stream.
+ * - Config reload (DeepStream 8.0 behaviour): everything resets. The caller frees the core
+ *   (rds_analytics_core_free) and makes a new one from the new config; no state carries over, the cumulative
+ *   counts included. */
 
 /* The object id of an object no tracker has given an id: DeepStream's UNTRACKED_OBJECT_ID. */
 #define RDS_ANALYTICS_UNTRACKED G_MAXUINT64
@@ -177,6 +188,12 @@ G_GNUC_INTERNAL void rds_analytics_core_free (RdsAnalyticsCore * core);
  * and fills @out. A new pad_index gets fresh state. A stream without groups still gets objCnt. */
 G_GNUC_INTERNAL void rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guint64 pts,
     const RdsAnalyticsObject * objs, guint n, RdsAnalyticsFrameResult * out);
+
+/* Clears the state of stream @pad_index, as when a new source takes its pad (ours: 8.0 ignores stream events, so a
+ * source re-added on the same pad inherits the old state): its histories, with their STOPPED state and "already
+ * counted" flags, its untracked-object warning, and its objCnt window and classes. The cumulative line-crossing
+ * counts are kept. A pad without state is left alone. */
+G_GNUC_INTERNAL void rds_analytics_core_reset_stream (RdsAnalyticsCore * core, guint pad_index);
 
 G_END_DECLS
 
