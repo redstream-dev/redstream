@@ -1209,7 +1209,8 @@ The object meta fields the tracker writes (`object_id`, `tracker_bbox_info`, `tr
   these are errors (ours, where 8.0 crashes, reads garbage or silently misbehaves): an empty value (except
   `class-id`), a `config-width` or `config-height` of 0, an ROI with an odd count or fewer than 3 points, a line
   crossing without exactly 8 values, a direction without exactly 4, negative or non-integer coordinates (fatal in
-  8.0 too), an empty list item (`1;;2`), a label used twice in one group, an empty label, and a stream number that is
+  8.0 too), an empty list item (`1;;2`), a label used twice in one group or in both the
+  roi-filtering and the overcrowding group of a stream, an empty label, and a stream number that is
   not one: not a decimal number without leading zeros (`-stream-00`, `-stream-007`), or above 4294967295. So two
   spellings never name one stream. `class-id=` and `class-id=;` mean every class; `mode=` in a direction group is
   accepted.
@@ -1234,7 +1235,7 @@ The object meta fields the tracker writes (`object_id`, `tracker_bbox_info`, `tr
 | `mode` | line-crossing | string | `loose` |  | supported | strict, balanced or loose; any other value reads as loose (DeepStream 8.0 behaviour). Matching is case-sensitive (ours: `Strict` reads as loose; 8.0 not observed) |
 | `mode` | direction-detection | string | none |  | accepted no-op | accepted and ignored, as in DeepStream 8.0 |
 | `extended` | line-crossing | bool | `0` |  | supported | 0: the crossing must hit the segment, 1: the infinite line (DeepStream 8.0 behaviour) |
-| `roi-<label>` | roi-filtering, overcrowding | polygon | none | >= 0 | supported | x1;y1;x2;y2;... in order around the polygon, at least 3 points; integers >= 0. Fewer than 3 points or an odd count is an error (ours): 8.0 accepts them (an ROI that never matches, a missing y read as 0) |
+| `roi-<label>` | roi-filtering, overcrowding | polygon | none | >= 0 | supported | x1;y1;x2;y2;... in order around the polygon, at least 3 points; integers >= 0. A label used by both the roi-filtering and the overcrowding group of a stream is an error (ours): both go in `objInROIcnt`, where 8.0 lets one count overwrite the other. Direction and line-crossing labels are independent. Fewer than 3 points or an odd count is an error (ours): 8.0 accepts them (an ROI that never matches, a missing y read as 0) |
 | `line-crossing-<label>` | line-crossing | line | none | >= 0 | supported | 8 integers >= 0: the direction vector (x1;y1;x2;y2), then the line's two ends. Another count is an error (ours): 8.0 reads a short line as garbage and ignores extra values |
 | `direction-<label>` | direction-detection | vector | none | >= 0 | supported | 4 integers >= 0: the vector from (x1;y1) to (x2;y2). Another count is an error (ours): 8.0 reads a missing value as 0 |
 

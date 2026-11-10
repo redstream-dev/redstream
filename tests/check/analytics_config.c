@@ -437,6 +437,13 @@ test_errors (void)
   text_fails (PROPERTY "[line-crossing-stream-0]\nline-crossing-L=0;0;0;10;0;5;10;5\n"
       "[line-crossing-stream-0]\nline-crossing-L=0;0;0;10;0;5;10;5\n", INVALID,
       "[line-crossing-stream-0] line-crossing-L", "duplicate label", NULL);
+  /* ours: a label in both the roi-filtering and the overcrowding group of a stream, whichever comes first */
+  text_fails (PROPERTY "[roi-filtering-stream-0]\nroi-A=0;0;10;0;10;10\n"
+      "[overcrowding-stream-0]\nroi-A=0;0;20;0;20;20\n", INVALID,
+      "[overcrowding-stream-0] roi-A", "label already used by [roi-filtering-stream-0]", NULL);
+  text_fails (PROPERTY "[overcrowding-stream-3]\nroi-B=0;0;20;0;20;20\n"
+      "[roi-filtering-stream-3]\nroi-A=0;0;10;0;10;10\nroi-B=0;0;10;0;10;10\n", INVALID,
+      "[roi-filtering-stream-3] roi-B", "label already used by [overcrowding-stream-3]", NULL);
   /* a feature group with no rule (DeepStream 8.0 behaviour), a bad stream number, an empty label (ours) */
   text_fails (PROPERTY "[roi-filtering-stream-0]\nenable=1\n", INVALID, "[roi-filtering-stream-0]", "no roi-<label>",
       NULL);
@@ -472,16 +479,19 @@ test_errors (void)
       "[direction-detection-stream-0] direction-D: 0;0;2147483648;0: ", "2147483648: must be at most 2147483647", NULL);
 }
 
-/* The same label in two features, or in two streams, is fine. */
+/* The same label in two streams, or in features that don't share a map (an ROI and a direction or a line), is fine;
+ * roi-filtering and overcrowding share objInROIcnt (see the errors). */
 static void
 test_labels_per_feature (void)
 {
   RdsAnalyticsConfig *cfg = text_ok (PROPERTY
-      "[roi-filtering-stream-0]\nroi-A=0;0;10;0;10;10\n[overcrowding-stream-0]\nroi-A=0;0;10;0;10;10\n"
-      "[roi-filtering-stream-1]\nroi-A=0;0;10;0;10;10\n");
+      "[roi-filtering-stream-0]\nroi-A=0;0;10;0;10;10\n[direction-detection-stream-0]\ndirection-A=0;0;10;0\n"
+      "[line-crossing-stream-0]\nline-crossing-A=0;0;0;10;0;5;10;5\n"
+      "[overcrowding-stream-0]\nroi-B=0;0;10;0;10;10\n[overcrowding-stream-1]\nroi-A=0;0;10;0;10;10\n");
 
-  g_assert_cmpstr (rule (group (cfg, 0, RDS_ANALYTICS_OVERCROWDING), 0)->label, ==, "A");
-  g_assert_cmpstr (rule (group (cfg, 1, RDS_ANALYTICS_ROI_FILTERING), 0)->label, ==, "A");
+  g_assert_cmpstr (rule (group (cfg, 0, RDS_ANALYTICS_DIRECTION), 0)->label, ==, "A");
+  g_assert_cmpstr (rule (group (cfg, 0, RDS_ANALYTICS_LINE_CROSSING), 0)->label, ==, "A");
+  g_assert_cmpstr (rule (group (cfg, 1, RDS_ANALYTICS_OVERCROWDING), 0)->label, ==, "A");
   rds_analytics_config_free (cfg);
 }
 

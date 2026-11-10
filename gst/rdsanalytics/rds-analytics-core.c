@@ -129,20 +129,23 @@ typedef struct
   GArray *bins;                 /* ModeBin */
 } ClassWindow;
 
-/* One frame of the window: its nonzero class counts (a class it doesn't list counts 0). */
+/* One frame of the window: its nonzero class counts (a class it doesn't list counts 0). A slot of the stream's ring,
+ * reused with its counts buffer. */
 typedef struct
 {
   guint64 pts;
   guint64 seq;
-  guint n;
-  RdsAnalyticsClassCount counts[];
+  guint n, cap;
+  RdsAnalyticsClassCount *counts;
 } WindowFrame;
 
 typedef struct
 {
   const CoreRules *rules;       /* NULL: the stream has no enabled group */
-  GArray *classes;              /* ClassWindow, in the order first seen */
-  GQueue frames;                /* WindowFrame *, oldest first */
+  GArray *classes;              /* ClassWindow, sorted by (guint) class_id */
+  /* the window's frames: a ring of n_slots slots, the oldest at head, n_frames in use; it grows when full */
+  WindowFrame *slots;
+  guint n_slots, head, n_frames;
   guint64 seq;
   guint64 last_pts;             /* RDS_ANALYTICS_PTS_NONE: none, or the last frame had none */
 } StreamState;
@@ -234,7 +237,7 @@ class_window_clear (gpointer p)
 static void
 window_clear (StreamState * st)
 {
-  g_queue_clear_full (&st->frames, g_free);
+  st->head = st->n_frames = 0;
   for (guint i = 0; i < st->classes->len; i++)
     g_array_set_size (g_array_index (st->classes, ClassWindow, i).bins, 0);
 }
@@ -242,7 +245,9 @@ window_clear (StreamState * st)
 static void
 stream_state_free (StreamState * st)
 {
-  g_queue_clear_full (&st->frames, g_free);
+  for (guint i = 0; i < st->n_slots; i++)
+    g_free (st->slots[i].counts);
+  g_free (st->slots);
   g_array_unref (st->classes);
   g_free (st);
 }
@@ -254,6 +259,7 @@ rds_analytics_core_new (const RdsAnalyticsConfig * cfg, guint out_w, guint out_h
 
   g_return_val_if_fail (cfg != NULL, NULL);
   g_return_val_if_fail (cfg->config_width > 0 && cfg->config_height > 0, NULL);
+  g_return_val_if_fail (out_w > 0 && out_h > 0, NULL);
 
   core = g_new0 (RdsAnalyticsCore, 1);
   core->window_ns = (guint64) cfg->obj_cnt_win_in_ms * G_GUINT64_CONSTANT (1000000);
@@ -318,7 +324,6 @@ get_stream (RdsAnalyticsCore * core, guint pad_index)
     st->rules = g_hash_table_lookup (core->rules, GUINT_TO_POINTER (pad_index));
     st->classes = g_array_new (FALSE, FALSE, sizeof (ClassWindow));
     g_array_set_clear_func (st->classes, class_window_clear);
-    g_queue_init (&st->frames);
     st->last_pts = RDS_ANALYTICS_PTS_NONE;
     g_hash_table_insert (core->streams, GUINT_TO_POINTER (pad_index), st);
   }
@@ -398,17 +403,51 @@ bins_mode (const GArray * bins)
   return best != NULL ? best->value : 0;
 }
 
+static WindowFrame *
+window_slot (StreamState * st, guint i)
+{
+  return &st->slots[(st->head + i) % st->n_slots];
+}
+
+/* A new slot at the tail, with room for @n counts. */
+static WindowFrame *
+window_push_slot (StreamState * st, guint n)
+{
+  WindowFrame *wf;
+
+  if (st->n_frames == st->n_slots) {
+    /* full: unroll into a ring twice the size, oldest first (every slot is in use, buffers included) */
+    guint n_slots = MAX (16, st->n_slots * 2);
+    WindowFrame *slots = g_new0 (WindowFrame, n_slots);
+
+    for (guint i = 0; i < st->n_frames; i++)
+      slots[i] = *window_slot (st, i);
+    g_free (st->slots);
+    st->slots = slots;
+    st->n_slots = n_slots;
+    st->head = 0;
+  }
+  wf = window_slot (st, st->n_frames++);
+  if (wf->cap < n) {
+    wf->cap = MAX (n, 2 * wf->cap);
+    wf->counts = g_renew (RdsAnalyticsClassCount, wf->counts, wf->cap);
+  }
+  wf->n = 0;
+  return wf;
+}
+
 static void
 window_pop (StreamState * st)
 {
-  WindowFrame *wf = g_queue_pop_head (&st->frames);
+  const WindowFrame *wf = window_slot (st, 0);
 
   for (guint i = 0; i < st->classes->len; i++) {
     ClassWindow *cw = &g_array_index (st->classes, ClassWindow, i);
 
     bins_remove (cw->bins, counts_lookup (wf->counts, wf->n, cw->class_id));
   }
-  g_free (wf);
+  st->head = (st->head + 1) % st->n_slots;
+  st->n_frames--;
 }
 
 /* The window: the stream's frames whose PTS is at most W = obj-cnt-win-in-ms before the current frame's, both
@@ -433,46 +472,47 @@ window_push (RdsAnalyticsCore * core, StreamState * st, guint64 pts)
     window_clear (st);
   st->last_pts = pts;
 
-  /* classes seen for the first time: the frames of the window before them count 0 (ours) */
+  /* classes seen for the first time: the frames of the window before them count 0 (ours). The classes are kept
+   * sorted by their id as unsigned, so -1 comes last: the order of 8.0's display-obj-cnt text (DeepStream 8.0
+   * behaviour). */
   for (guint i = 0; i < cur->len; i++) {
     const RdsAnalyticsClassCount *c = &g_array_index (cur, RdsAnalyticsClassCount, i);
-    gboolean known = FALSE;
+    guint k;
 
-    for (guint k = 0; k < st->classes->len && !known; k++)
-      known = g_array_index (st->classes, ClassWindow, k).class_id == c->class_id;
-    if (!known) {
+    for (k = 0; k < st->classes->len; k++)
+      if ((guint) g_array_index (st->classes, ClassWindow, k).class_id >= (guint) c->class_id)
+        break;
+    if (k == st->classes->len || g_array_index (st->classes, ClassWindow, k).class_id != c->class_id) {
       ClassWindow cw = { c->class_id, g_array_new (FALSE, FALSE, sizeof (ModeBin)) };
 
-      if (st->frames.length > 0)
-        bins_add (cw.bins, 0, st->frames.length, ((WindowFrame *) g_queue_peek_tail (&st->frames))->seq);
-      g_array_append_val (st->classes, cw);
+      if (st->n_frames > 0)
+        bins_add (cw.bins, 0, st->n_frames, window_slot (st, st->n_frames - 1)->seq);
+      g_array_insert_val (st->classes, k, cw);
     }
     if (c->count > 0)
       n_nonzero++;
   }
 
   seq = ++st->seq;
-  wf = g_malloc (sizeof (WindowFrame) + n_nonzero * sizeof (RdsAnalyticsClassCount));
+  wf = window_push_slot (st, n_nonzero);
   wf->pts = pts;
   wf->seq = seq;
-  wf->n = 0;
   for (guint i = 0; i < cur->len; i++) {
     const RdsAnalyticsClassCount *c = &g_array_index (cur, RdsAnalyticsClassCount, i);
 
     if (c->count > 0)
       wf->counts[wf->n++] = *c;
   }
-  g_queue_push_tail (&st->frames, wf);
   for (guint i = 0; i < st->classes->len; i++) {
     ClassWindow *cw = &g_array_index (st->classes, ClassWindow, i);
 
     bins_add (cw->bins, counts_lookup (wf->counts, wf->n, cw->class_id), 1, seq);
   }
 
-  while (st->frames.length > 1) {
-    const WindowFrame *head = g_queue_peek_head (&st->frames);
+  while (st->n_frames > 1) {
+    const WindowFrame *head = window_slot (st, 0);
 
-    if (st->frames.length <= OBJ_CNT_MAX_FRAMES && pts - head->pts <= core->window_ns)
+    if (st->n_frames <= OBJ_CNT_MAX_FRAMES && pts - head->pts <= core->window_ns)
       break;
     window_pop (st);
   }
@@ -560,7 +600,8 @@ rds_analytics_core_process_frame (RdsAnalyticsCore * core, guint pad_index, guin
         if (in != roi->inverse_roi) {
           g_array_index (core->roi_counts, RdsAnalyticsRoiCount, r).count++;
           g_ptr_array_add (core->labels, rule->label);
-          g_string_append_printf (core->strings, " ROI:%s", rule->label);
+          g_string_append (core->strings, " ROI:");
+          g_string_append (core->strings, rule->label);
         }
       }
     }

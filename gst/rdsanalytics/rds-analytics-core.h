@@ -85,9 +85,10 @@ typedef struct
   gboolean has_info;
 } RdsAnalyticsObjectResult;
 
-/* Owned by the core: valid until the next rds_analytics_core_process_frame or rds_analytics_core_free. Labels are
- * the core's copies. Every array is in config order: groups in the order of RdsAnalyticsFeature, rules in the
- * order of their keys. */
+/* Owned by the core: valid only until the next rds_analytics_core_process_frame (of any stream) or
+ * rds_analytics_core_free. So a caller writes everything it needs from a frame's result, its metas and its display
+ * meta included, before processing the next frame. Labels are the core's copies. Every array is in config order:
+ * groups in the order of RdsAnalyticsFeature, rules in the order of their keys. */
 typedef struct
 {
   /* objInROIcnt: every enabled ROI-filtering label, then every enabled overcrowding label, zeros included */
@@ -96,7 +97,8 @@ typedef struct
   /* ocStatus: every enabled overcrowding label */
   const RdsAnalyticsOcStatus *oc;
   guint n_oc;
-  /* objCnt: every class seen on the stream so far, in the order first seen; see rds_analytics_core_new */
+  /* objCnt: every class seen on the stream so far, sorted by the class id as unsigned, so -1 comes last (DeepStream
+   * 8.0 behaviour: the order of its display-obj-cnt text); see rds_analytics_core_new */
   const RdsAnalyticsClassCount *obj_cnt;
   guint n_obj_cnt;
   /* one per input object, in input order */

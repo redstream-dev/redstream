@@ -539,6 +539,7 @@ test_roi_labels (void)
   assert_labels (r.objects[1].roi_labels, r.objects[1].n_roi_labels, "Z");
   assert_labels (r.objects[1].oc_labels, r.objects[1].n_oc_labels, "");
   g_assert_cmpstr (r.objects[1].obj_status, ==, " ROI:Z");
+  g_assert_true (r.objects[1].has_info);
   rds_analytics_core_free (core);
 }
 
@@ -600,13 +601,13 @@ test_class_filter (void)
     g_assert_cmpstr (r.objects[i].obj_status, ==, "");
     g_assert_false (r.objects[i].has_info);
   }
-  /* objCnt: every class, in the order first seen */
+  /* objCnt: every class, -1 last */
   g_assert_cmpuint (r.n_obj_cnt, ==, 5);
   g_assert_cmpint (r.obj_cnt[0].class_id, ==, 0);
   g_assert_cmpint (r.obj_cnt[1].class_id, ==, 1);
   g_assert_cmpint (r.obj_cnt[2].class_id, ==, 2);
-  g_assert_cmpint (r.obj_cnt[3].class_id, ==, -1);
-  g_assert_cmpint (r.obj_cnt[4].class_id, ==, 5);
+  g_assert_cmpint (r.obj_cnt[3].class_id, ==, 5);
+  g_assert_cmpint (r.obj_cnt[4].class_id, ==, -1);
   for (guint i = 0; i < 5; i++)
     g_assert_cmpuint (r.obj_cnt[i].count, ==, 1);
   rds_analytics_core_free (core);
@@ -730,6 +731,32 @@ test_obj_cnt_ties (void)
   rds_analytics_core_free (core);
 }
 
+/* objCnt is sorted by the class id as unsigned, -1 last (DeepStream 8.0 behaviour: its display-obj-cnt text reads
+ * ClassId0 ... ClassId7 ClassId4294967295), whatever the order the classes are first seen in */
+static void
+test_obj_cnt_order (void)
+{
+  RdsAnalyticsCore *core = core_for (PROPERTY);
+  RdsAnalyticsObject first[] = { obj_at (1, 5, 100, 100), obj_at (2, -1, 200, 100), obj_at (3, 7, 300, 100) };
+  RdsAnalyticsObject later[] = { obj_at (4, 2, 100, 100), obj_at (5, -3, 200, 100), obj_at (6, 0, 300, 100) };
+  static const gint want[] = { 0, 2, 5, 7, -3, -1 };
+  RdsAnalyticsFrameResult r;
+
+  rds_analytics_core_process_frame (core, 0, 0, first, 3, &r);
+  g_assert_cmpuint (r.n_obj_cnt, ==, 3);
+  g_assert_cmpint (r.obj_cnt[0].class_id, ==, 5);
+  g_assert_cmpint (r.obj_cnt[1].class_id, ==, 7);
+  g_assert_cmpint (r.obj_cnt[2].class_id, ==, -1);
+  rds_analytics_core_process_frame (core, 0, FRAME_30FPS (1), later, 3, &r);
+  g_assert_cmpuint (r.n_obj_cnt, ==, G_N_ELEMENTS (want));
+  for (guint i = 0; i < G_N_ELEMENTS (want); i++)
+    g_assert_cmpint (r.obj_cnt[i].class_id, ==, want[i]);
+  /* each class keeps its own window: 5 was 1 then 0 (a tie, the newer), 2 was 0 then 1 */
+  g_assert_cmpuint (r.obj_cnt[2].count, ==, 0);
+  g_assert_cmpuint (r.obj_cnt[1].count, ==, 1);
+  rds_analytics_core_free (core);
+}
+
 /* The window holds the frames whose PTS is at most W before the current one: 5, 5, 3 gives 5 when the first frame
  * is exactly W back, and the tie 5, 3 (so 3) when it is 1 ns further */
 static void
@@ -808,6 +835,31 @@ test_obj_cnt_max_frames (void)
   rds_analytics_core_free (core);
 }
 
+/* A stream whose groups are all disabled is a stream without groups: empty maps, no object info, objCnt filled */
+static void
+test_all_disabled (void)
+{
+  RdsAnalyticsCore *core = core_for (PROPERTY "[roi-filtering-stream-0]\nenable=0\n"
+      "roi-RF=0;0;1280;0;1280;720;0;720\n"
+      "[overcrowding-stream-0]\nenable=0\nroi-OC=0;0;1280;0;1280;720;0;720\nobject-threshold=1\n");
+  RdsAnalyticsObject objs[] = { obj_at (1, 0, 100, 300), obj_at (2, 4, 200, 300) };
+  RdsAnalyticsFrameResult r;
+
+  rds_analytics_core_process_frame (core, 0, 0, objs, 2, &r);
+  g_assert_cmpuint (r.n_roi_counts, ==, 0);
+  g_assert_cmpuint (r.n_oc, ==, 0);
+  g_assert_cmpuint (r.n_objects, ==, 2);
+  for (guint i = 0; i < 2; i++) {
+    g_assert_cmpuint (r.objects[i].n_roi_labels, ==, 0);
+    g_assert_cmpuint (r.objects[i].n_oc_labels, ==, 0);
+    g_assert_cmpstr (r.objects[i].obj_status, ==, "");
+    g_assert_false (r.objects[i].has_info);
+  }
+  g_assert_cmpint (obj_cnt (&r, 0), ==, 1);
+  g_assert_cmpint (obj_cnt (&r, 4), ==, 1);
+  rds_analytics_core_free (core);
+}
+
 /* Streams are kept apart: their own groups, and their own objCnt windows */
 static void
 test_two_streams (void)
@@ -876,8 +928,10 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-core/roi/class-filter", test_class_filter);
   g_test_add_func ("/cpu/analytics-core/roi/disabled-untracked", test_disabled_and_untracked);
   g_test_add_func ("/cpu/analytics-core/roi/scaled", test_scaled_rules);
+  g_test_add_func ("/cpu/analytics-core/roi/all-disabled", test_all_disabled);
   g_test_add_func ("/cpu/analytics-core/obj-cnt/window", test_obj_cnt_window);
   g_test_add_func ("/cpu/analytics-core/obj-cnt/window-end", test_obj_cnt_window_end);
+  g_test_add_func ("/cpu/analytics-core/obj-cnt/order", test_obj_cnt_order);
   g_test_add_func ("/cpu/analytics-core/obj-cnt/ties", test_obj_cnt_ties);
   g_test_add_func ("/cpu/analytics-core/obj-cnt/max-frames", test_obj_cnt_max_frames);
   g_test_add_func ("/cpu/analytics-core/obj-cnt/edges", test_obj_cnt_edges);

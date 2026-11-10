@@ -116,7 +116,8 @@ static const KeyInfo keys[] = {
   {.name = "extended",.groups = GRP_LC,.type = TYPE_BOOL,.status = SUP,.def = "0",.field = GF (extended),
       .note = "0: the crossing must hit the segment, 1: the infinite line"},
   {.name = "roi-<label>",.groups = GRP_ROI | GRP_OC,.type = TYPE_POLYGON,.status = SUP, COORD,
-      .note = "x1;y1;x2;y2;... in order around the polygon, at least 3 points; integers >= 0"},
+      .note = "x1;y1;x2;y2;... in order around the polygon, at least 3 points; integers >= 0. A label used by both "
+      "the roi-filtering and the overcrowding group of a stream is an error"},
   {.name = "line-crossing-<label>",.groups = GRP_LC,.type = TYPE_LINE,.status = SUP, COORD,
       .note = "8 integers >= 0: the direction vector (x1;y1;x2;y2), then the line's two ends"},
   {.name = "direction-<label>",.groups = GRP_DIR,.type = TYPE_VECTOR,.status = SUP, COORD,
@@ -416,9 +417,35 @@ parse_property (GKeyFile * kf, const gchar * path, RdsAnalyticsConfig * cfg, GEr
   return TRUE;
 }
 
-static gboolean
-parse_feature_group (GKeyFile * kf, const gchar * path, const gchar * name, RdsAnalyticsGroup * g, GError ** error)
+/* The feature whose labels share objInROIcnt with @f's: ROI filtering and overcrowding; RDS_ANALYTICS_N_FEATURES for
+ * the others, whose labels are independent. */
+static RdsAnalyticsFeature
+label_sharing_feature (RdsAnalyticsFeature f)
 {
+  switch (f) {
+    case RDS_ANALYTICS_ROI_FILTERING:
+      return RDS_ANALYTICS_OVERCROWDING;
+    case RDS_ANALYTICS_OVERCROWDING:
+      return RDS_ANALYTICS_ROI_FILTERING;
+    default:
+      return RDS_ANALYTICS_N_FEATURES;
+  }
+}
+
+static gboolean
+group_has_label (const RdsAnalyticsGroup * g, const gchar * label)
+{
+  for (guint i = 0; g && i < g->rules->len; i++)
+    if (strcmp (((const RdsAnalyticsRule *) g_ptr_array_index (g->rules, i))->label, label) == 0)
+      return TRUE;
+  return FALSE;
+}
+
+static gboolean
+parse_feature_group (GKeyFile * kf, const gchar * path, const gchar * name, const RdsAnalyticsStream * s,
+    RdsAnalyticsGroup * g, GError ** error)
+{
+  RdsAnalyticsFeature other = label_sharing_feature (g->feature);
   guint kind = features[g->feature].kind;
   gchar **names = g_key_file_get_keys (kf, name, NULL, NULL);
   GHashTable *labels = g_hash_table_new (g_str_hash, g_str_equal);
@@ -444,6 +471,11 @@ parse_feature_group (GKeyFile * kf, const gchar * path, const gchar * name, RdsA
         ok = key_error (error, path, name, names[i], raw, "empty label");
       else if (!g_hash_table_add (labels, (gpointer) label))
         ok = key_error (error, path, name, names[i], raw, "duplicate label in this group");
+      /* ours: the ROI-filtering and overcrowding labels of a stream are the keys of one map, objInROIcnt, where 8.0
+       * lets one overwrite the other */
+      else if (other != RDS_ANALYTICS_N_FEATURES && group_has_label (s->groups[other], label))
+        ok = key_error (error, path, name, names[i], raw, "label already used by [%s-stream-%u]",
+            features[other].name, s->pad_index);
       else if (!*raw)           /* ours: an empty rule crashes 8.0 */
         ok = key_error (error, path, name, names[i], raw, "empty value");
       else if (!(rule = parse_rule (k, label, raw, &reason)))
@@ -553,7 +585,7 @@ parse_group (GKeyFile * kf, const gchar * path, const gchar * name, RdsAnalytics
     g->rules = g_ptr_array_new_with_free_func ((GDestroyNotify) rule_free);
     apply_defaults (g, features[f].kind);
     s->groups[f] = g;
-    return parse_feature_group (kf, path, name, g, error);
+    return parse_feature_group (kf, path, name, s, g, error);
   }
   /* ours: logged too */
   g_message ("%s:[%s]: unknown group, ignored", path, name);
