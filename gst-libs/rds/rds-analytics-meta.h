@@ -3,8 +3,8 @@
  *
  * rdsanalytics attaches one RdsUserMeta per frame, base_meta.meta_type RDS_FRAME_META_ANALYTICS, whose
  * user_meta_data is an RdsAnalyticsFrameMeta, to frame_user_meta_list; and one per object that has something to
- * report, RDS_OBJ_META_ANALYTICS with an RdsAnalyticsObjInfo, to obj_user_meta_list. The two types are DeepStream
- * 8.0's numbers (32 and 33), which 8.0 also uses as its user meta types.
+ * report, RDS_OBJ_META_ANALYTICS with an RdsAnalyticsObjInfo, to obj_user_meta_list (DeepStream 8.0 behaviour).
+ * The two types are DeepStream 8.0's numbers (32 and 33), which 8.0 also uses as its user meta types.
  *
  * The structs are C++ (std::string, std::vector, std::unordered_map) with DeepStream's documented field names and
  * types, so C++ reads them directly:
@@ -16,6 +16,10 @@
  *       uint32_t in_roi = m->objInROIcnt["RF"];
  *     }
  *   }
+ *
+ * The structs have libstdc++'s layout: C++ readers must be built with the same _GLIBCXX_USE_CXX11_ABI as the
+ * library (the default, as on DeepStream). Include this header at file scope, never inside extern "C" {}: it
+ * includes C++ standard headers and declares its own C linkage.
  *
  * C sees them as opaque types and uses the functions below, which C++ can use too. No function lets an exception
  * out: a failure (a NULL argument, an allocation that fails) logs a critical and returns NULL, FALSE or 0.
@@ -46,34 +50,40 @@ typedef struct RdsAnalyticsObjInfo RdsAnalyticsObjInfo;
 /* Per frame. The fields in DeepStream's documented order. */
 struct RdsAnalyticsFrameMeta
 {
-  /* per overcrowding ROI label: overcrowded on this frame */
+  /* per overcrowding ROI label: overcrowded on this frame, i.e. the ROI's count is at least object-threshold and
+   * above 0 (DeepStream 8.0 behaviour) */
   std::unordered_map<std::string, bool> ocStatus;
-  /* per ROI label (roi-filtering and overcrowding ROIs): the objects counted in it on this frame */
+  /* per ROI label: the objects counted in it on this frame. It holds the roi-filtering and the overcrowding ROIs,
+   * with an entry (0) from the first frame on; with inverse-roi, the objects outside (DeepStream 8.0 behaviour) */
   std::unordered_map<std::string, uint32_t> objInROIcnt;
-  /* per line-crossing label: the crossings counted on this frame */
+  /* per line-crossing label: the crossings counted on this frame (each object once per line: DeepStream 8.0
+   * behaviour) */
   std::unordered_map<std::string, uint64_t> objLCCurrCnt;
   /* per line-crossing label: the crossings counted so far */
   std::unordered_map<std::string, uint64_t> objLCCumCnt;
   /* the rdsanalytics element's unique-id */
   guint unique_id = 0;
-  /* per class_id: the objects on the frame (every class, whatever the class-id filters) */
+  /* per class_id: the object count of that class, the mode of the per-frame count over the obj-cnt-win-in-ms PTS
+   * window; every class counts, whatever the class-id filters (DeepStream 8.0 behaviour). A tie goes to the most
+   * recent count (ours) */
   std::unordered_map<int, uint32_t> objCnt;
 };
 
 /* Per object. The fields in DeepStream's documented order. */
 struct RdsAnalyticsObjInfo
 {
-  /* the labels of the ROIs the object is in (outside, with inverse-roi) */
+  /* the labels of the ROIs the object is in; with inverse-roi, those it is outside (DeepStream 8.0 behaviour) */
   std::vector<std::string> roiStatus;
   /* the labels of the overcrowding ROIs the object is in */
   std::vector<std::string> ocStatus;
-  /* the labels of the lines the object crossed on this frame */
+  /* the labels of the lines the object crossed, on the counting frame only (DeepStream 8.0 behaviour) */
   std::vector<std::string> lcStatus;
-  /* the matched direction labels, concatenated */
+  /* the matched direction labels, concatenated (DeepStream 8.0 behaviour) */
   std::string dirStatus;
   /* the rdsanalytics element's unique-id */
   guint unique_id = 0;
-  /* the object's statuses as one string (ROI, DIR, LC, STOPPED pieces) */
+  /* the object's statuses as one string: the " ROI:<l>", " DIR:<l> ", " LC:<l> " and " STOPPED " pieces in that
+   * order; overcrowding never appears in it (DeepStream 8.0 behaviour) */
   std::string objStatus;
 };
 #endif
@@ -118,7 +128,8 @@ RDS_API gboolean rds_analytics_frame_meta_get_obj_count (const RdsAnalyticsFrame
 /* 0 (with a critical) for NULL. */
 RDS_API guint rds_analytics_frame_meta_get_unique_id (const RdsAnalyticsFrameMeta * meta);
 
-/* Callbacks of the foreach functions. They must not change the meta they iterate. */
+/* Callbacks of the foreach functions. They must not change the meta they iterate. RdsAnalyticsLabelCountFunc
+ * serves the ROI counts too: their guint32 values are passed widened to guint64. */
 typedef void (*RdsAnalyticsLabelCountFunc) (const gchar * label, guint64 count, gpointer user_data);
 typedef void (*RdsAnalyticsLabelStatusFunc) (const gchar * label, gboolean status, gpointer user_data);
 typedef void (*RdsAnalyticsClassCountFunc) (gint class_id, guint32 count, gpointer user_data);

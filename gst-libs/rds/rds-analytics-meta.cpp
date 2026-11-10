@@ -86,6 +86,19 @@ wrap (RdsBatchMeta * batch_meta, RdsMetaType type, T * meta) noexcept
   return um;
 }
 
+/* Runs add and checks that um landed in *list, both under the batch's (recursive) meta lock. A refused add (logged
+ * by libgstrds) leaves the user meta acquired, released with the batch: not ours to free. */
+template <typename F>
+bool
+add_checked (RdsBatchMeta * batch_meta, RdsUserMetaList ** list, RdsUserMeta * um, F && add) noexcept
+{
+  rds_acquire_meta_lock (batch_meta);
+  add ();
+  bool added = g_list_find (*list, um) != NULL;
+  rds_release_meta_lock (batch_meta);
+  return added;
+}
+
 template <typename Map>
 bool
 lookup (const Map & map, const typename Map::key_type & key, typename Map::mapped_type * out)
@@ -140,9 +153,8 @@ rds_analytics_frame_meta_attach (RdsFrameMeta * frame_meta, guint unique_id)
   RdsUserMeta *um = wrap (frame_meta->base_meta.batch_meta, RDS_FRAME_META_ANALYTICS, meta);
   if (um == nullptr)
     return nullptr;
-  rds_add_user_meta_to_frame (frame_meta, um);
-  /* A refused add (logged) leaves the user meta acquired, released with the batch: not ours to free. */
-  if (g_list_find (frame_meta->frame_user_meta_list, um) == NULL) {
+  if (!add_checked (frame_meta->base_meta.batch_meta, &frame_meta->frame_user_meta_list, um,
+          [&] { rds_add_user_meta_to_frame (frame_meta, um); })) {
     g_critical ("%s: the user meta could not be added to frame meta %p", G_STRFUNC, frame_meta);
     return nullptr;
   }
@@ -277,12 +289,14 @@ gboolean
 rds_analytics_frame_meta_get_obj_count (const RdsAnalyticsFrameMeta * meta, gint class_id, guint32 * count)
 {
   g_return_val_if_fail (meta != NULL, FALSE);
-  uint32_t v;
-  if (!lookup (meta->objCnt, class_id, &v))
-    return FALSE;
-  if (count != NULL)
-    *count = v;
-  return TRUE;
+  return guarded<gboolean> (G_STRFUNC, FALSE, [&] () -> gboolean {
+        uint32_t v;
+        if (!lookup (meta->objCnt, class_id, &v))
+          return FALSE;
+        if (count != NULL)
+          *count = v;
+        return TRUE;
+      });
 }
 
 guint
@@ -390,8 +404,8 @@ rds_analytics_obj_info_attach (RdsObjectMeta * obj_meta, guint unique_id)
   RdsUserMeta *um = wrap (obj_meta->base_meta.batch_meta, RDS_OBJ_META_ANALYTICS, info);
   if (um == nullptr)
     return nullptr;
-  rds_add_user_meta_to_obj (obj_meta, um);
-  if (g_list_find (obj_meta->obj_user_meta_list, um) == NULL) {
+  if (!add_checked (obj_meta->base_meta.batch_meta, &obj_meta->obj_user_meta_list, um,
+          [&] { rds_add_user_meta_to_obj (obj_meta, um); })) {
     g_critical ("%s: the user meta could not be added to object meta %p", G_STRFUNC, obj_meta);
     return nullptr;
   }

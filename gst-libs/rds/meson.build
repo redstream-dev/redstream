@@ -76,8 +76,9 @@ import('pkgconfig').generate(librds,
   requires : ['gstreamer-1.0 >= 1.28', 'gstreamer-video-1.0 >= 1.28'])
 
 # libgstrds-analytics: rdsanalytics' metas (C++ structs, DeepStream-shaped) with their create, copy and release
-# functions and the C API over them. A small C++ library of its own, so libgstrds stays C.
-librds_analytics = library('gstrds-analytics-' + api_version,
+# functions and the C API over them. A small C++ library of its own, so libgstrds stays C. Always shared: the user
+# metas hold pointers to its copy and release functions, which must outlive the code that attached them.
+librds_analytics = shared_library('gstrds-analytics-' + api_version,
   'rds-analytics-meta.cpp',
   cpp_args : ['-DG_LOG_DOMAIN="rds"', '-DBUILDING_RDS'],
   include_directories : include_directories('..'),
