@@ -324,6 +324,13 @@ if rds_tracker_enabled
     suite : 'cpu', env : internal_test_env, protocol : 'tap', timeout : 300)
 endif
 
+# The rdsanalytics config parser on its own (temporary key files), with the key table and its rows in
+# docs/compat-matrix.md. It uses no GStreamer, so it gets the environment without plugin paths.
+test('analytics_config', executable('analytics_config', 'check' / 'analytics_config.c',
+    dependencies : [rdsanalytics_core_dep],
+    c_args : ['-DRDS_COMPAT_MATRIX="@0@"'.format(meson.project_source_root() / 'docs' / 'compat-matrix.md')]),
+  suite : 'cpu', env : internal_test_env, protocol : 'tap')
+
 if rds_tracker_enabled and rds_infer_enabled
   # rdstracker end to end on a public street clip with YOLO11n (pipeline_tracker; skipped until
   # tests/models/fetch-tracker-clip.sh and fetch-yolo11n.sh have run), and the four-source soak (its own entry,
