@@ -2076,6 +2076,7 @@ test_lc_segment (void)
     815, 820
   };
   static const gdouble xs[] = { 100, 300, 499, 499.5, 500, 500.5, 650, 799.5, 800, 800.5, 801, 900, 1200 };
+  static const gdouble w60_xs[] = { 470, 471, 829, 830 };
   const gchar *w20[] = {
     "", "", "", "", "", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "", "", "", "", "",
   };
@@ -2083,6 +2084,7 @@ test_lc_segment (void)
     "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20",
     "S@20", "S@20", "S@20", "S@20",
   };
+  const gchar *w60_edges[] = { "", "S@20", "S@20", "" };      /* 30 px: from 471 to 829 */
   const gchar *seg[] = {
     "", "", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "S@20", "", "",
   };
@@ -2099,11 +2101,132 @@ test_lc_segment (void)
   lc_seg_xs = edge_xs;
   check_lc (LC_SEG ("0"), 60, 20, lc_seg_path, w20, G_N_ELEMENTS (w20));
   check_lc (LC_SEG ("0"), 60, 60, lc_seg_path, w60, G_N_ELEMENTS (w60));
+  lc_seg_xs = w60_xs;
+  check_lc (LC_SEG ("0"), 60, 60, lc_seg_path, w60_edges, G_N_ELEMENTS (w60_edges));
   lc_seg_xs = xs;
   check_lc (LC_SEG ("0"), 60, 20, lc_seg_path, seg, G_N_ELEMENTS (seg));
   check_lc (LC_SEG ("1"), 60, 20, lc_seg_path, ext, G_N_ELEMENTS (ext));
   check_lc (PROPERTY LC_GROUP "line-crossing-S=650;300;650;500;500;380;800;420\nclass-id=-1\nextended=1\n"
       "mode=loose\n", 60, 20, lc_seg_path, slant, G_N_ELEMENTS (slant));
+}
+
+/* Segment ends on other lines (ours: the crossing point projected on the line, against the segment lengthened by
+ * w/2 = 10 px at each end, strictly), crossed perpendicularly, so the ties are exact:
+ * - the vertical line x 700 from y 200 to 500, crossed east at 10 px/frame at bottom-centre y 190, 191, 350, 509,
+ *   510;
+ * - the 3-4-5 slanted line (400, 300) - (700, 700), 500 px long, crossed along its normal at 10 px/frame where the
+ *   projection is -10, -5, 250, 505 and 510 px.
+ * Each object is on the line at frame 10. */
+static const gdouble lc_vert_ys[] = { 190, 191, 350, 509, 510 };
+static const gdouble lc_slant_ts[] = { -10, -5, 250, 505, 510 };
+
+static gboolean
+lc_vert_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  *cx = 600 + 10.0 * f;
+  *by = lc_vert_ys[i];
+  return TRUE;
+}
+
+static gboolean
+lc_slant_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  /* the point at t on the line, minus 10 frames of (8, -6) */
+  *cx = 400 + 0.6 * lc_slant_ts[i] + 8.0 * ((gdouble) f - 10);
+  *by = 300 + 0.8 * lc_slant_ts[i] - 6.0 * ((gdouble) f - 10);
+  return TRUE;
+}
+
+static void
+test_lc_segment_ends (void)
+{
+  const gchar *want[] = { "", "S@10", "S@10", "S@10", "" };
+
+  check_lc (PROPERTY LC_GROUP "line-crossing-S=600;300;800;300;700;200;700;500\nextended=0\n", 30, 20,
+      lc_vert_path, want, G_N_ELEMENTS (want));
+  check_lc (PROPERTY LC_GROUP "line-crossing-S=550;500;950;200;400;300;700;700\nextended=0\n", 30, 20,
+      lc_slant_path, want, G_N_ELEMENTS (want));
+}
+
+/* Degenerate rules count nothing and break nothing (ours): a vector along its line, a line of one point, a vector
+ * of zero length; the stream's ordinary rule still counts */
+static gboolean
+lc_down_path (guint i, guint f, gdouble * cx, gdouble * by, gdouble * h G_GNUC_UNUSED)
+{
+  *cx = 600 + 100.0 * i;
+  *by = 300 + 10.0 * f;
+  return TRUE;
+}
+
+static void
+test_lc_degenerate (void)
+{
+  const gchar *want[] = { "Dn@10", "Dn@10" };
+  RdsAnalyticsCore *core;
+  RdsAnalyticsFrameResult r;
+
+  for (guint m = 0; m < 2; m++) {
+    gchar *cfg = g_strdup_printf (PROPERTY LC_GROUP "line-crossing-Along=500;400;700;400;400;400;800;400\n"
+        "line-crossing-Point=640;300;640;500;600;400;600;400\nline-crossing-Zero=640;300;640;300;40;400;1240;400\n"
+        LC_RULE_DN "extended=%u\n", m);
+
+    check_lc (cfg, 30, 20, lc_down_path, want, G_N_ELEMENTS (want));
+    core = core_for (cfg);
+    for (guint f = 0; f < 30; f++) {
+      RdsAnalyticsObject o = obj_at (1, 0, 600, 300 + 10 * f);
+
+      rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), &o, 1, &r);
+    }
+    g_assert_cmpuint (r.n_lc, ==, 4);
+    for (guint l = 0; l < 3; l++)
+      g_assert_cmpuint (r.lc[l].cumulative, ==, 0);
+    g_assert_cmpuint (r.lc[3].cumulative, ==, 1);
+    rds_analytics_core_free (core);
+    g_free (cfg);
+  }
+}
+
+/* Two objects with the same id in one frame both past the line count once (ours: each adds its point to the one
+ * history, and the history's flag stops the second) */
+static void
+test_lc_duplicate_ids (void)
+{
+  RdsAnalyticsCore *core = core_for (LC_LOOSE);
+  RdsAnalyticsFrameResult r;
+  guint labels = 0;
+
+  for (guint f = 0; f < 30; f++) {
+    RdsAnalyticsObject objs[] = { obj_at (1, 0, 300, 300 + 10 * f), obj_at (1, 0, 320, 300 + 10 * f) };
+
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), objs, 2, &r);
+    labels += r.objects[0].n_lc_labels + r.objects[1].n_lc_labels;
+    g_assert_cmpuint (r.objects[0].n_lc_labels, ==, f == 10);
+    g_assert_cmpuint (r.objects[1].n_lc_labels, ==, 0);
+    g_assert_cmpuint (r.lc[0].current, ==, f == 10);
+  }
+  g_assert_cmpuint (labels, ==, 1);
+  g_assert_cmpuint (r.lc[0].cumulative, ==, 1);
+  rds_analytics_core_free (core);
+}
+
+/* Extreme coordinates, clamped to the int range: a line across the whole int range and points at the clamps. The
+ * sides and their difference must not overflow (run under UBSan) */
+static void
+test_lc_extreme (void)
+{
+  RdsAnalyticsCore *core = core_for (PROPERTY LC_GROUP
+      "line-crossing-L=0;0;10;10;0;2147483647;2147483647;0\nextended=0\nmode=loose\n");
+  RdsAnalyticsFrameResult r;
+
+  for (guint f = 0; f < 5; f++) {
+    RdsAnalyticsObject o = { 1, 0, f < 2 ? -10.0f : 3e9f, f < 2 ? -1e10f : 3e9f, 20, 40 };
+
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), &o, 1, &r);
+    g_assert_cmpuint (r.n_lc, ==, 1);
+    g_assert_cmpuint (r.objects[0].n_lc_labels, <=, 1);
+  }
+  g_assert_cmpuint (r.lc[0].cumulative, <=, 1);
+  rds_analytics_core_free (core);
 }
 
 /* Behaviours on the line y = 400 (Dn), with its reverse Up and a second line Dn2 at y = 550 */
@@ -2414,5 +2537,9 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-core/line-crossing/counts", test_lc_counts);
   g_test_add_func ("/cpu/analytics-core/line-crossing/no-group", test_lc_no_group);
   g_test_add_func ("/cpu/analytics-core/line-crossing/obj-status", test_lc_obj_status);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/segment-ends", test_lc_segment_ends);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/degenerate", test_lc_degenerate);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/duplicate-ids", test_lc_duplicate_ids);
+  g_test_add_func ("/cpu/analytics-core/line-crossing/extreme", test_lc_extreme);
   return g_test_run ();
 }

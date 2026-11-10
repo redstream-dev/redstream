@@ -52,12 +52,18 @@ G_GNUC_INTERNAL gboolean rds_analytics_point_in_polygon (RdsAnalyticsPoint p, co
  * per object passing the group's class-id filter, until the object has been counted on that line:
  * - "past" is the side of the line the vector points to, "before" the other one; the sides are exact on the integer
  *   points, so a point on a slanted line is on it (ours; see line_crossed);
- * - from n = 3 (loose), 10 (balanced) or 20 (strict) on, with ref the history's reference and d = newest - ref:
- *   ref strictly before the line, the newest point on or past it (loose) or strictly past it (balanced, strict);
+ * - a vector parallel to its line (or of zero length, or a line of one point) has no past side and never counts
+ *   (ours);
+ * - from n = 3 (loose), 10 (balanced) or 20 (strict) on, with ref the history's reference (the mean of its oldest 4
+ *   points once the window is full: ours for line crossing, as direction does; 8.0 can't be told from 2 there) and
+ *   d = newest - ref: ref strictly before the line, the newest point on or past it (loose) or strictly past it
+ *   (balanced, strict);
  * - the angle between d and the vector under 90 degrees (loose), under 60 (balanced) or under 36.87, cos > 0.8
  *   (strict; ours within 8.0's measured range), and |d| >= 32, 55 or 78 px;
- * - with extended=0, the crossing hits the segment l1 - l2 lengthened by half the current box width at each end,
- *   strictly; with extended=1, anywhere on the infinite line.
+ * - with extended=0, the crossing hits the segment l1 - l2 lengthened by half the box width at each end, strictly
+ *   (the current box's width: ours; 8.0's boxes kept theirs); on a slanted segment, the point where ref -> newest
+ *   meets the line, projected on it (ours: 8.0's runs only crossed horizontal segments straight down); with
+ *   extended=1, anywhere on the infinite line.
  * The object is then counted once on that line: lcStatus and the " LC:<l> " piece on that frame only, and the line's
  * counts. There is no STOPPED gate. Untracked objects are skipped (ours). */
 
@@ -122,8 +128,8 @@ typedef struct
   /* objStatus: " ROI:<l>" per ROI label, then " DIR:<l> " per direction, then " LC:<l> " per line counted on this
    * frame, then " STOPPED " (DeepStream 8.0 behaviour); "" when empty */
   const gchar *obj_status;
-  /* the object has something to report (a label, a direction, a line crossing or STOPPED): it gets an object meta (DeepStream 8.0
-   * behaviour) */
+  /* the object has something to report (a label, a direction, a line crossing or STOPPED): it gets an object meta
+   * (DeepStream 8.0 behaviour) */
   gboolean has_info;
 } RdsAnalyticsObjectResult;
 

@@ -753,12 +753,16 @@ static const LcMode lc_modes[] = {
   [RDS_ANALYTICS_MODE_STRICT] = {20, 78.0, 16, 25},
 };
 
-/* Which side of the line through @a and @b the point @p is on: the sign of the cross product (b - a) x (p - a),
- * exact in 64-bit integers for coordinates below 2^30 */
-static gint64
-line_side (RdsAnalyticsPoint a, RdsAnalyticsPoint b, gint64 px, gint64 py)
+/* Cross products for the line tests, exact for any int coordinates: each factor is a difference of two ints (33
+ * bits), each product 66 bits, so they are computed in 128 bits (GCC and Clang have __int128 on 64-bit targets) */
+__extension__ typedef __int128 LcCross;
+
+/* Which side of the line through @a and @b the point @p is on: the sign of the cross product (b - a) x (p - a) */
+static LcCross
+line_side (RdsAnalyticsPoint a, RdsAnalyticsPoint b, RdsAnalyticsPoint p)
 {
-  return ((gint64) b.x - a.x) * (py - a.y) - ((gint64) b.y - a.y) * (px - a.x);
+  return (LcCross) ((gint64) b.x - a.x) * ((gint64) p.y - a.y) - (LcCross) ((gint64) b.y - a.y) * ((gint64) p.x -
+      a.x);
 }
 
 /* Whether an object with reference @ref, newest point @cur and current box width @width crosses @rule (the
@@ -778,9 +782,10 @@ line_crossed (const CoreGroup * g, const CoreRule * rule, RdsAnalyticsPoint ref,
    * known). A vector along the line, or a line of one point, has no past side: never counted (ours). The sides are
    * exact cross products on the integer points (ours): a point exactly on a slanted line is on it. 8.0 counted
    * such a point at the line's first end but not in its middle or at its second end, one frame later each time,
-   * as a slope rounded to float, y1 + (x - x1) * (float) ((y2 - y1) / (x2 - x1)), would. */
-  gint64 past = ((gint64) l2.x - l1.x) * ((gint64) d2.y - d1.y) - ((gint64) l2.y - l1.y) * ((gint64) d2.x - d1.x);
-  gint64 s_ref = line_side (l1, l2, ref.x, ref.y), s_cur = line_side (l1, l2, cur.x, cur.y);
+   * as a float slope, y1 + (x - x1) * ((float) (y2 - y1) / (float) (x2 - x1)), evaluated in double would. */
+  LcCross past = (LcCross) ((gint64) l2.x - l1.x) * ((gint64) d2.y - d1.y) - (LcCross) ((gint64) l2.y - l1.y) *
+      ((gint64) d2.x - d1.x);
+  LcCross s_ref = line_side (l1, l2, ref), s_cur = line_side (l1, l2, cur);
 
   if (past == 0)
     return FALSE;
@@ -803,9 +808,11 @@ line_crossed (const CoreGroup * g, const CoreRule * rule, RdsAnalyticsPoint ref,
     /* DeepStream 8.0 behaviour: the crossing must hit the segment, lengthened by half the box width at each end,
      * strictly (a 20 px box counts from 9 px before an end, not from 10). 8.0's runs crossed horizontal segments
      * straight down, where every reading agrees; ours: the point where ref -> cur meets the line, projected on the
-     * segment, the current box's width, in double. */
+     * segment, and the current box's width, in double. A crossing exactly w/2 past an end is a tie decided exactly
+     * only when ref -> cur is perpendicular to the line (as in 8.0's runs); otherwise rounding decides it. The
+     * fraction u is in double, from the exact sides (their difference may not fit 64 bits). */
     gdouble lx = (gdouble) l2.x - l1.x, ly = (gdouble) l2.y - l1.y, len = sqrt (lx * lx + ly * ly);
-    gdouble u = (gdouble) s_ref / (gdouble) (s_ref - s_cur);    /* s_ref < 0 <= s_cur */
+    gdouble u = (gdouble) s_ref / ((gdouble) s_ref - (gdouble) s_cur);  /* s_ref < 0 <= s_cur */
     gdouble cx = ref.x + u * dx, cy = ref.y + u * dy;
     gdouble t = ((cx - l1.x) * lx + (cy - l1.y) * ly) / len, tol = MAX ((gdouble) width, 0.0) / 2;
 
@@ -826,7 +833,9 @@ line_crossing_eval (RdsAnalyticsCore * core, StreamState * st, const CoreGroup *
     return;
   ref = history_reference (h);
   cur = history_point (h, h->len - 1);
-  for (guint r = 0; r < lc->n_rules; r++) {
+  /* the history's flags are sized by st->n_lines, the group's rule count */
+  g_assert (st->n_lines == lc->n_rules);
+  for (guint r = 0; r < st->n_lines; r++) {
     if (h->lc_counted[r] || !line_crossed (lc, &lc->rules[r], ref, cur, width))
       continue;
     h->lc_counted[r] = TRUE;
