@@ -512,11 +512,17 @@ test('enc_nal', enc_nal_exe, args : ['-p', '/gpu/enc-nal'],
 test('enc_caps', executable('enc_caps', 'check' / 'enc_caps.c', dependencies : [rdsenc_gst_dep]),
   suite : 'cpu', env : test_env, protocol : 'tap')
 
+# rdsh264enc / rdsh265enc key-frame requests: the next frame into the queue, buffer lists, several on one frame,
+# flushes, clear.
+test('enc_keyunits', executable('enc_keyunits', 'check' / 'enc_keyunits.c', dependencies : [rdsenc_gst_dep]),
+  suite : 'cpu', env : test_env, protocol : 'tap')
+
 # rdsh264enc / rdsh265enc: registration, pads, DeepStream 8.0's properties and enums, no-op warnings, QP strings, the
 # inner chain, a missing VA encoder, the unsupported profiles, the VA properties a start sets, the preferred profile
 # and the input size check (cpu); encodes through the bins: GOPs, profiles, levels, rates, B frames, no filler, the
-# H.265 size, input timestamps, copy-meta, input memory, batches, DELTA_UNIT, a frame-rate change, forced key frames,
-# a resolution change, size limits and odd sizes (gpu, skipped without the VA encoders).
+# H.265 size, input timestamps, copy-meta, input memory, VA's plain input and own thread, latency, batches,
+# DELTA_UNIT, a frame-rate change, forced key frames, a resolution change, size limits and odd sizes (gpu, skipped
+# without the VA encoders).
 element_enc_exe = executable('element_enc', 'check' / 'element_enc.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep])
 test('element_enc_cpu', element_enc_exe, args : ['-p', '/cpu/enc'],
@@ -527,7 +533,8 @@ test('element_enc', element_enc_exe, args : ['-p', '/gpu/enc'],
 # rdsh264enc / rdsh265enc in pipelines: a round trip per codec through rdsvideodec (frame count, PTS and every frame's
 # PSNR against the source), two sources through rdsstreammux and rdsstreamdemux into one encoder each (gpu); and (its
 # own entry, pipeline_enc_soak, also in the soak suite) 3000 1080p frames per codec with the host and GPU memory
-# check. All skip without the VA encoders.
+# check, and the fps against RDS_TEST_ENC_MIN_FPS when it is set in the environment (unset: reported only). All skip
+# without the VA encoders.
 pipeline_enc_exe = executable('pipeline_enc', 'check' / 'pipeline_enc.c', dependencies : pipeline_deps)
 test('pipeline_enc', pipeline_enc_exe, args : ['-p', '/gpu/enc-pipeline'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)

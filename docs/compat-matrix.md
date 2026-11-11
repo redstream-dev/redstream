@@ -1329,17 +1329,17 @@ dumps) or **ours**.
 
 ### `rdsh264enc` (`nvv4l2h264enc`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html))
 
-A bin: `rdsvideoconvert ! video/x-raw,format=NV12 ! vah264enc ! video/x-h264,stream-format=byte-stream,alignment=au`,
-made when the element first goes to READY. Names, types, ranges and defaults as `gst-inspect-1.0` shows them for
-DeepStream 8.0's nvv4l2h264enc (the enum type names are ours). Flags (ours: 8.0's are wrong both ways): `bitrate`,
-`force-idr` and `force-intra` are changeable in PLAYING; every other writable property is changeable only in NULL or
-READY, and is read when the element starts (READY to PAUSED). Set later, it is stored, logs a warning and applies
-at the next start (DeepStream 8.0 takes some silently and ignores others). An accepted no-op logs one warning per
-property the first time it gets a value other than its default. At every start the bin sets them on `vah264enc` as
-the Notes say; a value outside VA's range is clamped to it. The output caps carry the profile and level the stream
-has (ours: DeepStream 8.0 writes "NULL"). VA picks the level from the size, frame rate and bitrate, so downstream caps
-that fix another `level` are not-negotiated, with a warning naming both levels (ours: DeepStream 8.0 writes the
-downstream level into the stream).
+A bin: `rdsvideoconvert ! video/x-raw,format=NV12 ! queue ! vah264enc !
+video/x-h264,stream-format=byte-stream,alignment=au`, made when the element first goes to READY. Names, types, ranges
+and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0's nvv4l2h264enc (the enum type names are ours). Flags
+(ours: 8.0's are wrong both ways): `bitrate`, `force-idr` and `force-intra` are changeable in PLAYING; every other
+writable property is changeable only in NULL or READY, and is read when the element starts (READY to PAUSED). Set later,
+it is stored, logs a warning and applies at the next start (DeepStream 8.0 takes some silently and ignores others). An
+accepted no-op logs one warning per property the first time it gets a value other than its default. At every start the
+bin sets them on `vah264enc` as the Notes say; a value outside VA's range is clamped to it. The output caps carry the
+profile and level the stream has (ours: DeepStream 8.0 writes "NULL"). VA picks the level from the size, frame rate and
+bitrate, so downstream caps that fix another `level` are not-negotiated, with a warning naming both levels (ours:
+DeepStream 8.0 writes the downstream level into the stream).
 
 | Property | Type | Default | Status | Notes |
 |---|---|---|---|---|
@@ -1351,7 +1351,7 @@ downstream level into the stream).
 | `vbvbufsize` | uint | `0` | supported | bits: VA's `cpb-size` in kbit (0: VA's choice) |
 | `idrinterval` | uint | `256` | supported | VA's `key-int-max`; 0 means 256 (DeepStream 8.0 behaviour); above 1024, 1024 with a warning (ours) |
 | `iframeinterval` | uint | `4294967295` | supported | 0 and 4294967295: no I frames between IDR frames (DeepStream 8.0 behaviour; the docs say 30). Otherwise VA's `i-frames` = ⌈idrinterval / N⌉ − 1, which VA spaces evenly: the same frames as 8.0 when N divides idrinterval (ours) |
-| `force-idr` | boolean | `FALSE` | supported | TRUE makes the next frame the VA encoder takes an IDR frame (ours: DeepStream 8.0 forces the frame after the one being processed), and a force-key-unit event goes downstream before it. Changeable in PLAYING (DeepStream 8.0 behaviour; its flags say NULL or READY only) and PAUSED; `min-force-key-unit-interval` applies. The IDR frame has parameter sets and the property reads back FALSE (ours: DeepStream 8.0's forced IDR frame has none unless `insert-sps-pps`, and it reads back TRUE). In NULL or READY it does nothing, as the first frame is an IDR frame anyway (ours). The setter never waits for the stream: the request is an upstream force-key-unit event into the VA encoder |
+| `force-idr` | boolean | `FALSE` | supported | TRUE makes the next frame into the bin an IDR frame (more exactly the next one out of the inner converter into the queue in front of the VA encoder, so frames already queued are not the ones forced; ours: DeepStream 8.0 forces the frame after the one being processed), and a force-key-unit event goes downstream before it. Changeable in PLAYING (DeepStream 8.0 behaviour; its flags say NULL or READY only) and PAUSED; `min-force-key-unit-interval` applies. The IDR frame has parameter sets and the property reads back FALSE (ours: DeepStream 8.0's forced IDR frame has none unless `insert-sps-pps`, and it reads back TRUE). In NULL or READY it does nothing, as the first frame is an IDR frame anyway (ours). The setter never waits for the stream: the request waits for that frame, then goes to the VA encoder as an upstream force-key-unit event |
 | `force-intra` | boolean | `FALSE` | supported | as `force-idr`: the frame is an IDR frame too (ours: VA can't force a non-IDR intra frame; DeepStream 8.0 gives an I frame, on H.265 one that is not a random access point) |
 | `profile` | enum `Baseline` (0), `Constrained-Baseline` (1), `Main` (2), `High` (4), `Constrained-High` (17), `High444` (7) | `Baseline` | supported | the preferred profile, used when downstream caps allow it; downstream caps that fix `profile` win (DeepStream 8.0 behaviour). A pad probe narrows VA's downstream caps query to it (VA takes the highest profile allowed, whatever the order of a list). Baseline and Constrained-Baseline give constrained-baseline, Main main, High and Constrained-High high (ours: 8.0 fails on the two Constrained values). `High444` is an error at start (READY to PAUSED) naming the profile (ours: VA has no High 4:4:4) |
 | `num-B-Frames` | uint 0..2 | `0` | supported | VA's `b-frames`. With a Baseline profile (from the property or from downstream caps): a warning and no B frames (ours: DeepStream 8.0 hangs, and VA alone writes B slices into the Baseline stream). When downstream allows Baseline and another profile and the property's isn't allowed, B frames pick the other (ours) |
@@ -1388,6 +1388,14 @@ the element still registers, and going to READY is an element error naming `vah2
 
 Stream behaviour (pad probes on the inner elements):
 
+- **Threads and memory:** the VA encoder runs on a streaming thread of its own, behind a queue of up to 3 frames
+  (unlimited in bytes and time), and the inner converter downloads into a plain system-memory pool of its own, which
+  VA copies into its surfaces (ours: more than twice the frame rate of one thread writing into VA's mapped surfaces).
+  So the bin adds a streaming thread and holds up to 3 converted NV12 frames in the queue (5 in the pool); the queue
+  adds nothing to the minimum latency and makes the maximum unbounded, as any queue without a time limit does. After
+  a resolution change the converter writes into VA's own surfaces instead, which is slower (VA copies only into
+  surfaces of the first size of the run), and into plain memory again back at the first size.
+
 - **Filler:** filler NAL units (type 12) are removed from the output, so CBR's bitrate is a ceiling and easy content
   comes out smaller (DeepStream 8.0 behaviour: its output has none). VA adds them once its rate-control buffer has
   filled, a few seconds into a CBR stream.
@@ -1404,10 +1412,12 @@ Stream behaviour (pad probes on the inner elements):
   its sequence on a frame-rate change but keeps the old framerate in its caps, and sends none when nothing else
   changed).
 - **Force-key-unit events:** from either direction (an upstream one from downstream, a downstream one from upstream)
-  they pass the ghost pads and the inner elements to the VA encoder, which makes the next frame (or the frame at the
-  event's running time) an IDR frame with parameter sets, whatever `all-headers` says (ours: DeepStream 8.0 ignores
-  them). The VA encoder sends a downstream force-key-unit event before that frame; its timestamp is the frame's PTS,
-  in the output's time domain (without B frames the input's, like the buffers).
+  they reach the VA encoder, which makes the next frame (or the frame at the event's running time) an IDR frame with
+  parameter sets, whatever `all-headers` says (ours: DeepStream 8.0 ignores them). A downstream one passes the queue in
+  order with the frames; an upstream one without a running time waits, as `force-idr` does, for the next frame into the
+  queue (ours), and one with a running time goes to VA at once. The VA encoder sends a downstream force-key-unit event
+  before that frame; its timestamp is the frame's PTS, in the output's time domain (without B frames the input's, like
+  the buffers).
 - **Resolution change:** new input caps mid-stream renegotiate the inner converter and the VA encoder: the first frame
   at the new size is an IDR frame with parameter sets and an SPS of the new size, and new output caps precede it
   (DeepStream 8.0 behaviour for H.264; for H.265 ours, DeepStream 8.0 hangs).

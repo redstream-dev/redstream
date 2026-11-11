@@ -1,22 +1,23 @@
 /* Redstream: GstRdsEncBin, the base of rdsh264enc and rdsh265enc, standing in for DeepStream's nvv4l2h264enc and
  * nvv4l2h265enc. A bin:
  *
- *   ghost sink pad -> rdsvideoconvert -> video/x-raw,format=NV12 -> vah26xenc -> capsfilter -> ghost src pad
+ *   ghost sink pad -> rdsvideoconvert -> video/x-raw,format=NV12 -> queue -> vah26xenc -> capsfilter -> ghost src pad
  *
  * The frames, memory:RDS or system memory (ours: DeepStream 8.0 takes NVMM only), are converted to system-memory NV12
- * and encoded by GStreamer's stock VA encoder. The inner elements are made when the bin first goes to READY, so the
- * elements always register and a missing VA encoder is an element error at start. Every property gst-inspect shows for
- * DeepStream 8.0's encoders keeps its name, type, range and default; the flags say what really happens (ours: 8.0's are
- * wrong both ways): bitrate, force-idr and force-intra are live, every other writable property is read at READY to
- * PAUSED (set later, it is stored with a warning and applied at the next start); force-idr and force-intra send the VA
- * encoder a force-key-unit event. The properties the VA encoder has no counterpart for are stored and do nothing; a
- * value other than the default logs one warning per property (ours). Pad probes, not extra elements, shape the VA
- * encoder's output: filler NAL units stripped, the H.265 conformance window fixed, the input's timestamps and segment
- * restored (without B frames), DELTA_UNIT set from the picture type, the input's framerate kept in the caps, batches
- * and sizes VA can't take refused and, with copy-meta, the input's metas copied over. Behaviour matching DeepStream 8.0
- * is marked "DeepStream 8.0 behaviour", our choices "ours"; every such choice has a row in docs/compat-matrix.md. The
- * pad probes are in gstrdsencbin-probes.c, the VA encoder's configuration in gstrdsencbin-va.c, the shared struct and
- * the locking rules in gstrdsencbin-private.h.
+ * (in a plain pool of the convert's, not VA's: VA copies them into its surfaces) and encoded by GStreamer's stock VA
+ * encoder, on a streaming thread of its own behind a queue of up to 3 frames (ours). The inner elements are made when
+ * the bin first goes to READY, so the elements always register and a missing VA encoder is an element error at start.
+ * Every property gst-inspect shows for DeepStream 8.0's encoders keeps its name, type, range and default; the flags say
+ * what really happens (ours: 8.0's are wrong both ways): bitrate, force-idr and force-intra are live, every other
+ * writable property is read at READY to PAUSED (set later, it is stored with a warning and applied at the next start);
+ * force-idr and force-intra force the next frame into the queue. The properties the VA encoder has no counterpart for
+ * are stored and do nothing; a value other than the default logs one warning per property (ours). Pad probes, not extra
+ * elements, shape the VA encoder's output: filler NAL units stripped, the H.265 conformance window fixed, the input's
+ * timestamps and segment restored (without B frames), DELTA_UNIT set from the picture type, the input's framerate kept
+ * in the caps, batches and sizes VA can't take refused and, with copy-meta, the input's metas copied over. Behaviour
+ * matching DeepStream 8.0 is marked "DeepStream 8.0 behaviour", our choices "ours"; every such choice has a row in
+ * docs/compat-matrix.md. The pad probes are in gstrdsencbin-probes.c, the VA encoder's configuration in
+ * gstrdsencbin-va.c, the shared struct and the locking rules in gstrdsencbin-private.h.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsencbin.h"
 #include "gstrdsencbin-private.h"
@@ -94,7 +95,7 @@ build_chain (GstRdsEncBin * self)
 {
   GstRdsEncBinPrivate *priv = PRIV (self);
   const GstRdsEncCodecInfo *info = GST_RDS_ENC_BIN_GET_CLASS (self)->info;
-  GstElement *convert, *rawcaps, *encoder, *srccaps;
+  GstElement *convert, *rawcaps, *queue, *encoder, *srccaps;
   GstPad *pad;
   GstCaps *caps;
 
@@ -106,18 +107,20 @@ build_chain (GstRdsEncBin * self)
 
   convert = gst_element_factory_make ("rdsvideoconvert", "convert");
   rawcaps = gst_element_factory_make ("capsfilter", "rawcaps");
+  queue = gst_element_factory_make ("queue", "vaqueue");
   encoder = gst_element_factory_make (info->va_factory, "encoder");
   srccaps = gst_element_factory_make ("capsfilter", "srccaps");
-  if (convert == NULL || rawcaps == NULL || encoder == NULL || srccaps == NULL) {
+  if (convert == NULL || rawcaps == NULL || queue == NULL || encoder == NULL || srccaps == NULL) {
     if (encoder == NULL)
       GST_ELEMENT_ERROR (self, CORE, MISSING_PLUGIN, ("The VA encoder '%s' is not available", info->va_factory),
           ("no element '%s': GStreamer's va plugin is missing, or the VA driver can't encode %s", info->va_factory,
               info->codec_name));
     else
       GST_ELEMENT_ERROR (self, CORE, MISSING_PLUGIN, ("An inner element is missing"),
-          ("needs rdsvideoconvert and capsfilter"));
+          ("needs rdsvideoconvert, capsfilter and queue"));
     drop_floating (&convert);
     drop_floating (&rawcaps);
+    drop_floating (&queue);
     drop_floating (&encoder);
     drop_floating (&srccaps);
     return FALSE;
@@ -130,13 +133,16 @@ build_chain (GstRdsEncBin * self)
       G_TYPE_STRING, "au", NULL);
   g_object_set (srccaps, "caps", caps, NULL);
   gst_caps_unref (caps);
+  /* the VA encoder on a streaming thread of its own, a few frames behind the convert (ours) */
+  g_object_set (queue, "max-size-buffers", VA_QUEUE_FRAMES, "max-size-bytes", 0u, "max-size-time", (guint64) 0,
+      NULL);
 
-  gst_bin_add_many (GST_BIN (self), convert, rawcaps, encoder, srccaps, NULL);
-  if (!gst_element_link_many (convert, rawcaps, encoder, srccaps, NULL)) {
-    GstElement *made[] = { convert, rawcaps, encoder, srccaps };
+  gst_bin_add_many (GST_BIN (self), convert, rawcaps, queue, encoder, srccaps, NULL);
+  if (!gst_element_link_many (convert, rawcaps, queue, encoder, srccaps, NULL)) {
+    GstElement *made[] = { convert, rawcaps, queue, encoder, srccaps };
 
     GST_ELEMENT_ERROR (self, CORE, NEGOTIATION, ("Cannot link the inner elements"),
-        ("rdsvideoconvert ! capsfilter ! %s ! capsfilter", info->va_factory));
+        ("rdsvideoconvert ! capsfilter ! queue ! %s ! capsfilter", info->va_factory));
     for (guint i = 0; i < G_N_ELEMENTS (made); i++) {
       gst_element_set_state (made[i], GST_STATE_NULL);
       gst_bin_remove (GST_BIN (self), made[i]);
@@ -151,7 +157,7 @@ build_chain (GstRdsEncBin * self)
   gst_ghost_pad_set_target (GST_GHOST_PAD (priv->src_ghost), pad);
   gst_object_unref (pad);
 
-  gst_rds_enc_bin_add_probes (self, encoder);
+  gst_rds_enc_bin_add_probes (self, queue, encoder);
 
   pad = gst_element_get_static_pad (encoder, "sink");
   caps = gst_pad_get_pad_template_caps (pad);
@@ -161,6 +167,7 @@ build_chain (GstRdsEncBin * self)
       &priv->max_height);
   priv->convert = convert;
   priv->rawcaps = rawcaps;
+  priv->queue = queue;
   priv->encoder = encoder;
   priv->srccaps = srccaps;
   GST_OBJECT_UNLOCK (self);
@@ -233,35 +240,31 @@ is_started (GstRdsEncBin * self)
   return MAX (GST_STATE (self), MAX (GST_STATE_NEXT (self), GST_STATE_PENDING (self))) > GST_STATE_READY;
 }
 
-/* force-idr or force-intra (@what) set TRUE: the next frame the VA encoder takes becomes an IDR frame with parameter
- * sets (force-intra too: VA can't force a non-IDR intra frame; ours). The request is an upstream force-key-unit event
- * (all headers, running time NONE: the next frame) sent into the VA encoder's src pad. Upstream events aren't
- * serialized, so the caller never waits for the streaming thread: a downstream one sent into VA's sink pad would
- * take its stream lock, held while a frame is pushed, and block the caller as long as a prerolled sink holds that
- * frame in PAUSED. VA makes the same frame the IDR either way. The event goes through min-force-key-unit-interval like
- * any other. Before the start (NULL, READY) it does nothing: VA's pads are inactive, and the first frame is an IDR
+/* force-idr or force-intra (@what) set TRUE: the next frame into the bin becomes an IDR frame with parameter sets
+ * (force-intra too: VA can't force a non-IDR intra frame; ours). More exactly the next frame into the queue in front
+ * of the VA encoder, after the convert: the request (an upstream force-key-unit event, all headers, running time
+ * NONE) waits for that frame and is sent into VA's src pad just before VA takes it, so the frames already in the
+ * queue are not the ones forced (gst_rds_enc_bin_request_key_unit). Nothing blocks on the streaming threads: a
+ * downstream event pushed into the queue would be serialized with the frames, but it takes the queue's stream lock,
+ * held while a full queue waits for VA, which waits for a prerolled sink in PAUSED. The event goes through
+ * min-force-key-unit-interval like any other. Before the start (NULL, READY) it does nothing, and a request made
+ * during the start (READY to PAUSED) may be dropped, as the start clears the requests: the first frame is an IDR
  * frame anyway (ours; DeepStream 8.0's flags say NULL or READY, but it acts on them in PLAYING). */
 static void
 request_key_unit (GstRdsEncBin * self, const gchar * what)
 {
-  GstRdsEncBinPrivate *priv = PRIV (self);
-  GstElement *encoder;
-  gboolean sent = FALSE;
+  gboolean started;
 
-  g_mutex_lock (&priv->va_lock);
-  encoder = get_encoder (self);
-  if (encoder != NULL) {
-    GstPad *pad = gst_element_get_static_pad (encoder, "src");
-
-    sent = gst_pad_send_event (pad, gst_video_event_new_upstream_force_key_unit (GST_CLOCK_TIME_NONE, TRUE, 0));
-    gst_object_unref (pad);
-    gst_object_unref (encoder);
+  GST_OBJECT_LOCK (self);
+  started = PRIV (self)->encoder != NULL && is_started (self);
+  GST_OBJECT_UNLOCK (self);
+  if (!started) {
+    GST_DEBUG_OBJECT (self, "%s: not started, nothing to do", what);
+    return;
   }
-  g_mutex_unlock (&priv->va_lock);
-  if (sent)
-    GST_DEBUG_OBJECT (self, "%s: the next frame is an IDR frame", what);
-  else
-    GST_DEBUG_OBJECT (self, "%s: not sent (not started or flushing)", what);
+  GST_DEBUG_OBJECT (self, "%s: the next frame is an IDR frame", what);
+  gst_rds_enc_bin_request_key_unit (self, gst_video_event_new_upstream_force_key_unit (GST_CLOCK_TIME_NONE, TRUE,
+          0));
 }
 
 /* A QP string property's new value @s is well formed (NULL unsets it). */
@@ -416,6 +419,7 @@ gst_rds_enc_bin_init (GstRdsEncBin * self)
   g_mutex_init (&priv->probe_lock);
   g_queue_init (&priv->in_segments);
   g_queue_init (&priv->records);
+  rds_enc_key_units_init (&priv->key_units);
   gst_segment_init (&priv->last_in_segment, GST_FORMAT_UNDEFINED);
 }
 

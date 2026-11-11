@@ -1,8 +1,9 @@
-/* rdsh264enc and rdsh265enc in pipelines (gpu): a round trip per codec, videotestsrc -> rdsvideoconvert (memory:RDS)
- * -> the encoder -> h26xparse -> rdsvideodec -> system NV12, with the frame count and every frame's PSNR against the
- * source frame of the same PTS; two sources through rdsstreammux and rdsstreamdemux into one encoder each; and (its
- * own test entry, in the soak suite) 3000 1080p frames per codec with host and GPU memory checked for growth
- * (rds-test-soak.h). Every test skips without a ROCm device or the VA encoder, parser and decoder it needs.
+/* rdsh264enc and rdsh265enc in pipelines (gpu): a round trip per codec, videotestsrc -> rdsvideoconvert (memory:RDS) ->
+ * the encoder -> h26xparse -> rdsvideodec -> system NV12, with the frame count and every frame's PSNR against the
+ * source frame of the same PTS; two sources through rdsstreammux and rdsstreamdemux into one encoder each; and (its own
+ * test entry, in the soak suite) 3000 1080p frames per codec with host and GPU memory checked for growth
+ * (rds-test-soak.h) and, with RDS_TEST_ENC_MIN_FPS set, the fps against that floor. Every test skips without a ROCm
+ * device or the VA encoder, parser and decoder it needs.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-media.h"
@@ -438,9 +439,29 @@ soak_probe (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gp
   return GST_PAD_PROBE_OK;
 }
 
+/* With RDS_TEST_ENC_MIN_FPS set (a number), @fps must reach it; unset, the fps is only reported. It is meant for
+ * release builds (the bins run at ~200 fps at 1080p on the test iGPU); debug and sanitized builds are slower. */
+static void
+check_min_fps (const EncCodec * c, gdouble fps)
+{
+  const gchar *env = g_getenv ("RDS_TEST_ENC_MIN_FPS"), *plugins = g_getenv ("GST_PLUGIN_PATH_1_0");
+  gchar *end = NULL;
+  gdouble min;
+
+  if (env == NULL || *env == '\0')
+    return;
+  min = g_ascii_strtod (env, &end);
+  if (end == env || *end != '\0')
+    g_error ("RDS_TEST_ENC_MIN_FPS=%s is not a number", env);
+  if (fps < min)
+    g_error ("%s: %.0f fps at %ux%u, below RDS_TEST_ENC_MIN_FPS=%s (build: the plugins in %s)", c->element, fps,
+        SOAK_W, SOAK_H, env, plugins != NULL ? plugins : "?");
+}
+
 /* 3000 1920x1080 frames of videotestsrc (smpte, moving) -> rdsvideoconvert (memory:RDS) -> the encoder (its default
  * 4 Mbit/s CBR) -> h26xparse -> fakesink: every frame comes out, VmRSS (under ASan, the live heap) grows by less than
- * 8 MiB and the process's GPU memory moves by less than 16 MiB between frame 600 and frame 3000. Reports the fps. */
+ * 8 MiB and the process's GPU memory moves by less than 16 MiB between frame 600 and frame 3000. Reports the fps, and
+ * checks it against RDS_TEST_ENC_MIN_FPS when that is set (check_min_fps). */
 static void
 test_soak (gconstpointer data)
 {
@@ -486,6 +507,7 @@ test_soak (gconstpointer data)
   g_assert_cmpuint (st.frames, ==, SOAK_FRAMES);
   g_assert_cmpint (host_growth, <, 8 * 1024 * 1024);
   g_assert_cmpint (ABS (gpu_delta), <, 16 * 1024 * 1024);
+  check_min_fps (c, st.frames / secs);
 }
 
 int

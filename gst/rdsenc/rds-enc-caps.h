@@ -1,7 +1,7 @@
 /* Redstream: the caps decisions of rdsh264enc and rdsh265enc (plugin-internal, not installed): the preferred profile
  * and the Baseline + B frames rule on the VA encoder's downstream caps answer, the downstream level check, and the
- * size range of the VA encoder's sink template and the limiting of caps to it. Plain caps in, caps or a verdict out, no element code, so the cpu
- * tests check them on plain caps.
+ * size range of the VA encoder's sink template and the limiting of caps to it. Plain caps in, caps or a verdict out,
+ * no element code, so the cpu tests check them on plain caps.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_ENC_CAPS_H
 #define RDS_ENC_CAPS_H

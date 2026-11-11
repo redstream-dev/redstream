@@ -8,6 +8,7 @@
 #include <gst/gst.h>
 
 #include "gstrdsencbin.h"
+#include "rds-enc-keyunits.h"
 
 /* Defines `GType func (void)`, registering the enum @type_name with the GEnumValues given (without the terminating
  * entry) the first time it is called. Precede it with a static prototype for a file-local type. */
@@ -96,25 +97,28 @@ typedef struct
 
 /* copy-meta keeps an input frame's metas until its output, or until 64 newer frames came in. */
 #define MAX_RECORD_AGE 64
+/* frames the queue in front of the VA encoder holds at most */
+#define VA_QUEUE_FRAMES 3u
 /* input segments waiting for their output segment; more than this means VA dropped some */
 #define MAX_PENDING_SEGMENTS 16
 
 /* Locking: the object lock guards the property values and the inner-element pointers. Forward a property to an inner
  * element or send it an event after unlocking, never under the object lock: take a reference with get_encoder () (or
- * the like) and drop the lock first. va_lock serialises what reaches the VA encoder while it runs (bitrate, and the
- * force-key-unit events of force-idr and force-intra) with the start's configure (), so a live value set during a start
- * is not overwritten by the start's older snapshot: a forward takes va_lock, reads the latest stored value under the
- * object lock, and sets it (or sends the event) with only va_lock held. Lock order: va_lock, then the object lock. The
- * probes never take va_lock (they run inside the VA encoder's own calls). configure () holds va_lock while it sets the
- * children's properties and posts nothing then, so don't set this bin's properties from its children's notify /
- * deep-notify or from a sync bus handler while it starts. The chain, and the probes on it, are made once, in
- * build_chain; per-run state (what the probes measure or warn about once) is reset at READY to PAUSED and PAUSED to
- * READY, not there.
+ * the like) and drop the lock first. va_lock serialises the live bitrate's forward to the VA encoder with the start's
+ * configure (), so a value set during a start is not overwritten by the start's older snapshot: the forward takes
+ * va_lock, reads the latest stored value under the object lock, and sets it with only va_lock held. force-idr and
+ * force-intra skip va_lock: they queue a request under probe_lock, which the probes send to VA. Lock order: va_lock,
+ * then the object lock. The probes never take va_lock (they run inside the VA encoder's own calls). configure () holds
+ * va_lock while it sets the children's properties and posts nothing then, so don't set this bin's properties from its
+ * children's notify / deep-notify or from a sync bus handler while it starts. The chain, and the probes on it, are made
+ * once, in build_chain; per-run state (what the probes measure or warn about once) is reset at READY to PAUSED and
+ * PAUSED to READY, not there.
  *
- * The stream probes (filler, timestamps, caps, batches, copy-meta) run on the streaming threads (upstream's at the
- * ghost sink pad, the VA encoder's at its pads) and keep their state under probe_lock, a leaf lock: no element, pad
- * or meta lock is taken while it is held (metas are copied, and records freed, after it is dropped), and nothing is
- * pushed or posted under it. They read b_frames_set under the object lock first, never both at once. */
+ * The stream probes (filler, timestamps, caps, batches, copy-meta, key-frame requests) run on the streaming threads
+ * (upstream's at the ghost sink pad and the queue's sink pad, the queue's at the VA encoder's sink pad, VA's at its
+ * src pad) and keep their state under probe_lock, a leaf lock: no element, pad or meta lock is taken while it is held
+ * (metas are copied, and records and events freed, after it is dropped), and nothing is pushed, sent or posted under
+ * it. They read b_frames_set under the object lock first, never both at once. */
 struct _GstRdsEncBinPrivate
 {
   GMutex va_lock;
@@ -122,6 +126,7 @@ struct _GstRdsEncBinPrivate
   /* the inner chain (object lock), made at the first NULL to READY and kept until finalize (the bin owns them) */
   GstElement *convert;          /* rdsvideoconvert */
   GstElement *rawcaps;          /* video/x-raw,format=NV12 */
+  GstElement *queue;            /* queue: the VA encoder's own streaming thread */
   GstElement *encoder;          /* vah264enc / vah265enc */
   GstElement *srccaps;          /* the codec's byte-stream caps */
   GstPad *sink_ghost, *src_ghost;
@@ -156,7 +161,9 @@ struct _GstRdsEncBinPrivate
   VideoSize out_size;           /* the input caps of the frames now leaving it */
   GstCaps *out_caps;            /* the last caps that left the VA encoder, as they left it */
   guint hevc_extra_bits;        /* num_extra_slice_header_bits of the last PPS */
+  VideoSize copy_size;          /* the run's first allocation size: the convert writes plain memory at it only */
   GQueue records;               /* MetaRecord *, copy-meta: the input metas by PTS, oldest first */
+  RdsEncKeyUnits key_units;     /* requests for a key frame on the next frame (gst_rds_enc_bin_request_key_unit) */
 };
 
 typedef struct _GstRdsEncBinPrivate GstRdsEncBinPrivate;
@@ -172,8 +179,12 @@ G_GNUC_INTERNAL gboolean gst_rds_enc_bin_configure (GstRdsEncBin * self);
 G_GNUC_INTERNAL void gst_rds_enc_bin_set_va_uint (GObject * o, const gchar * name, guint v);
 
 /* gstrdsencbin-probes.c */
-/* Adds every probe to the inner chain around @encoder and to the ghost sink pad; once, from build_chain. */
-G_GNUC_INTERNAL void gst_rds_enc_bin_add_probes (GstRdsEncBin * self, GstElement * encoder);
+/* Adds every probe to the inner chain around @queue and @encoder and to the ghost pads; once, from build_chain. */
+G_GNUC_INTERNAL void gst_rds_enc_bin_add_probes (GstRdsEncBin * self, GstElement * queue, GstElement * encoder);
+/* Asks for a key frame on the next frame into the queue in front of the VA encoder: @event (taken), an upstream
+ * force-key-unit event without a running time, is sent into the VA encoder's src pad just before that frame reaches
+ * VA. Called from any thread; never blocks. */
+G_GNUC_INTERNAL void gst_rds_enc_bin_request_key_unit (GstRdsEncBin * self, GstEvent * event);
 /* Clears the stream probes' state for a new run (also at finalize), with @copy_meta for it. */
 G_GNUC_INTERNAL void gst_rds_enc_bin_reset_probes (GstRdsEncBin * self, gboolean copy_meta);
 
