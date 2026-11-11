@@ -26,8 +26,8 @@ rdsenc_gst_dep = declare_dependency(link_with : rdsenc_gst,
 
 # rdsh264enc and rdsh265enc: bins over the stock VA encoders (needed at run time only).
 gstrdsenc = library('gstrdsenc',
-  files('plugin.c', 'gstrdsencbin.c', 'gstrdsencbin-probes.c', 'gstrdsencbin-va.c', 'gstrdsh264enc.c',
-    'gstrdsh265enc.c'),
+  files('plugin.c', 'gstrdsencbin.c', 'gstrdsencbin-probes.c', 'gstrdsencbin-sched.c', 'gstrdsencbin-va.c',
+    'gstrdsh264enc.c', 'gstrdsh265enc.c'),
   c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdsenc"'],
   dependencies : [rds_dep, gst_dep, rdsenc_props_dep, rdsenc_gst_dep, rds_plugin_headers_dep],
   gnu_symbol_visibility : 'hidden',

@@ -16,8 +16,9 @@
  * timestamps and segment restored (without B frames), DELTA_UNIT set from the picture type, the input's framerate kept
  * in the caps, batches and sizes VA can't take refused and, with copy-meta, the input's metas copied over. Behaviour
  * matching DeepStream 8.0 is marked "DeepStream 8.0 behaviour", our choices "ours"; every such choice has a row in
- * docs/compat-matrix.md. The pad probes are in gstrdsencbin-probes.c, the VA encoder's configuration in
- * gstrdsencbin-va.c, the shared struct and the locking rules in gstrdsencbin-private.h.
+ * docs/compat-matrix.md. The pad probes are in gstrdsencbin-probes.c, those around the queue (key-frame requests, the
+ * convert's pool) in gstrdsencbin-sched.c, the VA encoder's configuration in gstrdsencbin-va.c, the shared struct and
+ * the locking rules in gstrdsencbin-private.h.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsencbin.h"
 #include "gstrdsencbin-private.h"

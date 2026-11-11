@@ -1,6 +1,7 @@
 /* Redstream: what GstRdsEncBin's files and its two codecs share (plugin-internal): the enum helper, the property ids,
- * the private instance struct and its locking rules, and the functions gstrdsencbin.c, gstrdsencbin-probes.c (the
- * pad probes) and gstrdsencbin-va.c (the VA encoder's configuration) call in each other.
+ * the private instance struct and its locking rules, and the functions gstrdsencbin.c, gstrdsencbin-probes.c (the pad
+ * probes), gstrdsencbin-sched.c (the probes around the queue) and gstrdsencbin-va.c (the VA encoder's configuration)
+ * call in each other.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef GST_RDS_ENC_BIN_PRIVATE_H
 #define GST_RDS_ENC_BIN_PRIVATE_H
@@ -177,6 +178,14 @@ G_GNUC_INTERNAL GstRdsEncBinPrivate *gst_rds_enc_bin_get_priv (GstRdsEncBin * se
 G_GNUC_INTERNAL gboolean gst_rds_enc_bin_configure (GstRdsEncBin * self);
 /* Sets @o's uint @name to @v, clamped to its range; nothing when @o has no such property. */
 G_GNUC_INTERNAL void gst_rds_enc_bin_set_va_uint (GObject * o, const gchar * name, guint v);
+
+/* gstrdsencbin-sched.c */
+/* Adds the probes around the queue (the key-frame requests, the convert's pool); from gst_rds_enc_bin_add_probes. */
+G_GNUC_INTERNAL void gst_rds_enc_bin_add_sched_probes (GstRdsEncBin * self, GstElement * queue,
+    GstElement * encoder);
+/* From the VA encoder's sink buffer probe (@va_sink, its pad), for the frame @buf it is about to take: sends the
+ * key-frame requests given to that frame into VA's src pad. */
+G_GNUC_INTERNAL void gst_rds_enc_bin_send_key_units (GstRdsEncBin * self, GstPad * va_sink, GstBuffer * buf);
 
 /* gstrdsencbin-probes.c */
 /* Adds every probe to the inner chain around @queue and @encoder and to the ghost pads; once, from build_chain. */
