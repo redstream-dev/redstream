@@ -413,7 +413,7 @@ test_soak (void)
   g_assert_nonnull (plugin);
   module = g_module_open (gst_plugin_get_filename (plugin), G_MODULE_BIND_LOCAL);
   g_assert_nonnull (module);
-  g_assert_true (g_module_symbol (module, "rds_analytics_test_get_history_count",
+  g_assert_true (g_module_symbol (module, "gst_rds_analytics_test_get_history_count",
           (gpointer *) & st.get_history_count));
   gst_object_unref (plugin);
   st.ids = g_hash_table_new_full (g_int64_hash, g_int64_equal, g_free, NULL);

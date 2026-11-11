@@ -291,7 +291,7 @@ write_obj_infos (GPtrArray * obj_metas, const RdsAnalyticsFrameResult * res, gui
 static void
 process_frame (GstRdsAnalytics * self, RdsFrameMeta * fm, guint uid)
 {
-  RdsAnalyticsFrameResult res;
+  RdsAnalyticsFrameResult res = { 0 };
 
   g_array_set_size (self->objs, 0);
   g_ptr_array_set_size (self->obj_metas, 0);
@@ -379,7 +379,12 @@ gst_rds_analytics_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     g_clear_pointer (&self->core, rds_analytics_core_free);
   }
   if (!self->core) {
-    self->core = rds_analytics_core_new (self->cfg, w, h);
+    if (!(self->core = rds_analytics_core_new (self->cfg, w, h))) {
+      g_mutex_unlock (&self->core_lock);
+      GST_ELEMENT_ERROR (self, STREAM, FORMAT, ("rdsanalytics can't set up its rules for a %ux%u mux output", w, h),
+          ("rds_analytics_core_new failed"));
+      return GST_FLOW_ERROR;
+    }
     self->out_w = w;
     self->out_h = h;
     GST_DEBUG_OBJECT (self, "rules scaled from %ux%u to %ux%u", self->cfg->config_width, self->cfg->config_height,
@@ -522,7 +527,7 @@ gst_rds_analytics_class_init (GstRdsAnalyticsClass * klass)
 /* ---- test hooks ---- */
 
 guint
-rds_analytics_test_get_history_count (GstElement * element)
+gst_rds_analytics_test_get_history_count (GstElement * element)
 {
   GstRdsAnalytics *self = GST_RDS_ANALYTICS (element);
   guint n;

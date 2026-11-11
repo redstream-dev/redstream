@@ -17,7 +17,7 @@ GST_ELEMENT_REGISTER_DECLARE (rdsanalytics);
  * not API, no header installs it): the per-object histories the element's core holds over every stream (0 before
  * the first batch). Takes the element's core lock, so call it between buffers, e.g. from a probe on its source
  * pad. */
-__attribute__ ((visibility ("default"))) guint rds_analytics_test_get_history_count (GstElement * element);
+__attribute__ ((visibility ("default"))) guint gst_rds_analytics_test_get_history_count (GstElement * element);
 
 G_END_DECLS
 

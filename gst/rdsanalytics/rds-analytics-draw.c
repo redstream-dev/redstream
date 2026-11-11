@@ -51,7 +51,7 @@ coord (gdouble v)
 }
 
 /* The display meta @*cursor, or the next one with room (acquired and added to the frame when there is none). NULL
- * only when the pool gives none. */
+ * when the pool gives none or the frame refuses it. */
 static RdsDisplayMeta *
 meta_with_room (Overlay * o, guint * cursor, gboolean for_line)
 {
@@ -61,7 +61,11 @@ meta_with_room (Overlay * o, guint * cursor, gboolean for_line)
     if (*cursor == o->n_metas) {
       if (!(dm = rds_acquire_display_meta_from_pool (o->bm)))
         return NULL;
+      /* the add can refuse the meta (it logs why) without saying so: check it landed. One refused holds nothing
+       * yet, and the batch releases metas acquired but never added when it is destroyed, so it is just skipped */
       rds_add_display_meta_to_frame (o->fm, dm);
+      if (!g_list_find (o->fm->display_meta_list, dm))
+        return NULL;
       if (o->n_metas == o->cap) {
         RdsDisplayMeta **grown = g_new (RdsDisplayMeta *, o->cap * 2);
 

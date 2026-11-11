@@ -305,7 +305,7 @@ gst/rdstracker/    libgstrdstracker plugin: rdstracker (gstrdstracker.c: write-b
 gst/rdsanalytics/  libgstrdsanalytics plugin: rdsanalytics (gstrdsanalytics.c: in place, feeds the core from the batch
                    meta under its lock, writes the metas through libgstrds-analytics and the display meta; config-file
                    reloads, stream events, a core remade when the mux output size changes; test hook
-                   rds_analytics_test_get_history_count exported for pipeline_analytics). rds-analytics-config
+                   gst_rds_analytics_test_get_history_count exported for pipeline_analytics). rds-analytics-config
                    parses nvdsanalytics key files from one key table; rds-analytics-core is the analytics core
                    (geometry, per-stream state keyed by pad_index, histories and eviction, the four features, objCnt;
                    GLib only, no GStreamer or GPU). These two are the static rdsanalytics-core the tests link.
