@@ -497,9 +497,10 @@ test('element_compat_matrix', executable('element_compat_matrix', 'check' / 'ele
 test('enc_props', executable('enc_props', 'check' / 'enc_props.c', dependencies : [rdsenc_props_dep]),
   suite : 'cpu', env : internal_test_env, protocol : 'tap')
 
-# rdsh264enc / rdsh265enc Annex-B helpers and the test NAL walker: filler stripping, the timestamp shift and the H.265
-# SPS window fix on captured SPSs (cpu); the walker on VA-encoded streams, filler in a real CBR stream, VA's measured
-# shift and an encode -> fix -> decode round trip (gpu, skipped without the VA encoders). No plugin of ours.
+# rdsh264enc / rdsh265enc Annex-B helpers and the test NAL walker: filler stripping, the timestamp shift, the H.265
+# SPS window fix on captured SPSs, the level strings and the level rewrite on captured SPSs and VPSs (cpu); the walker
+# on VA-encoded streams, filler in a real CBR stream, VA's measured shift and an encode -> fix -> decode round trip
+# (gpu, skipped without the VA encoders). No plugin of ours.
 enc_nal_exe = executable('enc_nal', 'check' / 'enc_nal.c',
   dependencies : [rdsenc_gst_dep, gst_app_dep, gst_video_dep])
 test('enc_nal_cpu', enc_nal_exe, args : ['-p', '/cpu/enc-nal'],
@@ -507,8 +508,8 @@ test('enc_nal_cpu', enc_nal_exe, args : ['-p', '/cpu/enc-nal'],
 test('enc_nal', enc_nal_exe, args : ['-p', '/gpu/enc-nal'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120)
 
-# rdsh264enc / rdsh265enc caps decisions on plain caps: the preferred profile, Baseline + B frames, the level check,
-# VA's size range.
+# rdsh264enc / rdsh265enc caps decisions on plain caps: the preferred profile, Baseline + B frames, the level check
+# and verdict, VA's size range.
 test('enc_caps', executable('enc_caps', 'check' / 'enc_caps.c', dependencies : [rdsenc_gst_dep]),
   suite : 'cpu', env : test_env, protocol : 'tap')
 
@@ -519,10 +520,10 @@ test('enc_keyunits', executable('enc_keyunits', 'check' / 'enc_keyunits.c', depe
 
 # rdsh264enc / rdsh265enc: registration, pads, DeepStream 8.0's properties and enums, no-op warnings, QP strings, the
 # inner chain, a missing VA encoder, the unsupported profiles, the VA properties a start sets, the preferred profile
-# and the input size check (cpu); encodes through the bins: GOPs, profiles, levels, rates, B frames, no filler, the
-# H.265 size, input timestamps, copy-meta, input memory, VA's plain input and own thread, latency, batches,
-# DELTA_UNIT, a frame-rate change, forced key frames, a resolution change, size limits and odd sizes (gpu, skipped
-# without the VA encoders).
+# and the input size check (cpu); encodes through the bins: GOPs, profiles, levels (a downstream one written into the
+# stream, also over a renegotiation), rates, B frames, no filler, the H.265 size, input timestamps, copy-meta, input
+# memory, VA's plain input and own thread, latency, batches, DELTA_UNIT, a frame-rate change, forced key frames, a
+# resolution change, size limits and odd sizes (gpu, skipped without the VA encoders).
 element_enc_exe = executable('element_enc', 'check' / 'element_enc.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep])
 test('element_enc_cpu', element_enc_exe, args : ['-p', '/cpu/enc'],

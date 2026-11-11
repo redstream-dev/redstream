@@ -1,7 +1,8 @@
 /* Redstream: the Annex-B helpers of rdsh264enc and rdsh265enc: filler NAL stripping, the H.265 SPS
  * conformance-window fix (written from the H.265 specification, sections 7.3.2.2 and 7.3.3) and the removal of the
  * VA encoders' timestamp shift; intra access units by their slice headers (H.264 section 7.3.3, H.265 sections
- * 7.3.2.3 and 7.3.6.1).
+ * 7.3.2.3 and 7.3.6.1); the level strings (both specifications' Annex A) and the level in the parameter sets (H.264
+ * section 7.3.2.1.1, H.265 sections 7.3.2.1, 7.3.2.2 and 7.3.3).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-enc-nal.h"
 
@@ -422,8 +423,14 @@ done:
   return res;
 }
 
-GstBuffer *
-rds_enc_h265_fix_sps_buffer (GstBuffer * in, guint width, guint height)
+/* Rewrites one NAL unit (header included, no start code) of an access unit: RDS_ENC_SPS_FIXED with *@out (g_free)
+ * and *@out_size set to replace it, anything else to keep it. */
+typedef RdsEncSpsResult (*NalRewrite) (const guint8 * nal, gsize size, gpointer data, guint8 ** out,
+    gsize * out_size);
+
+/* @in with every NAL unit @rewrite replaces replaced; @in with a reference added when none is. */
+static GstBuffer *
+rewrite_buffer (GstBuffer * in, const gchar * what, NalRewrite rewrite, gpointer data)
 {
   GstBuffer *out = NULL;
   GByteArray *bytes = NULL;
@@ -431,25 +438,23 @@ rds_enc_h265_fix_sps_buffer (GstBuffer * in, guint width, guint height)
   GArray *spans;
   gsize copied = 0;
 
-  g_return_val_if_fail (GST_IS_BUFFER (in), NULL);
   if (!gst_buffer_map (in, &map, GST_MAP_READ))
-    return pass_unmapped (in, "SPS conformance-window fix");
+    return pass_unmapped (in, what);
   spans = nal_scan (map.data, map.size);
   for (guint i = 0; i < spans->len; i++) {
     const NalSpan *s = &g_array_index (spans, NalSpan, i);
-    guint8 *sps = NULL;
-    gsize sps_size = 0;
+    guint8 *nal = NULL;
+    gsize nal_size = 0;
 
-    if (nal_type (map.data, s, RDS_ENC_CODEC_H265) != RDS_ENC_H265_NAL_SPS
-        || rds_enc_h265_fix_sps (map.data + s->payload, s->end - s->payload, width, height, &sps,
-            &sps_size) != RDS_ENC_SPS_FIXED)
+    if (s->end <= s->payload
+        || rewrite (map.data + s->payload, s->end - s->payload, data, &nal, &nal_size) != RDS_ENC_SPS_FIXED)
       continue;
     if (bytes == NULL)
       bytes = g_byte_array_sized_new ((guint) map.size + 16);
     g_byte_array_append (bytes, map.data + copied, (guint) (s->payload - copied));
-    g_byte_array_append (bytes, sps, (guint) sps_size);
+    g_byte_array_append (bytes, nal, (guint) nal_size);
     copied = s->end;
-    g_free (sps);
+    g_free (nal);
   }
   if (bytes != NULL) {
     g_byte_array_append (bytes, map.data + copied, (guint) (map.size - copied));
@@ -459,6 +464,282 @@ rds_enc_h265_fix_sps_buffer (GstBuffer * in, guint width, guint height)
   g_array_unref (spans);
   gst_buffer_unmap (in, &map);
   return out != NULL ? out : gst_buffer_ref (in);
+}
+
+typedef struct
+{
+  guint width, height;
+} WantedSize;
+
+static RdsEncSpsResult
+fix_sps_nal (const guint8 * nal, gsize size, gpointer data, guint8 ** out, gsize * out_size)
+{
+  const WantedSize *ws = data;
+
+  return rds_enc_h265_fix_sps (nal, size, ws->width, ws->height, out, out_size);
+}
+
+GstBuffer *
+rds_enc_h265_fix_sps_buffer (GstBuffer * in, guint width, guint height)
+{
+  WantedSize ws = { width, height };
+
+  g_return_val_if_fail (GST_IS_BUFFER (in), NULL);
+  return rewrite_buffer (in, "SPS conformance-window fix", fix_sps_nal, &ws);
+}
+
+/* ------------------------------------------------------------------------------------------------------------ */
+/* Levels */
+
+typedef struct
+{
+  const gchar *name;
+  guint idc;
+} Level;
+
+/* in increasing order; H.264 "1b" (level_idc 9 in the High profiles) between "1" and "1.1" */
+static const Level h264_levels[] = {
+  {"1", 10}, {"1b", RDS_ENC_H264_LEVEL_1B}, {"1.1", 11}, {"1.2", 12}, {"1.3", 13}, {"2", 20}, {"2.1", 21},
+  {"2.2", 22}, {"3", 30}, {"3.1", 31}, {"3.2", 32}, {"4", 40}, {"4.1", 41}, {"4.2", 42}, {"5", 50}, {"5.1", 51},
+  {"5.2", 52}, {"6", 60}, {"6.1", 61}, {"6.2", 62},
+};
+
+static const Level h265_levels[] = {
+  {"1", 30}, {"2", 60}, {"2.1", 63}, {"3", 90}, {"3.1", 93}, {"4", 120}, {"4.1", 123}, {"5", 150}, {"5.1", 153},
+  {"5.2", 156}, {"6", 180}, {"6.1", 183}, {"6.2", 186},
+};
+
+static const Level *
+levels (RdsEncCodec codec, guint * n)
+{
+  if (codec == RDS_ENC_CODEC_H264) {
+    *n = G_N_ELEMENTS (h264_levels);
+    return h264_levels;
+  }
+  *n = G_N_ELEMENTS (h265_levels);
+  return h265_levels;
+}
+
+/* @level's index in its codec's table (its order), or -1. */
+static gint
+level_rank (RdsEncCodec codec, const gchar * level)
+{
+  guint n;
+  const Level *t = levels (codec, &n);
+
+  if (level == NULL)
+    return -1;
+  for (guint i = 0; i < n; i++)
+    if (g_str_equal (t[i].name, level))
+      return (gint) i;
+  return -1;
+}
+
+gint
+rds_enc_level_to_idc (RdsEncCodec codec, const gchar * level)
+{
+  guint n;
+  const Level *t = levels (codec, &n);
+  gint r = level_rank (codec, level);
+
+  return r < 0 ? -1 : (gint) t[r].idc;
+}
+
+const gchar *
+rds_enc_level_from_idc (RdsEncCodec codec, guint idc)
+{
+  guint n;
+  const Level *t = levels (codec, &n);
+
+  for (guint i = 0; i < n; i++)
+    if (t[i].idc == idc)
+      return t[i].name;
+  return NULL;
+}
+
+/* Baseline, Main and Extended: "1b" is level_idc 11 with constraint_set3_flag there. */
+static gboolean
+h264_1b_by_flag (guint profile_idc)
+{
+  return profile_idc == 66 || profile_idc == 77 || profile_idc == 88;
+}
+
+#define H264_CONSTRAINT_SET3 0x10
+
+const gchar *
+rds_enc_h264_level_from_sps (guint profile_idc, guint constraint_flags, guint level_idc)
+{
+  if (level_idc == 11 && h264_1b_by_flag (profile_idc) && (constraint_flags & H264_CONSTRAINT_SET3))
+    return "1b";
+  return rds_enc_level_from_idc (RDS_ENC_CODEC_H264, level_idc);
+}
+
+gboolean
+rds_enc_level_compare (RdsEncCodec codec, const gchar * a, const gchar * b, gint * cmp)
+{
+  gint ra = level_rank (codec, a), rb = level_rank (codec, b);
+
+  g_return_val_if_fail (cmp != NULL, FALSE);
+  if (ra < 0 || rb < 0)
+    return FALSE;
+  *cmp = ra < rb ? -1 : ra > rb ? 1 : 0;
+  return TRUE;
+}
+
+/* RBSP offsets (NAL unit header included) of general_level_idc: the HEVC VPS has 4 bytes of fixed fields before
+ * profile_tier_level (vps_video_parameter_set_id .. vps_reserved_0xffff_16bits), the SPS 1 (sps_video_parameter_set_id,
+ * sps_max_sub_layers_minus1, sps_temporal_id_nesting_flag); general_level_idc is the 12th byte of the PTL (after 8 bits
+ * of profile space, tier and profile, 32 compatibility flags and 48 bits of source, constraint and inbld flags). */
+#define H265_VPS_LEVEL_AT (2 + 4 + 11)
+#define H265_SPS_LEVEL_AT (2 + 1 + 11)
+/* H.264 level_idc after the header byte, profile_idc and the constraint flags */
+#define H264_LEVEL_AT 3
+
+RdsEncSpsResult
+rds_enc_set_level (const guint8 * nal, gsize size, RdsEncCodec codec, const gchar * level, guint8 ** out,
+    gsize * out_size)
+{
+  RdsEncSpsResult res = RDS_ENC_SPS_INVALID;
+  GByteArray *rbsp, *nal_out;
+  gint idc = rds_enc_level_to_idc (codec, level);
+  guint8 *flags = NULL, *lvl;
+  guint8 new_flags = 0, new_level;
+  gsize at;
+
+  g_return_val_if_fail (out != NULL && out_size != NULL, RDS_ENC_SPS_INVALID);
+  while (nal != NULL && size > 0 && nal[size - 1] == 0)
+    size--;                     /* trailing zero bytes: no part of the NAL unit */
+  if (nal == NULL || size < 2 || idc < 0 || (nal[0] & 0x80) != 0)
+    return RDS_ENC_SPS_INVALID;
+  if (codec == RDS_ENC_CODEC_H264) {
+    if ((nal[0] & 0x1f) != 7)
+      return RDS_ENC_SPS_INVALID;
+    at = H264_LEVEL_AT;
+  } else {
+    guint type = (nal[0] >> 1) & 0x3f;
+
+    if ((((nal[0] & 1) << 5) | (nal[1] >> 3)) != 0)    /* nuh_layer_id: the base layer only */
+      return RDS_ENC_SPS_INVALID;
+    if (type == 32)
+      at = H265_VPS_LEVEL_AT;
+    else if (type == RDS_ENC_H265_NAL_SPS)
+      at = H265_SPS_LEVEL_AT;
+    else
+      return RDS_ENC_SPS_INVALID;
+  }
+
+  /* the RBSP with the header bytes in front, so offsets count from the NAL unit's start */
+  rbsp = nal_to_rbsp (nal, size);
+  if (rbsp->len <= at)
+    goto done;
+  lvl = rbsp->data + at;
+  new_level = (guint8) idc;
+  if (codec == RDS_ENC_CODEC_H264) {
+    guint profile = rbsp->data[1];
+
+    flags = rbsp->data + 2;
+    new_flags = *flags;
+    if (h264_1b_by_flag (profile)) {
+      if (idc == RDS_ENC_H264_LEVEL_1B) {
+        new_level = 11;
+        new_flags |= H264_CONSTRAINT_SET3;
+      } else if (*lvl == 11 && (*flags & H264_CONSTRAINT_SET3)) {
+        new_flags &= ~H264_CONSTRAINT_SET3;     /* it meant "1b" */
+      }
+    }
+  }
+  if (*lvl == new_level && (flags == NULL || *flags == new_flags)) {
+    res = RDS_ENC_SPS_UNCHANGED;
+    goto done;
+  }
+  *lvl = new_level;
+  if (flags != NULL)
+    *flags = new_flags;
+
+  /* the header bytes are never zero, so they start no zero run; a level byte (9..186) is neither 0 nor <= 3, so it
+   * changes no escape; and the H.264 constraint flags byte, which can become 0x00 when constraint_set3_flag goes,
+   * sits between a non-zero profile_idc and level_idc, so it never forms one either: emulation prevention comes out
+   * where the input had it */
+  nal_out = g_byte_array_sized_new ((guint) size + 4);
+  rbsp_to_nal (rbsp, nal_out);
+  *out_size = nal_out->len;
+  *out = g_byte_array_free (nal_out, FALSE);
+  res = RDS_ENC_SPS_FIXED;
+
+done:
+  g_byte_array_unref (rbsp);
+  return res;
+}
+
+typedef struct
+{
+  RdsEncCodec codec;
+  const gchar *level;
+} WantedLevel;
+
+static RdsEncSpsResult
+set_level_nal (const guint8 * nal, gsize size, gpointer data, guint8 ** out, gsize * out_size)
+{
+  const WantedLevel *wl = data;
+
+  return rds_enc_set_level (nal, size, wl->codec, wl->level, out, out_size);
+}
+
+GstBuffer *
+rds_enc_set_level_buffer (GstBuffer * in, RdsEncCodec codec, const gchar * level)
+{
+  WantedLevel wl = { codec, level };
+
+  g_return_val_if_fail (GST_IS_BUFFER (in), NULL);
+  if (rds_enc_level_to_idc (codec, level) < 0)
+    return gst_buffer_ref (in);
+  return rewrite_buffer (in, "level rewrite", set_level_nal, &wl);
+}
+
+typedef struct
+{
+  guint width, height;
+  const gchar *level;
+} WantedH265;
+
+/* An SPS: the window fix, then the level, on its result; a VPS: the level. */
+static RdsEncSpsResult
+fix_parameter_set_nal (const guint8 * nal, gsize size, gpointer data, guint8 ** out, gsize * out_size)
+{
+  const WantedH265 *w = data;
+  guint8 *fixed = NULL, *leveled = NULL;
+  gsize fixed_size = 0, leveled_size = 0;
+  RdsEncSpsResult res = RDS_ENC_SPS_UNCHANGED;
+
+  if (((nal[0] >> 1) & 0x3f) == RDS_ENC_H265_NAL_SPS && w->width > 0 && w->height > 0
+      && rds_enc_h265_fix_sps (nal, size, w->width, w->height, &fixed, &fixed_size) == RDS_ENC_SPS_FIXED) {
+    nal = fixed;
+    size = fixed_size;
+    res = RDS_ENC_SPS_FIXED;
+  }
+  if (w->level != NULL
+      && rds_enc_set_level (nal, size, RDS_ENC_CODEC_H265, w->level, &leveled, &leveled_size) == RDS_ENC_SPS_FIXED) {
+    g_free (fixed);
+    *out = leveled;
+    *out_size = leveled_size;
+    return RDS_ENC_SPS_FIXED;
+  }
+  if (res == RDS_ENC_SPS_FIXED) {
+    *out = fixed;
+    *out_size = fixed_size;
+  }
+  return res;
+}
+
+GstBuffer *
+rds_enc_h265_fix_parameter_sets (GstBuffer * in, guint width, guint height, const gchar * level)
+{
+  WantedH265 w = { width, height, level };
+
+  g_return_val_if_fail (GST_IS_BUFFER (in), NULL);
+  if ((width == 0 || height == 0) && rds_enc_level_to_idc (RDS_ENC_CODEC_H265, level) < 0)
+    return gst_buffer_ref (in);
+  return rewrite_buffer (in, "parameter set fix", fix_parameter_set_nal, &w);
 }
 
 /* ------------------------------------------------------------------------------------------------------------ */

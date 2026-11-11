@@ -1997,32 +1997,154 @@ test_profiles (gconstpointer data)
   encoded_clear (&r);
 }
 
-/* VA sets the level itself: a downstream level equal to VA's negotiates (3.1 at 720p30 and 4 Mbit/s), another is
- * not-negotiated with a warning naming both (ours: DeepStream 8.0 writes the downstream level). */
+/* The level_idc of every SPS (and HEVC VPS) of @data, which must all be @idc; the number of them. */
+static guint
+check_stream_level (const Codec * c, const GByteArray * data, guint idc)
+{
+  GArray *nals = rds_test_nal_split (data->data, data->len, is_hevc (c));
+  guint n = 0;
+
+  for (guint i = 0; i < nals->len; i++) {
+    const RdsTestNal *nal = &g_array_index (nals, RdsTestNal, i);
+    RdsTestSps sps;
+
+    if (is_hevc (c) && nal->type == 32) {
+      g_assert_cmpuint (rds_test_h265_vps_level (nal->data, nal->size), ==, idc);
+      n++;
+    } else if (nal->type == (is_hevc (c) ? 33u : 7u)) {
+      if (is_hevc (c))
+        rds_test_h265_sps (nal->data, nal->size, &sps);
+      else
+        rds_test_h264_sps (nal->data, nal->size, &sps);
+      g_assert_cmpuint (sps.level_idc, ==, idc);
+      n++;
+    }
+  }
+  g_array_unref (nals);
+  return n;
+}
+
+/* The parameter set NAL units (VPS, SPS) of @data, concatenated. */
+static GByteArray *
+parameter_sets (const Codec * c, const GByteArray * data)
+{
+  GArray *nals = rds_test_nal_split (data->data, data->len, is_hevc (c));
+  GByteArray *out = g_byte_array_new ();
+
+  for (guint i = 0; i < nals->len; i++) {
+    const RdsTestNal *nal = &g_array_index (nals, RdsTestNal, i);
+
+    if (is_hevc (c) ? nal->type == 32 || nal->type == 33 : nal->type == 7)
+      g_byte_array_append (out, nal->data, (guint) nal->size);
+  }
+  g_array_unref (nals);
+  return out;
+}
+
+/* Decodes the byte stream @data with the stock VA decoder: the frames and the size of the last. */
+static guint
+decode_stream (const Codec * c, const GByteArray * data, gint * w, gint * h)
+{
+  const gchar *codec = is_hevc (c) ? "h265" : "h264";
+  gchar *desc = g_strdup_printf ("appsrc name=src caps=%s,stream-format=byte-stream format=bytes ! %sparse ! "
+      "va%sdec ! video/x-raw ! appsink name=sink sync=false", c->caps_name, codec, codec);
+  GstElement *p = gst_parse_launch (desc, NULL), *src, *sink;
+  GstSample *s;
+  guint frames = 0;
+
+  g_assert_nonnull (p);
+  src = gst_bin_get_by_name (GST_BIN (p), "src");
+  sink = gst_bin_get_by_name (GST_BIN (p), "sink");
+  g_assert_cmpint (gst_element_set_state (p, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  g_assert_cmpint (gst_app_src_push_buffer (GST_APP_SRC (src), gst_buffer_new_memdup (data->data, data->len)), ==,
+      GST_FLOW_OK);
+  g_assert_cmpint (gst_app_src_end_of_stream (GST_APP_SRC (src)), ==, GST_FLOW_OK);
+  while ((s = rds_test_pull (p, sink)) != NULL) {
+    const GstStructure *st = gst_caps_get_structure (gst_sample_get_caps (s), 0);
+
+    g_assert_true (gst_structure_get_int (st, "width", w));
+    g_assert_true (gst_structure_get_int (st, "height", h));
+    frames++;
+    gst_sample_unref (s);
+  }
+  gst_element_set_state (p, GST_STATE_NULL);
+  gst_object_unref (sink);
+  gst_object_unref (src);
+  gst_object_unref (p);
+  g_free (desc);
+  return frames;
+}
+
+/* VA computes its own level (3.1 at 720p30 and 4 Mbit/s, both codecs) and ignores a downstream one. A downstream
+ * level at or above it is written into the parameter sets and the output caps (DeepStream 8.0 behaviour); VA's own
+ * level leaves the stream as VA wrote it; a lower one would misdescribe the stream: not-negotiated, with a warning
+ * naming both (ours). */
 static void
 test_downstream_level (gconstpointer data)
 {
   const Codec *c = data;
+  static const struct
+  {
+    const gchar *level;
+    guint h264, h265;
+  } raised[] = { {"4.1", 41, 123}, {"5.1", 51, 153} };
   gchar *down, *desc;
-  Encoded r;
+  Encoded r, va;
+  GByteArray *ps, *ps_va;
   GstElement *p;
   GstBus *bus;
   GstMessage *m;
   GError *err = NULL;
+  gint w = 0, h = 0;
 
-  if (!require_va (c))
+  if (!require_va (c) || !rds_test_have_element (is_hevc (c) ? "vah265dec" : "vah264dec")) {
+    g_test_skip ("no ROCm device, VA encoder or VA decoder");
     return;
+  }
+  /* VA's own level: the same parameter sets as with no level downstream */
+  encode (c, "pattern=ball", "", NULL, 10, &va);
+  g_assert_cmpstr (gst_structure_get_string (gst_caps_get_structure (va.caps, 0), "level"), ==, "3.1");
+  g_assert_cmpuint (check_stream_level (c, va.data, is_hevc (c) ? 93 : 31), ==, is_hevc (c) ? 2 : 1);
   down = g_strdup_printf ("%s,level=(string)3.1", c->caps_name);
   encode (c, "pattern=ball", "", down, 10, &r);
   g_assert_cmpstr (gst_structure_get_string (gst_caps_get_structure (r.caps, 0), "level"), ==, "3.1");
+  ps = parameter_sets (c, r.data);
+  ps_va = parameter_sets (c, va.data);
+  g_assert_cmpmem (ps->data, ps->len, ps_va->data, ps_va->len);
+  g_byte_array_unref (ps);
   encoded_clear (&r);
   g_free (down);
 
+  /* above VA's: in the caps and every parameter set, the rest of them as VA wrote them, and the stream decodes */
+  for (guint i = 0; i < G_N_ELEMENTS (raised); i++) {
+    guint idc = is_hevc (c) ? raised[i].h265 : raised[i].h264;
+
+    down = g_strdup_printf ("%s,level=(string)%s", c->caps_name, raised[i].level);
+    encode (c, "pattern=ball", "", down, 10, &r);
+    g_assert_cmpstr (gst_structure_get_string (gst_caps_get_structure (r.caps, 0), "level"), ==, raised[i].level);
+    g_assert_cmpuint (check_stream_level (c, r.data, idc), ==, is_hevc (c) ? 2 : 1);
+    ps = parameter_sets (c, r.data);
+    g_assert_cmpuint (ps->len, ==, ps_va->len);
+    for (guint k = 0, diff = 0; k < ps->len; k++) {
+      if (ps->data[k] != ps_va->data[k])
+        g_assert_cmpuint (++diff, <=, is_hevc (c) ? 2 : 1);     /* the level byte of each */
+    }
+    g_byte_array_unref (ps);
+    g_assert_cmpuint (decode_stream (c, r.data, &w, &h), ==, 10);
+    g_assert_cmpint (w, ==, W);
+    g_assert_cmpint (h, ==, H);
+    encoded_clear (&r);
+    g_free (down);
+  }
+  g_byte_array_unref (ps_va);
+  encoded_clear (&va);
+
+  /* below VA's: refused */
   desc = g_strdup_printf ("videotestsrc num-buffers=10 ! video/x-raw,width=%d,height=%d,framerate=%d/1 ! %s ! "
-      "%s,level=(string)5.1 ! fakesink", W, H, FPS, c->element, c->caps_name);
+      "%s,level=(string)2 ! fakesink", W, H, FPS, c->element, c->caps_name);
   p = gst_parse_launch (desc, NULL);
   bus = gst_element_get_bus (p);
-  g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, "*level 5.1*VA encoder*3.1*");
+  g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, "*level 2*below*VA encoder*3.1*");
   gst_element_set_state (p, GST_STATE_PLAYING);
   m = gst_bus_timed_pop_filtered (bus, RDS_TEST_MEDIA_TIMEOUT, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
   g_assert_nonnull (m);
@@ -2449,13 +2571,15 @@ test_no_filler (gconstpointer data)
 }
 
 /* H.265 at widths that are not multiples of 64: the SPS and the decoder give the exact size (ours: VA's window
- * alone decodes 768 and 1398 wide). */
+ * alone decodes 768 and 1398 wide). With @level (NULL: none) downstream, the window fix and the level rewrite both
+ * apply to the same SPS: the size and the level (@idc) are both right. */
 static void
-check_h265_size (gint w, gint h)
+check_h265_size (gint w, gint h, const gchar * level, guint idc)
 {
   const Codec *c = &codecs[1];
+  gchar *down = level != NULL ? g_strdup_printf ("! video/x-h265,level=(string)%s ", level) : g_strdup ("");
   gchar *desc = g_strdup_printf ("videotestsrc num-buffers=10 pattern=ball ! video/x-raw,width=%d,height=%d,"
-      "framerate=30/1 ! %s name=enc ! fakesink name=sink", w, h, c->element);
+      "framerate=30/1 ! %s name=enc %s! fakesink name=sink", w, h, c->element, down);
   gchar *dec = g_strdup_printf ("appsrc name=src caps=video/x-h265,stream-format=byte-stream format=bytes ! "
       "h265parse ! vah265dec ! video/x-raw ! appsink name=sink sync=false");
   Run r = { 0 };
@@ -2476,9 +2600,15 @@ check_h265_size (gint w, gint h)
       rds_test_h265_sps (n->data, n->size, &sps);
       g_assert_cmpuint (sps.width, ==, (guint) w);
       g_assert_cmpuint (sps.height, ==, (guint) h);
+      if (level != NULL)
+        g_assert_cmpuint (sps.level_idc, ==, idc);
+    } else if (n->type == 32 && level != NULL) {
+      g_assert_cmpuint (rds_test_h265_vps_level (n->data, n->size), ==, idc);
     }
   }
   g_array_unref (nals);
+  if (level != NULL)
+    g_assert_cmpstr (gst_structure_get_string (gst_caps_get_structure (r.last_caps, 0), "level"), ==, level);
 
   p = gst_parse_launch (dec, NULL);
   src = gst_bin_get_by_name (GST_BIN (p), "src");
@@ -2503,6 +2633,7 @@ check_h265_size (gint w, gint h)
   run_clear (&r);
   g_free (dec);
   g_free (desc);
+  g_free (down);
 }
 
 static void
@@ -2512,8 +2643,9 @@ test_h265_size (void)
     g_test_skip ("no ROCm device, VA encoder or vah265dec");
     return;
   }
-  check_h265_size (720, 480);
-  check_h265_size (1366, 768);
+  check_h265_size (720, 480, NULL, 0);
+  check_h265_size (1366, 768, NULL, 0);
+  check_h265_size (1366, 768, "5.1", 153);
 }
 
 /* Without B frames, output PTS = DTS = input PTS and the duration and segment are the input's (DeepStream 8.0
@@ -3263,6 +3395,48 @@ check_resize (const Codec * c, gint w0, gint h0, gint w1, gint h1)
   g_free (desc);
 }
 
+/* A downstream level=5.1 over a renegotiation at frame 30 of 60, with an IDR frame every 15: to 640x360 (VA's own
+ * level would drop to 3), or to 15 fps (caps the bin sends itself, VA keeping its old ones): every parameter set,
+ * those of the IDR frames after the change included, and the last caps keep 5.1. */
+static void
+check_level_renegotiation (const Codec * c, gint w1, gint h1, gint fps1)
+{
+  gchar *desc = g_strdup_printf ("videotestsrc num-buffers=60 pattern=ball ! capsfilter name=cf caps=video/x-raw,"
+      "width=1280,height=720,framerate=30/1 ! %s name=enc idrinterval=15 ! %s,level=(string)5.1 ! "
+      "fakesink name=sink",
+      c->element, c->caps_name);
+  Run r = { 0 };
+  gint w = 0, h = 0, n = 0, d = 0;
+
+  r.change_caps = gst_caps_new_simple ("video/x-raw", "width", G_TYPE_INT, w1, "height", G_TYPE_INT, h1,
+      "framerate", GST_TYPE_FRACTION, fps1, 1, NULL);
+  r.change_at = 30;
+  run_pipeline (c, desc, &r, GST_CLOCK_TIME_NONE);
+  g_assert_cmpuint (r.out->len, ==, 60);
+  g_assert_cmpuint (check_stream_level (c, r.data, is_hevc (c) ? 153 : 51), >=, is_hevc (c) ? 8 : 4);
+  g_assert_cmpstr (gst_structure_get_string (gst_caps_get_structure (r.last_caps, 0), "level"), ==, "5.1");
+  g_assert_true (gst_structure_get_int (gst_caps_get_structure (r.last_caps, 0), "width", &w));
+  g_assert_true (gst_structure_get_int (gst_caps_get_structure (r.last_caps, 0), "height", &h));
+  g_assert_true (gst_structure_get_fraction (gst_caps_get_structure (r.last_caps, 0), "framerate", &n, &d));
+  g_assert_cmpint (w, ==, w1);
+  g_assert_cmpint (h, ==, h1);
+  g_assert_cmpint (n, ==, fps1);
+  g_assert_cmpint (d, ==, 1);
+  run_clear (&r);
+  g_free (desc);
+}
+
+static void
+test_level_renegotiation (gconstpointer data)
+{
+  const Codec *c = data;
+
+  if (!require_va (c))
+    return;
+  check_level_renegotiation (c, 640, 360, 30);
+  check_level_renegotiation (c, 1280, 720, 15);
+}
+
 /* @w0x@h0 -> @w1x@h1 at frame 30 -> @w0x@h0 again at frame 60, of 90: an IDR frame with an SPS of its size at each
  * change, and the VA encoder gets plain memory in both @w0x@h0 phases and its own surfaces in between. */
 static void
@@ -3556,6 +3730,8 @@ main (int argc, char **argv)
   g_test_add_data_func ("/gpu/enc/resize-h265", &codecs[1], test_resize);
   g_test_add_data_func ("/gpu/enc/resize-back-h264", &codecs[0], test_resize_back);
   g_test_add_data_func ("/gpu/enc/resize-back-h265", &codecs[1], test_resize_back);
+  g_test_add_data_func ("/gpu/enc/level-renegotiation-h264", &codecs[0], test_level_renegotiation);
+  g_test_add_data_func ("/gpu/enc/level-renegotiation-h265", &codecs[1], test_level_renegotiation);
   g_test_add_func ("/gpu/enc/sizes-h264", test_sizes_h264);
   g_test_add_func ("/gpu/enc/sizes-h265", test_sizes_h265);
   g_test_add_data_func ("/gpu/enc/odd-size-h264", &codecs[0], test_odd_size);

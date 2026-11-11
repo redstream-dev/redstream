@@ -1,6 +1,7 @@
 /* rdsh264enc / rdsh265enc Annex-B helpers: filler stripping (positions, start-code lengths, both codecs, metas and
  * flags kept), the timestamp-shift removal on times and segments, the H.265 SPS conformance-window fix on SPSs
- * captured from vah265enc and intra access units on hand-coded slice headers (cpu); the test walker on streams from
+ * captured from vah265enc, intra access units on hand-coded slice headers, and the level strings and the level
+ * rewrite on parameter sets captured from vah264enc and vah265enc (cpu); the test walker on streams from
  * the VA encoders, filler stripping on a real CBR stream, the VA encoders' measured shift and an encode → fix →
  * decode round trip (gpu).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
@@ -53,6 +54,24 @@ static const guint8 h264_sps_1920x1080[] = {
 static const guint8 h264_sps_1281x721[] = {
   0x27, 0x64, 0x00, 0x20, 0xac, 0x56, 0x80, 0x51, 0x05, 0xde, 0x22, 0x23, 0xff, 0x00, 0x01, 0x00,
   0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0xc9, 0xf0, 0x88, 0x46, 0xe0,
+};
+
+/* Parameter sets at 1280x720 (30 fps) for the level rewrite, captured the same way: vah264enc's SPS with no profile
+ * downstream (High, level 3.1) and with `profile=constrained-baseline` downstream (profile_idc 66 with
+ * constraint_set0 and set1, level 3.1); vah265enc's VPS (level 3.1; its SPS is sps_1280x720, also 3.1). */
+static const guint8 h264_sps_high_720p[] = {
+  0x27, 0x64, 0x00, 0x1f, 0xac, 0x56, 0x80, 0x50, 0x05, 0xbb, 0xff, 0x00, 0x01, 0x00, 0x01, 0x10,
+  0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0xc9, 0xf0, 0x88, 0x46, 0xe0,
+};
+
+static const guint8 h264_sps_cb_720p[] = {
+  0x27, 0x42, 0xc0, 0x1f, 0xab, 0x40, 0x28, 0x02, 0xdd, 0xff, 0x80, 0x00, 0x80, 0x00, 0x88, 0x00,
+  0x00, 0x03, 0x00, 0x08, 0x00, 0x00, 0x03, 0x01, 0xe4, 0xf8, 0x44, 0x23, 0x70,
+};
+
+static const guint8 vps_1280x720[] = {
+  0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
+  0x00, 0x00, 0x03, 0x00, 0x5d, 0x2c, 0x09,
 };
 
 /* ------------------------------------------------------------------------------------------------------------ */
@@ -830,6 +849,468 @@ test_sps_fix_buffer (void)
 }
 
 /* ------------------------------------------------------------------------------------------------------------ */
+/* Levels */
+
+static void
+test_level_map (void)
+{
+  static const gchar *h264[] = { "1", "1b", "1.1", "1.2", "1.3", "2", "2.1", "2.2", "3", "3.1", "3.2", "4", "4.1",
+    "4.2", "5", "5.1", "5.2", "6", "6.1", "6.2" };
+  static const gint h264_idc[] = { 10, 9, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52, 60, 61, 62 };
+  static const gchar *h265[] = { "1", "2", "2.1", "3", "3.1", "4", "4.1", "5", "5.1", "5.2", "6", "6.1", "6.2" };
+  static const gint h265_idc[] = { 30, 60, 63, 90, 93, 120, 123, 150, 153, 156, 180, 183, 186 };
+  static const gchar *unknown[] = { "", "0", "1.0", "1.4", "2.3", "3.3", "7", "6.3", "31", "abc", "3.1 ", " 3.1",
+    "3,1", "1B" };
+  gint cmp = 99;
+
+  for (guint i = 0; i < G_N_ELEMENTS (h264); i++) {
+    g_assert_cmpint (rds_enc_level_to_idc (RDS_ENC_CODEC_H264, h264[i]), ==, h264_idc[i]);
+    g_assert_cmpstr (rds_enc_level_from_idc (RDS_ENC_CODEC_H264, (guint) h264_idc[i]), ==, h264[i]);
+    /* in increasing order: "1b" sits between "1" and "1.1" */
+    if (i > 0) {
+      g_assert_true (rds_enc_level_compare (RDS_ENC_CODEC_H264, h264[i], h264[i - 1], &cmp));
+      g_assert_cmpint (cmp, >, 0);
+      g_assert_true (rds_enc_level_compare (RDS_ENC_CODEC_H264, h264[i - 1], h264[i], &cmp));
+      g_assert_cmpint (cmp, <, 0);
+    }
+    g_assert_true (rds_enc_level_compare (RDS_ENC_CODEC_H264, h264[i], h264[i], &cmp));
+    g_assert_cmpint (cmp, ==, 0);
+  }
+  for (guint i = 0; i < G_N_ELEMENTS (h265); i++) {
+    g_assert_cmpint (rds_enc_level_to_idc (RDS_ENC_CODEC_H265, h265[i]), ==, h265_idc[i]);
+    g_assert_cmpstr (rds_enc_level_from_idc (RDS_ENC_CODEC_H265, (guint) h265_idc[i]), ==, h265[i]);
+    if (i > 0) {
+      g_assert_true (rds_enc_level_compare (RDS_ENC_CODEC_H265, h265[i], h265[i - 1], &cmp));
+      g_assert_cmpint (cmp, >, 0);
+    }
+  }
+  g_assert_true (rds_enc_level_compare (RDS_ENC_CODEC_H264, "4", "3.1", &cmp));
+  g_assert_cmpint (cmp, >, 0);
+  g_assert_true (rds_enc_level_compare (RDS_ENC_CODEC_H265, "2", "3.1", &cmp));
+  g_assert_cmpint (cmp, <, 0);
+
+  /* unknown strings and idcs, and the levels of one codec only */
+  for (guint i = 0; i < G_N_ELEMENTS (unknown); i++) {
+    g_assert_cmpint (rds_enc_level_to_idc (RDS_ENC_CODEC_H264, unknown[i]), ==, -1);
+    g_assert_cmpint (rds_enc_level_to_idc (RDS_ENC_CODEC_H265, unknown[i]), ==, -1);
+  }
+  g_assert_cmpint (rds_enc_level_to_idc (RDS_ENC_CODEC_H264, NULL), ==, -1);
+  g_assert_cmpint (rds_enc_level_to_idc (RDS_ENC_CODEC_H265, "1b"), ==, -1);
+  g_assert_cmpint (rds_enc_level_to_idc (RDS_ENC_CODEC_H265, "1.1"), ==, -1);
+  g_assert_cmpint (rds_enc_level_to_idc (RDS_ENC_CODEC_H265, "3.2"), ==, -1);
+  g_assert_null (rds_enc_level_from_idc (RDS_ENC_CODEC_H264, 0));
+  g_assert_null (rds_enc_level_from_idc (RDS_ENC_CODEC_H264, 14));
+  g_assert_null (rds_enc_level_from_idc (RDS_ENC_CODEC_H264, 93));
+  g_assert_null (rds_enc_level_from_idc (RDS_ENC_CODEC_H265, 31));
+  g_assert_null (rds_enc_level_from_idc (RDS_ENC_CODEC_H265, 96));
+  cmp = 99;
+  g_assert_false (rds_enc_level_compare (RDS_ENC_CODEC_H264, "3.3", "3.1", &cmp));
+  g_assert_false (rds_enc_level_compare (RDS_ENC_CODEC_H264, "3.1", NULL, &cmp));
+  g_assert_false (rds_enc_level_compare (RDS_ENC_CODEC_H265, "1b", "1", &cmp));
+  g_assert_cmpint (cmp, ==, 99);
+
+  /* "1b" in an H.264 SPS, both ways: level_idc 11 + constraint_set3_flag (0x10) in Baseline, Main and Extended,
+   * level_idc 9 in the High profiles; 11 with the flag in a High profile is 1.1 (the flag means something else) */
+  g_assert_cmpstr (rds_enc_h264_level_from_sps (66, 0xd0, 11), ==, "1b");
+  g_assert_cmpstr (rds_enc_h264_level_from_sps (77, 0x10, 11), ==, "1b");
+  g_assert_cmpstr (rds_enc_h264_level_from_sps (88, 0x10, 11), ==, "1b");
+  g_assert_cmpstr (rds_enc_h264_level_from_sps (66, 0xc0, 11), ==, "1.1");
+  g_assert_cmpstr (rds_enc_h264_level_from_sps (100, 0x00, 9), ==, "1b");
+  g_assert_cmpstr (rds_enc_h264_level_from_sps (100, 0x10, 11), ==, "1.1");
+  g_assert_cmpstr (rds_enc_h264_level_from_sps (66, 0xd0, 31), ==, "3.1");
+  g_assert_cmpstr (rds_enc_h264_level_from_sps (100, 0x00, 51), ==, "5.1");
+  g_assert_null (rds_enc_h264_level_from_sps (100, 0x00, 33));
+}
+
+/* Rewrites @nal's level to @level and checks: the walker reads @idc, the NAL unit has the same size and the same
+ * emulation prevention, and every byte but the level one is the same (also in the RBSP); *@at is the NAL unit
+ * byte that changed (G_MAXSIZE: none) and *@rbsp_at the RBSP one. With @constraint_flags >= 0 (H.264) the walker
+ * reads them too; the constraint flags byte may then differ as well. */
+static void
+check_level_set (const guint8 * nal, gsize size, RdsEncCodec codec, const gchar * level, guint idc,
+    gint constraint_flags, gsize * at, gsize * rbsp_at)
+{
+  gboolean vps = codec == RDS_ENC_CODEC_H265 && ((nal[0] >> 1) & 0x3f) == 32;
+  guint8 *out = NULL;
+  gsize out_size = 0, diff_nal = G_MAXSIZE, diff_rbsp = G_MAXSIZE;
+  GByteArray *rb_in, *rb_out;
+  RdsTestSps s;
+
+  g_assert_cmpint (rds_enc_set_level (nal, size, codec, level, &out, &out_size), ==, RDS_ENC_SPS_FIXED);
+  g_assert_cmpuint (out_size, ==, size);
+  g_assert_cmpuint (rds_test_nal_epb_count (out, out_size), ==, rds_test_nal_epb_count (nal, size));
+  if (codec == RDS_ENC_CODEC_H264) {
+    rds_test_h264_sps (out, out_size, &s);
+    g_assert_cmpuint (s.level_idc, ==, idc);
+    if (constraint_flags >= 0)
+      g_assert_cmphex (s.constraint_flags, ==, (guint) constraint_flags);
+    g_assert_cmpstr (rds_enc_h264_level_from_sps (s.profile_idc, s.constraint_flags, s.level_idc), ==, level);
+  } else if (vps) {
+    g_assert_cmpuint (rds_test_h265_vps_level (out, out_size), ==, idc);
+  } else {
+    RdsTestSps before;
+    gchar *t_in = rds_test_h265_sps_tail (nal, size), *t_out = rds_test_h265_sps_tail (out, out_size);
+
+    rds_test_h265_sps (nal, size, &before);
+    rds_test_h265_sps (out, out_size, &s);
+    g_assert_cmpuint (s.level_idc, ==, idc);
+    g_assert_cmpuint (s.width, ==, before.width);
+    g_assert_cmpuint (s.height, ==, before.height);
+    g_assert_cmpstr (t_out, ==, t_in);
+    g_free (t_in);
+    g_free (t_out);
+  }
+  /* one byte differs (two for an H.264 "1b" change in Baseline: the constraint flags too) */
+  for (gsize i = 0; i < size; i++) {
+    if (out[i] == nal[i])
+      continue;
+    if (codec == RDS_ENC_CODEC_H264 && i == 2)
+      continue;                 /* the constraint flags */
+    g_assert_cmpuint (diff_nal, ==, G_MAXSIZE);
+    diff_nal = i;
+  }
+  rb_in = rds_test_nal_rbsp (nal, size);
+  rb_out = rds_test_nal_rbsp (out, out_size);
+  g_assert_cmpuint (rb_out->len, ==, rb_in->len);
+  for (guint i = 0; i < rb_in->len; i++) {
+    if (rb_out->data[i] == rb_in->data[i] || (codec == RDS_ENC_CODEC_H264 && i == 2))
+      continue;
+    g_assert_cmpuint (diff_rbsp, ==, G_MAXSIZE);
+    diff_rbsp = i;
+  }
+  g_byte_array_unref (rb_in);
+  g_byte_array_unref (rb_out);
+  *at = diff_nal;
+  *rbsp_at = diff_rbsp;
+  g_free (out);
+}
+
+static void
+test_level_h264 (void)
+{
+  guint8 *out = (guint8 *) "untouched";
+  gsize out_size = 99, at, rbsp_at;
+  guint8 one_b[sizeof (h264_sps_cb_720p)];
+
+  /* High: level_idc is the RBSP's (and the NAL unit's) byte 3, after the header, profile_idc and the flags */
+  check_level_set (h264_sps_high_720p, sizeof (h264_sps_high_720p), RDS_ENC_CODEC_H264, "4.1", 41, 0x00, &at,
+      &rbsp_at);
+  g_assert_cmpuint (at, ==, 3);
+  g_assert_cmpuint (rbsp_at, ==, 3);
+  check_level_set (h264_sps_high_720p, sizeof (h264_sps_high_720p), RDS_ENC_CODEC_H264, "5.1", 51, 0x00, &at,
+      &rbsp_at);
+  check_level_set (h264_sps_high_720p, sizeof (h264_sps_high_720p), RDS_ENC_CODEC_H264, "6.2", 62, 0x00, &at,
+      &rbsp_at);
+  /* "1b" in High: level_idc 9, the flags stay */
+  check_level_set (h264_sps_high_720p, sizeof (h264_sps_high_720p), RDS_ENC_CODEC_H264, "1b", 9, 0x00, &at,
+      &rbsp_at);
+  /* Constrained Baseline: 4.1 keeps set0 and set1 */
+  check_level_set (h264_sps_cb_720p, sizeof (h264_sps_cb_720p), RDS_ENC_CODEC_H264, "4.1", 41, 0xc0, &at, &rbsp_at);
+  g_assert_cmpuint (at, ==, 3);
+  /* "1b" in Baseline: level_idc 11 and constraint_set3_flag; from "1b" to "1.1" or "3.1" the flag goes again */
+  check_level_set (h264_sps_cb_720p, sizeof (h264_sps_cb_720p), RDS_ENC_CODEC_H264, "1b", 11, 0xd0, &at, &rbsp_at);
+  memcpy (one_b, h264_sps_cb_720p, sizeof (one_b));
+  one_b[2] = 0xd0;
+  one_b[3] = 11;
+  check_level_set (one_b, sizeof (one_b), RDS_ENC_CODEC_H264, "1.1", 11, 0xc0, &at, &rbsp_at);
+  g_assert_cmpuint (at, ==, G_MAXSIZE);   /* only the flags changed */
+  check_level_set (one_b, sizeof (one_b), RDS_ENC_CODEC_H264, "3.1", 31, 0xc0, &at, &rbsp_at);
+  g_assert_cmpuint (at, ==, 3);
+
+  /* already that level: unchanged, outputs untouched */
+  g_assert_cmpint (rds_enc_set_level (h264_sps_high_720p, sizeof (h264_sps_high_720p), RDS_ENC_CODEC_H264, "3.1",
+          &out, &out_size), ==, RDS_ENC_SPS_UNCHANGED);
+  g_assert_cmpint (rds_enc_set_level (one_b, sizeof (one_b), RDS_ENC_CODEC_H264, "1b", &out, &out_size), ==,
+      RDS_ENC_SPS_UNCHANGED);
+  /* not an SPS, cut short, an unknown level, the forbidden bit */
+  g_assert_cmpint (rds_enc_set_level (h264_pps, sizeof (h264_pps), RDS_ENC_CODEC_H264, "4.1", &out, &out_size), ==,
+      RDS_ENC_SPS_INVALID);
+  g_assert_cmpint (rds_enc_set_level (h264_sps_high_720p, 3, RDS_ENC_CODEC_H264, "4.1", &out, &out_size), ==,
+      RDS_ENC_SPS_INVALID);
+  g_assert_cmpint (rds_enc_set_level (h264_sps_high_720p, sizeof (h264_sps_high_720p), RDS_ENC_CODEC_H264, "4.4",
+          &out, &out_size), ==, RDS_ENC_SPS_INVALID);
+  g_assert_cmpint (rds_enc_set_level (h264_sps_high_720p, sizeof (h264_sps_high_720p), RDS_ENC_CODEC_H264, NULL,
+          &out, &out_size), ==, RDS_ENC_SPS_INVALID);
+  g_assert_cmpint (rds_enc_set_level (sps_1280x720, sizeof (sps_1280x720), RDS_ENC_CODEC_H264, "4.1", &out,
+          &out_size), ==, RDS_ENC_SPS_INVALID);
+  memcpy (one_b, h264_sps_cb_720p, sizeof (one_b));
+  one_b[0] |= 0x80;
+  g_assert_cmpint (rds_enc_set_level (one_b, sizeof (one_b), RDS_ENC_CODEC_H264, "4.1", &out, &out_size), ==,
+      RDS_ENC_SPS_INVALID);
+  g_assert_cmpstr ((const gchar *) out, ==, "untouched");
+  g_assert_cmpuint (out_size, ==, 99);
+}
+
+static void
+test_level_h265 (void)
+{
+  guint8 *out = (guint8 *) "untouched";
+  gsize out_size = 99, at, rbsp_at;
+  guint8 bad[sizeof (sps_1280x720)];
+
+  /* general_level_idc is RBSP byte 2 + 1 + 11 of the SPS and 2 + 4 + 11 of the VPS (header included) */
+  check_level_set (sps_1280x720, sizeof (sps_1280x720), RDS_ENC_CODEC_H265, "4.1", 123, -1, &at, &rbsp_at);
+  g_assert_cmpuint (rbsp_at, ==, 14);
+  check_level_set (sps_1280x720, sizeof (sps_1280x720), RDS_ENC_CODEC_H265, "5.1", 153, -1, &at, &rbsp_at);
+  check_level_set (sps_1280x720, sizeof (sps_1280x720), RDS_ENC_CODEC_H265, "6.2", 186, -1, &at, &rbsp_at);
+  check_level_set (sps_1280x720, sizeof (sps_1280x720), RDS_ENC_CODEC_H265, "1", 30, -1, &at, &rbsp_at);
+  check_level_set (vps_1280x720, sizeof (vps_1280x720), RDS_ENC_CODEC_H265, "4.1", 123, -1, &at, &rbsp_at);
+  g_assert_cmpuint (rbsp_at, ==, 17);
+  check_level_set (vps_1280x720, sizeof (vps_1280x720), RDS_ENC_CODEC_H265, "5.1", 153, -1, &at, &rbsp_at);
+  /* other sizes' SPSs too */
+  check_level_set (sps_720x480, sizeof (sps_720x480), RDS_ENC_CODEC_H265, "5.1", 153, -1, &at, &rbsp_at);
+  check_level_set (sps_1366x768, sizeof (sps_1366x768), RDS_ENC_CODEC_H265, "5.1", 153, -1, &at, &rbsp_at);
+
+  g_assert_cmpint (rds_enc_set_level (sps_1280x720, sizeof (sps_1280x720), RDS_ENC_CODEC_H265, "3.1", &out,
+          &out_size), ==, RDS_ENC_SPS_UNCHANGED);
+  g_assert_cmpint (rds_enc_set_level (vps_1280x720, sizeof (vps_1280x720), RDS_ENC_CODEC_H265, "3.1", &out,
+          &out_size), ==, RDS_ENC_SPS_UNCHANGED);
+  /* a PPS, cut short before the level, an H.264 level string, another layer */
+  g_assert_cmpint (rds_enc_set_level (h265_slice, sizeof (h265_slice), RDS_ENC_CODEC_H265, "4.1", &out,
+          &out_size), ==, RDS_ENC_SPS_INVALID);
+  g_assert_cmpint (rds_enc_set_level (sps_1280x720, 17, RDS_ENC_CODEC_H265, "4.1", &out, &out_size), ==,
+      RDS_ENC_SPS_INVALID);
+  g_assert_cmpint (rds_enc_set_level (vps_1280x720, 20, RDS_ENC_CODEC_H265, "4.1", &out, &out_size), ==,
+      RDS_ENC_SPS_INVALID);
+  g_assert_cmpint (rds_enc_set_level (sps_1280x720, sizeof (sps_1280x720), RDS_ENC_CODEC_H265, "1b", &out,
+          &out_size), ==, RDS_ENC_SPS_INVALID);
+  g_assert_cmpint (rds_enc_set_level (h264_sps_high_720p, sizeof (h264_sps_high_720p), RDS_ENC_CODEC_H265, "4.1",
+          &out, &out_size), ==, RDS_ENC_SPS_INVALID);
+  memcpy (bad, sps_1280x720, sizeof (bad));
+  bad[1] = (1 << 3) | 1;        /* nuh_layer_id 1 */
+  g_assert_cmpint (rds_enc_set_level (bad, sizeof (bad), RDS_ENC_CODEC_H265, "4.1", &out, &out_size), ==,
+      RDS_ENC_SPS_INVALID);
+  g_assert_cmpstr ((const gchar *) out, ==, "untouched");
+  g_assert_cmpuint (out_size, ==, 99);
+}
+
+/* VA's PTL has zero runs before general_level_idc (the reserved constraint bits), escaped by emulation prevention
+ * bytes: the level byte is found on the RBSP, so its NAL unit offset is past them. A level byte (9..186) is never a
+ * zero byte nor <= 3, so it can neither need nor end an escape: every level leaves the emulation prevention as it
+ * was, and nothing unescaped. */
+static void
+test_level_emulation (void)
+{
+  static const gchar *h265[] = { "1", "2", "2.1", "3", "3.1", "4", "4.1", "5", "5.1", "5.2", "6", "6.1", "6.2" };
+  static const gchar *h264[] = { "1", "1b", "1.1", "1.2", "1.3", "2", "2.1", "2.2", "3", "3.1", "3.2", "4", "4.1",
+    "4.2", "5", "5.1", "5.2", "6", "6.1", "6.2" };
+  gsize at, rbsp_at;
+
+  g_assert_cmpuint (rds_test_nal_epb_count (sps_1280x720, 18), ==, 3);
+  g_assert_cmpuint (rds_test_nal_epb_count (vps_1280x720, 21), ==, 3);
+  check_level_set (sps_1280x720, sizeof (sps_1280x720), RDS_ENC_CODEC_H265, "4.1", 123, -1, &at, &rbsp_at);
+  g_assert_cmpuint (at, ==, 17);
+  g_assert_cmpuint (rbsp_at, ==, 14);
+  check_level_set (vps_1280x720, sizeof (vps_1280x720), RDS_ENC_CODEC_H265, "4.1", 123, -1, &at, &rbsp_at);
+  g_assert_cmpuint (at, ==, 20);
+  g_assert_cmpuint (rbsp_at, ==, 17);
+
+  for (guint i = 0; i < G_N_ELEMENTS (h265); i++) {
+    const guint8 *nals[] = { sps_1280x720, vps_1280x720, sps_720x480 };
+    const gsize sizes[] = { sizeof (sps_1280x720), sizeof (vps_1280x720), sizeof (sps_720x480) };
+
+    for (guint k = 0; k < G_N_ELEMENTS (nals); k++) {
+      guint8 *out = NULL;
+      gsize size = 0;
+      RdsEncSpsResult res = rds_enc_set_level (nals[k], sizes[k], RDS_ENC_CODEC_H265, h265[i], &out, &size);
+
+      if (res == RDS_ENC_SPS_UNCHANGED)
+        continue;
+      g_assert_cmpint (res, ==, RDS_ENC_SPS_FIXED);
+      g_assert_cmpuint (size, ==, sizes[k]);
+      g_assert_cmpuint (rds_test_nal_epb_count (out, size), ==, rds_test_nal_epb_count (nals[k], sizes[k]));
+      for (gsize j = 0; j + 2 < size; j++)
+        g_assert_false (out[j] == 0 && out[j + 1] == 0 && out[j + 2] <= 2);
+      g_free (out);
+    }
+  }
+  for (guint i = 0; i < G_N_ELEMENTS (h264); i++) {
+    if (g_str_equal (h264[i], "3.1"))
+      continue;
+    check_level_set (h264_sps_high_720p, sizeof (h264_sps_high_720p), RDS_ENC_CODEC_H264, h264[i],
+        (guint) rds_enc_level_to_idc (RDS_ENC_CODEC_H264, h264[i]), -1, &at, &rbsp_at);
+    check_level_set (h264_sps_cb_720p, sizeof (h264_sps_cb_720p), RDS_ENC_CODEC_H264, h264[i],
+        g_str_equal (h264[i], "1b") ? 11 : (guint) rds_enc_level_to_idc (RDS_ENC_CODEC_H264, h264[i]), -1, &at,
+        &rbsp_at);
+  }
+}
+
+/* An HEVC access unit: VPS, SPS, PPS, slice. */
+static GByteArray *
+make_h265_au (const guint8 * vps, gsize vps_size, const guint8 * sps, gsize sps_size)
+{
+  static const guint8 pps[] = { 0x44, 0x01, 0xc1, 0x73, 0xd1, 0x89 };
+  const Part au[] = { {4, vps, vps_size, FALSE}, {4, sps, sps_size, FALSE}, P (4, pps, FALSE),
+    P (3, h265_slice, FALSE) };
+
+  return join (au, G_N_ELEMENTS (au), TRUE);
+}
+
+/* @nal with @level, which must change it. */
+static guint8 *
+with_level (const guint8 * nal, gsize size, RdsEncCodec codec, const gchar * level, gsize * out_size)
+{
+  guint8 *out = NULL;
+
+  g_assert_cmpint (rds_enc_set_level (nal, size, codec, level, &out, out_size), ==, RDS_ENC_SPS_FIXED);
+  return out;
+}
+
+static void
+test_level_buffer (void)
+{
+  GByteArray *au, *want;
+  GstBuffer *b, *out;
+  guint8 *vps, *sps;
+  gsize vps_size, sps_size;
+
+  /* H.265: the VPS and the SPS */
+  au = make_h265_au (vps_1280x720, sizeof (vps_1280x720), sps_1280x720, sizeof (sps_1280x720));
+  b = make_buffer (au->data, au->len);
+  out = rds_enc_set_level_buffer (b, RDS_ENC_CODEC_H265, "5.1");
+  g_assert_true (out != b);
+  assert_like_input (out);
+  vps = with_level (vps_1280x720, sizeof (vps_1280x720), RDS_ENC_CODEC_H265, "5.1", &vps_size);
+  sps = with_level (sps_1280x720, sizeof (sps_1280x720), RDS_ENC_CODEC_H265, "5.1", &sps_size);
+  want = make_h265_au (vps, vps_size, sps, sps_size);
+  assert_buffer_bytes (out, want->data, want->len);
+  gst_buffer_unref (out);
+  /* the same level: the same buffer */
+  out = rds_enc_set_level_buffer (b, RDS_ENC_CODEC_H265, "3.1");
+  g_assert_true (out == b);
+  gst_buffer_unref (out);
+  gst_buffer_unref (b);
+  b = make_buffer (want->data, want->len);
+  out = rds_enc_set_level_buffer (b, RDS_ENC_CODEC_H265, "5.1");
+  g_assert_true (out == b);
+  gst_buffer_unref (out);
+  /* an unknown level: the same buffer */
+  out = rds_enc_set_level_buffer (b, RDS_ENC_CODEC_H265, "9");
+  g_assert_true (out == b);
+  gst_buffer_unref (out);
+  gst_buffer_unref (b);
+  g_byte_array_unref (want);
+  g_byte_array_unref (au);
+  g_free (vps);
+  g_free (sps);
+
+  /* no parameter set: the same buffer */
+  {
+    const Part slice[] = { P (4, h265_slice, FALSE) };
+
+    au = join (slice, 1, TRUE);
+    b = make_buffer (au->data, au->len);
+    out = rds_enc_set_level_buffer (b, RDS_ENC_CODEC_H265, "5.1");
+    g_assert_true (out == b);
+    gst_buffer_unref (out);
+    gst_buffer_unref (b);
+    g_byte_array_unref (au);
+  }
+
+  /* H.264: SPS, PPS, IDR; 3- and 4-byte start codes */
+  {
+    const Part parts[] = { {4, h264_sps_high_720p, sizeof (h264_sps_high_720p), FALSE}, P (3, h264_pps, FALSE),
+      P (4, h264_idr, FALSE) };
+    Part fixed[G_N_ELEMENTS (parts)];
+
+    au = join (parts, G_N_ELEMENTS (parts), TRUE);
+    b = make_buffer (au->data, au->len);
+    out = rds_enc_set_level_buffer (b, RDS_ENC_CODEC_H264, "4.1");
+    g_assert_true (out != b);
+    assert_like_input (out);
+    sps = with_level (h264_sps_high_720p, sizeof (h264_sps_high_720p), RDS_ENC_CODEC_H264, "4.1", &sps_size);
+    memcpy (fixed, parts, sizeof (parts));
+    fixed[0].nal = sps;
+    fixed[0].size = sps_size;
+    want = join (fixed, G_N_ELEMENTS (fixed), TRUE);
+    assert_buffer_bytes (out, want->data, want->len);
+    gst_buffer_unref (out);
+    out = rds_enc_set_level_buffer (b, RDS_ENC_CODEC_H264, "3.1");
+    g_assert_true (out == b);
+    gst_buffer_unref (out);
+    gst_buffer_unref (b);
+    g_byte_array_unref (want);
+    g_byte_array_unref (au);
+    g_free (sps);
+  }
+}
+
+/* The H.265 window fix and the level rewrite on one SPS, in either order and in the one-pass helper: the same bytes,
+ * the exact size and the new level; the one-pass helper with only one of them is that one alone. */
+static void
+test_level_with_window (void)
+{
+  GByteArray *au = make_h265_au (vps_1280x720, sizeof (vps_1280x720), sps_1366x768, sizeof (sps_1366x768));
+  GstBuffer *b = make_buffer (au->data, au->len), *t, *a1, *a2;
+  GstMapInfo m1, m2;
+  GArray *nals;
+  RdsTestSps s;
+
+  t = rds_enc_h265_fix_sps_buffer (b, 1366, 768);
+  a1 = rds_enc_set_level_buffer (t, RDS_ENC_CODEC_H265, "5.1");
+  gst_buffer_unref (t);
+  t = rds_enc_set_level_buffer (b, RDS_ENC_CODEC_H265, "5.1");
+  a2 = rds_enc_h265_fix_sps_buffer (t, 1366, 768);
+  gst_buffer_unref (t);
+  assert_like_input (a1);
+  g_assert_true (gst_buffer_map (a1, &m1, GST_MAP_READ));
+  g_assert_true (gst_buffer_map (a2, &m2, GST_MAP_READ));
+  g_assert_cmpmem (m1.data, m1.size, m2.data, m2.size);
+  gst_buffer_unmap (a2, &m2);
+  gst_buffer_unref (a2);
+  a2 = rds_enc_h265_fix_parameter_sets (b, 1366, 768, "5.1");
+  assert_like_input (a2);
+  assert_buffer_bytes (a2, m1.data, m1.size);
+  gst_buffer_unref (a2);
+  /* one of the two only */
+  t = rds_enc_h265_fix_sps_buffer (b, 1366, 768);
+  a2 = rds_enc_h265_fix_parameter_sets (b, 1366, 768, NULL);
+  g_assert_true (gst_buffer_map (t, &m2, GST_MAP_READ));
+  assert_buffer_bytes (a2, m2.data, m2.size);
+  gst_buffer_unmap (t, &m2);
+  gst_buffer_unref (a2);
+  gst_buffer_unref (t);
+  t = rds_enc_set_level_buffer (b, RDS_ENC_CODEC_H265, "5.1");
+  a2 = rds_enc_h265_fix_parameter_sets (b, 0, 0, "5.1");
+  g_assert_true (gst_buffer_map (t, &m2, GST_MAP_READ));
+  assert_buffer_bytes (a2, m2.data, m2.size);
+  gst_buffer_unmap (t, &m2);
+  gst_buffer_unref (a2);
+  gst_buffer_unref (t);
+  /* nothing to do: the same buffer */
+  a2 = rds_enc_h265_fix_parameter_sets (b, 0, 0, NULL);
+  g_assert_true (a2 == b);
+  gst_buffer_unref (a2);
+  {
+    GByteArray *right = make_h265_au (vps_1280x720, sizeof (vps_1280x720), sps_1280x720, sizeof (sps_1280x720));
+    GstBuffer *rb = make_buffer (right->data, right->len);
+
+    a2 = rds_enc_h265_fix_parameter_sets (rb, 1280, 720, "3.1");
+    g_assert_true (a2 == rb);
+    gst_buffer_unref (a2);
+    gst_buffer_unref (rb);
+    g_byte_array_unref (right);
+  }
+  a2 = rds_enc_h265_fix_parameter_sets (b, 1366, 768, "5.1");
+  g_assert_true (gst_buffer_map (a2, &m2, GST_MAP_READ));
+  nals = rds_test_nal_split (m1.data, m1.size, TRUE);
+  g_assert_cmpuint (nals->len, ==, 4);
+  g_assert_cmpuint (rds_test_h265_vps_level (g_array_index (nals, RdsTestNal, 0).data,
+          g_array_index (nals, RdsTestNal, 0).size), ==, 153);
+  rds_test_h265_sps (g_array_index (nals, RdsTestNal, 1).data, g_array_index (nals, RdsTestNal, 1).size, &s);
+  g_assert_cmpuint (s.width, ==, 1366);
+  g_assert_cmpuint (s.height, ==, 768);
+  g_assert_cmpuint (s.level_idc, ==, 153);
+  g_array_unref (nals);
+  gst_buffer_unmap (a1, &m1);
+  gst_buffer_unmap (a2, &m2);
+  gst_buffer_unref (a1);
+  gst_buffer_unref (a2);
+  gst_buffer_unref (b);
+  g_byte_array_unref (au);
+}
+
+/* ------------------------------------------------------------------------------------------------------------ */
 /* GPU: real streams */
 
 #define REQUIRE_ELEMENT(name) G_STMT_START {                     \
@@ -1241,6 +1722,12 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/enc-nal/sps-emulation", test_sps_fix_emulation);
   g_test_add_func ("/cpu/enc-nal/sps-emulation-captured", test_sps_fix_emulation_captured);
   g_test_add_func ("/cpu/enc-nal/sps-buffer", test_sps_fix_buffer);
+  g_test_add_func ("/cpu/enc-nal/level-map", test_level_map);
+  g_test_add_func ("/cpu/enc-nal/level-h264", test_level_h264);
+  g_test_add_func ("/cpu/enc-nal/level-h265", test_level_h265);
+  g_test_add_func ("/cpu/enc-nal/level-emulation", test_level_emulation);
+  g_test_add_func ("/cpu/enc-nal/level-buffer", test_level_buffer);
+  g_test_add_func ("/cpu/enc-nal/level-with-window", test_level_with_window);
   g_test_add_func ("/cpu/enc-nal/intra-h264", test_intra_h264);
   g_test_add_func ("/cpu/enc-nal/intra-h265", test_intra_h265);
 

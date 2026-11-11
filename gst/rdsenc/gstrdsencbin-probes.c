@@ -1,7 +1,7 @@
-/* Redstream: GstRdsEncBin's pad probes: the preferred profile and the level warning on the VA encoder's caps, the
- * input size check on the bin's sink pad; filler stripping, the H.265 conformance window, the input's timestamps
- * (on buffers, segments and force-key-unit events), DELTA_UNIT, the framerate in the caps, batch refusal and
- * copy-meta on its stream. Locking: gstrdsencbin-private.h.
+/* Redstream: GstRdsEncBin's pad probes: the preferred profile and the downstream level on the VA encoder's caps, the
+ * input size check on the bin's sink pad; filler stripping, the H.265 conformance window, the level in the parameter
+ * sets, the input's timestamps (on buffers, segments and force-key-unit events), DELTA_UNIT, the framerate in the
+ * caps, batch refusal and copy-meta on its stream. Locking: gstrdsencbin-private.h.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsencbin-private.h"
 
@@ -86,32 +86,62 @@ caps_query_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 }
 
 /* The VA encoder's output caps. VA computes the level from the size, frame rate and bitrate and writes it in its caps
- * and the stream; a `level` that downstream caps fix to another value makes the caps refused (not-negotiated).
- * DeepStream 8.0 writes the downstream level instead; here it is a warning, once per run, naming both (ours). */
+ * and the stream, ignoring a downstream one. When downstream caps fix a level above VA's, the caps get that level and
+ * the src buffer probe writes it into every parameter set (DeepStream 8.0 behaviour). A downstream level below VA's
+ * would misdescribe the stream: the caps stay refused (not-negotiated), with a warning once per run naming both
+ * (ours). Each CAPS event decides again (a renegotiation); caps whose level is already the one being written (the
+ * bin's own framerate caps, sent from out_caps) keep it. Caveat: caps renegotiated without VA restarting would leave
+ * the old level in the SPS until the next IDR frame (VA writes parameter sets only there); in the tested paths (a
+ * resolution or frame-rate change) VA restarts with an IDR frame. */
 static GstPadProbeReturn
 caps_event_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
   GstRdsEncBin *self = user_data;
   GstRdsEncBinPrivate *priv = PRIV (self);
-  GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info);
-  GstCaps *caps, *allowed;
-  const gchar *level;
+  RdsEncCodec codec = GST_RDS_ENC_BIN_GET_CLASS (self)->info->codec;
+  GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info), *out;
+  GstCaps *caps, *allowed, *raised;
+  const gchar *level, *raise_to = NULL;
   gchar *want = NULL;
-  gboolean warn, refused;
+  gboolean warn;
+  RdsEncLevelVerdict verdict;
 
   if (GST_EVENT_TYPE (ev) != GST_EVENT_CAPS)
     return GST_PAD_PROBE_OK;
   gst_event_parse_caps (ev, &caps);
   level = gst_structure_get_string (gst_caps_get_structure (caps, 0), "level");
-  if (level == NULL)
+  if (level == NULL) {
+    g_mutex_lock (&priv->probe_lock);
+    priv->level = NULL;
+    g_mutex_unlock (&priv->probe_lock);
     return GST_PAD_PROBE_OK;
+  }
   /* What downstream allows (the src capsfilter's accept-caps would only check its own caps). This query comes back
    * through caps_query_probe on this pad, which recomputes the same b-frames as during VA's profile decision, so it
    * sets nothing; were it ever to set b-frames here, that would only apply at VA's next reconfiguration. */
   allowed = gst_pad_peer_query_caps (pad, NULL);
-  refused = rds_enc_caps_level_refused (caps, allowed, &want);
+  verdict = rds_enc_caps_level_check (caps, allowed, codec, &raise_to, &want);
   gst_caps_unref (allowed);
-  if (!refused)                 /* accepted, or refused for more than the level */
+
+  g_mutex_lock (&priv->probe_lock);
+  if (verdict == RDS_ENC_LEVEL_RAISE)
+    priv->level = raise_to;
+  else if (verdict == RDS_ENC_LEVEL_REFUSED || priv->level == NULL || !g_str_equal (priv->level, level))
+    priv->level = NULL;
+  g_mutex_unlock (&priv->probe_lock);
+
+  if (verdict == RDS_ENC_LEVEL_RAISE) {
+    GST_DEBUG_OBJECT (self, "downstream caps fix level %s, above the VA encoder's %s: writing it", raise_to, level);
+    raised = gst_caps_copy (caps);
+    gst_caps_set_simple (raised, "level", G_TYPE_STRING, raise_to, NULL);
+    out = gst_event_new_caps (raised);
+    gst_caps_unref (raised);
+    gst_event_set_seqnum (out, gst_event_get_seqnum (ev));
+    gst_event_unref (ev);
+    GST_PAD_PROBE_INFO_DATA (info) = out;
+    return GST_PAD_PROBE_OK;
+  }
+  if (verdict != RDS_ENC_LEVEL_REFUSED)         /* accepted, or refused for more than the level */
     return GST_PAD_PROBE_OK;
 
   GST_OBJECT_LOCK (self);
@@ -119,9 +149,9 @@ caps_event_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   priv->level_warned = TRUE;
   GST_OBJECT_UNLOCK (self);
   if (warn)
-    g_warning ("%s: downstream caps ask for level %s, but the VA encoder sets the level itself (%s for this size, "
-        "frame rate and bitrate): drop the level from the caps after the encoder", GST_OBJECT_NAME (self), want,
-        level);
+    g_warning ("%s: downstream caps ask for level %s, below the VA encoder's level for this size, frame rate and "
+        "bitrate (%s) or not a single known level: not negotiated; ask for one level from %s up, or drop the level "
+        "from the caps after the encoder", GST_OBJECT_NAME (self), want, level, level);
   g_free (want);
   return GST_PAD_PROBE_OK;
 }
@@ -322,6 +352,7 @@ gst_rds_enc_bin_reset_probes (GstRdsEncBin * self, gboolean copy_meta)
   priv->out_size = (VideoSize) { 0 };
   gst_clear_caps (&priv->out_caps);
   priv->hevc_extra_bits = 0;
+  priv->level = NULL;
   priv->copy_size = (VideoSize) { 0 };
   g_mutex_unlock (&priv->probe_lock);
   free_records (old);
@@ -685,6 +716,8 @@ set_metas (GstRdsEncBinPrivate * priv, GstBuffer * buf, GstClockTime in_pts)
  *   filler only is dropped;
  * - H.265: the SPS conformance window set from the input size (ours: VA on this Mesa decodes too wide when the width
  *   is not a multiple of 64), on the buffers VA marks as key units (it writes parameter sets only before IDRs);
+ * - a downstream level above VA's (caps_event_probe) written into every SPS, and H.265 VPS, of those buffers too
+ *   (DeepStream 8.0 behaviour), in the same pass as the window fix and after it (they change different fields);
  * - DELTA_UNIT cleared on intra pictures (IDR and I) and set on the others (DeepStream 8.0 behaviour: VA marks only
  *   its IDRs);
  * - the timestamp shift removed (va_src_event_probe), duration kept;
@@ -701,8 +734,9 @@ va_src_buffer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   GstClockTime shift, va_shift;
   GstCaps *new_caps = NULL;
   VideoSize v;
+  const gchar *level;
   guint extra;
-  gboolean intra = FALSE, mapped;
+  gboolean intra = FALSE, mapped, key;
   GstMapInfo map;
 
   res = rds_enc_strip_filler (buf, codec);
@@ -730,6 +764,7 @@ va_src_buffer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
     }
   }
   v = priv->out_size;
+  level = priv->level;
   g_mutex_unlock (&priv->probe_lock);
   if (new_caps != NULL) {
     /* Pushed on VA's src pad from inside its own buffer probe: the push runs on this streaming thread, which holds
@@ -742,9 +777,14 @@ va_src_buffer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
     gst_caps_unref (new_caps);
   }
 
-  if (codec == RDS_ENC_CODEC_H265 && !GST_BUFFER_FLAG_IS_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT) && v.width > 0
-      && v.height > 0) {
-    res = rds_enc_h265_fix_sps_buffer (buf, (guint) v.width, (guint) v.height);
+  key = !GST_BUFFER_FLAG_IS_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
+  if (key && codec == RDS_ENC_CODEC_H265 && ((v.width > 0 && v.height > 0) || level != NULL)) {
+    /* one pass: the window fix, then the level */
+    res = rds_enc_h265_fix_parameter_sets (buf, (guint) MAX (v.width, 0), (guint) MAX (v.height, 0), level);
+    gst_buffer_unref (buf);
+    buf = res;
+  } else if (key && level != NULL) {
+    res = rds_enc_set_level_buffer (buf, codec, level);
     gst_buffer_unref (buf);
     buf = res;
   }

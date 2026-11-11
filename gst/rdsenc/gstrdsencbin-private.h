@@ -162,6 +162,8 @@ struct _GstRdsEncBinPrivate
   VideoSize out_size;           /* the input caps of the frames now leaving it */
   GstCaps *out_caps;            /* the last caps that left the VA encoder, as they left it */
   guint hevc_extra_bits;        /* num_extra_slice_header_bits of the last PPS */
+  const gchar *level;           /* the downstream level written into the parameter sets (a static string; NULL: VA's
+                                 * own), set by each CAPS event out of the VA encoder */
   VideoSize copy_size;          /* the run's first allocation size: the convert writes plain memory at it only */
   GQueue records;               /* MetaRecord *, copy-meta: the input metas by PTS, oldest first */
   RdsEncKeyUnits key_units;     /* requests for a key frame on the next frame (gst_rds_enc_bin_request_key_unit) */

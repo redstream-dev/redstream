@@ -1,5 +1,5 @@
 /* Redstream: the caps decisions of rdsh264enc and rdsh265enc: the preferred profile, the Baseline + B frames rule,
- * the downstream level check and the VA encoder's size range, on plain caps.
+ * the downstream level check and verdict and the VA encoder's size range, on plain caps.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-enc-caps.h"
 
@@ -117,6 +117,45 @@ rds_enc_caps_level_refused (const GstCaps * caps, const GstCaps * allowed, gchar
     return FALSE;
   *wanted = want;
   return TRUE;
+}
+
+RdsEncLevelVerdict
+rds_enc_caps_level_check (const GstCaps * caps, const GstCaps * allowed, RdsEncCodec codec, const gchar ** raise_to,
+    gchar ** wanted)
+{
+  const gchar *have, *down = NULL, *canon;
+  gchar *want = NULL;
+  gint cmp;
+
+  g_return_val_if_fail (raise_to != NULL && wanted != NULL, RDS_ENC_LEVEL_ACCEPTED);
+  if (!rds_enc_caps_level_refused (caps, allowed, &want))
+    return RDS_ENC_LEVEL_ACCEPTED;
+  have = gst_structure_get_string (gst_caps_get_structure (caps, 0), "level");
+  for (guint i = 0; i < gst_caps_get_size (allowed); i++) {
+    const GValue *v = gst_structure_get_value (gst_caps_get_structure (allowed, i), "level");
+
+    if (v != NULL) {
+      down = G_VALUE_HOLDS_STRING (v) ? g_value_get_string (v) : NULL;
+      break;
+    }
+  }
+  if (down != NULL && rds_enc_level_compare (codec, down, have, &cmp) && cmp > 0) {
+    GstCaps *raised = gst_caps_copy (caps);
+    gboolean ok;
+
+    canon = rds_enc_level_from_idc (codec, (guint) rds_enc_level_to_idc (codec, down));
+    for (guint i = 0; i < gst_caps_get_size (raised); i++)
+      gst_structure_set (gst_caps_get_structure (raised, i), "level", G_TYPE_STRING, canon, NULL);
+    ok = gst_caps_can_intersect (raised, allowed);
+    gst_caps_unref (raised);
+    if (ok) {
+      g_free (want);
+      *raise_to = canon;
+      return RDS_ENC_LEVEL_RAISE;
+    }
+  }
+  *wanted = want;
+  return RDS_ENC_LEVEL_REFUSED;
 }
 
 /* @v (an int or an int range) as [*min, *max]; FALSE for anything else. */

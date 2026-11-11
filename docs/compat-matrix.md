@@ -1338,8 +1338,11 @@ it is stored, logs a warning and applies at the next start (DeepStream 8.0 takes
 accepted no-op logs one warning per property the first time it gets a value other than its default. At every start the
 bin sets them on `vah264enc` as the Notes say; a value outside VA's range is clamped to it. The output caps carry the
 profile and level the stream has (ours: DeepStream 8.0 writes "NULL"). VA picks the level from the size, frame rate and
-bitrate, so downstream caps that fix another `level` are not-negotiated, with a warning naming both levels (ours:
-DeepStream 8.0 writes the downstream level into the stream).
+bitrate, and ignores a downstream one. Downstream caps that fix a `level` at or above VA's get it: it is written into
+every SPS (`level_idc`; H.264 "1b" as `level_idc` 11 with `constraint_set3_flag` in Baseline, Main and Extended, 9 in
+High) and, for H.265, every VPS and SPS (`general_level_idc`), and the output caps carry it (DeepStream 8.0
+behaviour). A downstream level below VA's, or a list of levels, is not-negotiated with a warning naming both levels
+(ours: the stream would claim a level its size, frame rate or bitrate exceeds).
 
 | Property | Type | Default | Status | Notes |
 |---|---|---|---|---|

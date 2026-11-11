@@ -1,12 +1,14 @@
 /* Redstream: the caps decisions of rdsh264enc and rdsh265enc (plugin-internal, not installed): the preferred profile
- * and the Baseline + B frames rule on the VA encoder's downstream caps answer, the downstream level check, and the
- * size range of the VA encoder's sink template and the limiting of caps to it. Plain caps in, caps or a verdict out,
- * no element code, so the cpu tests check them on plain caps.
+ * and the Baseline + B frames rule on the VA encoder's downstream caps answer, the downstream level check and verdict,
+ * and the size range of the VA encoder's sink template and the limiting of caps to it. Plain caps in, caps or a
+ * verdict out, no element code, so the cpu tests check them on plain caps.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_ENC_CAPS_H
 #define RDS_ENC_CAPS_H
 
 #include <gst/gst.h>
+
+#include "rds-enc-nal.h"
 
 G_BEGIN_DECLS
 
@@ -29,6 +31,21 @@ G_GNUC_INTERNAL GstCaps *rds_enc_caps_narrow (const GstCaps * answer, const gcha
  * downstream's level, serialized (a string, or a list); otherwise FALSE and *@wanted untouched. */
 G_GNUC_INTERNAL gboolean rds_enc_caps_level_refused (const GstCaps * caps, const GstCaps * allowed,
     gchar ** wanted);
+
+typedef enum
+{
+  RDS_ENC_LEVEL_ACCEPTED,       /* nothing to do: accepted, no level, or refused for more than the level */
+  RDS_ENC_LEVEL_RAISE,          /* write downstream's level into the caps and the stream */
+  RDS_ENC_LEVEL_REFUSED,        /* refused because of the level only, and not raisable */
+} RdsEncLevelVerdict;
+
+/* What to do with the encoder's output @caps (whose level is the VA encoder's) when the downstream caps @allowed are
+ * refused because of the level only (as rds_enc_caps_level_refused): RDS_ENC_LEVEL_RAISE when downstream fixes one
+ * known level (a string) above the caps' one and @caps with it are accepted; *@raise_to is then that level (a static
+ * string). RDS_ENC_LEVEL_REFUSED otherwise (a level below, a list, an unknown level); *@wanted (g_free) is then
+ * downstream's level, serialized. The outputs are set only for their verdict. */
+G_GNUC_INTERNAL RdsEncLevelVerdict rds_enc_caps_level_check (const GstCaps * caps, const GstCaps * allowed,
+    RdsEncCodec codec, const gchar ** raise_to, gchar ** wanted);
 
 /* The size range the VA encoder takes on system memory, from @templ (its sink pad template's caps): the width and
  * height of the first structure without caps features (or with memory:SystemMemory only) whose width and height are

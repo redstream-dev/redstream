@@ -1,6 +1,6 @@
 /* rdsh264enc / rdsh265enc caps decisions on plain caps: the preferred profile against downstream answers, the
- * Baseline + B frames rule, the downstream level check, the size range from the VA encoder's template and caps
- * limited to it.
+ * Baseline + B frames rule, the downstream level check and verdict (written into the stream or refused), the size
+ * range from the VA encoder's template and caps limited to it.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-enc-caps.h"
 
@@ -105,6 +105,65 @@ test_level (void)
   check_level ("video/x-h264, profile=(string)high", "video/x-h264, profile=(string)main", NULL);
 }
 
+/* rds_enc_caps_level_check of @caps against @allowed: @verdict, and the level to write (RAISE) or downstream's
+ * serialized (REFUSED). */
+static void
+check_level_verdict (const gchar * caps, const gchar * allowed, RdsEncCodec codec, RdsEncLevelVerdict verdict,
+    const gchar * want)
+{
+  GstCaps *c = gst_caps_from_string (caps), *a = gst_caps_from_string (allowed);
+  const gchar *raise_to = "untouched";
+  gchar *wanted = NULL;
+
+  g_test_message ("%s against %s", caps, allowed);
+  g_assert_cmpint (rds_enc_caps_level_check (c, a, codec, &raise_to, &wanted), ==, verdict);
+  if (verdict == RDS_ENC_LEVEL_RAISE) {
+    g_assert_cmpstr (raise_to, ==, want);
+    g_assert_null (wanted);
+  } else {
+    g_assert_cmpstr (raise_to, ==, "untouched");
+    g_assert_cmpstr (wanted, ==, verdict == RDS_ENC_LEVEL_REFUSED ? want : NULL);
+  }
+  g_free (wanted);
+  gst_caps_unref (a);
+  gst_caps_unref (c);
+}
+
+#define OUT265 "video/x-h265, profile=(string)main, tier=(string)main, level=(string)3.1, width=(int)1280"
+
+static void
+test_level_verdict (void)
+{
+  /* a fixed downstream level above VA's: written (DeepStream 8.0 behaviour) */
+  check_level_verdict (OUT, "video/x-h264, level=(string)4.1", RDS_ENC_CODEC_H264, RDS_ENC_LEVEL_RAISE, "4.1");
+  check_level_verdict (OUT, "video/x-h264, level=(string)5.1", RDS_ENC_CODEC_H264, RDS_ENC_LEVEL_RAISE, "5.1");
+  check_level_verdict (OUT, "video/x-h264, level=(string)4", RDS_ENC_CODEC_H264, RDS_ENC_LEVEL_RAISE, "4");
+  check_level_verdict (OUT, "video/x-h264, profile=(string)high, level=(string)4.1; video/x-h264",
+      RDS_ENC_CODEC_H264, RDS_ENC_LEVEL_ACCEPTED, NULL);  /* the second structure takes VA's caps as they are */
+  check_level_verdict (OUT265, "video/x-h265, level=(string)5.1", RDS_ENC_CODEC_H265, RDS_ENC_LEVEL_RAISE, "5.1");
+  check_level_verdict ("video/x-h264, level=(string)1", "video/x-h264, level=(string)1b", RDS_ENC_CODEC_H264,
+      RDS_ENC_LEVEL_RAISE, "1b");
+  /* the same level or none: nothing to do */
+  check_level_verdict (OUT, "video/x-h264, level=(string)3.1", RDS_ENC_CODEC_H264, RDS_ENC_LEVEL_ACCEPTED, NULL);
+  check_level_verdict (OUT, "video/x-h264", RDS_ENC_CODEC_H264, RDS_ENC_LEVEL_ACCEPTED, NULL);
+  check_level_verdict ("video/x-h264, profile=(string)high", "video/x-h264, level=(string)4.1", RDS_ENC_CODEC_H264,
+      RDS_ENC_LEVEL_ACCEPTED, NULL);
+  /* refused for another reason too: not the level's business */
+  check_level_verdict (OUT, "video/x-h264, profile=(string)main, level=(string)4.1", RDS_ENC_CODEC_H264,
+      RDS_ENC_LEVEL_ACCEPTED, NULL);
+  /* below VA's, a list, an unknown level, an H.264 level for H.265: refused (ours) */
+  check_level_verdict (OUT, "video/x-h264, level=(string)2", RDS_ENC_CODEC_H264, RDS_ENC_LEVEL_REFUSED, "2");
+  check_level_verdict (OUT, "video/x-h264, level=(string)1b", RDS_ENC_CODEC_H264, RDS_ENC_LEVEL_REFUSED, "1b");
+  check_level_verdict (OUT, "video/x-h264, level=(string){ 4, 4.1 }", RDS_ENC_CODEC_H264, RDS_ENC_LEVEL_REFUSED,
+      "{ (string)4, (string)4.1 }");
+  check_level_verdict (OUT, "video/x-h264, level=(string)9.9", RDS_ENC_CODEC_H264, RDS_ENC_LEVEL_REFUSED, "9.9");
+  check_level_verdict (OUT265, "video/x-h265, level=(string)3", RDS_ENC_CODEC_H265, RDS_ENC_LEVEL_REFUSED, "3");
+  check_level_verdict (OUT265, "video/x-h265, level=(string)3.2", RDS_ENC_CODEC_H265, RDS_ENC_LEVEL_REFUSED, "3.2");
+  /* VA's own level unknown: refused */
+  check_level_verdict ("video/x-h264, level=(string)7", "video/x-h264, level=(string)4.1", RDS_ENC_CODEC_H264,
+      RDS_ENC_LEVEL_REFUSED, "4.1");
+}
+
 /* rds_enc_caps_size_range on @templ: FALSE when @want is NULL, else the range "min_w max_w min_h max_h". */
 static void
 check_range (const gchar * templ, const gchar * want)
@@ -190,6 +249,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/enc-caps/preferred", test_preferred);
   g_test_add_func ("/cpu/enc-caps/b-frames", test_b_frames);
   g_test_add_func ("/cpu/enc-caps/level", test_level);
+  g_test_add_func ("/cpu/enc-caps/level-verdict", test_level_verdict);
   g_test_add_func ("/cpu/enc-caps/size-range", test_size_range);
   g_test_add_func ("/cpu/enc-caps/limit-size", test_limit_size);
   ret = g_test_run ();

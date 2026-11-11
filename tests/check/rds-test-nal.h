@@ -1,8 +1,8 @@
 /* A small Annex-B walker for the encoder tests, written separately from the plugin's own NAL code so it checks that
  * code independently: NAL units and access units of a byte stream, NAL types, the first slice's slice_type (H.264
- * and HEVC), the SPS profile_idc / level_idc, the SPS cropping (H.264 frame cropping, HEVC conformance window)
- * with the displayed size, and the VUI's timing info. Header-only (static inline functions); fails the test on a
- * stream it can't read.
+ * and HEVC), the SPS profile_idc / level_idc (and H.264's constraint flags), the HEVC VPS level, the SPS cropping
+ * (H.264 frame cropping, HEVC conformance window) with the displayed size, and the VUI's timing info. Header-only
+ * (static inline functions); fails the test on a stream it can't read.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_TEST_NAL_H
 #define RDS_TEST_NAL_H
@@ -149,6 +149,7 @@ rds_test_se (RdsTestBits * b)
 typedef struct
 {
   guint profile_idc;
+  guint constraint_flags;       /* H.264: constraint_set0_flag (MSB) .. reserved_zero_2bits */
   guint level_idc;
   guint chroma_format_idc;
   guint coded_width, coded_height;      /* luma samples */
@@ -215,7 +216,7 @@ rds_test_h264_sps (const guint8 * nal, gsize size, RdsTestSps * sps)
   memset (sps, 0, sizeof (*sps));
   g_assert_cmpuint (nal[0] & 0x1f, ==, 7);
   sps->profile_idc = rds_test_bits (&b, 8);
-  (void) rds_test_bits (&b, 8); /* constraint flags */
+  sps->constraint_flags = rds_test_bits (&b, 8);
   sps->level_idc = rds_test_bits (&b, 8);
   (void) rds_test_ue (&b);      /* seq_parameter_set_id */
   sps->chroma_format_idc = 1;
@@ -331,6 +332,27 @@ rds_test_h265_skip_st_ref_pic_set (RdsTestBits * b, guint idx, guint * num_delta
     }
     num_delta_pocs[idx] = neg + pos;
   }
+}
+
+/* general_level_idc of an HEVC VPS NAL unit (2-byte header included). */
+static inline guint
+rds_test_h265_vps_level (const guint8 * nal, gsize size)
+{
+  GByteArray *rbsp = rds_test_nal_rbsp (nal, size);
+  RdsTestBits b = { rbsp->data, rbsp->len * 8, 16 };
+  guint level;
+
+  g_assert_cmpuint ((nal[0] >> 1) & 0x3f, ==, 32);
+  /* vps_video_parameter_set_id, vps_base_layer_internal_flag, vps_base_layer_available_flag, vps_max_layers_minus1,
+   * vps_max_sub_layers_minus1, vps_temporal_id_nesting_flag, vps_reserved_0xffff_16bits */
+  (void) rds_test_bits (&b, 4 + 1 + 1 + 6 + 3 + 1);
+  g_assert_cmpuint (rds_test_bits (&b, 16), ==, 0xffff);
+  /* profile_tier_level: profile space, tier, profile, compatibility flags, source and constraint flags, inbld */
+  for (guint i = 0; i < 8 + 32 + 4 + 43 + 1; i++)
+    (void) rds_test_bit (&b);
+  level = rds_test_bits (&b, 8);
+  g_byte_array_unref (rbsp);
+  return level;
 }
 
 /* Parses an HEVC SPS NAL unit (2-byte header included) up to the conformance window, and with @vui on to the VUI's
