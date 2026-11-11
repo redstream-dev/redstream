@@ -331,7 +331,7 @@ test('analytics_config', executable('analytics_config', 'check' / 'analytics_con
     c_args : ['-DRDS_COMPAT_MATRIX="@0@"'.format(meson.project_source_root() / 'docs' / 'compat-matrix.md')]),
   suite : 'cpu', env : internal_test_env, protocol : 'tap')
 # The analytics core on scripted objects: rule scaling, the reference point and the inside test (with DeepStream
-# 8.0's observed results on the probe boxes), ROI filtering, overcrowding and the object counts.
+# 8.0's observed results on the same boxes), ROI filtering, overcrowding and the object counts.
 test('analytics_core', executable('analytics_core', 'check' / 'analytics_core.c',
     dependencies : [rdsanalytics_core_dep]),
   suite : 'cpu', env : internal_test_env, protocol : 'tap')

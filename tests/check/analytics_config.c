@@ -673,7 +673,7 @@ walk_key (const RdsAnalyticsKeyDesc * key, gpointer user_data)
   g_free (name);
 }
 
-/* Every key DeepStream 8.0 reads (its public docs, and the probe's undocumented ones), by group kind. */
+/* Every key DeepStream 8.0 reads, documented or observed, by group kind. */
 static const gchar *const known[] = {
   "property.enable", "property.config-width", "property.config-height", "property.osd-mode",
   "property.display-font-size", "property.obj-cnt-win-in-ms", "property.display-obj-cnt",

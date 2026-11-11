@@ -11,16 +11,18 @@ mechanical changes: element factory names behind an `#ifdef`, the same config fi
 metadata-traversal code via a compatibility header.
 
 Status: **pre-alpha.** M1's pipeline runs end to end from files and RTSP streams (decode → mux → infer → tracker →
-tiler → OSD → display, `samples/rds-test3`). The libgstrds core is in place (surfaces, `memory:RDS`, pools,
+analytics → tiler → OSD → display, `samples/rds-test3`). The libgstrds core is in place (surfaces, `memory:RDS`, pools,
 metadata, events, read-only surface views, the `rds_buf_surf_transform` GPU transform and its many-to-one composite).
 The elements so far: `rdsvideodec` (rocDecode H.264/H.265 decode), `rdsvideoconvert` (convert, scale, crop),
 `rdsstreammux` (the default scaling mux: batches of fixed-size slots), `rdsstreamdemux` (zero-copy per-source
 views of the batch), `rdsinfer` (MIGraphX primary and secondary detector, secondary classifier with the per-object
 cache: nvinfer configs, custom bbox and classifier parsers, object, classifier and tensor meta), `rdstracker` (the IOU
-and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs), `rdsmultistreamtiler` (batches into one
-tiled frame), `rdsosd` (boxes, text, lines, arrows, circles and the clock, drawn on the GPU by default or on the CPU,
-the same pixels, Pango for text), `rdslogger` (per-stream FPS lines), `rdsvideosink` (display through a stock
-GStreamer sink) and `rdsurisrcbin` (file and RTSP sources, with RTSP reconnection). Nothing here is stable.
+and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs), `rdsanalytics` (ROI filtering,
+overcrowding, direction and line crossing on the CPU, nvdsanalytics configs, DeepStream-shaped C++ metas with a C
+API, the `osd-mode` overlays as display meta), `rdsmultistreamtiler` (batches into one tiled frame), `rdsosd`
+(boxes, text, lines, arrows, circles and the clock, drawn on the GPU by default or on the CPU, the same pixels, Pango
+for text), `rdslogger` (per-stream FPS lines), `rdsvideosink` (display through a stock GStreamer sink) and
+`rdsurisrcbin` (file and RTSP sources, with RTSP reconnection). Nothing here is stable.
 
 ## Architecture principles
 
@@ -49,7 +51,7 @@ GStreamer sink) and `rdsurisrcbin` (file and RTSP sources, with RTSP reconnectio
 | `nvinfer` | `rdsinfer` | primary detector; secondary detectors, classifiers (per-object cache) and tensor-output models; custom bbox and classifier parser ABI, tensor meta. Primary classifiers and segmentation later |
 | `nvtracker` | `rdstracker` | IOU and NvSORT done (CPU); NvDCF / NvDeepSORT later |
 | `nvdsosd` | `rdsosd` | bbox, text, lines, circles |
-| `nvdsanalytics` | `rdsanalytics` | ROI, line crossing, direction, overcrowding (M2) |
+| `nvdsanalytics` | `rdsanalytics` | done: ROI filtering, overcrowding, direction (with STOPPED) and line crossing on the CPU; C++ metas in libgstrds-analytics |
 | `nveglglessink` / `nv3dsink` | `rdsvideosink` | display sink |
 | `nvdslogger` | `rdslogger` | per-stream FPS |
 | `nvv4l2h264enc` / `nvv4l2h265enc` | `rdsh264enc` / `rdsh265enc` | VA (VCN) encode with DeepStream property names (M2) |
@@ -300,10 +302,19 @@ gst/rdstracker/    libgstrdstracker plugin: rdstracker (gstrdstracker.c: write-b
                    cascaded matching; GLib only, no GStreamer or GPU); rds-tracker-kf the Kalman filter. These three
                    are the static rdstracker-core library, which the tests link directly. Optional (-Dtracker,
                    default auto): needs only libyaml, not MIGraphX
-docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its rdsinfer
-                   and rdstracker config-key tables must match the key tables: the infer_config and tracker_config
-                   tests check every row; element_compat_matrix checks the tiler, OSD, logger, sink and URI source
-                   bin property tables against the elements' properties)
+gst/rdsanalytics/  libgstrdsanalytics plugin: rdsanalytics (gstrdsanalytics.c: in place, feeds the core from the batch
+                   meta under its lock, writes the metas through libgstrds-analytics and the display meta; config-file
+                   reloads, stream events, a core remade when the mux output size changes; test hook
+                   rds_analytics_test_get_history_count exported for pipeline_analytics). rds-analytics-config
+                   parses nvdsanalytics key files from one key table; rds-analytics-core is the analytics core
+                   (geometry, per-stream state keyed by pad_index, histories and eviction, the four features, objCnt;
+                   GLib only, no GStreamer or GPU). These two are the static rdsanalytics-core the tests link.
+                   rds-analytics-draw turns a frame's results into display meta and object text (osd-mode,
+                   display-obj-cnt), the static rdsanalytics-draw (it needs libgstrds' meta types). Always built
+docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its rdsinfer,
+                   rdstracker and rdsanalytics config-key tables must match the key tables: the infer_config,
+                   tracker_config and analytics_config tests check every row; element_compat_matrix checks the tiler,
+                   OSD, logger, sink, URI source bin and analytics property tables against the elements' properties)
 samples/rds-test2/ clean-room sample with a secondary classifier: YOLO11n, NvSORT, YOLO11n-cls on the vehicles
                    (per-frame object, vehicle and labelled counts, label totals; --dry-run, --no-display,
                    --pgie-config, --sgie-config, --tracker-config)
@@ -425,16 +436,28 @@ meson test -C build-rel --print-errorlogs
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
 - The compat-matrix lints (`/cpu/infer-config/compat-matrix`, `/cpu/tracker-config/compat-matrix`) run only in
   builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
-  check the rdsinfer key tables in `docs/compat-matrix.md`. A new or changed config key needs its row there; the
+  check the rdsinfer key tables in `docs/compat-matrix.md`. `/cpu/analytics-config/compat-matrix` (rdsanalytics is
+  always built) runs in every build. A new or changed config key needs its row there; the
   test's message prints the expected row. `/cpu/elements/compat-matrix` does the same for the property tables of
   `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger`, `rdsvideosink`, `rdsurisrcbin` and `rdsanalytics`:
   every property except those of GstObject, GstElement and GstBin needs a row (GstBaseTransform's `qos` included;
   GstBin's may have one), and a row naming no property fails too.
-- **Tracker, tiler, OSD, logger and sink behaviour.** Where NVIDIA's docs are silent, `rdstracker`,
-  `rdsmultistreamtiler`, `rdsosd`, `rdslogger` and `rdsvideosink` match observed DeepStream 8.0 behaviour, except where
-  8.0 is clearly broken; there they do the sane thing. Code comments say "DeepStream 8.0 behaviour" or "ours", and
-  every such choice has a row in the compat matrix's behaviour tables ("Tracking behaviour", "Tiling behaviour",
-  "Drawing behaviour", "Logging behaviour", "Display behaviour"): keep them in step.
+- **Tracker, analytics, tiler, OSD, logger and sink behaviour.** Where NVIDIA's docs are silent, `rdstracker`,
+  `rdsanalytics`, `rdsmultistreamtiler`, `rdsosd`, `rdslogger` and `rdsvideosink` match observed DeepStream 8.0
+  behaviour, except where 8.0 is clearly broken; there they do the sane thing. Code comments say "DeepStream 8.0
+  behaviour" or "ours", and every such choice has a row in the compat matrix's behaviour tables ("Tracking
+  behaviour", "Analytics element behaviour", "Analytics behaviour", "Analytics drawing behaviour", "Tiling
+  behaviour", "Drawing behaviour", "Logging behaviour", "Display behaviour"), or in the analytics config section and
+  key table: keep them in step.
+- **Analytics metas (C++).** `RdsAnalyticsFrameMeta` and `RdsAnalyticsObjInfo` are C++ structs (std::string,
+  std::vector, std::unordered_map) with libstdc++'s layout, so code that reads their fields must be built with the
+  same `_GLIBCXX_USE_CXX11_ABI` as libgstrds-analytics (the default). Include `rds/rds-analytics-meta.h` at file
+  scope, never inside `extern "C" {}`. C code (the element, `rds-test3`) uses the C API only. The library is always
+  shared: the user metas point to its copy and release functions, which must outlive the code that attached them.
+- **Analytics core results** (`RdsAnalyticsFrameResult`) belong to the core and last only until the next
+  `rds_analytics_core_process_frame` (of any stream) or `rds_analytics_core_free`: write a frame's metas and display
+  meta before processing the next frame. The element calls the core under its own core lock; the test hook takes
+  it too, so call it between buffers.
 - **The street clip** (`tests/models/fetch-tracker-clip.sh`, CC0 from Wikimedia Commons) is VP8, which nothing in
   `redstream:dev` decodes: the script decodes it with a pinned PyAV in a throwaway Python container and encodes it
   with `vah264enc` in the dev image. The encoding depends on the GPU and driver (another hash is only a warning), and

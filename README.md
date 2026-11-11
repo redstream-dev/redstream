@@ -3,10 +3,10 @@
 **GStreamer video and audio analytics on AMD GPUs: an open-source, ROCm-based functional equivalent of NVIDIA DeepStream.**
 
 > Status: **pre-alpha.** The first milestone's pipeline runs end to end on an AMD GPU: decode → batch → detect →
-> track → tile → on-screen display → window, from files or RTSP streams, with the core library `libgstrds`, eleven
-> elements (`rdsurisrcbin`, `rdsvideodec`, `rdsvideoconvert`, `rdsstreammux`, `rdsstreamdemux`, `rdsinfer`,
-> `rdstracker`, `rdsmultistreamtiler`, `rdsosd`, `rdslogger`, `rdsvideosink`) and the `rds-compile` tool (see "What
-> works" below). APIs and element names will change.
+> track → analytics → tile → on-screen display → window, from files or RTSP streams, with the core library
+> `libgstrds`, twelve elements (`rdsurisrcbin`, `rdsvideodec`, `rdsvideoconvert`, `rdsstreammux`, `rdsstreamdemux`,
+> `rdsinfer`, `rdstracker`, `rdsanalytics`, `rdsmultistreamtiler`, `rdsosd`, `rdslogger`, `rdsvideosink`) and the
+> `rds-compile` tool (see "What works" below). APIs and element names will change.
 
 ![A street clip with detection boxes, class labels and track IDs drawn by rdsosd](docs/media/demo.gif)
 
@@ -81,6 +81,9 @@ Jetson-specific hardware blocks.
   NvMultiObjectTracker, on the CPU, reading the same YAML low-level config files (NvDCF and NvDeepSORT configs run
   as NvSORT). Where NVIDIA's docs leave behaviour open, it follows observed DeepStream 8.0 behaviour, and the compat
   matrix lists every point where it differs. Our own tuned configs are in `samples/tracker/`.
+- **`rdsanalytics`** (`nvdsanalytics`): ROI filtering, overcrowding, direction (with the stopped state) and line
+  crossing on the tracked objects, on the CPU, from nvdsanalytics config files, with DeepStream-shaped frame and
+  object metas and the `osd-mode` overlays as display meta (see "Analytics" below).
 - **`rdsmultistreamtiler`** (`nvmultistreamtiler`): composes a batch into one rows × columns frame on the GPU and
   merges the sources' metadata into it, scaled into the tiles, as DeepStream 8.0 does; `show-source` shows one
   source alone.
@@ -94,7 +97,7 @@ Jetson-specific hardware blocks.
 - **`rds-compile`** (`trtexec`): compiles and caches `rdsinfer`'s MIGraphX program ahead of time.
 - **Compat header** `rds/rds_compat.h`: DeepStream names for the above, plus runtime remapping of element names
   (`nvurisrcbin` → `rdsurisrcbin`, `nvv4l2decoder` → `rdsvideodec`, `nvstreammux` → `rdsstreammux`, `nvinfer` →
-  `rdsinfer`, `nvtracker` → `rdstracker`, `nvdsosd` → `rdsosd`, …).
+  `rdsinfer`, `nvtracker` → `rdstracker`, `nvdsanalytics` → `rdsanalytics`, `nvdsosd` → `rdsosd`, …).
 
 [`docs/compat-matrix.md`](docs/compat-matrix.md) lists every mapped name and property with its status. Built from
 this repository (see "Getting started"; `tests/media/make-test-media.sh` generates the clips), a decode and convert
@@ -200,6 +203,35 @@ on about one batch in ten: of the 9576 times a vehicle was selected (once per ve
 and the rest, 93.7 %, were served from the cache. Classifying every vehicle on every frame
 (`secondary-reinfer-interval: 0`) slows the sample to about 32 fps.
 
+### Analytics
+
+`rdsanalytics` (`nvdsanalytics`) goes after the tracker. It reads nvdsanalytics config files
+(`[property]` with `config-width` and `config-height`, then `[roi-filtering-stream-<n>]`, `[overcrowding-stream-<n>]`,
+`[direction-detection-stream-<n>]` and `[line-crossing-stream-<n>]` groups, `<n>` the stream's mux pad), scales the
+rules to the mux output and, per frame, attaches the frame meta (`objInROIcnt`, `ocStatus`, `objLCCurrCnt`,
+`objLCCumCnt`, `objCnt`) and, on each object with something to report, the object meta (`roiStatus`, `ocStatus`,
+`lcStatus`, `dirStatus`, `objStatus`), as user metas of DeepStream 8.0's types 32 and 33. `osd-mode` 1 and 2 add
+the rules, counts and statuses as display meta for `rdsosd`.
+
+The metas are DeepStream's C++ structs, with the same field names and types, in `rds/rds-analytics-meta.h`
+(library `redstream-analytics-1.0`, which replaces `nvds_analytics_meta.h`), so C++ code reads them as on
+DeepStream (`m->objInROIcnt["RF"]`); C code uses its C API (`rds_analytics_frame_meta_get_roi_count`,
+`rds_analytics_frame_meta_foreach_lc_cum_count`, `rds_analytics_obj_info_get_obj_status`, …).
+
+Where the docs are silent it follows observed DeepStream 8.0 behaviour, except where 8.0 is clearly broken: objects
+without a tracker id no longer turn off direction and line crossing for their stream, a config that 8.0 would crash
+on or misread (empty values, short lines, `config-width=0`, duplicate labels, …) fails at start naming the key, and
+stream resets clear a stream's state. The compat matrix lists every such choice.
+
+```bash
+GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse \
+  ! rdsvideodec ! m.sink_0 rdsstreammux name=m batch-size=1 width=1280 height=720 \
+  ! rdsinfer config-file-path=samples/rds-test3/rds_test3_pgie_config.yml batch-size=1 \
+  ! rdstracker ll-config-file=samples/tracker/config_tracker_NvSORT.yml \
+  ! rdsanalytics config-file=samples/rds-test3/rds_test3_analytics_config.txt \
+  ! rdsvideoconvert ! "video/x-raw(memory:RDS),format=RGBA" ! rdsosd ! rdsvideosink sync=false
+```
+
 ## How it maps to DeepStream
 
 | DeepStream | Redstream | Status |
@@ -212,7 +244,7 @@ and the rest, 93.7 %, were served from the cache. Classifying every vehicle on e
 | `nvtracker` | `rdstracker` | works (IOU, NvSORT) |
 | `nvdsosd` | `rdsosd` | works |
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | works |
-| `nvdsanalytics` | `rdsanalytics` | planned |
+| `nvdsanalytics` | `rdsanalytics` | works (ROI filtering, overcrowding, direction, line crossing) |
 | `nveglglessink`, `nv3dsink` | `rdsvideosink` | works |
 | `nvdslogger` | `rdslogger` | works |
 | `nvv4l2h264enc`, `nvv4l2h265enc` | `rdsh264enc`, `rdsh265enc` | planned |
@@ -233,8 +265,10 @@ and the rest, 93.7 %, were served from the cache. Classifying every vehicle on e
 **M2: production-style multi-model pipeline**
 - Done: secondary inference (`process-mode=2`): detectors, classifiers and tensor-output models on object crops, with
   DeepStream's per-object classifier cache and the `rds-test2` sample.
-- Next: sliced inference (SAHI-style tiles of large frames, reusing the secondary-mode crops), then `rdsanalytics`
-  (ROI and line-crossing analytics) and the H.264 encoder for a recording branch.
+- Done: `rdsanalytics` (ROI filtering, overcrowding, direction and line crossing), with `rds-test3
+  --analytics-config`.
+- Next: sliced inference (SAHI-style tiles of large frames, reusing the secondary-mode crops), then the H.264 encoder
+  for a recording branch.
 - Pose detector with keypoints.
 - Metadata edits in pad probes.
 

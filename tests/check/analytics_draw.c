@@ -87,7 +87,7 @@ typedef guint (*ObjectsFunc) (guint frame, RdsAnalyticsObject * out);
 #define WHITE { 1, 1, 1, 1 }
 #define BLACK { 0, 0, 0, 1 }
 
-/* the scripted objects' own border, as the probe gave them */
+/* the scripted objects' own border, as observed DeepStream 8.0 runs gave them */
 static const RdsOSD_ColorParams own_border = RED;
 
 typedef struct
@@ -190,7 +190,7 @@ typedef struct
 } Drawn;
 
 /* Runs frames 0 .. @frame - 1 of @objects through a core for @config at @w x @h, then frame @frame in a batch meta,
- * whose object metas get a 2 px border in the probe's red and no text, and draws it. */
+ * whose object metas get a 2 px border in the red of the observed DeepStream 8.0 runs and no text, and draws it. */
 static void
 draw_scenario (Drawn * d, const gchar * config, guint w, guint h, ObjectsFunc objects, guint frame)
 {
