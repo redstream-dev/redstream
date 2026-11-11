@@ -2627,6 +2627,27 @@ test_life_evict_keeps_seen (void)
   rds_analytics_core_free (core);
 }
 
+/* The histories the core holds: one per tracked object of a stream with line crossing, kept while seen and dropped
+ * once evicted (ours): ids 1-100, one per frame at 30 fps, then 1100 empty frames (36.7 s) */
+static void
+test_life_evict_count (void)
+{
+  RdsAnalyticsCore *core = core_for (LC_LOOSE);
+  RdsAnalyticsFrameResult r;
+
+  g_assert_cmpuint (rds_analytics_core_count_histories (core), ==, 0);
+  for (guint f = 0; f < 100; f++) {
+    RdsAnalyticsObject o = obj_at (f + 1, 0, 200, 300);
+
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), &o, 1, &r);
+  }
+  g_assert_cmpuint (rds_analytics_core_count_histories (core), ==, 100);
+  for (guint f = 100; f < 1200; f++)
+    rds_analytics_core_process_frame (core, 0, FRAME_30FPS (f), NULL, 0, &r);
+  g_assert_cmpuint (rds_analytics_core_count_histories (core), ==, 0);
+  rds_analytics_core_free (core);
+}
+
 /* DeepStream 8.0 behaviour: a history is kept across a 30-frame absence. id 1 at y 300, 310, 320 (frames 0-2),
  * absent 30 frames, back at y 420: its 4th observation, ref 305, so it counts at once */
 static void
@@ -2842,6 +2863,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-core/life-cycle/evict", test_life_evict);
   g_test_add_func ("/cpu/analytics-core/life-cycle/evict-no-pts", test_life_evict_no_pts);
   g_test_add_func ("/cpu/analytics-core/life-cycle/evict-keeps-seen", test_life_evict_keeps_seen);
+  g_test_add_func ("/cpu/analytics-core/life-cycle/evict-count", test_life_evict_count);
   g_test_add_func ("/cpu/analytics-core/life-cycle/absence", test_life_absence);
   g_test_add_func ("/cpu/analytics-core/life-cycle/no-pts-stretch", test_life_no_pts_stretch);
   g_test_add_func ("/cpu/analytics-core/life-cycle/evict-edges", test_life_evict_edges);

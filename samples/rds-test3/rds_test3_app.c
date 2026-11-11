@@ -1,12 +1,14 @@
 /* rds-test3: multi-stream detection sample in the style of a DeepStream application.
  * Built against Redstream's compat header, so DeepStream factory names are remapped at runtime.
  *
- *   rds-test3 [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE]
+ *   rds-test3 [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE] [--analytics-config FILE]
  *             [--rtsp-reconnect-interval S] [--rtsp-reconnect-attempts N] [--select-rtp-protocol P] URI [URI...]
  *
  * --pgie-config defaults to rds_test3_pgie_config.yml in this sample's source directory. --tracker-config adds a
  * tracker (nvtracker, with that low-level config file) after the primary detector; without it there is none, as in
- * DeepStream's test3. --no-display replaces the display sink with "fakesink sync=false" (as fast as it goes).
+ * DeepStream's test3. --analytics-config adds the analytics (nvdsanalytics, with that config file) after the tracker, or
+ * after the primary detector without one (direction and line crossing then skip the untracked objects); without it
+ * there is none. --no-display replaces the display sink with "fakesink sync=false" (as fast as it goes).
  *
  * Each URI is an nvurisrcbin (file, RTSP, anything GStreamer has a source for), its source-id the URI's position, its
  * vsrc_0 linked to the muxer's sink_<position>. For RTSP URIs, --rtsp-reconnect-interval (seconds, default 0: no
@@ -28,7 +30,13 @@
  *   source <source_id> frame <frame_num>: objects <n> (person: <p>, cars: <c>)
  *
  * counted before the tiler (which merges the batch into one frame). The class ids of "person" and "car" come from
- * the PGIE config's label file; a label the file doesn't have is counted as 0.
+ * the PGIE config's label file; a label the file doesn't have is counted as 0. With --analytics-config the line goes
+ * on with the frame's analytics: the objects in each ROI on this frame, and the line crossings counted so far on
+ * each line, labels in alphabetical order:
+ *
+ *   source <source_id> frame <frame_num>: objects <n> (person: <p>, cars: <c>) roi <label>=<n>... lc <label>=<n>...
+ *
+ * ("roi" or "lc" left out when the source's config has no such rule).
  *
  * SPDX-License-Identifier: MIT */
 #include <glib-unix.h>
@@ -38,6 +46,9 @@
 #include <string.h>
 
 #include <rds/rds_compat.h>
+/* the analytics metas' C API (library redstream-analytics-1.0), where DeepStream code includes
+ * nvds_analytics_meta.h */
+#include <rds/rds-analytics-meta.h>
 /* YAML PGIE configs are read for their label file with the YAML reader rdsinfer uses, an in-tree helper that is not
  * installed: an app built outside this tree uses a key-file config, or its own YAML reader. */
 #if RDS_TEST3_HAVE_YAML
@@ -58,21 +69,25 @@
 #define DEFAULT_PGIE_CONFIG RDS_TEST3_SOURCE_DIR "/rds_test3_pgie_config.yml"
 
 /* DeepStream factory names, as a DeepStream app would write them, in pipeline order; the tracker only with
- * --tracker-config, and fakesink instead of the display sink with --no-display. */
+ * --tracker-config, the analytics only with --analytics-config, and fakesink instead of the display sink with
+ * --no-display. */
 static const gchar *all_factories[] = {
-  "nvstreammux", "nvinfer", "nvtracker", "nvmultistreamtiler", "nvvideoconvert", "nvdsosd", "nveglglessink",
+  "nvstreammux", "nvinfer", "nvtracker", "nvdsanalytics", "nvmultistreamtiler", "nvvideoconvert", "nvdsosd",
+  "nveglglessink",
 };
 
 #define MAX_FACTORIES G_N_ELEMENTS (all_factories)
 
 /* The factories of this run into @names; returns how many. */
 static guint
-pipeline_factories (gboolean tracker, gboolean display, const gchar ** names)
+pipeline_factories (gboolean tracker, gboolean analytics, gboolean display, const gchar ** names)
 {
   guint n = 0;
 
   for (gsize i = 0; i < MAX_FACTORIES; i++) {
     if (!tracker && strcmp (all_factories[i], "nvtracker") == 0)
+      continue;
+    if (!analytics && strcmp (all_factories[i], "nvdsanalytics") == 0)
       continue;
     names[n++] = !display && strcmp (all_factories[i], "nveglglessink") == 0 ? "fakesink" : all_factories[i];
   }
@@ -183,15 +198,75 @@ lookup_counted_classes (const gchar * pgie_config)
   return ids;
 }
 
-/* Before the tiler (it merges the batch into one frame meta): one line per frame with its object counts. */
+/* The analytics' "<label>=<count>" pieces of one frame, collected by the foreach callbacks. */
+static void
+add_label_count (const gchar * label, guint64 count, gpointer user_data)
+{
+  g_ptr_array_add (user_data, g_strdup_printf ("%s=%" G_GUINT64_FORMAT, label, count));
+}
+
+static gint
+compare_strings (gconstpointer a, gconstpointer b)
+{
+  return strcmp (*(const gchar * const *) a, *(const gchar * const *) b);
+}
+
+/* Appends " <what> <label>=<count>..." to @line, the labels sorted (the metas' maps have no order); nothing when
+ * @pieces is empty. Empties @pieces. */
+static void
+append_label_counts (GString * line, const gchar * what, GPtrArray * pieces)
+{
+  if (pieces->len == 0)
+    return;
+  g_ptr_array_sort (pieces, compare_strings);
+  g_string_append_printf (line, " %s", what);
+  for (guint i = 0; i < pieces->len; i++)
+    g_string_append_printf (line, " %s", (const gchar *) g_ptr_array_index (pieces, i));
+  g_ptr_array_set_size (pieces, 0);
+}
+
+/* The analytics of @frame_meta, as nvdsanalytics attaches them: a frame user meta of type
+ * NVDS_USER_FRAME_META_NVDSANALYTICS holding an NvDsAnalyticsFrameMeta. Appends its ROI counts and its cumulative
+ * line-crossing counts to @line. */
+static void
+append_analytics (GString * line, NvDsFrameMeta * frame_meta)
+{
+  for (NvDsMetaList * l = frame_meta->frame_user_meta_list; l != NULL; l = l->next) {
+    NvDsUserMeta *user_meta = l->data;
+    const NvDsAnalyticsFrameMeta *meta = user_meta->user_meta_data;
+    GPtrArray *pieces;
+
+    if (user_meta->base_meta.meta_type != NVDS_USER_FRAME_META_NVDSANALYTICS || meta == NULL)
+      continue;
+    pieces = g_ptr_array_new_with_free_func (g_free);
+    rds_analytics_frame_meta_foreach_roi_count (meta, add_label_count, pieces);
+    append_label_counts (line, "roi", pieces);
+    rds_analytics_frame_meta_foreach_lc_cum_count (meta, add_label_count, pieces);
+    append_label_counts (line, "lc", pieces);
+    g_ptr_array_unref (pieces);
+    break;
+  }
+}
+
+typedef struct
+{
+  CountedClasses ids;
+  gboolean analytics;
+} CountOptions;
+
+/* Before the tiler (it merges the batch into one frame meta): one line per frame with its object counts, and with
+ * --analytics-config its analytics. */
 static GstPadProbeReturn
 count_objects_probe (GstPad * pad G_GNUC_UNUSED, GstPadProbeInfo * info, gpointer user_data)
 {
-  const CountedClasses *ids = user_data;
+  const CountOptions *opts = user_data;
+  const CountedClasses *ids = &opts->ids;
+  GString *line;
   NvDsBatchMeta *batch_meta = gst_buffer_get_nvds_batch_meta (GST_PAD_PROBE_INFO_BUFFER (info));
 
   if (batch_meta == NULL)
     return GST_PAD_PROBE_OK;
+  line = g_string_new (NULL);
   nvds_acquire_meta_lock (batch_meta);
   for (NvDsMetaList * l_frame = batch_meta->frame_meta_list; l_frame != NULL; l_frame = l_frame->next) {
     NvDsFrameMeta *frame_meta = l_frame->data;
@@ -206,10 +281,14 @@ count_objects_probe (GstPad * pad G_GNUC_UNUSED, GstPadProbeInfo * info, gpointe
       else if (ids->car >= 0 && obj_meta->class_id == ids->car)
         cars++;
     }
-    g_print ("source %u frame %d: objects %u (person: %u, cars: %u)\n", frame_meta->source_id,
+    g_string_printf (line, "source %u frame %d: objects %u (person: %u, cars: %u)", frame_meta->source_id,
         frame_meta->frame_num, frame_meta->num_obj_meta, persons, cars);
+    if (opts->analytics)
+      append_analytics (line, frame_meta);
+    g_print ("%s\n", line->str);
   }
   nvds_release_meta_lock (batch_meta);
+  g_string_free (line, TRUE);
   return GST_PAD_PROBE_OK;
 }
 
@@ -352,10 +431,10 @@ typedef struct
 
 static int
 run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const gchar * tracker_config,
-    gboolean display, const SourceOptions * opts)
+    const gchar * analytics_config, gboolean display, const SourceOptions * opts)
 {
   const gchar *factories[MAX_FACTORIES];
-  guint n_factories = pipeline_factories (tracker_config != NULL, display, factories);
+  guint n_factories = pipeline_factories (tracker_config != NULL, analytics_config != NULL, display, factories);
   GstElement *elements[MAX_FACTORIES];
   GstElement *pipeline = gst_pipeline_new ("rds-test3");
 
@@ -382,6 +461,7 @@ run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const
   GstElement *mux = element_for (factories, elements, n_factories, "nvstreammux");
   GstElement *pgie = element_for (factories, elements, n_factories, "nvinfer");
   GstElement *tracker = element_for (factories, elements, n_factories, "nvtracker");
+  GstElement *analytics = element_for (factories, elements, n_factories, "nvdsanalytics");
   GstElement *tiler = element_for (factories, elements, n_factories, "nvmultistreamtiler");
   guint rows = (guint) sqrt (num_sources);
   guint cols = (guint) ceil (1.0 * num_sources / rows);
@@ -391,14 +471,16 @@ run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const
   g_object_set (pgie, "config-file-path", pgie_config, "batch-size", num_sources, NULL);
   if (tracker)
     g_object_set (tracker, "ll-config-file", tracker_config, NULL);
+  if (analytics)
+    g_object_set (analytics, "config-file", analytics_config, NULL);
   g_object_set (tiler, "rows", rows, "columns", cols, "width", TILED_WIDTH, "height", TILED_HEIGHT, NULL);
   if (!display)
     g_object_set (element_for (factories, elements, n_factories, "fakesink"), "sync", FALSE, NULL);
 
-  CountedClasses ids = lookup_counted_classes (pgie_config);
-  GstPad *count_pad = gst_element_get_static_pad (tracker ? tracker : pgie, "src");
+  CountOptions count_opts = { lookup_counted_classes (pgie_config), analytics != NULL };
+  GstPad *count_pad = gst_element_get_static_pad (analytics ? analytics : tracker ? tracker : pgie, "src");
 
-  gst_pad_add_probe (count_pad, GST_PAD_PROBE_TYPE_BUFFER, count_objects_probe, &ids, NULL);
+  gst_pad_add_probe (count_pad, GST_PAD_PROBE_TYPE_BUFFER, count_objects_probe, &count_opts, NULL);
   gst_object_unref (count_pad);
 
   BusState state = { g_main_loop_new (NULL, FALSE), FALSE, pipeline,
@@ -465,7 +547,7 @@ main (int argc, char **argv)
 {
   gboolean dry_run = FALSE, no_display = FALSE;
   SourceOptions opts = { -1, G_MININT, -1 };
-  gchar *pgie_config = NULL, *tracker_config = NULL;
+  gchar *pgie_config = NULL, *tracker_config = NULL, *analytics_config = NULL;
   gchar **uris = NULL;
   GOptionEntry entries[] = {
     {"dry-run", 0, 0, G_OPTION_ARG_NONE, &dry_run, "Print the element mapping and exit", NULL},
@@ -475,6 +557,9 @@ main (int argc, char **argv)
         "Primary inference config file (default: " DEFAULT_PGIE_CONFIG ")", "FILE"},
     {"tracker-config", 0, 0, G_OPTION_ARG_FILENAME, &tracker_config,
         "Add a tracker after the primary detector, with this low-level tracker config file", "FILE"},
+    {"analytics-config", 0, 0, G_OPTION_ARG_FILENAME, &analytics_config,
+        "Add the analytics after the tracker (or the primary detector), with this config file; the count lines "
+          "then show the ROI and line-crossing counts", "FILE"},
     {"rtsp-reconnect-interval", 0, 0, G_OPTION_ARG_INT, &opts.reconnect_interval,
         "RTSP: seconds without data before reconnecting (default 0: no reconnection, as in DeepStream 8.0)", "S"},
     {"rtsp-reconnect-attempts", 0, 0, G_OPTION_ARG_INT, &opts.reconnect_attempts,
@@ -502,7 +587,7 @@ main (int argc, char **argv)
   guint num_sources = uris ? g_strv_length (uris) : 0;
   if (num_sources == 0) {
     g_printerr ("Usage: %s [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE] "
-        "[--rtsp-reconnect-interval S] [--rtsp-reconnect-attempts N] [--select-rtp-protocol P] URI [URI...]\n",
+        "[--analytics-config FILE] [--rtsp-reconnect-interval S] [--rtsp-reconnect-attempts N] [--select-rtp-protocol P] URI [URI...]\n",
         argv[0]);
     return 1;
   }
@@ -512,19 +597,21 @@ main (int argc, char **argv)
     g_strfreev (uris);
     g_free (pgie_config);
     g_free (tracker_config);
+    g_free (analytics_config);
     return 1;
   }
-  if (tracker_config && !*tracker_config) {
-    g_printerr ("--tracker-config needs a file\n");
+  if ((tracker_config && !*tracker_config) || (analytics_config && !*analytics_config)) {
+    g_printerr ("%s needs a file\n", tracker_config && !*tracker_config ? "--tracker-config" : "--analytics-config");
     g_strfreev (uris);
     g_free (pgie_config);
     g_free (tracker_config);
+    g_free (analytics_config);
     return 1;
   }
 
   if (dry_run) {
     const gchar *factories[MAX_FACTORIES];
-    guint n = pipeline_factories (tracker_config != NULL, !no_display, factories);
+    guint n = pipeline_factories (tracker_config != NULL, analytics_config != NULL, !no_display, factories);
 
     g_print ("sources: %u\n", num_sources);
     g_print ("pgie config: %s\n", pgie_config ? pgie_config : DEFAULT_PGIE_CONFIG);
@@ -534,11 +621,12 @@ main (int argc, char **argv)
     ret = 0;
   } else {
     ret = run_pipeline (uris, num_sources, pgie_config ? pgie_config : DEFAULT_PGIE_CONFIG, tracker_config,
-        !no_display, &opts);
+        analytics_config, !no_display, &opts);
   }
 
   g_strfreev (uris);
   g_free (pgie_config);
   g_free (tracker_config);
+  g_free (analytics_config);
   return ret;
 }

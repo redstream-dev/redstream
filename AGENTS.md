@@ -308,8 +308,9 @@ samples/rds-test2/ clean-room sample with a secondary classifier: YOLO11n, NvSOR
                    (per-frame object, vehicle and labelled counts, label totals; --dry-run, --no-display,
                    --pgie-config, --sgie-config, --tracker-config)
 samples/rds-test3/ clean-room test3-style multi-stream sample (end to end: nvurisrcbin sources, per-frame counts, tiler,
-                   OSD, display; --dry-run, --no-display, --pgie-config, --tracker-config, the RTSP options; Ctrl-C
-                   stops with an EOS)
+                   OSD, display; --dry-run, --no-display, --pgie-config, --tracker-config, --analytics-config (with
+                   rds_test3_analytics_config.txt, our analytics config for the street clip), the RTSP options;
+                   Ctrl-C stops with an EOS)
 samples/tracker/   our IOU and NvSORT low-level tracker configs for rdstracker (tuned on the street clip)
 tools/rds-compile/ rds-compile: pre-builds rdsinfer's programs (every program of a dynamic batch) with its config
                    parser and engine set (exit 2: all up to date)
@@ -390,14 +391,16 @@ meson test -C build-rel --print-errorlogs
   registry in `build/tests/registry.bin`. ASan builds scan plugins in-process (`GST_REGISTRY_FORK=no`), because
   `gst-plugin-scanner` can't load sanitized plugins. ASan runs with `use_sigaltstack=0` (Mesa's LLVM, loaded by the
   VA driver, installs its own alternate signal stack). The soak tests (`pipeline_soak`, `pipeline_mux_soak`,
-  `pipeline_infer_soak`, `pipeline_tracker_soak`, `pipeline_osd_soak`, `rds_test2_soak`) check host memory growth on
-  VmRSS, or under ASan on ASan's live heap (`__sanitizer_get_current_allocated_bytes`, which leaves out the
-  quarantine, so ASan keeps its default options); the normal build's VmRSS check covers memory that bypasses malloc
-  (HIP pinned memory). They are also in the `soak` suite; `pipeline_infer_soak` takes about 4 min with YOLO11n (3000
-  batches of 4 at ~50 fps on a small iGPU, also under ASan), `pipeline_tracker_soak` about 6 min with the street clip
-  (4068 batches of 4), `pipeline_osd_soak` (the same through the tiler and rdsosd) about 6.5 min and `rds_test2_soak`
-  (rds-test2's pipeline, YOLO11n-cls on the vehicles too) about 7 min, so `meson test --no-suite soak` leaves the soaks
-  out. Their memory probes live in `tests/check/rds-test-soak.h`: host memory, and GPU memory from this process's DRM
+  `pipeline_infer_soak`, `pipeline_tracker_soak`, `pipeline_osd_soak`, `rds_test2_soak`, `pipeline_analytics_soak`)
+  check host memory growth on VmRSS, or under ASan on ASan's live heap (`__sanitizer_get_current_allocated_bytes`,
+  which leaves out the quarantine, so ASan keeps its default options); the normal build's VmRSS check covers memory
+  that bypasses malloc (HIP pinned memory). They are also in the `soak` suite; `pipeline_infer_soak` takes about 4 min
+  with YOLO11n (3000 batches of 4 at ~50 fps on a small iGPU, also under ASan), `pipeline_tracker_soak` about 6 min
+  with the street clip (4068 batches of 4), `pipeline_osd_soak` (the same through the tiler and rdsosd) about 6.5 min,
+  `rds_test2_soak` (rds-test2's pipeline, YOLO11n-cls on the vehicles too) about 7 min and
+  `pipeline_analytics_soak` (the tracker soak's chain with rdsanalytics after the tracker; it also checks that
+  eviction bounds the histories) about 8 min, so `meson test --no-suite soak` leaves the soaks out. Their memory
+  probes live in `tests/check/rds-test-soak.h`: host memory, and GPU memory from this process's DRM
   fdinfo (`drm-total-vram` + `drm-total-gtt` of its render-node fds, where HIP allocations are accounted), so other
   processes on the GPU don't skew it; `hipMemGetInfo` is device-wide.
 - Element and pipeline test `main()`s end with `gst_deinit ()` after `g_test_run ()`. Without it, a test process can

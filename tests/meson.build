@@ -385,6 +385,29 @@ if rds_tracker_enabled and rds_infer_enabled
   test('pipeline_tracker_soak', pipeline_tracker_exe, args : ['-p', '/gpu/tracker-soak'],
     suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,
     depends : rds_plugins)
+
+  # rdsanalytics end to end on the street clip with YOLO11n, NvSORT and the rds-test3 sample's analytics config (and
+  # rdsosd drawing osd-mode 2, when built): a frame meta on every frame, people in the ROI, crossings, a cumulative
+  # count that never decreases, the same totals on two runs (pipeline_analytics); and the four-source soak (its own
+  # entry, pipeline_analytics_soak, also in the soak suite: host and GPU memory, and the histories bounded by
+  # eviction, read with the plugin's test hook). Both skip until tests/models/fetch-tracker-clip.sh and
+  # fetch-yolo11n.sh have run. The YOLO11n programs are shared with the other YOLO11n tests. Never in parallel.
+  pipeline_analytics_exe = executable('pipeline_analytics', 'check' / 'pipeline_analytics.c',
+    dependencies : pipeline_deps + [rds_analytics_dep, dependency('gmodule-2.0')],
+    c_args : [
+      '-DRDS_TEST_CACHE_MODELS="@0@"'.format(meson.project_source_root() / '.cache' / 'models'),
+      '-DRDS_TEST_CACHE_MEDIA="@0@"'.format(meson.project_source_root() / '.cache' / 'media'),
+      '-DRDS_TEST_SAMPLES="@0@"'.format(meson.project_source_root() / 'samples'),
+      '-DRDS_TEST_BUILD_DIR="@0@"'.format(meson.current_build_dir()),
+      '-DRDS_HAVE_OSD=@0@'.format(rds_osd_enabled ? 1 : 0),
+    ])
+  # two runs of about 40 s each, up to 500 s each with a first YOLO11n compile
+  test('pipeline_analytics', pipeline_analytics_exe, args : ['-p', '/gpu/analytics-yolo'],
+    suite : ['gpu', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1200,
+    depends : rds_plugins)
+  test('pipeline_analytics_soak', pipeline_analytics_exe, args : ['-p', '/gpu/analytics-soak'],
+    suite : ['gpu', 'soak', 'yolo'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 1800,
+    depends : rds_plugins)
 endif
 
 if rds_osd_enabled
@@ -565,9 +588,9 @@ test('rds_rtsp_serve', find_program('tools/rds_rtsp_serve.sh'),
   }),
   depends : rds_rtsp_serve_depends)
 
-# The dry run checks the compat mapping, the default PGIE config and --tracker-config; gst-inspect-1.0 (when found)
-# checks that the mapped decoder, converter, tiler and display sink (and rdsinfer, rdstracker and rdsosd, when built)
-# resolve to real elements from the build tree. Not in ASan builds: the uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process
+# The dry run checks the compat mapping, the default PGIE config, --tracker-config and --analytics-config;
+# gst-inspect-1.0 (when found) checks that the mapped decoder, converter, tiler, analytics and display sink (and
+# rdsinfer, rdstracker and rdsosd, when built) resolve to real elements from the build tree. Not in ASan builds: the uninstrumented gst-inspect-1.0 can't load sanitized plugins in-process
 # (plugin_load covers loading there).
 gst_inspect = find_program('gst-inspect-1.0', required : false)
 test('rds_test3_dry_run',
@@ -581,6 +604,15 @@ test('rds_test3_dry_run',
 # first run compiles the batch-4 program.
 test('rds_test3_run',
   find_program('samples/rds_test3_run.sh'),
+  args : [rds_test3_exe, meson.project_source_root(), meson.current_build_dir(),
+    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
+  suite : ['gpu', 'yolo'], env : test_env, is_parallel : false, timeout : 900, depends : rds_plugins)
+
+# rds-test3 --analytics-config end to end on two copies of the street clip: the sample's analytics config, its ROI and
+# line counts on the count lines, the same for both sources (gpu; skips as rds_test3_run does). About 75 s; never in
+# parallel with the other YOLO11n tests (the first run compiles the batch-2 program).
+test('rds_test3_analytics',
+  find_program('samples/rds_test3_analytics.sh'),
   args : [rds_test3_exe, meson.project_source_root(), meson.current_build_dir(),
     rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
   suite : ['gpu', 'yolo'], env : test_env, is_parallel : false, timeout : 900, depends : rds_plugins)

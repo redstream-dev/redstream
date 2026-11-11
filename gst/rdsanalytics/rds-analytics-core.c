@@ -950,6 +950,24 @@ rds_analytics_core_remove_stream (RdsAnalyticsCore * core, guint pad_index)
   g_hash_table_remove (core->streams, GUINT_TO_POINTER (pad_index));
 }
 
+guint
+rds_analytics_core_count_histories (const RdsAnalyticsCore * core)
+{
+  GHashTableIter it;
+  gpointer value;
+  guint n = 0;
+
+  g_return_val_if_fail (core != NULL, 0);
+  g_hash_table_iter_init (&it, core->streams);
+  while (g_hash_table_iter_next (&it, NULL, &value)) {
+    const StreamState *st = value;
+
+    if (st->histories)
+      n += g_hash_table_size (st->histories);
+  }
+  return n;
+}
+
 const RdsAnalyticsRule *
 rds_analytics_core_get_rules (const RdsAnalyticsCore * core, guint pad_index, RdsAnalyticsFeature feature,
     guint * n_rules)

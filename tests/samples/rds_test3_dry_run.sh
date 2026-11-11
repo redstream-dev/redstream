@@ -25,6 +25,17 @@ fi
 out=$("$1" --dry-run --tracker-config tracker.yml file:///dev/null)
 echo "$out"
 echo "$out" | grep -A1 -x 'nvinfer -> rdsinfer' | grep -qx 'nvtracker -> rdstracker'
+# --analytics-config adds the analytics right after the tracker (after the primary detector without one); without it
+# there is none
+if echo "$out" | grep -q nvdsanalytics; then
+  exit 1
+fi
+out=$("$1" --dry-run --tracker-config tracker.yml --analytics-config analytics.txt file:///dev/null)
+echo "$out"
+echo "$out" | grep -A1 -x 'nvtracker -> rdstracker' | grep -qx 'nvdsanalytics -> rdsanalytics'
+echo "$out" | grep -A1 -x 'nvdsanalytics -> rdsanalytics' | grep -qx 'nvmultistreamtiler -> rdsmultistreamtiler'
+out=$("$1" --dry-run --analytics-config analytics.txt file:///dev/null)
+echo "$out" | grep -A1 -x 'nvinfer -> rdsinfer' | grep -qx 'nvdsanalytics -> rdsanalytics'
 # --no-display swaps the display sink for fakesink, nothing else
 out=$("$1" --dry-run --no-display file:///dev/null)
 echo "$out"
@@ -43,12 +54,15 @@ fi
 if "$1" --dry-run --tracker-config '' file:///dev/null >/dev/null 2>&1; then
   exit 1
 fi
+if "$1" --dry-run --analytics-config '' file:///dev/null >/dev/null 2>&1; then
+  exit 1
+fi
 
-# nvurisrcbin, nvv4l2decoder, nvvideoconvert, nvmultistreamtiler, nveglglessink and (when built) nvinfer, nvtracker and
-# nvdsosd map to real elements of the build tree (GST_PLUGIN_PATH_1_0 comes from the test environment).
+# nvurisrcbin, nvv4l2decoder, nvvideoconvert, nvmultistreamtiler, nveglglessink, nvdsanalytics and (when built) nvinfer,
+# nvtracker and nvdsosd map to real elements of the build tree (GST_PLUGIN_PATH_1_0 comes from the test environment).
 if [ -n "${2:-}" ]; then
   # one element per call: given several names, gst-inspect-1.0 only looks at the last one
-  elements='rdsurisrcbin rdsvideodec rdsvideoconvert rdsmultistreamtiler rdsvideosink'
+  elements='rdsurisrcbin rdsvideodec rdsvideoconvert rdsmultistreamtiler rdsvideosink rdsanalytics'
   if [ "${3:-}" = infer ]; then
     elements="$elements rdsinfer"
   fi

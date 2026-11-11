@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: MIT
+# rdsanalytics config for rds-test3 (--analytics-config) on the street clip (tests/models/fetch-tracker-clip.sh: a
+# diagonal crosswalk, people walking east and west, cars driving east). Ours, written for that clip in the format of
+# DeepStream's nvdsanalytics configs; the coordinates are in a 1280x720 config space, scaled to the mux output.
+#
+# Each stream has the same three rules, so up to four copies of the clip (sources 0-3) count alike:
+# - roi-Crosswalk: the people (class 0) on the near half of the street, in the middle of the frame;
+# - line-crossing-Eastbound: people and cars (classes 0 and 2) crossing the vertical line x = 640, from y 380 down
+#   to the bottom of the frame, going east (the direction vector points right);
+# - direction-West: people going west.
+# An object stands for its box's bottom centre. osd-mode=2 draws the rules, the counts and each object's status.
+[property]
+enable=1
+config-width=1280
+config-height=720
+osd-mode=2
+display-font-size=12
+
+[roi-filtering-stream-0]
+enable=1
+roi-Crosswalk=320;420;960;420;960;720;320;720
+inverse-roi=0
+class-id=0
+
+[line-crossing-stream-0]
+enable=1
+line-crossing-Eastbound=600;560;680;560;640;380;640;720
+class-id=0;2
+extended=0
+mode=loose
+
+[direction-detection-stream-0]
+enable=1
+direction-West=680;560;600;560
+class-id=0
+
+[roi-filtering-stream-1]
+enable=1
+roi-Crosswalk=320;420;960;420;960;720;320;720
+inverse-roi=0
+class-id=0
+
+[line-crossing-stream-1]
+enable=1
+line-crossing-Eastbound=600;560;680;560;640;380;640;720
+class-id=0;2
+extended=0
+mode=loose
+
+[direction-detection-stream-1]
+enable=1
+direction-West=680;560;600;560
+class-id=0
+
+[roi-filtering-stream-2]
+enable=1
+roi-Crosswalk=320;420;960;420;960;720;320;720
+inverse-roi=0
+class-id=0
+
+[line-crossing-stream-2]
+enable=1
+line-crossing-Eastbound=600;560;680;560;640;380;640;720
+class-id=0;2
+extended=0
+mode=loose
+
+[direction-detection-stream-2]
+enable=1
+direction-West=680;560;600;560
+class-id=0
+
+[roi-filtering-stream-3]
+enable=1
+roi-Crosswalk=320;420;960;420;960;720;320;720
+inverse-roi=0
+class-id=0
+
+[line-crossing-stream-3]
+enable=1
+line-crossing-Eastbound=600;560;680;560;640;380;640;720
+class-id=0;2
+extended=0
+mode=loose
+
+[direction-detection-stream-3]
+enable=1
+direction-West=680;560;600;560
+class-id=0

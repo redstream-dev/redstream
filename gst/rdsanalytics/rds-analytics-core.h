@@ -204,6 +204,10 @@ G_GNUC_INTERNAL void rds_analytics_core_reset_stream (RdsAnalyticsCore * core, g
  * left alone. */
 G_GNUC_INTERNAL void rds_analytics_core_remove_stream (RdsAnalyticsCore * core, guint pad_index);
 
+/* The histories the core holds, over every stream: one per tracked object seen within the eviction age on a
+ * stream with a direction or line-crossing group. For tests (the soak checks that eviction bounds them). */
+G_GNUC_INTERNAL guint rds_analytics_core_count_histories (const RdsAnalyticsCore * core);
+
 /* The rules of @feature on stream @pad_index, scaled to the mux output, in config order, for drawing them: only an
  * enabled group's (DeepStream 8.0 behaviour: a disabled group is not drawn either). NULL, with *@n_rules 0, when the
  * stream has no such enabled group. Owned by the core and read-only: valid until rds_analytics_core_free. */

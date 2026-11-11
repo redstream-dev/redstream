@@ -166,6 +166,22 @@ Four copies of the clip through the whole `rds-test3` chain run at about 44–46
 the detector sets the pace, and the tiler and OSD add about 2.5 ms per batch (2.1 ms tiling, 0.4 ms drawing; release
 build).
 
+`--analytics-config FILE` adds `rdsanalytics` after the tracker (DeepStream's `nvdsanalytics`, with its config
+format), and each count line then ends with the frame's ROI counts and the line crossings counted so far:
+
+```bash
+GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 \
+  --tracker-config samples/tracker/config_tracker_NvSORT.yml \
+  --analytics-config samples/rds-test3/rds_test3_analytics_config.txt \
+  file://$PWD/.cache/media/crosswalk-720p.h264
+# source 0 frame 499: objects 20 (person: 12, cars: 2) roi Crosswalk=6 lc Eastbound=14
+```
+
+The sample config, written for the street clip (the same rules for sources 0 to 3), has an ROI over the middle of the
+near street counting people, a vertical line in the middle of the frame counting people and cars going east, and a
+direction rule for people going west; `osd-mode=2` draws the rules, the counts and each object's status. On the clip,
+29 objects cross the line, and the ROI has people on 1325 of the 1356 frames.
+
 The `rds-test2` sample adds a secondary classifier, shaped like DeepStream's `deepstream-test2`: after the tracker,
 YOLO11n-cls (ImageNet classes) runs in `rdsinfer`'s secondary mode on the cars, motorcycles, buses and trucks of at
 least 64×64 pixels, and its label is appended to each vehicle's text (ImageNet has no plain "car" class: expect

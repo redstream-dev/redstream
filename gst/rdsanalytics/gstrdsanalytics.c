@@ -519,6 +519,20 @@ gst_rds_analytics_class_init (GstRdsAnalyticsClass * klass)
   trans_class->transform_ip_on_passthrough = TRUE;
 }
 
+/* ---- test hooks ---- */
+
+guint
+rds_analytics_test_get_history_count (GstElement * element)
+{
+  GstRdsAnalytics *self = GST_RDS_ANALYTICS (element);
+  guint n;
+
+  g_mutex_lock (&self->core_lock);
+  n = self->core ? rds_analytics_core_count_histories (self->core) : 0;
+  g_mutex_unlock (&self->core_lock);
+  return n;
+}
+
 static void
 gst_rds_analytics_init (GstRdsAnalytics * self)
 {
