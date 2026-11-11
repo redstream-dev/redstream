@@ -320,6 +320,7 @@ test_clip (void)
 #define SOAK_MIN_BATCHES 3000
 #define SOAK_SAMPLE_EVERY 300   /* batches between memory samples */
 #define SOAK_MAX_SAMPLES 16
+#define SOAK_MAX_LOOPS 4
 
 typedef guint (*GetHistoryCountFunc) (GstElement * element);
 
@@ -328,6 +329,7 @@ typedef struct
   GstElement *analytics;
   GetHistoryCountFunc get_history_count;
   StreamTotals t[SOAK_SOURCES];
+  guint64 loop_cum[SOAK_SOURCES][SOAK_MAX_LOOPS];       /* the cumulative count at each loop's last frame */
   GHashTable *ids;              /* the distinct (pad_index, object_id) seen */
   guint batches, frames;
   guint histories_max;
@@ -354,6 +356,12 @@ soak_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_da
 
     g_assert_cmpuint (fm->pad_index, <, SOAK_SOURCES);
     check_frame (fm, &st->t[fm->pad_index]);
+    if (st->t[fm->pad_index].frames % CLIP_FRAMES == 0) {
+      guint loop = st->t[fm->pad_index].frames / CLIP_FRAMES - 1;
+
+      g_assert_cmpuint (loop, <, SOAK_MAX_LOOPS);
+      st->loop_cum[fm->pad_index][loop] = st->t[fm->pad_index].crossings;
+    }
     for (GList * o = fm->obj_meta_list; o; o = o->next) {
       guint64 key = ((guint64) fm->pad_index << 56) ^ ((RdsObjectMeta *) o->data)->object_id;
 
@@ -376,9 +384,10 @@ soak_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_da
  * rdsstreammux, rdsinfer (YOLO11n), rdstracker (NvSORT) and rdsanalytics (the sample config, which has the same
  * rules on streams 0-3) into a fakesink: VmRSS (under ASan, the live heap) grows by less than 8 MiB and the
  * process's GPU memory moves by less than 16 MiB between the second memory sample (600 batches) and the last; the
- * live histories (one per tracked object, the direction and line rules need them) stay well below the distinct
+ * live histories (one per tracked object, the direction and line rules need them) stay below half the distinct
  * objects of the run, since histories unseen for 30 s of PTS (or 900 frames) are dropped; and every source counts
- * crossings in every loop. Reports the fps. */
+ * crossings in every loop. Reports the fps. Measured (debug build, 3 loops, 4068 batches of 4 at 35 fps): 3308
+ * distinct objects, at most 756 live histories, 87 crossings per source (29 per loop), VmRSS +0.70 MiB. */
 static void
 test_soak (void)
 {
@@ -475,10 +484,16 @@ test_soak (void)
       MIB (gpu_delta));
   g_assert_cmpuint (st.batches, ==, CLIP_FRAMES * loops);
   g_assert_cmpuint (st.frames, ==, SOAK_SOURCES * CLIP_FRAMES * loops);
+  g_assert_cmpuint (loops, <=, SOAK_MAX_LOOPS);
   for (guint i = 0; i < SOAK_SOURCES; i++) {
     g_assert_cmpuint (st.t[i].frames, ==, CLIP_FRAMES * loops);
-    /* at least one crossing per loop */
-    g_assert_cmpuint (st.t[i].crossings, >=, loops);
+    /* crossings counted in every loop */
+    for (guint l = 0; l < loops; l++) {
+      guint64 before = l ? st.loop_cum[i][l - 1] : 0;
+
+      g_test_message ("source %u, loop %u: %" G_GUINT64_FORMAT " crossings", i, l, st.loop_cum[i][l] - before);
+      g_assert_cmpuint (st.loop_cum[i][l], >, before);
+    }
   }
   /* eviction: without it every distinct object would keep its history to the end */
   g_assert_cmpuint (st.histories_max, >, 0);

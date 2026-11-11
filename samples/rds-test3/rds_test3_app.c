@@ -6,9 +6,9 @@
  *
  * --pgie-config defaults to rds_test3_pgie_config.yml in this sample's source directory. --tracker-config adds a
  * tracker (nvtracker, with that low-level config file) after the primary detector; without it there is none, as in
- * DeepStream's test3. --analytics-config adds the analytics (nvdsanalytics, with that config file) after the tracker, or
- * after the primary detector without one (direction and line crossing then skip the untracked objects); without it
- * there is none. --no-display replaces the display sink with "fakesink sync=false" (as fast as it goes).
+ * DeepStream's test3. --analytics-config adds the analytics (nvdsanalytics, with that config file) after the
+ * tracker, or after the primary detector without one (direction and line crossing then skip the untracked objects);
+ * without it there is none. --no-display replaces the display sink with "fakesink sync=false" (as fast as it goes).
  *
  * Each URI is an nvurisrcbin (file, RTSP, anything GStreamer has a source for), its source-id the URI's position, its
  * vsrc_0 linked to the muxer's sink_<position>. For RTSP URIs, --rtsp-reconnect-interval (seconds, default 0: no
@@ -587,7 +587,8 @@ main (int argc, char **argv)
   guint num_sources = uris ? g_strv_length (uris) : 0;
   if (num_sources == 0) {
     g_printerr ("Usage: %s [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE] "
-        "[--analytics-config FILE] [--rtsp-reconnect-interval S] [--rtsp-reconnect-attempts N] [--select-rtp-protocol P] URI [URI...]\n",
+        "[--analytics-config FILE] [--rtsp-reconnect-interval S] [--rtsp-reconnect-attempts N] "
+        "[--select-rtp-protocol P] URI [URI...]\n",
         argv[0]);
     return 1;
   }
@@ -600,13 +601,24 @@ main (int argc, char **argv)
     g_free (analytics_config);
     return 1;
   }
-  if ((tracker_config && !*tracker_config) || (analytics_config && !*analytics_config)) {
-    g_printerr ("%s needs a file\n", tracker_config && !*tracker_config ? "--tracker-config" : "--analytics-config");
-    g_strfreev (uris);
-    g_free (pgie_config);
-    g_free (tracker_config);
-    g_free (analytics_config);
-    return 1;
+  /* the config-file options, given with an empty file name */
+  const struct
+  {
+    const gchar *name;
+    const gchar *value;
+  } file_options[] = {
+    {"--tracker-config", tracker_config},
+    {"--analytics-config", analytics_config},
+  };
+  for (gsize i = 0; i < G_N_ELEMENTS (file_options); i++) {
+    if (file_options[i].value && !*file_options[i].value) {
+      g_printerr ("%s needs a file\n", file_options[i].name);
+      g_strfreev (uris);
+      g_free (pgie_config);
+      g_free (tracker_config);
+      g_free (analytics_config);
+      return 1;
+    }
   }
 
   if (dry_run) {

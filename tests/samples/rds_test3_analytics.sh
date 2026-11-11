@@ -52,12 +52,15 @@ t1=$(date +%s.%N)
 grep -v '^source ' "$log" || true
 [ "$status" -eq 0 ] || fail "rds-test3 exited with $status"
 
-pattern='^source [0-9]+ frame [0-9]+: objects [0-9]+ \(person: [0-9]+, cars: [0-9]+\) roi Crosswalk=[0-9]+ lc Eastbound=[0-9]+$'
+pattern='^source [0-9]+ frame [0-9]+: objects [0-9]+ \(person: [0-9]+, cars: [0-9]+\) '
+pattern="${pattern}roi Crosswalk=[0-9]+ lc Eastbound=[0-9]+\$"
 lines=$(grep -c '^source ' "$log" || true)
 [ "$(grep -cE "$pattern" "$log" || true)" -eq "$lines" ] || fail 'count lines not in the expected format'
 [ "$lines" -eq $((SOURCES * CLIP_FRAMES)) ] || fail "$lines count lines, expected $((SOURCES * CLIP_FRAMES))"
 for s in $(seq 0 $((SOURCES - 1))); do
-  # frames in order, the cumulative count never decreasing; prints "<frames with people in the ROI> <crossings>"
+  # frames in order, the cumulative count never decreasing; prints "<frames with people in the ROI> <crossings>".
+  # The awk fields ($4 the frame number, $12 the ROI count, $14 the cumulative crossings) depend on the line format
+  # checked just above: change both together.
   totals=$(grep "^source $s frame " "$log" | awk -v want=$CLIP_FRAMES -v s="$s" '
     { split($4, f, ":"); split($12, r, "="); split($14, c, "=")
       if (f[1] != NR - 1) { print "source " s ": frame " f[1] " at line " NR > "/dev/stderr"; bad = 1; exit }
