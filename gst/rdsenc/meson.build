@@ -22,3 +22,14 @@ rdsenc_nal = static_library('rdsenc-nal',
 rdsenc_nal_dep = declare_dependency(link_with : rdsenc_nal,
   include_directories : include_directories('.'),
   dependencies : [gst_dep])
+
+# rdsh264enc and rdsh265enc: bins over the stock VA encoders (needed at run time only).
+gstrdsenc = library('gstrdsenc',
+  files('plugin.c', 'gstrdsencbin.c', 'gstrdsh264enc.c', 'gstrdsh265enc.c'),
+  c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdsenc"'],
+  dependencies : [rds_dep, gst_dep, rdsenc_props_dep, rdsenc_nal_dep],
+  gnu_symbol_visibility : 'hidden',
+  install_rpath : rds_install_rpath,
+  install : true,
+  install_dir : get_option('libdir') / 'gstreamer-1.0')
+rds_plugins += gstrdsenc

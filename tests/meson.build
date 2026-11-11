@@ -486,7 +486,7 @@ test('element_logger', executable('element_logger', 'check' / 'element_logger.c'
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
 # docs/compat-matrix.md has a property-table row for every property of rdsmultistreamtiler, rdsosd (when built),
-# rdslogger, rdsvideosink, rdsurisrcbin and rdsanalytics, and none for a property they lack.
+# rdslogger, rdsvideosink, rdsurisrcbin, rdsanalytics, rdsh264enc and rdsh265enc, and none for a property they lack.
 test('element_compat_matrix', executable('element_compat_matrix', 'check' / 'element_compat_matrix.c',
     dependencies : test_deps,
     c_args : ['-DRDS_HAVE_OSD=@0@'.format(rds_osd_enabled ? 1 : 0),
@@ -506,6 +506,16 @@ test('enc_nal_cpu', enc_nal_exe, args : ['-p', '/cpu/enc-nal'],
   suite : 'cpu', env : test_env, protocol : 'tap')
 test('enc_nal', enc_nal_exe, args : ['-p', '/gpu/enc-nal'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120)
+
+# rdsh264enc / rdsh265enc: registration, pads, DeepStream 8.0's properties and enums, no-op warnings, QP strings, the
+# inner chain, a missing VA encoder and the unsupported profiles (cpu); encodes through the bins (gpu, skipped without
+# the VA encoders).
+element_enc_exe = executable('element_enc', 'check' / 'element_enc.c',
+  dependencies : test_deps + [gst_app_dep, gst_video_dep])
+test('element_enc_cpu', element_enc_exe, args : ['-p', '/cpu/enc'],
+  suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
+test('element_enc', element_enc_exe, args : ['-p', '/gpu/enc'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
 
 # rdsvideosink: properties, forwarding and start errors (cpu); RDS frames into the inner sink, batched input (gpu).
 element_videosink_exe = executable('element_videosink', 'check' / 'element_videosink.c',

@@ -1,5 +1,6 @@
-/* docs/compat-matrix.md has a property table for rdsmultistreamtiler, rdsosd, rdslogger, rdsvideosink, rdsurisrcbin and
- * rdsanalytics: one row per property the element has, and no row for a property it lacks (cpu).
+/* docs/compat-matrix.md has a property table for rdsmultistreamtiler, rdsosd, rdslogger, rdsvideosink, rdsurisrcbin,
+ * rdsanalytics, rdsh264enc and rdsh265enc: one row per property the element has, and no row for a property it lacks
+ * (cpu).
  *
  * The properties checked are those g_object_class_list_properties returns, minus the ones GstObject, GstElement and
  * GstBin install (`name`, `parent`, `async-handling`, `message-forward`): every GStreamer element has them, and
@@ -14,7 +15,7 @@
 #include <string.h>
 
 static const gchar *const elements[] = { "rdsmultistreamtiler", "rdsosd", "rdslogger", "rdsvideosink", "rdsurisrcbin",
-  "rdsanalytics"
+  "rdsanalytics", "rdsh264enc", "rdsh265enc"
 };
 
 static gboolean

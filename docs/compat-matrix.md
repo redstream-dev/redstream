@@ -38,8 +38,8 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvdslogger` | `rdslogger` | supported | passthrough, any caps; prints each stream's frame rate to stdout in DeepStream 8.0's `**PERF` line format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
 | `nveglglessink` | `rdsvideosink` | supported | display bin: `rdsvideoconvert` to system-memory BGRx, then a stock GStreamer sink (`video-sink`, default `autovideosink`); one frame per buffer; properties and behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nv3dsink` | `rdsvideosink` | supported | as `nveglglessink` (nv3dsink's properties are a subset of nveglglessink's) | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
-| `nvv4l2h264enc` | `rdsh264enc` | planned | VA (VCN) encode, M2 | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
-| `nvv4l2h265enc` | `rdsh265enc` | planned | VA (VCN) encode, M2 | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
+| `nvv4l2h264enc` | `rdsh264enc` | in progress | a bin over the stock VA encoder `vah264enc` (VCN), through `rdsvideoconvert` to system-memory NV12; `memory:RDS` or system-memory input. Done: DeepStream 8.0's properties (stored and read back), the inner elements, the errors at start (no VA encoder, an unsupported profile). Not yet: the properties applied to the VA encoder, filler stripping, input timestamps, `copy-meta`, forced key frames; properties below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html) |
+| `nvv4l2h265enc` | `rdsh265enc` | in progress | a bin over the stock VA encoder `vah265enc` (VCN), through `rdsvideoconvert` to system-memory NV12; `memory:RDS` or system-memory input. Done: DeepStream 8.0's properties (stored and read back), the inner elements, the errors at start (no VA encoder, an unsupported profile). Not yet: the properties applied to the VA encoder, filler stripping, input timestamps, `copy-meta`, forced key frames; properties below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html) |
 
 ### `rdsurisrcbin` (`nvurisrcbin`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin))
 
@@ -1326,6 +1326,74 @@ dumps) or **ours**.
 | `roi-<label>` | roi-filtering, overcrowding | polygon | none | >= 0 | supported | x1;y1;x2;y2;... in order around the polygon, at least 3 points; integers >= 0. A label used by both the roi-filtering and the overcrowding group of a stream is an error (ours): both go in `objInROIcnt`, where 8.0 lets one count overwrite the other. Direction and line-crossing labels are independent. Fewer than 3 points or an odd count is an error (ours): 8.0 accepts them (an ROI that never matches, a missing y read as 0) |
 | `line-crossing-<label>` | line-crossing | line | none | >= 0 | supported | 8 integers >= 0: the direction vector (x1;y1;x2;y2), then the line's two ends. Another count is an error (ours): 8.0 reads a short line as garbage and ignores extra values |
 | `direction-<label>` | direction-detection | vector | none | >= 0 | supported | 4 integers >= 0: the vector from (x1;y1) to (x2;y2). Another count is an error (ours): 8.0 reads a missing value as 0 |
+
+### `rdsh264enc` (`nvv4l2h264enc`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html))
+
+A bin: `rdsvideoconvert ! video/x-raw,format=NV12 ! vah264enc ! video/x-h264,stream-format=byte-stream,alignment=au`,
+made when the element first goes to READY. Names, types, ranges and defaults as `gst-inspect-1.0` shows them for
+DeepStream 8.0's nvv4l2h264enc (the enum type names are ours). Flags (ours: 8.0's are wrong both ways): `bitrate`,
+`force-idr` and `force-intra` are changeable in PLAYING; every other writable property is changeable only in NULL or
+READY, and is read when the element starts (READY to PAUSED). Set later, it is stored, logs a warning and applies
+at the next start (DeepStream 8.0 takes some silently and ignores others). An accepted no-op logs one warning per
+property the first time it gets a value other than its default. So far the properties are stored and read back and
+the profile is checked at start; the Notes give how each maps onto `vah264enc`.
+
+| Property | Type | Default | Status | Notes |
+|---|---|---|---|---|
+| `bitrate` | uint | `4000000` | supported | bit/s: VA's `bitrate` in kbit/s (rounded, at least 1). Changeable in PLAYING (DeepStream 8.0 behaviour); on VA a change there forces an IDR, and after a drop the rate settles above the target (ours) |
+| `control-rate` | enum `variable_bitrate` (0), `constant_bitrate` (1), `constantQP` (2) | `constant_bitrate` | supported | VA's `rate-control`: vbr, cbr, cqp |
+| `maxbitrate` | uint | `0` | supported | bit/s: with `variable_bitrate` and above `bitrate`, VA's `target-percentage` = 100 × bitrate / maxbitrate (1..100); otherwise no effect (DeepStream 8.0 behaviour) |
+| `constqp` | string | NULL | supported | `I:P:B`, each 0..51: VA's `qpi`, `qpp`, `qpb`, used with `constantQP` only (DeepStream 8.0 behaviour). A malformed string is refused with a warning naming the property, and the old value stays (ours: DeepStream 8.0 crashes); NULL unsets it |
+| `qp-range` | string | NULL | supported | `minP,maxP:minI,maxI:minB,maxB`, each 0..51: VA's `min-qp` and `max-qp` from the P pair (ours: VA has one range). Malformed strings as `constqp` |
+| `vbvbufsize` | uint | `0` | supported | bits: VA's `cpb-size` in kbit (0: VA's choice) |
+| `idrinterval` | uint | `256` | supported | VA's `key-int-max`; 0 means 256 (DeepStream 8.0 behaviour); above 1024, 1024 with a warning (ours) |
+| `iframeinterval` | uint | `4294967295` | supported | 0 and 4294967295: no I frames between IDR frames (DeepStream 8.0 behaviour; the docs say 30). Otherwise VA's `i-frames` = ⌈idrinterval / N⌉ − 1, which VA spaces evenly: the same frames as 8.0 when N divides idrinterval (ours) |
+| `force-idr` | boolean | `FALSE` | supported | TRUE makes the next frame an IDR frame with parameter sets; reads back FALSE. Changeable in PLAYING (DeepStream 8.0 behaviour; its flags say NULL or READY only) |
+| `force-intra` | boolean | `FALSE` | supported | as `force-idr`: the frame is an IDR frame too (ours: VA can't force a non-IDR intra frame) |
+| `profile` | enum `Baseline` (0), `Constrained-Baseline` (1), `Main` (2), `High` (4), `Constrained-High` (17), `High444` (7) | `Baseline` | supported | the preferred profile, used when downstream caps allow it; downstream caps that fix `profile` win (DeepStream 8.0 behaviour). Baseline and Constrained-Baseline give constrained-baseline, Main main, High and Constrained-High high (ours: 8.0 fails on the two Constrained values). `High444` is an error at start (READY to PAUSED) naming the profile (ours: VA has no High 4:4:4) |
+| `num-B-Frames` | uint 0..2 | `0` | supported | VA's `b-frames`. With a Baseline profile (from the property or from downstream caps): a warning and no B frames (ours: DeepStream 8.0 hangs) |
+| `num-Ref-Frames` | uint 0..8 | `0` | supported | VA's `ref-frames` when above 0; 0 keeps VA's default, 3, the number DeepStream 8.0 uses |
+| `disable-cabac` | boolean | `FALSE` | supported | VA's `cabac` = !disable-cabac |
+| `insert-aud` | boolean | `FALSE` | supported | VA's `aud` |
+| `min-force-key-unit-interval` | uint64 | `0` | supported | nanoseconds: passed to the VA encoder |
+| `qos` | boolean | `FALSE` | supported | passed to the VA encoder |
+| `copy-meta` | boolean | `FALSE` | supported | the input buffer's metas (`RdsBatchMeta` included) are copied onto the encoded buffer of the same frame. Buffer flags come from the encoder (ours: DeepStream 8.0 copies the input's flags too, clearing DELTA_UNIT on every buffer) |
+| `gpu-id` | uint | `0` | supported | the inner `rdsvideoconvert`'s `gpu-id` |
+| `preset-id` | uint 1..7 | `1` | accepted no-op | VA's `target-usage` is always 1 (ours: the only setting that holds CBR at the target, and the fastest) |
+| `insert-sps-pps` | boolean | `FALSE` | accepted no-op | parameter sets always precede every IDR frame (ours) |
+| `initqp` | string | NULL | accepted no-op | malformed strings are refused as for `constqp` |
+| `cq` | uint 0..51 | `0` | accepted no-op | |
+| `aq` | uint 0..15 | `0` | accepted no-op | |
+| `vbvinit`, `SliceIntraRefreshInterval` | uint | `0` | accepted no-op | |
+| `slice-header-spacing` | uint64 | `0` | accepted no-op | |
+| `temporalaq`, `extended-colorformat`, `bit-packetization`, `enable-lossless` | boolean | `FALSE` | accepted no-op | |
+| `insert-vui` | boolean | `TRUE` | accepted no-op | |
+| `intra-refresh` | string | `1,30,1` | accepted no-op | DeepStream 8.0 shows this default but does not apply it |
+| `tuning-info-id` | enum `HighQualityPreset` (1), `LowLatencyPreset` (2), `UltraLowLatencyPreset` (3), `LosslessPreset` (4) | `LowLatencyPreset` | accepted no-op | |
+| `sei-uuid` | string | `NVDS_CUSTOMMETA` | accepted no-op | |
+| `cudaenc-memtype` | enum `memtype_device` (0), `memtype_pinned` (1), `memtype_unified` (2) | `memtype_device` | accepted no-op | |
+| `capture-io-mode`, `output-io-mode` | enum `auto` (0), `mmap` (2), `dmabuf-import` (5) | `auto` | accepted no-op | |
+| `extra-controls` | GstStructure | NULL | accepted no-op | |
+| `device` | string, read-only | `/dev/v4l2-nvenc` | accepted no-op | DeepStream 8.0's value; nothing opens it |
+| `device-fd` | int, read-only | `-1` | accepted no-op | |
+| `device-name` | string, read-only | empty | accepted no-op | |
+
+Pads: `sink` (a ghost pad of `rdsvideoconvert`'s): `memory:RDS` or system memory, `NV12`, `I420`, `RGBA`, `BGRA`,
+`RGBx`, `BGRx`, `RGB`, `BGR`, `GRAY8` (ours: DeepStream 8.0 takes NVMM only); `src`: `video/x-h264`,
+`stream-format=byte-stream`, `alignment=au`. Without `vah264enc` (no VA plugin, or a driver that can't encode H.264)
+the element still registers, and going to READY is an element error naming `vah264enc`. Rank none.
+
+### `rdsh265enc` (`nvv4l2h265enc`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html))
+
+The same bin over `vah265enc`, with `video/x-h265` on `src`, and the same properties as `rdsh264enc` (from
+DeepStream 8.0's nvv4l2h265enc), except that it has no `disable-cabac` and its own `profile` enum.
+
+| Property | Type | Default | Status | Notes |
+|---|---|---|---|---|
+| `bitrate`, `control-rate`, `maxbitrate`, `constqp`, `qp-range`, `vbvbufsize`, `idrinterval`, `iframeinterval`, `force-idr`, `force-intra`, `num-Ref-Frames`, `insert-aud`, `min-force-key-unit-interval`, `qos`, `copy-meta`, `gpu-id` | as `rdsh264enc` | as `rdsh264enc` | supported | as `rdsh264enc` |
+| `profile` | enum `Main` (0), `Main10` (1), `FREXT` (3) | `Main` | supported | `Main` gives main. `Main10` and `FREXT` are an error at start (READY to PAUSED) naming the profile (ours: they need P010 or 4:4:4 input, which the bin can't produce yet) |
+| `num-B-Frames` | uint 0..2 | `0` | supported | VA's `b-frames`; VA on VCN 3 writes no B frames in H.265 whatever the value |
+| `preset-id`, `insert-sps-pps`, `initqp`, `cq`, `aq`, `vbvinit`, `SliceIntraRefreshInterval`, `slice-header-spacing`, `temporalaq`, `extended-colorformat`, `bit-packetization`, `enable-lossless`, `insert-vui`, `intra-refresh`, `tuning-info-id`, `sei-uuid`, `cudaenc-memtype`, `capture-io-mode`, `output-io-mode`, `extra-controls`, `device`, `device-fd`, `device-name` | as `rdsh264enc` | as `rdsh264enc` | accepted no-op | as `rdsh264enc` |
 
 ## Audio (on request)
 
