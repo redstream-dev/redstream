@@ -3,6 +3,7 @@
 #include "rds-analytics-draw.h"
 
 #include <math.h>
+#include <string.h>
 
 /* DeepStream 8.0 behaviour */
 #define LINES_PER_META 15
@@ -30,7 +31,10 @@ typedef struct
   RdsFrameMeta *fm;
   RdsBatchMeta *bm;
   guint font_size;
-  GPtrArray *metas;             /* RdsDisplayMeta *, in the frame's list order */
+  /* the metas in the frame's list order: in local, or in a heap copy past its size */
+  RdsDisplayMeta *local[8];
+  RdsDisplayMeta **metas;
+  guint n_metas, cap;
   guint text_meta, line_meta;   /* the first meta that may have room */
 } Overlay;
 
@@ -54,13 +58,22 @@ meta_with_room (Overlay * o, guint * cursor, gboolean for_line)
   for (;;) {
     RdsDisplayMeta *dm;
 
-    if (*cursor == o->metas->len) {
+    if (*cursor == o->n_metas) {
       if (!(dm = rds_acquire_display_meta_from_pool (o->bm)))
         return NULL;
       rds_add_display_meta_to_frame (o->fm, dm);
-      g_ptr_array_add (o->metas, dm);
+      if (o->n_metas == o->cap) {
+        RdsDisplayMeta **grown = g_new (RdsDisplayMeta *, o->cap * 2);
+
+        memcpy (grown, o->metas, o->n_metas * sizeof *grown);
+        if (o->metas != o->local)
+          g_free (o->metas);
+        o->metas = grown;
+        o->cap *= 2;
+      }
+      o->metas[o->n_metas++] = dm;
     }
-    dm = g_ptr_array_index (o->metas, *cursor);
+    dm = o->metas[*cursor];
     if (for_line ? dm->num_lines < LINES_PER_META : dm->num_labels < TEXTS_PER_META)
       return dm;
     (*cursor)++;
@@ -184,6 +197,7 @@ add_rules (Overlay * o, const RdsAnalyticsCore * core, guint pad, const RdsAnaly
       if (g_strcmp0 (res->oc[k].label, r[i].label) == 0)
         text = g_strdup_printf ("%s OverCrowding=%s, Count=%u", r[i].label, res->oc[k].status ? "True" : "False",
             res->oc[k].count);
+    /* text stays NULL in osd-mode 1; in 2 it never does with the core, which lists every overcrowding label */
     add_point_text (o, text ? text : g_strdup (r[i].label), r[i].points[0], &orange);
   }
 
@@ -197,7 +211,7 @@ add_rules (Overlay * o, const RdsAnalyticsCore * core, guint pad, const RdsAnaly
   /* the direction vector, then the line; the label at the line's second point */
   r = rds_analytics_core_get_rules (core, pad, RDS_ANALYTICS_LINE_CROSSING, &n);
   for (guint i = 0; i < n; i++) {
-    guint64 cum = 0;
+    guint64 cum = 0;            /* never left 0 by a missing label with the core, which lists every line */
 
     add_arrow (o, r[i].points[0], r[i].points[1], &green);
     add_line (o, coord (r[i].points[2].x), coord (r[i].points[2].y), coord (r[i].points[3].x),
@@ -236,11 +250,14 @@ rds_analytics_draw_frame (RdsFrameMeta * fm, const RdsAnalyticsConfig * cfg, con
 
   g_return_if_fail (fm != NULL && cfg != NULL && core != NULL && res != NULL);
   g_return_if_fail (res->n_objects == 0 || objs != NULL);
+  if (!cfg->display_obj_cnt && cfg->osd_mode == 0)
+    return;                     /* nothing to draw (DeepStream 8.0 behaviour) */
 
   o.fm = fm;
   o.bm = fm->base_meta.batch_meta;
   o.font_size = cfg->display_font_size;
-  o.metas = g_ptr_array_new ();
+  o.metas = o.local;
+  o.cap = G_N_ELEMENTS (o.local);
   /* in every osd-mode, before the labels (DeepStream 8.0 behaviour) */
   if (cfg->display_obj_cnt)
     add_obj_cnt (&o, res);
@@ -248,5 +265,6 @@ rds_analytics_draw_frame (RdsFrameMeta * fm, const RdsAnalyticsConfig * cfg, con
     add_rules (&o, core, fm->pad_index, res, cfg->osd_mode >= 2);
   if (cfg->osd_mode >= 2)
     write_objects (res, objs, cfg->display_font_size);
-  g_ptr_array_unref (o.metas);
+  if (o.metas != o.local)
+    g_free (o.metas);
 }

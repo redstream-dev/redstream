@@ -638,6 +638,21 @@ test_obj_cnt_classes (void)
 
 /* ---- ours ---- */
 
+/* display-obj-cnt before any object: the bare "Count for" (ours: 8.0 not observed). */
+static void
+test_obj_cnt_empty (void)
+{
+  static const ExpText texts[] = { {"Count for", 5, 5, YELLOW} };
+  static const guint no_lines[] = { 0 };
+  gchar *config = config_text (0, TRUE, 0, "");
+  Drawn d;
+
+  draw_scenario (&d, config, 1280, 720, no_objects, 0);
+  assert_display (&d, 1, no_lines, texts, G_N_ELEMENTS (texts), NULL, 0, 12);
+  drawn_clear (&d);
+  g_free (config);
+}
+
 /* An object near the top and an upward vector on the left edge: coordinates below 0 become 0 (ours: 8.0 not
  * observed; the fields are unsigned). An object's earlier text is replaced (and freed: leaks show under ASan). */
 static void
@@ -683,8 +698,8 @@ test_clamped (void)
   g_free (config);
 }
 
-/* More texts than one display meta holds: the rest go in the next (ours: 8.0 not observed). 17 ROIs give 17 labels
- * and 68 lines: texts 16 + 1, lines 15 a meta. */
+/* More texts than one display meta holds: the rest go in the next (ours: 8.0 not observed). 40 ROIs give 40 labels
+ * and 160 lines: texts 16 + 16 + 8, lines 15 a meta, so 11 display metas. */
 static void
 test_text_overflow (void)
 {
@@ -693,15 +708,15 @@ test_text_overflow (void)
   Drawn d;
   guint metas = 0, labels = 0, lines = 0;
 
-  for (guint i = 0; i < 17; i++)
+  for (guint i = 0; i < 40; i++)
     g_string_append_printf (groups, "roi-R%u=%u;0;%u;0;%u;10;%u;10\n", i, 20 * i, 20 * i + 10, 20 * i + 10, 20 * i);
   config = config_text (1, FALSE, 0, groups->str);
   draw_scenario (&d, config, 1280, 720, no_objects, 0);
   for (GList * l = d.fm->display_meta_list; l; l = l->next, metas++) {
     const RdsDisplayMeta *dm = l->data;
 
-    g_assert_cmpuint (dm->num_labels, ==, metas == 0 ? 16 : metas == 1 ? 1 : 0);
-    g_assert_cmpuint (dm->num_lines, ==, metas < 4 ? 15 : 8);
+    g_assert_cmpuint (dm->num_labels, ==, metas < 2 ? 16 : metas == 2 ? 8 : 0);
+    g_assert_cmpuint (dm->num_lines, ==, metas < 10 ? 15 : 10);
     for (guint t = 0; t < dm->num_labels; t++, labels++) {
       gchar *want = g_strdup_printf ("R%u", labels);
 
@@ -710,9 +725,9 @@ test_text_overflow (void)
     }
     lines += dm->num_lines;
   }
-  g_assert_cmpuint (metas, ==, 5);
-  g_assert_cmpuint (labels, ==, 17);
-  g_assert_cmpuint (lines, ==, 68);
+  g_assert_cmpuint (metas, ==, 11);
+  g_assert_cmpuint (labels, ==, 40);
+  g_assert_cmpuint (lines, ==, 160);
   drawn_clear (&d);
   g_free (config);
   g_string_free (groups, TRUE);
@@ -738,6 +753,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-draw/mode2-font-size", test_mode2_font_size);
   g_test_add_func ("/cpu/analytics-draw/line-overflow", test_line_overflow);
   g_test_add_func ("/cpu/analytics-draw/obj-cnt-classes", test_obj_cnt_classes);
+  g_test_add_func ("/cpu/analytics-draw/obj-cnt-empty", test_obj_cnt_empty);
   g_test_add_func ("/cpu/analytics-draw/clamped", test_clamped);
   g_test_add_func ("/cpu/analytics-draw/text-overflow", test_text_overflow);
   ret = g_test_run ();

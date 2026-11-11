@@ -1008,8 +1008,11 @@ test_display (void)
     if (cases[c].obj_text) {
       g_assert_cmpuint (in_roi->text_params.x_offset, ==, 90);
       g_assert_cmpuint (in_roi->text_params.y_offset, ==, 250);
+      /* cyan */
+      g_assert_cmpfloat (in_roi->rect_params.border_color.red, ==, 0);
       g_assert_cmpfloat (in_roi->rect_params.border_color.green, ==, 1);
       g_assert_cmpfloat (in_roi->rect_params.border_color.blue, ==, 1);
+      g_assert_cmpfloat (in_roi->rect_params.border_color.alpha, ==, 1);
     }
     g_assert_null (other->text_params.display_text);
     gst_buffer_unref (buf);
