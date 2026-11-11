@@ -1,9 +1,10 @@
 /* rdsh264enc and rdsh265enc: registration, pads, every property's name, type, range, default and flags as
  * gst-inspect shows them for DeepStream 8.0's nvv4l2h264enc / nvv4l2h265enc, the enum types, the accepted no-ops'
  * warning, malformed QP strings, the inner chain, a missing VA encoder, one that doesn't link, the unsupported
- * profiles, what a start sets on the VA encoder, the preferred-profile caps answer, and the output probes on a
- * stand-in's pushes: a buffer of filler only dropped, a segment sent again (cpu; a stand-in element takes the VA
- * encoder's factory name where the bin has to reach READY); per codec on the real VA encoders: a short encode,
+ * profiles, what a start sets on the VA encoder, and the output probes on a stand-in's pushes: a buffer of filler
+ * only dropped, a segment sent again (cpu; a stand-in element takes the VA encoder's factory name where the bin has
+ * to reach READY); the preferred-profile caps answer of a started bin, with the stand-in (gpu: the start needs
+ * rdsvideoconvert's GPU); per codec on the real VA encoders: a short encode,
  * properties set while PLAYING, GOP layouts and parameter sets, profiles and levels in the SPS and the caps, a
  * downstream level, CBR rates, a live bitrate change, B frames and Baseline, preset-id and gpu-id, and what the bin's
  * pad probes do: no filler, the H.265 size, input timestamps (also after a seek and with B frames), copy-meta,
@@ -1238,6 +1239,13 @@ check_profiles (guint codec, gint pref, guint b, const gchar * down, const gchar
 static void
 test_preferred_profile (void)
 {
+  /* The answer is narrowed only while the bin is started, and its rdsvideoconvert needs a GPU to start (a failed
+   * start clears the run's profile), so this is a gpu test. The decisions themselves are checked on plain caps by
+   * enc_caps. */
+  if (!rds_test_have_gpu ()) {
+    g_test_skip ("no ROCm device: the bin can't start");
+    return;
+  }
   /* H.264: Baseline 0, Main 2, High 4 */
   check_profiles (0, 2, 0, NULL, "main", 0, FALSE);
   check_profiles (0, 0, 0, NULL, "constrained-baseline", 0, FALSE);
@@ -2581,9 +2589,9 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/enc/link-failure", test_link_failure);
   g_test_add_func ("/cpu/enc/unsupported-profile", test_unsupported_profile);
   g_test_add_func ("/cpu/enc/configure", test_configure);
-  g_test_add_func ("/cpu/enc/preferred-profile", test_preferred_profile);
   g_test_add_func ("/cpu/enc/filler-only-dropped", test_filler_only_dropped);
   g_test_add_func ("/cpu/enc/segment-again", test_segment_again);
+  g_test_add_func ("/gpu/enc/preferred-profile", test_preferred_profile);
   g_test_add_data_func ("/gpu/enc/smoke-h264", &codecs[0], test_smoke);
   g_test_add_data_func ("/gpu/enc/smoke-h265", &codecs[1], test_smoke);
   g_test_add_data_func ("/gpu/enc/set-while-playing-h264", &codecs[0], test_set_while_playing);
