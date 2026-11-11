@@ -1,11 +1,15 @@
 /* rdsh264enc and rdsh265enc: registration, pads, every property's name, type, range, default and flags as
  * gst-inspect shows them for DeepStream 8.0's nvv4l2h264enc / nvv4l2h265enc, the enum types, the accepted no-ops'
- * warning, malformed QP strings, the inner chain, a missing VA encoder, one that doesn't link and the unsupported
- * profiles (cpu; a stand-in element takes the VA encoder's factory name where the bin has to reach READY); a short
- * encode and properties set while PLAYING, per codec (gpu, each skipped without its VA encoder).
+ * warning, malformed QP strings, the inner chain, a missing VA encoder, one that doesn't link, the unsupported
+ * profiles, what a start sets on the VA encoder and the preferred-profile caps answer (cpu; a stand-in element takes
+ * the VA encoder's factory name where the bin has to reach READY); per codec on the real VA encoders: a short encode,
+ * properties set while PLAYING, GOP layouts and parameter sets, profiles and levels in the SPS and the caps, a
+ * downstream level, CBR rates, a live bitrate change, B frames and Baseline, preset-id and gpu-id (gpu, each skipped
+ * without its VA encoder).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-media.h"
+#include "rds-test-nal.h"
 
 #include <string.h>
 
@@ -92,11 +96,138 @@ rds_test_va_bad_src_class_init (RdsTestVaBadSrcClass * klass)
       "Does nothing", "Redstream contributors");
 }
 
+/* A stand-in with the VA encoders' properties (names, ranges and defaults as gst-inspect shows them for vah264enc),
+ * to check what the bin sets at start. */
+typedef struct
+{
+  GstElement parent;
+  GValue values[32];
+} RdsTestVaProps;
+typedef struct
+{
+  GstElementClass parent_class;
+} RdsTestVaPropsClass;
+
+static GType rds_test_va_props_get_type (void);
+G_DEFINE_TYPE (RdsTestVaProps, rds_test_va_props, GST_TYPE_ELEMENT);
+
+static GType
+rds_test_va_rc_get_type (void)
+{
+  static gsize id = 0;
+  static const GEnumValue values[] = {
+    {2, "Constant Bitrate", "cbr"},
+    {4, "Variable Bitrate", "vbr"},
+    {16, "Constant Quantizer", "cqp"},
+    {0, NULL, NULL},
+  };
+
+  if (g_once_init_enter (&id))
+    g_once_init_leave (&id, g_enum_register_static ("RdsTestVaRateControl", values));
+  return (GType) id;
+}
+
+typedef struct
+{
+  const gchar *name;
+  guint min, max, def;
+} VaUintProp;
+
+static const VaUintProp va_uint_props[] = {
+  {"bitrate", 0, 2048000, 0},
+  {"target-percentage", 50, 100, 66},
+  {"qpi", 0, 51, 26},
+  {"qpp", 0, 51, 26},
+  {"qpb", 0, 51, 26},
+  {"min-qp", 0, 51, 1},
+  {"max-qp", 0, 51, 51},
+  {"cpb-size", 0, 2048000, 0},
+  {"key-int-max", 0, 1024, 0},
+  {"i-frames", 0, 1023, 0},
+  {"target-usage", 1, 7, 4},
+  {"b-frames", 0, 31, 0},
+  {"ref-frames", 0, 16, 3},
+};
+
+static void
+rds_test_va_props_set (GObject * o, guint id, const GValue * v, G_GNUC_UNUSED GParamSpec * ps)
+{
+  g_value_copy (v, &((RdsTestVaProps *) o)->values[id]);
+}
+
+static void
+rds_test_va_props_get (GObject * o, guint id, GValue * v, G_GNUC_UNUSED GParamSpec * ps)
+{
+  g_value_copy (&((RdsTestVaProps *) o)->values[id], v);
+}
+
+static void
+rds_test_va_props_finalize (GObject * o)
+{
+  RdsTestVaProps *self = (RdsTestVaProps *) o;
+
+  for (guint i = 0; i < G_N_ELEMENTS (self->values); i++)
+    if (G_IS_VALUE (&self->values[i]))
+      g_value_unset (&self->values[i]);
+  G_OBJECT_CLASS (rds_test_va_props_parent_class)->finalize (o);
+}
+
+static void
+rds_test_va_props_init (RdsTestVaProps * self)
+{
+  GParamSpec **specs;
+  guint n;
+
+  gst_element_add_pad (GST_ELEMENT (self), gst_pad_new_from_static_template (&stand_in_sink, "sink"));
+  gst_element_add_pad (GST_ELEMENT (self), gst_pad_new_from_static_template (&stand_in_src, "src"));
+  specs = g_object_class_list_properties (G_OBJECT_GET_CLASS (self), &n);
+  for (guint i = 0; i < n; i++) {
+    if (specs[i]->owner_type != rds_test_va_props_get_type ())
+      continue;
+    g_value_init (&self->values[specs[i]->param_id], specs[i]->value_type);
+    g_param_value_set_default (specs[i], &self->values[specs[i]->param_id]);
+  }
+  g_free (specs);
+}
+
+static void
+rds_test_va_props_class_init (RdsTestVaPropsClass * klass)
+{
+  GObjectClass *oc = G_OBJECT_CLASS (klass);
+  GstElementClass *ec = GST_ELEMENT_CLASS (klass);
+  const GParamFlags f = G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS;
+  guint id = 1;
+
+  oc->set_property = rds_test_va_props_set;
+  oc->get_property = rds_test_va_props_get;
+  oc->finalize = rds_test_va_props_finalize;
+  for (guint i = 0; i < G_N_ELEMENTS (va_uint_props); i++) {
+    const VaUintProp *p = &va_uint_props[i];
+
+    g_object_class_install_property (oc, id++, g_param_spec_uint (p->name, p->name, p->name, p->min, p->max,
+            p->def, f));
+  }
+  g_object_class_install_property (oc, id++, g_param_spec_enum ("rate-control", "rc", "rc",
+          rds_test_va_rc_get_type (), 2, f));
+  g_object_class_install_property (oc, id++, g_param_spec_boolean ("cabac", "cabac", "cabac", TRUE, f));
+  g_object_class_install_property (oc, id++, g_param_spec_boolean ("aud", "aud", "aud", FALSE, f));
+  g_object_class_install_property (oc, id++, g_param_spec_boolean ("qos", "qos", "qos", FALSE, f));
+  g_object_class_install_property (oc, id++, g_param_spec_uint64 ("min-force-key-unit-interval", "mfku", "mfku",
+          0, G_MAXUINT64, 0, f));
+  g_assert_cmpuint (id, <=, 32);
+
+  gst_element_class_add_static_pad_template (ec, &stand_in_sink);
+  gst_element_class_add_static_pad_template (ec, &stand_in_src);
+  gst_element_class_set_static_metadata (ec, "VA encoder stand-in with properties", "Codec/Encoder/Video",
+      "Does nothing", "Redstream contributors");
+}
+
 typedef enum
 {
   VA_REAL,
   VA_STAND_IN,
   VA_BAD_SRC,
+  VA_PROPS,
   VA_NONE,
 } VaMode;
 
@@ -108,10 +239,36 @@ is_stand_in (GstPluginFeature * f)
   if (G_TYPE_FROM_INSTANCE (f) != GST_TYPE_ELEMENT_FACTORY)
     return FALSE;
   t = gst_element_factory_get_element_type (GST_ELEMENT_FACTORY (f));
-  return t == rds_test_va_stand_in_get_type () || t == rds_test_va_bad_src_get_type ();
+  return g_type_is_a (t, rds_test_va_stand_in_get_type ()) || g_type_is_a (t, rds_test_va_bad_src_get_type ())
+      || g_type_is_a (t, rds_test_va_props_get_type ());
+}
+
+/* The stand-in of @mode for codec @i: a subtype per codec. An element class points at the factory it was first
+ * registered with, without a reference, so one type must not serve two factory names, and a removed stand-in
+ * factory is kept alive (removed_stand_ins). */
+static GType
+stand_in_type (VaMode mode, guint i)
+{
+  static GType types[3][G_N_ELEMENTS (codecs)];
+  static const gchar *names[3] = { "RdsTestVaStandIn", "RdsTestVaBadSrc", "RdsTestVaProps" };
+  guint k = mode == VA_STAND_IN ? 0 : mode == VA_BAD_SRC ? 1 : 2;
+
+  g_assert_true (mode == VA_STAND_IN || mode == VA_BAD_SRC || mode == VA_PROPS);
+  if (types[k][i] == 0) {
+    GType parent = k == 0 ? rds_test_va_stand_in_get_type () : k == 1 ? rds_test_va_bad_src_get_type ()
+        : rds_test_va_props_get_type ();
+    GTypeQuery q;
+    gchar *name = g_strdup_printf ("%s_%s", names[k], codecs[i].va_factory);
+
+    g_type_query (parent, &q);
+    types[k][i] = g_type_register_static_simple (parent, name, q.class_size, NULL, q.instance_size, NULL, 0);
+    g_free (name);
+  }
+  return types[k][i];
 }
 
 static GstPluginFeature *real_va[G_N_ELEMENTS (codecs)];        /* the real factories, while removed */
+static GPtrArray *removed_stand_ins;    /* never freed: element classes point at them */
 
 /* Puts the factory named @c->va_factory in the registry as @mode says. */
 static void
@@ -123,6 +280,9 @@ set_va (const Codec * c, VaMode mode)
 
   if (f != NULL) {
     if (is_stand_in (f)) {
+      if (removed_stand_ins == NULL)
+        removed_stand_ins = g_ptr_array_new ();
+      g_ptr_array_add (removed_stand_ins, gst_object_ref (f));
       gst_registry_remove_feature (reg, f);
     } else if (mode != VA_REAL) {
       if (real_va[i] == NULL)
@@ -131,10 +291,8 @@ set_va (const Codec * c, VaMode mode)
     }
     gst_object_unref (f);
   }
-  if (mode == VA_STAND_IN)
-    g_assert_true (gst_element_register (NULL, c->va_factory, GST_RANK_NONE, rds_test_va_stand_in_get_type ()));
-  else if (mode == VA_BAD_SRC)
-    g_assert_true (gst_element_register (NULL, c->va_factory, GST_RANK_NONE, rds_test_va_bad_src_get_type ()));
+  if (mode == VA_STAND_IN || mode == VA_BAD_SRC || mode == VA_PROPS)
+    g_assert_true (gst_element_register (NULL, c->va_factory, GST_RANK_NONE, stand_in_type (mode, i)));
   else if (mode == VA_REAL && real_va[i] != NULL) {
     g_assert_true (gst_registry_add_feature (reg, real_va[i]));
     real_va[i] = NULL;
@@ -824,6 +982,280 @@ test_unsupported_profile (void)
   check_profile_fails (1, 3, "FREXT");
 }
 
+/* ---- what the bin sets on the VA encoder (the stand-in with VA's properties) ---- */
+
+static guint
+get_uint (GstElement * e, const gchar * name)
+{
+  guint v;
+
+  g_object_get (e, name, &v, NULL);
+  return v;
+}
+
+static gboolean
+get_bool (GstElement * e, const gchar * name)
+{
+  gboolean v;
+
+  g_object_get (e, name, &v, NULL);
+  return v;
+}
+
+static guint64
+get_uint64 (GstElement * e, const gchar * name)
+{
+  guint64 v;
+
+  g_object_get (e, name, &v, NULL);
+  return v;
+}
+
+static gchar *
+get_enum_nick (GstElement * e, const gchar * name)
+{
+  GValue v = G_VALUE_INIT;
+  GParamSpec *ps = g_object_class_find_property (G_OBJECT_GET_CLASS (e), name);
+  GEnumValue *ev;
+
+  g_value_init (&v, ps->value_type);
+  g_object_get_property (G_OBJECT (e), name, &v);
+  ev = g_enum_get_value (g_type_class_peek (ps->value_type), g_value_get_enum (&v));
+  g_value_unset (&v);
+  return g_strdup (ev->value_nick);
+}
+
+/* Starts @p (READY to PAUSED). Without a ROCm device rdsvideoconvert can't start, so the start fails after the bin
+ * has configured its encoder; either way the VA properties are set. */
+static void
+start_any (GstElement * p)
+{
+  GstStateChangeReturn r = gst_element_set_state (p, GST_STATE_PAUSED);
+  GstBus *bus = gst_element_get_bus (p);
+
+  if (r == GST_STATE_CHANGE_FAILURE)
+    g_test_message ("the start failed (no ROCm device?): only the configuration is checked");
+  gst_bus_set_flushing (bus, TRUE);
+  gst_bus_set_flushing (bus, FALSE);
+  gst_object_unref (bus);
+}
+
+static void
+test_configure (void)
+{
+  for (guint i = 0; i < G_N_ELEMENTS (codecs); i++) {
+    const Codec *c = &codecs[i];
+    GstElement *p = gst_pipeline_new (NULL), *e = gst_element_factory_make (c->element, NULL), *va, *conv;
+    gchar *rc;
+
+    set_va (c, VA_PROPS);
+    gst_bin_add (GST_BIN (p), e);
+    g_object_set (e, "bitrate", 2500400u, "control-rate", 0, "maxbitrate", 4000000u, "constqp", "20:22:24",
+        "qp-range", "10,40:5,30:1,51", "vbvbufsize", 3000000u, "iframeinterval", 100u, "num-B-Frames", 2u,
+        "insert-aud", TRUE, "min-force-key-unit-interval", (guint64) 5000, "qos", TRUE, "gpu-id", 3u,
+        "idrinterval", 2000u, NULL);
+    if (i == 0)
+      g_object_set (e, "disable-cabac", TRUE, NULL);
+    g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, "*preset-id*no effect*");
+    g_object_set (e, "preset-id", 7u, NULL);
+    g_test_assert_expected_messages ();
+    g_assert_cmpint (gst_element_set_state (p, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+    va = gst_bin_get_by_name (GST_BIN (e), "encoder");
+    conv = gst_bin_get_by_name (GST_BIN (e), "convert");
+    g_assert_true (G_TYPE_CHECK_INSTANCE_TYPE (va, rds_test_va_props_get_type ()));
+    /* left over from an earlier run: the bin sets VA's defaults back */
+    g_object_set (va, "qpi", 40u, "ref-frames", 5u, NULL);
+
+    g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, "*idrinterval 2000*1024*");
+    start_any (p);
+    g_test_assert_expected_messages ();
+    rc = get_enum_nick (va, "rate-control");
+    g_assert_cmpstr (rc, ==, "vbr");
+    g_free (rc);
+    g_assert_cmpuint (get_uint (va, "bitrate"), ==, 2500);
+    g_assert_cmpuint (get_uint (va, "target-percentage"), ==, 62);
+    g_assert_cmpuint (get_uint (va, "qpi"), ==, 26);    /* constqp only with constantQP */
+    g_assert_cmpuint (get_uint (va, "qpp"), ==, 26);
+    g_assert_cmpuint (get_uint (va, "qpb"), ==, 26);
+    g_assert_cmpuint (get_uint (va, "min-qp"), ==, 10);
+    g_assert_cmpuint (get_uint (va, "max-qp"), ==, 40);
+    g_assert_cmpuint (get_uint (va, "cpb-size"), ==, 3000);
+    g_assert_cmpuint (get_uint (va, "key-int-max"), ==, 1024);
+    g_assert_cmpuint (get_uint (va, "i-frames"), ==, 10);
+    g_assert_cmpuint (get_uint (va, "target-usage"), ==, 1);
+    g_assert_cmpuint (get_uint (va, "b-frames"), ==, 2);
+    g_assert_cmpuint (get_uint (va, "ref-frames"), ==, 3);
+    g_assert_cmpint (get_bool (va, "cabac"), ==, i != 0);       /* H.265 has no disable-cabac: VA's default */
+    g_assert_true (get_bool (va, "aud"));
+    g_assert_true (get_bool (va, "qos"));
+    g_assert_cmpuint (get_uint64 (va, "min-force-key-unit-interval"), ==, 5000);
+    g_assert_cmpuint (get_uint (conv, "gpu-id"), ==, 3);
+
+    /* the next start reads the properties again */
+    gst_element_set_state (p, GST_STATE_READY);
+    g_object_set (e, "control-rate", 2, "maxbitrate", 40000000u, "num-Ref-Frames", 4u, "bitrate", 3000000000u,
+        "idrinterval", 0u, "iframeinterval", 0u, "qp-range", NULL, "gpu-id", 0u, NULL);
+    g_object_set (va, "target-percentage", 80u, NULL);
+    start_any (p);
+    rc = get_enum_nick (va, "rate-control");
+    g_assert_cmpstr (rc, ==, "cqp");
+    g_free (rc);
+    g_assert_cmpuint (get_uint (va, "qpi"), ==, 20);
+    g_assert_cmpuint (get_uint (va, "qpp"), ==, 22);
+    g_assert_cmpuint (get_uint (va, "qpb"), ==, 24);
+    g_assert_cmpuint (get_uint (va, "target-percentage"), ==, 66);      /* maxbitrate: VBR only */
+    g_assert_cmpuint (get_uint (va, "min-qp"), ==, 1);
+    g_assert_cmpuint (get_uint (va, "max-qp"), ==, 51);
+    g_assert_cmpuint (get_uint (va, "ref-frames"), ==, 4);
+    g_assert_cmpuint (get_uint (va, "bitrate"), ==, 2048000);   /* VA's largest */
+    g_assert_cmpuint (get_uint (va, "key-int-max"), ==, 256);   /* idrinterval 0 is 256 */
+    g_assert_cmpuint (get_uint (va, "i-frames"), ==, 0);
+
+    /* a target percentage below VA's smallest (50) is raised to it */
+    gst_element_set_state (p, GST_STATE_READY);
+    g_object_set (e, "control-rate", 1, NULL);
+    start_any (p);
+    rc = get_enum_nick (va, "rate-control");
+    g_assert_cmpstr (rc, ==, "cbr");
+    g_free (rc);
+    gst_element_set_state (p, GST_STATE_READY);
+    g_object_set (e, "control-rate", 0, "bitrate", 1000000u, "maxbitrate", 30000000u, NULL);
+    start_any (p);
+    g_assert_cmpuint (get_uint (va, "target-percentage"), ==, 50);
+
+    /* bitrate is live: forwarded at once */
+    g_object_set (e, "bitrate", 1500000u, NULL);
+    g_assert_cmpuint (get_uint (va, "bitrate"), ==, 1500);
+
+    gst_element_set_state (p, GST_STATE_NULL);
+    gst_object_unref (va);
+    gst_object_unref (conv);
+    gst_object_unref (p);
+    set_va (c, VA_REAL);
+  }
+}
+
+/* The profiles in @caps' profile fields, sorted and comma-separated ("" when none). */
+static gchar *
+profile_set (const GstCaps * caps)
+{
+  GPtrArray *names = g_ptr_array_new ();
+  gchar *s;
+
+  for (guint i = 0; i < gst_caps_get_size (caps); i++) {
+    const GValue *v = gst_structure_get_value (gst_caps_get_structure (caps, i), "profile");
+
+    if (v == NULL)
+      continue;
+    if (G_VALUE_HOLDS_STRING (v)) {
+      g_ptr_array_add (names, (gpointer) g_value_get_string (v));
+    } else {
+      g_assert_true (GST_VALUE_HOLDS_LIST (v));
+      for (guint j = 0; j < gst_value_list_get_size (v); j++)
+        g_ptr_array_add (names, (gpointer) g_value_get_string (gst_value_list_get_value (v, j)));
+    }
+  }
+  g_ptr_array_sort_values (names, (GCompareFunc) g_strcmp0);
+  g_ptr_array_add (names, NULL);
+  s = g_strjoinv (",", (gchar **) names->pdata);
+  g_ptr_array_unref (names);
+  return s;
+}
+
+/* The answer the VA encoder gets to its downstream caps query, as the profiles in it, with the bin's `profile`
+ * @pref, `num-B-Frames` @b and the caps @down (or none) after the bin; *@b_out: the encoder's b-frames then.
+ * @queries: how many times the encoder asks (VA asks again when it renegotiates). */
+static gchar *
+query_profiles (guint codec, gint pref, guint b, const gchar * down, guint queries, guint * b_out)
+{
+  const Codec *c = &codecs[codec];
+  gchar *desc, *filter_s, *s = NULL;
+  GstElement *p, *e, *va;
+  GstPad *pad;
+  GstCaps *filter;
+
+  set_va (c, VA_PROPS);
+  desc = g_strdup_printf ("%s name=enc profile=%d num-B-Frames=%u ! %s ! fakesink", c->element, pref, b,
+      down != NULL ? down : "identity");
+  p = gst_parse_launch (desc, NULL);
+  g_assert_nonnull (p);
+  e = gst_bin_get_by_name (GST_BIN (p), "enc");
+  g_assert_cmpint (gst_element_set_state (p, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  start_any (p);
+  va = gst_bin_get_by_name (GST_BIN (e), "encoder");
+  pad = gst_element_get_static_pad (va, "src");
+  /* VA asks with its src template */
+  filter_s = g_strdup_printf ("%s, profile=(string){ %s }, stream-format=(string)byte-stream, alignment=(string)au",
+      c->caps_name, codec == 0 ? "constrained-baseline, main, high" : "main, main-10");
+  filter = gst_caps_from_string (filter_s);
+  for (guint i = 0; i < queries; i++) {
+    GstCaps *res = gst_pad_peer_query_caps (pad, filter);
+    gchar *rs = gst_caps_to_string (res);
+
+    g_free (s);
+    s = profile_set (res);
+    g_test_message ("%s, profile %d, b %u: %s", down ? down : "no caps", pref, b, rs);
+    g_free (rs);
+    gst_caps_unref (res);
+  }
+  *b_out = get_uint (va, "b-frames");
+  gst_caps_unref (filter);
+  g_free (filter_s);
+  gst_element_set_state (p, GST_STATE_NULL);
+  gst_object_unref (pad);
+  gst_object_unref (va);
+  gst_object_unref (e);
+  gst_object_unref (p);
+  g_free (desc);
+  set_va (c, VA_REAL);
+  return s;
+}
+
+static void
+check_profiles (guint codec, gint pref, guint b, const gchar * down, const gchar * want, guint want_b,
+    gboolean warn)
+{
+  guint b_out;
+  gchar *got;
+
+  if (warn)
+    g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, "*num-B-Frames*Baseline*");
+  /* twice: one warning per run */
+  got = query_profiles (codec, pref, b, down, 2, &b_out);
+  g_test_assert_expected_messages ();
+  g_assert_cmpstr (got, ==, want);
+  g_assert_cmpuint (b_out, ==, want_b);
+  g_free (got);
+}
+
+/* The `profile` property is a preference: the bin narrows the VA encoder's downstream caps answer to it when
+ * downstream allows it; downstream caps that fix the profile win. With B frames and a Baseline result: no B
+ * frames and a warning; with B frames and a choice, the Baseline profiles are left out. */
+static void
+test_preferred_profile (void)
+{
+  /* H.264: Baseline 0, Main 2, High 4 */
+  check_profiles (0, 2, 0, NULL, "main", 0, FALSE);
+  check_profiles (0, 0, 0, NULL, "constrained-baseline", 0, FALSE);
+  check_profiles (0, 4, 0, NULL, "high", 0, FALSE);
+  check_profiles (0, 2, 0, "video/x-h264,profile=high", "high", 0, FALSE);
+  check_profiles (0, 4, 0, "video/x-h264,profile={main,constrained-baseline}", "constrained-baseline,main", 0,
+      FALSE);
+  check_profiles (0, 2, 0, "video/x-h264,profile={main,high}", "main", 0, FALSE);
+  /* B frames */
+  check_profiles (0, 2, 2, NULL, "main", 2, FALSE);
+  check_profiles (0, 0, 2, NULL, "constrained-baseline", 0, TRUE);
+  check_profiles (0, 1, 1, NULL, "constrained-baseline", 0, TRUE);
+  check_profiles (0, 4, 2, "video/x-h264,profile=constrained-baseline", "constrained-baseline", 0, TRUE);
+  check_profiles (0, 2, 2, "video/x-h264,profile={constrained-baseline,high}", "high", 2, FALSE);
+  /* the preferred Baseline is allowed, so it is chosen, without B frames */
+  check_profiles (0, 0, 2, "video/x-h264,profile={constrained-baseline,main}", "constrained-baseline", 0, TRUE);
+  /* H.265: Main */
+  check_profiles (1, 0, 0, NULL, "main", 0, FALSE);
+  check_profiles (1, 0, 2, NULL, "main", 2, FALSE);
+  check_profiles (1, 0, 0, "video/x-h265,profile=main-10", "main-10", 0, FALSE);
+}
+
 /* ---- gpu ---- */
 
 #define SMOKE_FRAMES 30
@@ -922,6 +1354,446 @@ test_set_while_playing (gconstpointer data)
   g_free (desc);
 }
 
+/* ---- gpu: the mapping on the real VA encoders (1280x720 at 30 fps from videotestsrc) ---- */
+
+#define W 1280
+#define H 720
+#define FPS 30
+
+static gboolean
+is_hevc (const Codec * c)
+{
+  return c == &codecs[1];
+}
+
+/* What an encode gave. */
+typedef struct
+{
+  GByteArray *data;             /* the whole byte stream */
+  GArray *sizes;                /* guint per output buffer: bytes without filler NAL units */
+  GstCaps *caps;                /* the output caps */
+  /* a live bitrate change before input frame change_at */
+  GstElement *enc;
+  guint change_at, new_bitrate, in_frames;
+} Encoded;
+
+static void
+encoded_clear (Encoded * r)
+{
+  g_byte_array_unref (r->data);
+  g_array_unref (r->sizes);
+  gst_clear_caps (&r->caps);
+}
+
+static void
+on_encoded (G_GNUC_UNUSED GstElement * sink, GstBuffer * buf, GstPad * pad, gpointer user_data)
+{
+  Encoded *r = user_data;
+  GstMapInfo map;
+  GArray *nals;
+  guint bytes = 0;
+  gboolean hevc;
+
+  if (r->caps == NULL)
+    r->caps = gst_pad_get_current_caps (pad);
+  hevc = g_str_equal (gst_structure_get_name (gst_caps_get_structure (r->caps, 0)), "video/x-h265");
+  g_assert_true (gst_buffer_map (buf, &map, GST_MAP_READ));
+  g_byte_array_append (r->data, map.data, map.size);
+  nals = rds_test_nal_split (map.data, map.size, hevc);
+  for (guint i = 0; i < nals->len; i++) {
+    const RdsTestNal *n = &g_array_index (nals, RdsTestNal, i);
+
+    if (n->type != (hevc ? 38u : 12u))
+      bytes += n->size + 4;     /* with a 4-byte start code */
+  }
+  g_array_append_val (r->sizes, bytes);
+  g_array_unref (nals);
+  gst_buffer_unmap (buf, &map);
+}
+
+static GstPadProbeReturn
+count_input (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gpointer user_data)
+{
+  Encoded *r = user_data;
+
+  if (r->new_bitrate > 0 && r->in_frames == r->change_at)
+    g_object_set (r->enc, "bitrate", r->new_bitrate, NULL);
+  r->in_frames++;
+  return GST_PAD_PROBE_OK;
+}
+
+/* Encodes @frames frames of videotestsrc @src (its properties) through @c's element with @props, then @down (caps
+ * after the element; NULL: the codec's caps name) into @r. */
+static void
+encode (const Codec * c, const gchar * src, const gchar * props, const gchar * down, guint frames, Encoded * r)
+{
+  gchar *desc = g_strdup_printf ("videotestsrc num-buffers=%u %s ! video/x-raw,width=%d,height=%d,framerate=%d/1 ! "
+      "%s name=enc %s ! %s ! fakesink name=sink signal-handoffs=true", frames, src, W, H, FPS, c->element,
+      props, down != NULL ? down : c->caps_name);
+  GstElement *p = gst_parse_launch (desc, NULL), *sink;
+  GstPad *pad;
+
+  g_assert_nonnull (p);
+  g_test_message ("%s", desc);
+  r->data = g_byte_array_new ();
+  r->sizes = g_array_new (FALSE, FALSE, sizeof (guint));
+  r->caps = NULL;
+  r->in_frames = 0;
+  r->enc = gst_bin_get_by_name (GST_BIN (p), "enc");
+  pad = gst_element_get_static_pad (r->enc, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, count_input, r, NULL);
+  gst_object_unref (pad);
+  sink = gst_bin_get_by_name (GST_BIN (p), "sink");
+  g_signal_connect (sink, "handoff", G_CALLBACK (on_encoded), r);
+  run_to_eos (p);
+  g_assert_cmpuint (r->sizes->len, ==, frames);
+  gst_object_unref (sink);
+  gst_clear_object (&r->enc);
+  gst_object_unref (p);
+  g_free (desc);
+}
+
+static gboolean
+au_is_idr (const RdsTestAu * au, gboolean hevc)
+{
+  return hevc ? rds_test_au_has (au, 19) || rds_test_au_has (au, 20) : rds_test_au_has (au, 5);
+}
+
+static gboolean
+au_has_parameter_sets (const RdsTestAu * au, gboolean hevc)
+{
+  return hevc ? rds_test_au_has (au, 32) && rds_test_au_has (au, 33) && rds_test_au_has (au, 34)
+      : rds_test_au_has (au, 7) && rds_test_au_has (au, 8);
+}
+
+/* The first SPS of @r. */
+static void
+first_sps (const Codec * c, const Encoded * r, RdsTestSps * sps)
+{
+  GArray *nals = rds_test_nal_split (r->data->data, r->data->len, is_hevc (c));
+
+  for (guint i = 0; i < nals->len; i++) {
+    const RdsTestNal *n = &g_array_index (nals, RdsTestNal, i);
+
+    if (n->type == (is_hevc (c) ? 33u : 7u)) {
+      if (is_hevc (c))
+        rds_test_h265_sps (n->data, n->size, sps);
+      else
+        rds_test_h264_sps (n->data, n->size, sps);
+      g_array_unref (nals);
+      return;
+    }
+  }
+  g_error ("no SPS");
+}
+
+/* The caps level string for a level_idc (H.264: 31 -> 3.1; HEVC: 30 x level, 93 -> 3.1). */
+static gchar *
+level_string (const Codec * c, guint idc)
+{
+  if (is_hevc (c))
+    return idc % 30 == 0 ? g_strdup_printf ("%u", idc / 30) : g_strdup_printf ("%u.%u", idc / 30, idc % 30 / 3);
+  return idc % 10 == 0 ? g_strdup_printf ("%u", idc / 10) : g_strdup_printf ("%u.%u", idc / 10, idc % 10);
+}
+
+/* The output caps carry the profile and level the SPS has. */
+static void
+check_caps_match_sps (const Codec * c, const Encoded * r, const gchar * profile, guint profile_idc)
+{
+  const GstStructure *st = gst_caps_get_structure (r->caps, 0);
+  RdsTestSps sps;
+  gchar *level;
+
+  first_sps (c, r, &sps);
+  g_assert_cmpuint (sps.profile_idc, ==, profile_idc);
+  g_assert_cmpstr (gst_structure_get_string (st, "profile"), ==, profile);
+  level = level_string (c, sps.level_idc);
+  g_assert_cmpstr (gst_structure_get_string (st, "level"), ==, level);
+  g_free (level);
+}
+
+/* GOP layout: the first frame and every @idr-th are IDR frames with parameter sets before them; between them,
+ * @i_frames intra frames (at multiples of @every when @every > 0), the rest P frames. */
+static void
+check_gop (const Codec * c, guint idrinterval, guint iframeinterval, guint idr, guint i_frames, guint every)
+{
+  gboolean hevc = is_hevc (c);
+  gchar *props = iframeinterval > 0 ? g_strdup_printf ("idrinterval=%u iframeinterval=%u", idrinterval,
+      iframeinterval) : g_strdup_printf ("idrinterval=%u", idrinterval);
+  Encoded r = { 0 };
+  GArray *aus;
+  guint intra_in_gop = 0;
+
+  encode (c, "pattern=ball", props, NULL, 300, &r);
+  aus = rds_test_nal_aus (r.data->data, r.data->len, hevc);
+  g_assert_cmpuint (aus->len, ==, 300);
+  for (guint k = 0; k < aus->len; k++) {
+    const RdsTestAu *au = &g_array_index (aus, RdsTestAu, k);
+    guint pos = k % idr;
+
+    if (pos == 0) {
+      g_assert_true (au_is_idr (au, hevc));
+      g_assert_true (au_has_parameter_sets (au, hevc));
+      if (k > 0)
+        g_assert_cmpuint (intra_in_gop, ==, i_frames);
+      intra_in_gop = 0;
+      continue;
+    }
+    g_assert_false (au_is_idr (au, hevc));
+    g_assert_cmpuint (au->first_slice_type, !=, RDS_TEST_H264_SLICE_B);
+    if (au->first_slice_type == RDS_TEST_H264_SLICE_I) {
+      intra_in_gop++;
+      if (every > 0)
+        g_assert_cmpuint (pos % every, ==, 0);
+    } else {
+      g_assert_cmpuint (au->first_slice_type, ==, RDS_TEST_H264_SLICE_P);
+      if (every > 0)
+        g_assert_cmpuint (pos % every, !=, 0);
+    }
+  }
+  g_array_unref (aus);
+  encoded_clear (&r);
+  g_free (props);
+}
+
+static void
+test_gop (gconstpointer data)
+{
+  const Codec *c = data;
+
+  if (!require_va (c))
+    return;
+  check_gop (c, 30, 0, 30, 0, 0);       /* iframeinterval: none */
+  check_gop (c, 30, 10, 30, 2, 10);
+  check_gop (c, 45, 30, 45, 1, 0);      /* VA spaces its one I frame evenly, not at 30 */
+  check_gop (c, 256, 0, 256, 0, 0);     /* the defaults */
+}
+
+typedef struct
+{
+  gint value;
+  const gchar *caps_profile;
+  guint profile_idc;
+} ProfileCase;
+
+static void
+test_profiles (gconstpointer data)
+{
+  const Codec *c = data;
+  static const ProfileCase h264[] = {
+    {0, "constrained-baseline", 66}, {1, "constrained-baseline", 66}, {2, "main", 77}, {4, "high", 100},
+    {17, "high", 100},
+  };
+  static const ProfileCase h265[] = { {0, "main", 1} };
+  const ProfileCase *cases = is_hevc (c) ? h265 : h264;
+  guint n = is_hevc (c) ? G_N_ELEMENTS (h265) : G_N_ELEMENTS (h264);
+  Encoded r;
+
+  if (!require_va (c))
+    return;
+  for (guint i = 0; i < n; i++) {
+    gchar *props = g_strdup_printf ("profile=%d", cases[i].value);
+
+    encode (c, "pattern=ball", props, NULL, 10, &r);
+    check_caps_match_sps (c, &r, cases[i].caps_profile, cases[i].profile_idc);
+    encoded_clear (&r);
+    g_free (props);
+  }
+  /* downstream caps that fix the profile win */
+  if (is_hevc (c)) {
+    encode (c, "pattern=ball", "profile=0", "video/x-h265,profile=main", 10, &r);
+    check_caps_match_sps (c, &r, "main", 1);
+  } else {
+    encode (c, "pattern=ball", "profile=4", "video/x-h264,profile=main", 10, &r);
+    check_caps_match_sps (c, &r, "main", 77);
+    encoded_clear (&r);
+    encode (c, "pattern=ball", "profile=0", "video/x-h264,profile={main,high}", 10, &r);
+    check_caps_match_sps (c, &r, "high", 100);
+  }
+  encoded_clear (&r);
+}
+
+/* VA sets the level itself: a downstream level equal to VA's negotiates (3.1 at 720p30 and 4 Mbit/s), another is
+ * not-negotiated with a warning naming both (ours: DeepStream 8.0 writes the downstream level). */
+static void
+test_downstream_level (gconstpointer data)
+{
+  const Codec *c = data;
+  gchar *down, *desc;
+  Encoded r;
+  GstElement *p;
+  GstBus *bus;
+  GstMessage *m;
+  GError *err = NULL;
+
+  if (!require_va (c))
+    return;
+  down = g_strdup_printf ("%s,level=(string)3.1", c->caps_name);
+  encode (c, "pattern=ball", "", down, 10, &r);
+  g_assert_cmpstr (gst_structure_get_string (gst_caps_get_structure (r.caps, 0), "level"), ==, "3.1");
+  encoded_clear (&r);
+  g_free (down);
+
+  desc = g_strdup_printf ("videotestsrc num-buffers=10 ! video/x-raw,width=%d,height=%d,framerate=%d/1 ! %s ! "
+      "%s,level=(string)5.1 ! fakesink", W, H, FPS, c->element, c->caps_name);
+  p = gst_parse_launch (desc, NULL);
+  bus = gst_element_get_bus (p);
+  g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, "*level 5.1*VA encoder*3.1*");
+  gst_element_set_state (p, GST_STATE_PLAYING);
+  m = gst_bus_timed_pop_filtered (bus, RDS_TEST_MEDIA_TIMEOUT, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+  g_assert_nonnull (m);
+  g_assert_cmpint (GST_MESSAGE_TYPE (m), ==, GST_MESSAGE_ERROR);
+  gst_message_parse_error (m, &err, NULL);
+  g_assert_error (err, GST_STREAM_ERROR, GST_STREAM_ERROR_FAILED);    /* not-negotiated */
+  g_clear_error (&err);
+  gst_message_unref (m);
+  gst_element_set_state (p, GST_STATE_NULL);
+  g_test_assert_expected_messages ();
+  gst_object_unref (bus);
+  gst_object_unref (p);
+  g_free (desc);
+}
+
+/* kbit/s of output buffers [@from, @to) without filler NAL units */
+static gdouble
+rate_kbps (const Encoded * r, guint from, guint to)
+{
+  guint64 bytes = 0;
+
+  for (guint i = from; i < to; i++)
+    bytes += g_array_index (r->sizes, guint, i);
+  return bytes * 8.0 / 1000.0 / ((to - from) / (gdouble) FPS);
+}
+
+/* Content hard enough that CBR needs no filler to reach its target (it may still add some). */
+#define HARD_SRC "pattern=smpte horizontal-speed=8"
+
+static void
+test_cbr (gconstpointer data)
+{
+  const Codec *c = data;
+  static const guint targets[] = { 1000000, 4000000 };
+
+  if (!require_va (c))
+    return;
+  for (guint i = 0; i < G_N_ELEMENTS (targets); i++) {
+    gchar *props = g_strdup_printf ("bitrate=%u", targets[i]);
+    Encoded r;
+    gdouble kbps;
+
+    encode (c, HARD_SRC, props, NULL, 300, &r);
+    /* VA's H.265 CBR settles about 20 % above a 1 Mbit/s target on this content (measured: ~1245 kbit/s, QP 33..48,
+     * so not out of QP range); everything else holds +-10 % */
+    gdouble over = is_hevc (c) && targets[i] == 1000000 ? 1.3 : 1.1;
+
+    kbps = rate_kbps (&r, 0, 300);
+    g_test_message ("%s CBR %u kbit/s: %.0f kbit/s without filler", c->element, targets[i] / 1000, kbps);
+    g_assert_cmpfloat (kbps, >=, targets[i] / 1000.0 * 0.9);
+    g_assert_cmpfloat (kbps, <=, targets[i] / 1000.0 * over);
+    encoded_clear (&r);
+    g_free (props);
+  }
+}
+
+/* bitrate is live: 4 -> 1 Mbit/s halfway. VA restarts rate control there (an IDR) and settles above the new target,
+ * so only a drop of at least 40 % is asserted. */
+static void
+test_live_bitrate (gconstpointer data)
+{
+  const Codec *c = data;
+  Encoded r = { .change_at = 150, .new_bitrate = 1000000 };
+  gdouble first, second;
+
+  if (!require_va (c))
+    return;
+  encode (c, HARD_SRC, "bitrate=4000000", NULL, 300, &r);
+  /* the first 30 frames of each half: VA's rate control settling */
+  first = rate_kbps (&r, 30, 150);
+  second = rate_kbps (&r, 180, 300);
+  g_test_message ("%s: %.0f kbit/s, then %.0f kbit/s", c->element, first, second);
+  g_assert_cmpfloat (second, <=, first * 0.6);
+  encoded_clear (&r);
+}
+
+/* Counts the H.264 B pictures of @r by the first slice of each AU (VA writes one slice per picture). */
+static guint
+count_b (const Codec * c, const Encoded * r)
+{
+  GArray *aus = rds_test_nal_aus (r->data->data, r->data->len, is_hevc (c));
+  guint b = 0;
+
+  for (guint k = 0; k < aus->len; k++)
+    b += g_array_index (aus, RdsTestAu, k).first_slice_type == RDS_TEST_H264_SLICE_B;
+  g_array_unref (aus);
+  return b;
+}
+
+/* H.264 B frames: with Main they are there; with Baseline, from the property or from downstream caps, a warning and
+ * none (VA would write them into a Baseline stream). count_b looks at the first slice of each AU only, which is every
+ * slice: VA writes one slice per picture. This also guards the order of VA's reconfiguration that the bin's
+ * caps-query probe relies on. */
+static void
+test_b_frames (void)
+{
+  const Codec *c = &codecs[0];
+  Encoded r;
+
+  if (!require_va (c))
+    return;
+  encode (c, "pattern=ball", "profile=2 num-B-Frames=2", NULL, 60, &r);
+  g_assert_cmpuint (count_b (c, &r), >, 0);
+  check_caps_match_sps (c, &r, "main", 77);
+  encoded_clear (&r);
+
+  g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, "*num-B-Frames=2*Baseline*");
+  encode (c, "pattern=ball", "profile=0 num-B-Frames=2", NULL, 60, &r);
+  g_test_assert_expected_messages ();
+  g_assert_cmpuint (count_b (c, &r), ==, 0);
+  check_caps_match_sps (c, &r, "constrained-baseline", 66);
+  encoded_clear (&r);
+
+  g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, "*num-B-Frames=1*Baseline*");
+  encode (c, "pattern=ball", "profile=4 num-B-Frames=1", "video/x-h264,profile=constrained-baseline", 60, &r);
+  g_test_assert_expected_messages ();
+  g_assert_cmpuint (count_b (c, &r), ==, 0);
+  check_caps_match_sps (c, &r, "constrained-baseline", 66);
+  encoded_clear (&r);
+}
+
+/* preset-id doesn't reach the VA encoder (target-usage is always 1); gpu-id reaches rdsvideoconvert. */
+static void
+test_inner_settings (gconstpointer data)
+{
+  const Codec *c = data;
+  gchar *desc = g_strdup_printf ("videotestsrc ! video/x-raw,width=%d,height=%d ! %s name=enc ! fakesink", W, H,
+      c->element);
+  GstElement *p, *e, *va, *conv;
+
+  if (!require_va (c)) {
+    g_free (desc);
+    return;
+  }
+  p = gst_parse_launch (desc, NULL);
+  e = gst_bin_get_by_name (GST_BIN (p), "enc");
+  g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, "*preset-id*no effect*");
+  g_object_set (e, "preset-id", 7u, NULL);
+  g_test_assert_expected_messages ();
+  g_assert_cmpint (gst_element_set_state (p, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  va = gst_bin_get_by_name (GST_BIN (e), "encoder");
+  conv = gst_bin_get_by_name (GST_BIN (e), "convert");
+  g_object_set (conv, "gpu-id", 5u, NULL);      /* the start sets the bin's (0) */
+  g_assert_cmpint (gst_element_set_state (p, GST_STATE_PAUSED), !=, GST_STATE_CHANGE_FAILURE);
+  g_assert_cmpint (gst_element_get_state (p, NULL, NULL, 10 * GST_SECOND), ==, GST_STATE_CHANGE_SUCCESS);
+  g_assert_cmpuint (get_uint (va, "target-usage"), ==, 1);
+  g_assert_cmpuint (get_uint (conv, "gpu-id"), ==, 0);
+  gst_element_set_state (p, GST_STATE_NULL);
+  gst_object_unref (va);
+  gst_object_unref (conv);
+  gst_object_unref (e);
+  gst_object_unref (p);
+  g_free (desc);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -940,10 +1812,25 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/enc/missing-va", test_missing_va);
   g_test_add_func ("/cpu/enc/link-failure", test_link_failure);
   g_test_add_func ("/cpu/enc/unsupported-profile", test_unsupported_profile);
+  g_test_add_func ("/cpu/enc/configure", test_configure);
+  g_test_add_func ("/cpu/enc/preferred-profile", test_preferred_profile);
   g_test_add_data_func ("/gpu/enc/smoke-h264", &codecs[0], test_smoke);
   g_test_add_data_func ("/gpu/enc/smoke-h265", &codecs[1], test_smoke);
   g_test_add_data_func ("/gpu/enc/set-while-playing-h264", &codecs[0], test_set_while_playing);
   g_test_add_data_func ("/gpu/enc/set-while-playing-h265", &codecs[1], test_set_while_playing);
+  g_test_add_data_func ("/gpu/enc/gop-h264", &codecs[0], test_gop);
+  g_test_add_data_func ("/gpu/enc/gop-h265", &codecs[1], test_gop);
+  g_test_add_data_func ("/gpu/enc/profiles-h264", &codecs[0], test_profiles);
+  g_test_add_data_func ("/gpu/enc/profiles-h265", &codecs[1], test_profiles);
+  g_test_add_data_func ("/gpu/enc/downstream-level-h264", &codecs[0], test_downstream_level);
+  g_test_add_data_func ("/gpu/enc/downstream-level-h265", &codecs[1], test_downstream_level);
+  g_test_add_data_func ("/gpu/enc/cbr-h264", &codecs[0], test_cbr);
+  g_test_add_data_func ("/gpu/enc/cbr-h265", &codecs[1], test_cbr);
+  g_test_add_data_func ("/gpu/enc/live-bitrate-h264", &codecs[0], test_live_bitrate);
+  g_test_add_data_func ("/gpu/enc/live-bitrate-h265", &codecs[1], test_live_bitrate);
+  g_test_add_func ("/gpu/enc/b-frames-h264", test_b_frames);
+  g_test_add_data_func ("/gpu/enc/inner-settings-h264", &codecs[0], test_inner_settings);
+  g_test_add_data_func ("/gpu/enc/inner-settings-h265", &codecs[1], test_inner_settings);
   ret = g_test_run ();
   gst_deinit ();
   return ret;

@@ -501,15 +501,19 @@ test('enc_props', executable('enc_props', 'check' / 'enc_props.c', dependencies 
 # SPS window fix on captured SPSs (cpu); the walker on VA-encoded streams, filler in a real CBR stream, VA's measured
 # shift and an encode -> fix -> decode round trip (gpu, skipped without the VA encoders). No plugin of ours.
 enc_nal_exe = executable('enc_nal', 'check' / 'enc_nal.c',
-  dependencies : [rdsenc_nal_dep, gst_app_dep, gst_video_dep])
+  dependencies : [rdsenc_gst_dep, gst_app_dep, gst_video_dep])
 test('enc_nal_cpu', enc_nal_exe, args : ['-p', '/cpu/enc-nal'],
   suite : 'cpu', env : test_env, protocol : 'tap')
 test('enc_nal', enc_nal_exe, args : ['-p', '/gpu/enc-nal'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120)
 
+# rdsh264enc / rdsh265enc caps decisions on plain caps: the preferred profile, Baseline + B frames, the level check.
+test('enc_caps', executable('enc_caps', 'check' / 'enc_caps.c', dependencies : [rdsenc_gst_dep]),
+  suite : 'cpu', env : test_env, protocol : 'tap')
+
 # rdsh264enc / rdsh265enc: registration, pads, DeepStream 8.0's properties and enums, no-op warnings, QP strings, the
-# inner chain, a missing VA encoder and the unsupported profiles (cpu); encodes through the bins (gpu, skipped without
-# the VA encoders).
+# inner chain, a missing VA encoder, the unsupported profiles, the VA properties a start sets and the preferred profile
+# (cpu); encodes through the bins: GOPs, profiles, levels, rates, B frames (gpu, skipped without the VA encoders).
 element_enc_exe = executable('element_enc', 'check' / 'element_enc.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep])
 test('element_enc_cpu', element_enc_exe, args : ['-p', '/cpu/enc'],

@@ -11,23 +11,24 @@ rdsenc_props_dep = declare_dependency(link_with : rdsenc_props,
   include_directories : include_directories('.'),
   dependencies : [dependency('glib-2.0')])
 
-# The Annex-B helpers (filler stripping, the H.265 SPS window fix, the timestamp shift): GStreamer core only, so the
-# cpu tests link it without any plugin.
-rdsenc_nal = static_library('rdsenc-nal',
-  files('rds-enc-nal.c'),
+# The Annex-B helpers (filler stripping, the H.265 SPS window fix, the timestamp shift) and the caps decisions (the
+# preferred profile, Baseline + B frames, the downstream level): GStreamer core only, so the cpu tests link it without
+# any plugin.
+rdsenc_gst = static_library('rdsenc-gst',
+  files('rds-enc-nal.c', 'rds-enc-caps.c'),
   c_args : ['-DG_LOG_DOMAIN="rdsenc"'],
-  dependencies : [gst_dep],
+  dependencies : [gst_dep, rdsenc_props_dep],
   gnu_symbol_visibility : 'hidden',
   pic : true)
-rdsenc_nal_dep = declare_dependency(link_with : rdsenc_nal,
+rdsenc_gst_dep = declare_dependency(link_with : rdsenc_gst,
   include_directories : include_directories('.'),
-  dependencies : [gst_dep])
+  dependencies : [gst_dep, rdsenc_props_dep])
 
 # rdsh264enc and rdsh265enc: bins over the stock VA encoders (needed at run time only).
 gstrdsenc = library('gstrdsenc',
   files('plugin.c', 'gstrdsencbin.c', 'gstrdsh264enc.c', 'gstrdsh265enc.c'),
   c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdsenc"'],
-  dependencies : [rds_dep, gst_dep, rdsenc_props_dep, rdsenc_nal_dep, rds_plugin_headers_dep],
+  dependencies : [rds_dep, gst_dep, rdsenc_props_dep, rdsenc_gst_dep, rds_plugin_headers_dep],
   gnu_symbol_visibility : 'hidden',
   install_rpath : rds_install_rpath,
   install : true,

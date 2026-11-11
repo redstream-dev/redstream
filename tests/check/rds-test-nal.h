@@ -1,7 +1,7 @@
 /* A small Annex-B walker for the encoder tests, written separately from the plugin's own NAL code so it checks that
- * code independently: NAL units and access units of a byte stream, NAL types, the first slice's slice_type
- * (H.264), the SPS profile_idc / level_idc and the SPS cropping (H.264 frame cropping, HEVC conformance window) with
- * the displayed size. Header-only (static inline functions); fails the test on a stream it can't read.
+ * code independently: NAL units and access units of a byte stream, NAL types, the first slice's slice_type (H.264
+ * and HEVC), the SPS profile_idc / level_idc and the SPS cropping (H.264 frame cropping, HEVC conformance window)
+ * with the displayed size. Header-only (static inline functions); fails the test on a stream it can't read.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_TEST_NAL_H
 #define RDS_TEST_NAL_H
@@ -346,8 +346,45 @@ rds_test_h264_slice_type (const guint8 * nal, gsize size)
 #define RDS_TEST_H264_SLICE_B 1
 #define RDS_TEST_H264_SLICE_I 2
 
-/* One access unit of a byte stream: its NAL types in order, and for H.264 the first slice's slice_type (G_MAXUINT
- * when the AU has no slice). */
+/* num_extra_slice_header_bits of an HEVC PPS NAL unit (2-byte header included). */
+static inline guint
+rds_test_h265_pps_extra_bits (const guint8 * nal, gsize size)
+{
+  GByteArray *rbsp = rds_test_nal_rbsp (nal, size);
+  RdsTestBits b = { rbsp->data, rbsp->len * 8, 16 };
+  guint n;
+
+  (void) rds_test_ue (&b);      /* pps_pic_parameter_set_id */
+  (void) rds_test_ue (&b);      /* pps_seq_parameter_set_id */
+  (void) rds_test_bits (&b, 2); /* dependent_slice_segments_enabled_flag, output_flag_present_flag */
+  n = rds_test_bits (&b, 3);
+  g_byte_array_unref (rbsp);
+  return n;
+}
+
+/* The slice_type of the first slice segment of an HEVC picture (first_slice_segment_in_pic_flag set), given its
+ * PPS's num_extra_slice_header_bits, as the H.264 constants above (HEVC codes B 0, P 1, I 2). */
+static inline guint
+rds_test_h265_slice_type (const guint8 * nal, gsize size, guint extra_bits)
+{
+  GByteArray *rbsp = rds_test_nal_rbsp (nal, size);
+  RdsTestBits b = { rbsp->data, rbsp->len * 8, 16 };
+  guint type = (nal[0] >> 1) & 0x3f, t;
+
+  g_assert_cmpuint (rds_test_bit (&b), ==, 1);  /* first_slice_segment_in_pic_flag */
+  if (type >= 16 && type <= 23)
+    (void) rds_test_bit (&b);   /* no_output_of_prior_pics_flag */
+  (void) rds_test_ue (&b);      /* slice_pic_parameter_set_id */
+  if (extra_bits > 0)
+    (void) rds_test_bits (&b, extra_bits);      /* slice_reserved_flag[] */
+  t = rds_test_ue (&b);
+  g_byte_array_unref (rbsp);
+  g_assert_cmpuint (t, <=, 2);
+  return t == 0 ? RDS_TEST_H264_SLICE_B : t == 1 ? RDS_TEST_H264_SLICE_P : RDS_TEST_H264_SLICE_I;
+}
+
+/* One access unit of a byte stream: its NAL types in order, and the first slice's slice_type as the
+ * RDS_TEST_H264_SLICE_* constants, for HEVC too (G_MAXUINT when the AU has no slice). */
 typedef struct
 {
   GArray *types;                /* guint */
@@ -385,6 +422,7 @@ rds_test_nal_aus (const guint8 * data, gsize size, gboolean hevc)
   GArray *aus = g_array_new (FALSE, TRUE, sizeof (RdsTestAu));
   RdsTestAu *cur = NULL;
   gboolean have_vcl = FALSE;
+  guint extra_bits = 0;         /* HEVC: the last PPS's num_extra_slice_header_bits (one PPS id in our streams) */
 
   g_array_set_clear_func (aus, rds_test_au_clear);
   for (guint i = 0; i < nals->len; i++) {
@@ -401,8 +439,11 @@ rds_test_nal_aus (const guint8 * data, gsize size, gboolean hevc)
       have_vcl = FALSE;
     }
     g_array_append_val (cur->types, n->type);
-    if (vcl && !have_vcl && !hevc)
-      cur->first_slice_type = rds_test_h264_slice_type (n->data, n->size);
+    if (hevc && n->type == 34)
+      extra_bits = rds_test_h265_pps_extra_bits (n->data, n->size);
+    if (vcl && !have_vcl)
+      cur->first_slice_type = hevc ? rds_test_h265_slice_type (n->data, n->size, extra_bits)
+          : rds_test_h264_slice_type (n->data, n->size);
     have_vcl |= vcl;
   }
   g_array_unref (nals);

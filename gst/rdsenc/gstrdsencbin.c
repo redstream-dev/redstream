@@ -18,6 +18,7 @@
 
 #include <rds/rds.h>
 
+#include "rds-enc-caps.h"
 #include "rds-enc-props.h"
 #include "rds-video-convert-caps.h"
 
@@ -94,11 +95,19 @@ typedef struct _GstRdsEncBinPrivate GstRdsEncBinPrivate;
 
 /* Locking: the object lock guards the property values and the inner-element pointers. Forward a property to an
  * inner element or send it an event after unlocking, never under the object lock: take a reference with
- * get_encoder () (or the like) and drop the lock first. The chain, and the probes on it, are made once, in
- * build_chain; per-run state (what the probes measure or warn about once) is reset at READY to PAUSED and
- * PAUSED to READY, not there. */
+ * get_encoder () (or the like) and drop the lock first. va_lock serialises the writes of the properties the VA
+ * encoder takes while running (bitrate; the forced key frames will take it too) with the start's configure (), so
+ * a live value set during a start is not overwritten by the start's older snapshot: a forward takes va_lock, reads
+ * the latest stored value under the object lock, and sets it with only va_lock held. Lock order: va_lock, then the
+ * object lock. The probes never take va_lock (they run inside the VA encoder's own calls). configure () holds
+ * va_lock while it sets the children's properties and posts nothing then, so don't set this bin's properties from
+ * its children's notify / deep-notify or from a sync bus handler while it starts. The chain, and the
+ * probes on it, are made once, in build_chain; per-run state (what the probes measure or warn about once) is reset
+ * at READY to PAUSED and PAUSED to READY, not there. */
 struct _GstRdsEncBinPrivate
 {
+  GMutex va_lock;
+
   /* the inner chain (object lock), made at the first NULL to READY and kept until finalize (the bin owns them) */
   GstElement *convert;          /* rdsvideoconvert */
   GstElement *rawcaps;          /* video/x-raw,format=NV12 */
@@ -110,7 +119,12 @@ struct _GstRdsEncBinPrivate
   GValue values[N_PROPS];
   guint noops_warned;           /* bit per no-op property, from PROP_NOOP_FIRST */
 
-  const gchar *va_profile;      /* the profile property's VA caps profile, set at READY to PAUSED */
+  /* per run (object lock): set at READY to PAUSED, cleared at PAUSED to READY */
+  const gchar *va_profile;      /* the profile property's VA caps profile */
+  guint b_frames;               /* num-B-Frames read at the start */
+  guint b_frames_set;           /* what the VA encoder's b-frames was last set to */
+  gboolean b_frames_warned;     /* the Baseline + B frames warning was given */
+  gboolean level_warned;        /* the downstream level warning was given */
 };
 
 G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (GstRdsEncBin, gst_rds_enc_bin, GST_TYPE_BIN);
@@ -153,6 +167,175 @@ drop_floating (GstElement ** e)
   if (*e != NULL)
     gst_object_unref (gst_object_ref_sink (*e));
   *e = NULL;
+}
+
+/* ---- setting the VA encoder's properties ---- */
+
+/* @o's property @name, or NULL (with a debug line) when it has none: a VA encoder of another version might lack
+ * one, and the tests' stand-ins lack most. */
+static GParamSpec *
+find_prop (GObject * o, const gchar * name)
+{
+  GParamSpec *ps = g_object_class_find_property (G_OBJECT_GET_CLASS (o), name);
+
+  if (ps == NULL)
+    GST_DEBUG_OBJECT (o, "no property %s", name);
+  return ps;
+}
+
+/* Sets @o's uint @name to @v, clamped to its range (ours: e.g. VA's bitrate stops at 2048000 kbit/s and its
+ * target-percentage starts at 50). */
+static void
+set_uint (GObject * o, const gchar * name, guint v)
+{
+  GParamSpec *ps = find_prop (o, name);
+  GParamSpecUInt *u;
+
+  if (ps == NULL)
+    return;
+  g_return_if_fail (G_IS_PARAM_SPEC_UINT (ps));
+  u = G_PARAM_SPEC_UINT (ps);
+  if (v < u->minimum || v > u->maximum) {
+    GST_INFO_OBJECT (o, "%s %u clamped to %u..%u", name, v, u->minimum, u->maximum);
+    v = CLAMP (v, u->minimum, u->maximum);
+  }
+  g_object_set (o, name, v, NULL);
+}
+
+static void
+set_bool (GObject * o, const gchar * name, gboolean v)
+{
+  if (find_prop (o, name) != NULL)
+    g_object_set (o, name, v, NULL);
+}
+
+static void
+set_uint64 (GObject * o, const gchar * name, guint64 v)
+{
+  if (find_prop (o, name) != NULL)
+    g_object_set (o, name, v, NULL);
+}
+
+/* Sets @o's @name back to its default (what "leave VA's choice" means across restarts). */
+static void
+set_default (GObject * o, const gchar * name)
+{
+  GParamSpec *ps = find_prop (o, name);
+
+  if (ps != NULL)
+    g_object_set_property (o, name, g_param_spec_get_default_value (ps));
+}
+
+/* ---- the preferred profile ---- */
+
+/* The answer to the VA encoder's downstream CAPS queries, decided by rds_enc_caps_narrow: narrowed to the `profile`
+ * property's profile when downstream allows it (downstream caps that fix another profile win: DeepStream 8.0
+ * behaviour), and with B frames requested, Baseline left out when there is a choice. When only Baseline is left and
+ * B frames were requested (H.264), the VA encoder's b-frames is set to 0 with one warning per run (ours: VA would
+ * write B slices into a Baseline stream).
+ *
+ * Why setting b-frames here works, and what to re-check on a GStreamer update (written against gst-plugins-bad 1.28's
+ * va plugin): VA's reconfiguration first decides the profile, asking downstream for its allowed caps (this query),
+ * then resets its state, copying the b-frames *property* into the GOP settings, then builds the GOP structure. VA has
+ * a Baseline check of its own that drops B frames, but it runs during the profile decision, before the reset, so the
+ * reset undoes it. Our property change, made inside the same query, is what the reset copies. If VA reorders these
+ * steps, /gpu/enc/b-frames-h264 (Baseline from the property and from downstream caps: no B slices) fails. */
+static GstPadProbeReturn
+caps_query_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstRdsEncBin *self = user_data;
+  GstRdsEncBinPrivate *priv = PRIV (self);
+  const GstRdsEncCodecInfo *codec = GST_RDS_ENC_BIN_GET_CLASS (self)->info;
+  GstQuery *q = GST_PAD_PROBE_INFO_QUERY (info);
+  GstCaps *res, *narrowed;
+  const gchar *pref;
+  guint requested, b_frames, b_set;
+  gboolean only_baseline = FALSE, warn = FALSE;
+
+  if (GST_QUERY_TYPE (q) != GST_QUERY_CAPS || !(GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_PULL))
+    return GST_PAD_PROBE_OK;
+  gst_query_parse_caps_result (q, &res);
+  if (res == NULL || gst_caps_is_empty (res) || gst_caps_is_any (res))
+    return GST_PAD_PROBE_OK;
+
+  GST_OBJECT_LOCK (self);
+  pref = priv->va_profile;      /* a static string */
+  requested = priv->b_frames;
+  GST_OBJECT_UNLOCK (self);
+  if (pref == NULL)             /* not started */
+    return GST_PAD_PROBE_OK;
+
+  narrowed = rds_enc_caps_narrow (res, codec->caps_name, pref, requested, &only_baseline);
+  only_baseline = only_baseline && requested > 0;
+  b_frames = rds_enc_b_frames (requested, only_baseline, NULL);
+
+  GST_DEBUG_OBJECT (self, "downstream caps %" GST_PTR_FORMAT " -> %" GST_PTR_FORMAT ", b-frames %u", res, narrowed,
+      b_frames);
+  gst_query_set_caps_result (q, narrowed);
+  gst_caps_unref (narrowed);
+
+  GST_OBJECT_LOCK (self);
+  b_set = priv->b_frames_set;
+  priv->b_frames_set = b_frames;
+  if (only_baseline && !priv->b_frames_warned) {
+    priv->b_frames_warned = TRUE;
+    warn = TRUE;
+  }
+  GST_OBJECT_UNLOCK (self);
+
+  if (warn)
+    g_warning ("%s: num-B-Frames=%u with a Baseline profile: Baseline has no B frames, so none are encoded",
+        GST_OBJECT_NAME (self), requested);
+  if (b_frames != b_set) {
+    GstElement *encoder = gst_pad_get_parent_element (pad);
+
+    if (encoder != NULL) {
+      set_uint (G_OBJECT (encoder), "b-frames", b_frames);
+      gst_object_unref (encoder);
+    }
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+/* The VA encoder's output caps. VA computes the level from the size, frame rate and bitrate and writes it in its caps
+ * and the stream; a `level` that downstream caps fix to another value makes the caps refused (not-negotiated).
+ * DeepStream 8.0 writes the downstream level instead; here it is a warning, once per run, naming both (ours). */
+static GstPadProbeReturn
+caps_event_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstRdsEncBin *self = user_data;
+  GstRdsEncBinPrivate *priv = PRIV (self);
+  GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info);
+  GstCaps *caps, *allowed;
+  const gchar *level;
+  gchar *want = NULL;
+  gboolean warn, refused;
+
+  if (GST_EVENT_TYPE (ev) != GST_EVENT_CAPS)
+    return GST_PAD_PROBE_OK;
+  gst_event_parse_caps (ev, &caps);
+  level = gst_structure_get_string (gst_caps_get_structure (caps, 0), "level");
+  if (level == NULL)
+    return GST_PAD_PROBE_OK;
+  /* What downstream allows (the src capsfilter's accept-caps would only check its own caps). This query comes back
+   * through caps_query_probe on this pad, which recomputes the same b-frames as during VA's profile decision, so it
+   * sets nothing; were it ever to set b-frames here, that would only apply at VA's next reconfiguration. */
+  allowed = gst_pad_peer_query_caps (pad, NULL);
+  refused = rds_enc_caps_level_refused (caps, allowed, &want);
+  gst_caps_unref (allowed);
+  if (!refused)                 /* accepted, or refused for more than the level */
+    return GST_PAD_PROBE_OK;
+
+  GST_OBJECT_LOCK (self);
+  warn = !priv->level_warned;
+  priv->level_warned = TRUE;
+  GST_OBJECT_UNLOCK (self);
+  if (warn)
+    g_warning ("%s: downstream caps ask for level %s, but the VA encoder sets the level itself (%s for this size, "
+        "frame rate and bitrate): drop the level from the caps after the encoder", GST_OBJECT_NAME (self), want,
+        level);
+  g_free (want);
+  return GST_PAD_PROBE_OK;
 }
 
 /* Makes and links the inner elements and points the ghost pads at them, once. FALSE (with an element error naming
@@ -219,6 +402,12 @@ build_chain (GstRdsEncBin * self)
   gst_ghost_pad_set_target (GST_GHOST_PAD (priv->src_ghost), pad);
   gst_object_unref (pad);
 
+  pad = gst_element_get_static_pad (encoder, "src");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM | GST_PAD_PROBE_TYPE_PULL, caps_query_probe, self,
+      NULL);
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, caps_event_probe, self, NULL);
+  gst_object_unref (pad);
+
   GST_OBJECT_LOCK (self);
   priv->convert = convert;
   priv->rawcaps = rawcaps;
@@ -230,7 +419,7 @@ build_chain (GstRdsEncBin * self)
 
 /* The VA encoder, with a reference, or NULL before the first start: for the paths that reach it while streaming
  * (live properties, events), which use it after dropping the object lock. */
-static G_GNUC_UNUSED GstElement *
+static GstElement *
 get_encoder (GstRdsEncBin * self)
 {
   GstElement *e;
@@ -241,8 +430,41 @@ get_encoder (GstRdsEncBin * self)
   return e;
 }
 
-/* Reads the properties for a start (READY to PAUSED). FALSE (with an element error): a setting the VA encoder can't
- * do. */
+/* Sets the VA encoder's rate-control to the mode @nick (cbr, vbr, cqp); the modes are the device's, so one it doesn't
+ * offer is a warning and VA keeps its own. */
+static void
+set_rate_control (GstRdsEncBin * self, GObject * va, const gchar * nick)
+{
+  GParamSpec *ps = find_prop (va, "rate-control");
+  GEnumClass *ec;
+  GEnumValue *ev;
+
+  if (ps == NULL)
+    return;
+  g_return_if_fail (G_IS_PARAM_SPEC_ENUM (ps));
+  ec = G_PARAM_SPEC_ENUM (ps)->enum_class;
+  ev = g_enum_get_value_by_nick (ec, nick);
+  if (ev == NULL) {
+    g_warning ("%s: the VA encoder has no %s rate control on this device; it keeps its own", GST_OBJECT_NAME (self),
+        nick);
+    return;
+  }
+  g_object_set (va, "rate-control", ev->value, NULL);
+}
+
+/* What a start reads, in one snapshot under the object lock. */
+typedef struct
+{
+  guint bitrate, control_rate, maxbitrate, vbvbufsize, idrinterval, iframeinterval, b_frames, ref_frames, gpu_id;
+  gchar *constqp, *qp_range;
+  gboolean disable_cabac, insert_aud, qos;
+  guint64 min_fku_interval;
+  gint profile;
+  GstElement *encoder, *convert;
+} Settings;
+
+/* Reads the properties for a start (READY to PAUSED) and sets them on the inner elements. FALSE (with an element
+ * error): a setting the VA encoder can't do. */
 static gboolean
 configure (GstRdsEncBin * self)
 {
@@ -250,28 +472,130 @@ configure (GstRdsEncBin * self)
   const GstRdsEncCodecInfo *info = GST_RDS_ENC_BIN_GET_CLASS (self)->info;
   const gchar *va_profile = NULL;
   GError *err = NULL;
-  gint profile;
+  Settings st;
+  GObject *va;
+  guint qp[3], range[6], key_int_max, target_pct;
+  gboolean capped, vbr, ok = FALSE;
 
+  g_mutex_lock (&priv->va_lock);
   GST_OBJECT_LOCK (self);
-  profile = g_value_get_enum (&priv->values[PROP_PROFILE]);
+  st.bitrate = g_value_get_uint (&priv->values[PROP_BITRATE]);
+  st.control_rate = (guint) g_value_get_enum (&priv->values[PROP_CONTROL_RATE]);
+  st.maxbitrate = g_value_get_uint (&priv->values[PROP_MAXBITRATE]);
+  st.vbvbufsize = g_value_get_uint (&priv->values[PROP_VBVBUFSIZE]);
+  st.idrinterval = g_value_get_uint (&priv->values[PROP_IDRINTERVAL]);
+  st.iframeinterval = g_value_get_uint (&priv->values[PROP_IFRAMEINTERVAL]);
+  st.b_frames = g_value_get_uint (&priv->values[PROP_NUM_B_FRAMES]);
+  st.ref_frames = g_value_get_uint (&priv->values[PROP_NUM_REF_FRAMES]);
+  st.gpu_id = g_value_get_uint (&priv->values[PROP_GPU_ID]);
+  st.constqp = g_value_dup_string (&priv->values[PROP_CONSTQP]);
+  st.qp_range = g_value_dup_string (&priv->values[PROP_QP_RANGE]);
+  st.disable_cabac = info->has_cabac && g_value_get_boolean (&priv->values[PROP_DISABLE_CABAC]);
+  st.insert_aud = g_value_get_boolean (&priv->values[PROP_INSERT_AUD]);
+  st.qos = g_value_get_boolean (&priv->values[PROP_QOS]);
+  st.min_fku_interval = g_value_get_uint64 (&priv->values[PROP_MIN_FORCE_KEY_UNIT_INTERVAL]);
+  st.profile = g_value_get_enum (&priv->values[PROP_PROFILE]);
+  st.encoder = gst_object_ref (priv->encoder);
+  st.convert = gst_object_ref (priv->convert);
   GST_OBJECT_UNLOCK (self);
 
   /* ours: H.264 High444 (VA has no High 4:4:4) and H.265 Main10 / FREXT (they need P010 / 4:4:4 input) */
-  if (!info->va_profile (profile, &va_profile, &err)) {
-    GST_ELEMENT_ERROR (self, LIBRARY, SETTINGS, ("%s", err->message),
-        ("profile=%d", profile));
-    g_clear_error (&err);
-    return FALSE;
+  if (!info->va_profile (st.profile, &va_profile, &err))
+    goto out;                   /* the error is posted after va_lock is dropped */
+  GST_DEBUG_OBJECT (self, "profile %d: VA profile %s", st.profile, va_profile);
+
+  va = G_OBJECT (st.encoder);
+  vbr = st.control_rate == 0;
+  set_rate_control (self, va, vbr ? "vbr" : st.control_rate == 2 ? "cqp" : "cbr");
+  set_uint (va, "bitrate", rds_enc_kbps (st.bitrate));
+  /* maxbitrate: the peak in VBR only (DeepStream 8.0 behaviour) */
+  target_pct = rds_enc_target_percentage (st.bitrate, st.maxbitrate, vbr);
+  if (target_pct > 0)
+    set_uint (va, "target-percentage", target_pct);
+  else
+    set_default (va, "target-percentage");
+  /* constqp: in CQP only (DeepStream 8.0 behaviour) */
+  if (st.control_rate == 2 && st.constqp != NULL && rds_enc_parse_qp_triplet (st.constqp, qp)) {
+    set_uint (va, "qpi", qp[0]);
+    set_uint (va, "qpp", qp[1]);
+    set_uint (va, "qpb", qp[2]);
+  } else {
+    set_default (va, "qpi");
+    set_default (va, "qpp");
+    set_default (va, "qpb");
   }
+  /* qp-range: VA has one range, taken from the P pair (ours) */
+  if (st.qp_range != NULL && rds_enc_parse_qp_range (st.qp_range, range)) {
+    set_uint (va, "min-qp", range[0]);
+    set_uint (va, "max-qp", range[1]);
+  } else {
+    set_default (va, "min-qp");
+    set_default (va, "max-qp");
+  }
+  set_uint (va, "cpb-size", st.vbvbufsize / 1000);
+  key_int_max = rds_enc_key_int_max (st.idrinterval, &capped);
+  if (capped)
+    g_warning ("%s: idrinterval %u is above the VA encoder's largest key-int-max; using %u", GST_OBJECT_NAME (self),
+        st.idrinterval, key_int_max);
+  set_uint (va, "key-int-max", key_int_max);
+  set_uint (va, "i-frames", rds_enc_i_frames (st.iframeinterval, key_int_max));
+  /* ours: preset-id is a no-op; target-usage 1 is the only one that holds CBR at the target */
+  set_uint (va, "target-usage", 1);
+  /* b-frames: lowered to 0 by caps_query_probe when the profile turns out to be Baseline */
+  set_uint (va, "b-frames", st.b_frames);
+  if (st.ref_frames > 0)
+    set_uint (va, "ref-frames", st.ref_frames);
+  else
+    set_default (va, "ref-frames");
+  if (info->has_cabac)
+    set_bool (va, "cabac", !st.disable_cabac);
+  set_bool (va, "aud", st.insert_aud);
+  set_uint64 (va, "min-force-key-unit-interval", st.min_fku_interval);
+  set_bool (va, "qos", st.qos);
+  g_object_set (st.convert, "gpu-id", st.gpu_id, NULL);
+
+  GST_OBJECT_LOCK (self);
   priv->va_profile = va_profile;
-  GST_DEBUG_OBJECT (self, "profile %d: VA profile %s", profile, va_profile);
-  return TRUE;
+  priv->b_frames = st.b_frames;
+  priv->b_frames_set = st.b_frames;
+  priv->b_frames_warned = FALSE;
+  priv->level_warned = FALSE;
+  GST_OBJECT_UNLOCK (self);
+  ok = TRUE;
+
+out:
+  g_mutex_unlock (&priv->va_lock);
+  if (err != NULL) {
+    GST_ELEMENT_ERROR (self, LIBRARY, SETTINGS, ("%s", err->message), ("profile=%d", st.profile));
+    g_clear_error (&err);
+  }
+  g_free (st.constqp);
+  g_free (st.qp_range);
+  gst_object_unref (st.encoder);
+  gst_object_unref (st.convert);
+  return ok;
+}
+
+/* Clears the per-run state (PAUSED to READY). */
+static void
+reset_run (GstRdsEncBin * self)
+{
+  GstRdsEncBinPrivate *priv = PRIV (self);
+
+  GST_OBJECT_LOCK (self);
+  priv->va_profile = NULL;
+  priv->b_frames = 0;
+  priv->b_frames_set = 0;
+  priv->b_frames_warned = FALSE;
+  priv->level_warned = FALSE;
+  GST_OBJECT_UNLOCK (self);
 }
 
 static GstStateChangeReturn
 gst_rds_enc_bin_change_state (GstElement * element, GstStateChange transition)
 {
   GstRdsEncBin *self = GST_RDS_ENC_BIN (element);
+  GstStateChangeReturn ret;
 
   switch (transition) {
     case GST_STATE_CHANGE_NULL_TO_READY:
@@ -279,13 +603,18 @@ gst_rds_enc_bin_change_state (GstElement * element, GstStateChange transition)
         return GST_STATE_CHANGE_FAILURE;
       break;
     case GST_STATE_CHANGE_READY_TO_PAUSED:
+      /* before the chain-up: the VA encoder reads its properties when it configures, after READY */
       if (!configure (self))
         return GST_STATE_CHANGE_FAILURE;
       break;
     default:
       break;
   }
-  return GST_ELEMENT_CLASS (gst_rds_enc_bin_parent_class)->change_state (element, transition);
+  ret = GST_ELEMENT_CLASS (gst_rds_enc_bin_parent_class)->change_state (element, transition);
+  if (transition == GST_STATE_CHANGE_PAUSED_TO_READY
+      || (transition == GST_STATE_CHANGE_READY_TO_PAUSED && ret == GST_STATE_CHANGE_FAILURE))
+    reset_run (self);
+  return ret;
 }
 
 /* ---- properties ---- */
@@ -358,6 +687,24 @@ gst_rds_enc_bin_set_property (GObject * object, guint prop_id, const GValue * va
   if (warn_started)
     g_warning ("%s: %s set after the start is stored and applied at the next start (NULL or READY to PAUSED)",
         GST_OBJECT_NAME (self), pspec->name);
+
+  /* bitrate is live (DeepStream 8.0 behaviour): on VA a change forces an IDR and restarts rate control (ours) */
+  if (prop_id == PROP_BITRATE) {
+    GstElement *encoder;
+    guint bitrate;
+
+    /* the latest stored value, under va_lock: a concurrent forward or start can't leave an older one on VA */
+    g_mutex_lock (&priv->va_lock);
+    encoder = get_encoder (self);
+    GST_OBJECT_LOCK (self);
+    bitrate = g_value_get_uint (&priv->values[PROP_BITRATE]);
+    GST_OBJECT_UNLOCK (self);
+    if (encoder != NULL) {
+      set_uint (G_OBJECT (encoder), "bitrate", rds_enc_kbps (bitrate));
+      gst_object_unref (encoder);
+    }
+    g_mutex_unlock (&priv->va_lock);
+  }
 }
 
 static void
@@ -415,12 +762,14 @@ gst_rds_enc_bin_finalize (GObject * object)
     if (G_IS_VALUE (&priv->values[i]))
       g_value_unset (&priv->values[i]);
   }
+  g_mutex_clear (&priv->va_lock);
   G_OBJECT_CLASS (gst_rds_enc_bin_parent_class)->finalize (object);
 }
 
 static void
-gst_rds_enc_bin_init (G_GNUC_UNUSED GstRdsEncBin * self)
+gst_rds_enc_bin_init (GstRdsEncBin * self)
 {
+  g_mutex_init (&PRIV (self)->va_lock);
 }
 
 static void
