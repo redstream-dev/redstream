@@ -21,8 +21,9 @@ and NvSORT trackers on the CPU, with NvMultiObjectTracker YAML configs), `rdsana
 overcrowding, direction and line crossing on the CPU, nvdsanalytics configs, DeepStream-shaped C++ metas with a C
 API, the `osd-mode` overlays as display meta), `rdsmultistreamtiler` (batches into one tiled frame), `rdsosd`
 (boxes, text, lines, arrows, circles and the clock, drawn on the GPU by default or on the CPU, the same pixels, Pango
-for text), `rdslogger` (per-stream FPS lines), `rdsvideosink` (display through a stock GStreamer sink) and
-`rdsurisrcbin` (file and RTSP sources, with RTSP reconnection). Nothing here is stable.
+for text), `rdslogger` (per-stream FPS lines), `rdsvideosink` (display through a stock GStreamer sink),
+`rdsurisrcbin` (file and RTSP sources, with RTSP reconnection) and `rdsh264enc` / `rdsh265enc` (bins over the stock VA
+encoders with DeepStream 8.0's encoder properties). Nothing here is stable.
 
 ## Architecture principles
 
@@ -54,7 +55,7 @@ for text), `rdslogger` (per-stream FPS lines), `rdsvideosink` (display through a
 | `nvdsanalytics` | `rdsanalytics` | done: ROI filtering, overcrowding, direction (with STOPPED) and line crossing on the CPU; C++ metas in libgstrds-analytics |
 | `nveglglessink` / `nv3dsink` | `rdsvideosink` | display sink |
 | `nvdslogger` | `rdslogger` | per-stream FPS |
-| `nvv4l2h264enc` / `nvv4l2h265enc` | `rdsh264enc` / `rdsh265enc` | VA (VCN) encode with DeepStream property names (M2) |
+| `nvv4l2h264enc` / `nvv4l2h265enc` | `rdsh264enc` / `rdsh265enc` | done: bins over the stock `vah264enc` / `vah265enc` (VCN) with DeepStream 8.0's properties; frames go through system memory |
 | `nvstreammux` / `nvstreamdemux` (audio) | `rdsstreammux` / `rdsstreamdemux` | on request: batches of mono S16LE/F32LE audio, as the new mux does |
 | `nvinferaudio` | `rdsinferaudio` | on request: audio classifier on MIGraphX, log-mel spectrogram (`audio-transform`) on the GPU |
 | `nvdsaudiotemplate` | `rdsaudiotemplate` | on request: custom-library hook for single or batched audio |
@@ -149,6 +150,14 @@ Known gotchas:
   known then: a stream that stops mid-flow (an RTSP reconnection) gets its last picture out only when new data or an
   EOS comes. `rdsurisrcbin` tells such a leftover from the new session's frames by PTS.
 - Stock `vah26xdec` exports tiled NV12 DMABufs (AMD modifier `0x0200000000401b03`). Never read them as linear.
+- GStreamer 1.28's `vah26xenc` leaks one `GstCaps` per frame-rate renegotiation (reproduced without our bins), and
+  builds its copy pool for system-memory input once per start, so after a resolution change it would copy at the old
+  size (a `gst_video_frame_copy` critical on a shrink, a partial frame on a grow). The bins let their convert write
+  plain memory only at a run's first size and VA's own surfaces after a resize, which is slower. So in a soak that
+  changes the frame rate, leaked caps are VA's, not the bins'; one that changes the size runs slower after it.
+- In a git worktree whose `.cache/media` and `.cache/models` are symlinks to the main checkout's, mount the main
+  checkout's `.cache` in the container at its host path too (`-v /path/to/main/.cache:/path/to/main/.cache`), or the
+  links dangle and the tests that need the clips and models skip.
 - Run docker with `--user $(id -u):$(id -g)` so build outputs aren't root-owned. From zsh, wrap `$RUN`-style
   variables in `bash -c` (zsh doesn't word-split them).
 - Include GLib/GStreamer **before** HIP: HIP defines `__noinline__` as a macro, which breaks `gmacros.h`. Public
@@ -312,10 +321,23 @@ gst/rdsanalytics/  libgstrdsanalytics plugin: rdsanalytics (gstrdsanalytics.c: i
                    GLib only, no GStreamer or GPU). These two are the static rdsanalytics-core the tests link.
                    rds-analytics-draw turns a frame's results into display meta and object text (osd-mode,
                    display-obj-cnt), the static rdsanalytics-draw (it needs libgstrds' meta types). Always built
+gst/rdsenc/        libgstrdsenc plugin (plugin.c): rdsh264enc and rdsh265enc, one GstRdsEncBin base class
+                   (gstrdsencbin.c: properties, the inner chain rdsvideoconvert ! NV12 ! queue ! vah26xenc !
+                   capsfilter, state changes) with a codec descriptor each (gstrdsh264enc.c, gstrdsh265enc.c);
+                   gstrdsencbin-va.c sets the VA encoder's properties at start, gstrdsencbin-probes.c has the pad
+                   probes (batches, sizes, filler, timestamps, DELTA_UNIT, copy-meta, caps, levels, the H.265 window),
+                   gstrdsencbin-sched.c the key-frame requests around the queue and the convert's allocation probe;
+                   gstrdsencbin-private.h the private struct, its locking rules and what the files share. The static
+                   rdsenc-gst (GStreamer core only: rds-enc-nal, the Annex-B helpers; rds-enc-caps, the caps decisions;
+                   rds-enc-keyunits, the key-frame bookkeeping) and rdsenc-props (GLib only: the property mapping and
+                   QP string parsers) are what the cpu tests link. Always built; at run time it needs the stock `va`
+                   plugin (vah264enc, vah265enc) and a Mesa VA driver that encodes: without them the elements
+                   register, and going to READY is an error naming the missing encoder
 docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its rdsinfer,
                    rdstracker and rdsanalytics config-key tables must match the key tables: the infer_config,
                    tracker_config and analytics_config tests check every row; element_compat_matrix checks the tiler,
-                   OSD, logger, sink, URI source bin and analytics property tables against the elements' properties)
+                   OSD, logger, sink, URI source bin, analytics and encoder property tables against the elements'
+                   properties)
 samples/rds-test2/ clean-room sample with a secondary classifier: YOLO11n, NvSORT, YOLO11n-cls on the vehicles
                    (per-frame object, vehicle and labelled counts, label totals; --dry-run, --no-display,
                    --pgie-config, --sgie-config, --tracker-config)
@@ -435,21 +457,38 @@ meson test -C build-rel --print-errorlogs
   reproducible export) into the git-ignored `.cache/models`, with its test reference data. Never commit it or
   anything derived from it; tests that need it `g_test_skip` with a message naming the script.
 - Put new tests next to the existing ones and register them in `tests/meson.build`, in the `cpu` or `gpu` suite.
+- The `cpu` suite must pass with no GPU devices at all (a hosted CI runner): run it in a container without `--device`
+  and `--group-add`. A check that needs a device goes behind `rds_test_have_gpu ()` (`tests/check/rds-test-util.h`)
+  or under a `/gpu` path.
+- One executable can feed a cpu and a gpu entry, split with GLib's `-p /cpu/...` and `-p /gpu/...`. `-p PATH` runs
+  only the tests one level below PATH, so keep test paths in such executables flat (`/gpu/enc/force-idr-h264`, not
+  `/gpu/enc/force-idr/h264`): deeper tests silently don't run.
+- **Encoder tests.** `enc_props` (the property mapping and QP strings), `enc_nal_cpu` (the Annex-B helpers and level
+  rewrite on captured parameter sets), `enc_caps` (the caps decisions) and `enc_keyunits` (the key-frame bookkeeping)
+  link the static libraries only; `element_enc_cpu` covers registration, properties and enums against DeepStream
+  8.0's, the inner chain and the start errors, with stand-ins under the VA factory names. The gpu side (`enc_nal`,
+  `element_enc`, `pipeline_enc`: encodes, a round trip through `rdsvideodec` with PSNR, a mux and demux branch) and
+  `rds_test3_output` (`rds-test3 --output` on the street clip) skip without `vah264enc` / `vah265enc`.
+  `pipeline_enc_soak` (also in the `soak` suite) encodes 3000 1080p frames per codec with the soak memory checks; it
+  checks the fps only when `RDS_TEST_ENC_MIN_FPS` is set (the shared iGPU's fps varies too much for a fixed floor).
+  `element_compat_matrix` checks the encoders' property tables.
 - The compat-matrix lints (`/cpu/infer-config/compat-matrix`, `/cpu/tracker-config/compat-matrix`) run only in
   builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
   check the rdsinfer key tables in `docs/compat-matrix.md`. `/cpu/analytics-config/compat-matrix` (rdsanalytics is
   always built) runs in every build. A new or changed config key needs its row there; the
   test's message prints the expected row. `/cpu/elements/compat-matrix` does the same for the property tables of
-  `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger`, `rdsvideosink`, `rdsurisrcbin` and `rdsanalytics`:
+  `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger`, `rdsvideosink`, `rdsurisrcbin`, `rdsanalytics`,
+  `rdsh264enc` and `rdsh265enc`:
   every property except those of GstObject, GstElement and GstBin needs a row (GstBaseTransform's `qos` included;
   GstBin's may have one), and a row naming no property fails too.
-- **Tracker, analytics, tiler, OSD, logger and sink behaviour.** Where NVIDIA's docs are silent, `rdstracker`,
-  `rdsanalytics`, `rdsmultistreamtiler`, `rdsosd`, `rdslogger` and `rdsvideosink` match observed DeepStream 8.0
-  behaviour, except where 8.0 is clearly broken; there they do the sane thing. Code comments say "DeepStream 8.0
-  behaviour" or "ours", and every such choice has a row in the compat matrix's behaviour tables ("Tracking
-  behaviour", "Analytics element behaviour", "Analytics behaviour", "Analytics drawing behaviour", "Tiling
-  behaviour", "Drawing behaviour", "Logging behaviour", "Display behaviour"), or in the analytics config section and
-  key table: keep them in step.
+- **Tracker, analytics, tiler, OSD, logger, sink and encoder behaviour.** Where NVIDIA's docs are silent,
+  `rdstracker`, `rdsanalytics`, `rdsmultistreamtiler`, `rdsosd`, `rdslogger`, `rdsvideosink`, `rdsh264enc` and
+  `rdsh265enc` match observed DeepStream 8.0 behaviour, except where 8.0 is clearly broken; there they do the sane
+  thing. Code comments say "DeepStream 8.0 behaviour" or "ours", and every such choice has a row in the compat
+  matrix's behaviour tables ("Tracking behaviour", "Analytics element behaviour", "Analytics behaviour", "Analytics
+  drawing behaviour", "Tiling behaviour", "Drawing behaviour", "Logging behaviour", "Display behaviour"), in the
+  analytics config section and key table, or in the encoders' property tables and stream behaviour lists: keep them
+  in step.
 - **Analytics metas (C++).** `RdsAnalyticsFrameMeta` and `RdsAnalyticsObjInfo` are C++ structs (std::string,
   std::vector, std::unordered_map) with libstdc++'s layout, so code that reads their fields must be built with the
   same `_GLIBCXX_USE_CXX11_ABI` as libgstrds-analytics (the default). Include `rds/rds-analytics-meta.h` at file

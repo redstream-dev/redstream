@@ -3,10 +3,11 @@
 **GStreamer video and audio analytics on AMD GPUs: an open-source, ROCm-based functional equivalent of NVIDIA DeepStream.**
 
 > Status: **pre-alpha.** The first milestone's pipeline runs end to end on an AMD GPU: decode → batch → detect →
-> track → analytics → tile → on-screen display → window, from files or RTSP streams, with the core library
-> `libgstrds`, twelve elements (`rdsurisrcbin`, `rdsvideodec`, `rdsvideoconvert`, `rdsstreammux`, `rdsstreamdemux`,
-> `rdsinfer`, `rdstracker`, `rdsanalytics`, `rdsmultistreamtiler`, `rdsosd`, `rdslogger`, `rdsvideosink`) and the
-> `rds-compile` tool (see "What works" below). APIs and element names will change.
+> track → analytics → tile → on-screen display → window or encoded file, from files or RTSP streams, with the core
+> library `libgstrds`, fourteen elements (`rdsurisrcbin`, `rdsvideodec`, `rdsvideoconvert`, `rdsstreammux`,
+> `rdsstreamdemux`, `rdsinfer`, `rdstracker`, `rdsanalytics`, `rdsmultistreamtiler`, `rdsosd`, `rdslogger`,
+> `rdsvideosink`, `rdsh264enc`, `rdsh265enc`) and the `rds-compile` tool (see "What works" below). APIs and element
+> names will change.
 
 ![A street clip with detection boxes, class labels and track IDs drawn by rdsosd](docs/media/demo.gif)
 
@@ -94,6 +95,14 @@ Jetson-specific hardware blocks.
 - **`rdslogger`** (`nvdslogger`): prints each stream's frame rate in DeepStream's `**PERF` line format.
 - **`rdsvideosink`** (`nveglglessink`, `nv3dsink`): shows frames in a window through a stock GStreamer sink
   (`autovideosink` by default), with the DeepStream sinks' property names.
+- **`rdsh264enc`, `rdsh265enc`** (`nvv4l2h264enc`, `nvv4l2h265enc`): H.264 and H.265 encoding, as bins over
+  GStreamer's VA-API encoders (`vah264enc`, `vah265enc`), from `memory:RDS` or system memory. DeepStream 8.0's
+  property names and defaults are mapped onto VA's (`bitrate`, also while playing, `control-rate`, `idrinterval`,
+  `profile`, `num-B-Frames`, …); the rest are accepted and do nothing. Parameter sets precede every IDR frame, CBR
+  filler is stripped, and without B frames the output has the input's timestamps. Also `copy-meta`, forced key frames
+  (`force-idr`, force-key-unit events), a profile and level set by downstream caps, and resolution changes mid-stream.
+  Sizes outside VA's range (128 to 4096 for H.264) are refused. The compat matrix has the details, and the
+  DeepStream 8.0 bugs they don't reproduce.
 - **`rds-compile`** (`trtexec`): compiles and caches `rdsinfer`'s MIGraphX program ahead of time.
 - **Compat header** `rds/rds_compat.h`: DeepStream names for the above, plus runtime remapping of element names
   (`nvurisrcbin` → `rdsurisrcbin`, `nvv4l2decoder` → `rdsvideodec`, `nvstreammux` → `rdsstreammux`, `nvinfer` →
@@ -146,9 +155,9 @@ GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 \
 ```
 
 `--no-display` runs to a fakesink as fast as it can; `GST_DEBUG=rdstracker:5` adds the tracker's per-frame log.
-`--output FILE` encodes the tiled, annotated frames into a file instead (`rdsvideoconvert` → `rdsh264enc` →
-`h264parse` → `qtmux` for `.mp4`, `matroskamux` for `.mkv`; `--codec h265` for `rdsh265enc` and `h265parse`), and
-wins over `--no-display`; the file is finished at the end of the streams or on Ctrl-C:
+`--output FILE` writes the tiled, annotated frames to a file instead of a window: `.mp4` (`qtmux`) or `.mkv`
+(`matroskamux`), through `rdsvideoconvert`, `rdsh264enc` and `h264parse`; `--codec h265` uses `rdsh265enc` and
+`h265parse`. It wins over `--no-display`, and the file is finished at the end of the streams or on Ctrl-C:
 
 ```bash
 GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 --output out.mp4 \
@@ -256,7 +265,7 @@ GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/cross
 | `nvdsanalytics` | `rdsanalytics` | works (ROI filtering, overcrowding, direction, line crossing) |
 | `nveglglessink`, `nv3dsink` | `rdsvideosink` | works |
 | `nvdslogger` | `rdslogger` | works |
-| `nvv4l2h264enc`, `nvv4l2h265enc` | `rdsh264enc`, `rdsh265enc` | in design (over the VA-API encoders; frames go through system memory for now, see "Zero-copy and where it stops") |
+| `nvv4l2h264enc`, `nvv4l2h265enc` | `rdsh264enc`, `rdsh265enc` | works (bins over GStreamer's VA-API encoders; frames go through system memory for now, see "Zero-copy and where it stops") |
 | Audio batching in `nvstreammux` / `nvstreamdemux` | audio in `rdsstreammux` / `rdsstreamdemux` | on request |
 | `nvinferaudio` | `rdsinferaudio` (MIGraphX) | on request |
 | `nvdsaudiotemplate` | `rdsaudiotemplate` | on request |
@@ -269,12 +278,12 @@ From decode to the last analytics element, frames stay in GPU memory (`memory:RD
 GPU surfaces, and batching, inference, tracking, analytics, tiling and on-screen display all work on them in place
 or GPU to GPU. Frames leave the GPU only where a stock GStreamer element takes over:
 
-- **Encoding (`rdsh264enc`, `rdsh265enc`, in design).** These will be bins over GStreamer's VA-API encoders
-  (`vah264enc`, `vah265enc`). Those encoders take NV12 in system memory or AMD-tiled VA surfaces, but Redstream's GPU
-  surfaces are linear, so the bins convert to NV12 on the GPU and then copy each frame to system memory. On the
-  Ryzen 7000 iGPU that costs about 1.4 ms per 1080p frame, against 7–11 ms for the encode itself (and on an APU the
-  "system memory" is the same DRAM). A zero-copy path, with the GPU writing straight into linear VA surfaces, is
-  planned behind the same elements.
+- **Encoding (`rdsh264enc`, `rdsh265enc`).** These are bins over GStreamer's VA-API encoders (`vah264enc`,
+  `vah265enc`). Those encoders take NV12 in system memory or AMD-tiled VA surfaces, but Redstream's GPU surfaces are
+  linear, so the bins convert to NV12 on the GPU and copy each frame into plain system memory, about 0.5 ms per
+  1080p frame on the Ryzen 7000 iGPU (on an APU the "system memory" is the same DRAM); the VA encoder then uploads
+  it. The encode runs on a thread of its own, so it overlaps the next frame's conversion. A zero-copy path, with the
+  GPU writing straight into VA surfaces, is still planned behind the same elements.
 - **Display (`rdsvideosink`).** It converts on the GPU, then hands system-memory frames to a stock video sink.
 - **`rdsosd process-mode=0`.** That mode draws on the CPU by design. The default mode draws on the GPU.
 
@@ -291,8 +300,8 @@ or GPU to GPU. Frames leave the GPU only where a stock GStreamer element takes o
   DeepStream's per-object classifier cache and the `rds-test2` sample.
 - Done: `rdsanalytics` (ROI filtering, overcrowding, direction and line crossing), with `rds-test3
   --analytics-config`.
-- Next: sliced inference (SAHI-style tiles of large frames, reusing the secondary-mode crops), then the H.264 encoder
-  for a recording branch.
+- Done: H.264 and H.265 encoding (`rdsh264enc`, `rdsh265enc`) for a recording branch, with `rds-test3 --output`.
+- Next: sliced inference (SAHI-style tiles of large frames, reusing the secondary-mode crops).
 - Pose detector with keypoints.
 - Metadata edits in pad probes.
 
@@ -324,10 +333,13 @@ Early numbers on a 2-CU Ryzen 9 7900X iGPU:
 - `rdsosd` at 1280×720 with about 60 objects, release build: about 0.3 ms per frame on the GPU (about 1.2 ms with
   `process-mode=0`, the CPU drawing and the GPU↔CPU syncs included). On 1920×1080 frames from `rdsstreamdemux`,
   which it draws on a private copy: about 0.9 ms on the GPU, about 7 ms on the CPU (the copy's CPU staging).
+- `rdsh264enc` / `rdsh265enc` at 1080p, 4 Mbit/s CBR, release build, `gst-launch-1.0` from `videotestsrc` uploaded
+  to the GPU into a fakesink: about 205 fps H.264 and about 215 fps H.265, the VA encoder's own limit with its copy
+  from system memory. With a parser after it (the 3000-frame soak test): 194–207 fps.
 
 ### Known issues
 
-Both were seen with ROCm 10.1 on the gfx1036 iGPU, which runs as gfx1030 through `HSA_OVERRIDE_GFX_VERSION`, a
+These two were seen with ROCm 10.1 on the gfx1036 iGPU, which runs as gfx1030 through `HSA_OVERRIDE_GFX_VERSION`, a
 configuration AMD does not support. Whether officially supported GPUs are affected is not known yet.
 
 - **SDMA copy faults.** With more HIP streams than hardware queues, which a multi-stream pipeline easily has, an
@@ -343,6 +355,15 @@ configuration AMD does not support. Whether officially supported GPUs are affect
   on an idle host they never failed. `HSA_DISABLE_CACHE=1` avoids it (0 of 80 runs) but costs about 23 % of
   `rds-test3`'s throughput, so only the test suite sets it. On affected systems, `process-mode=0` (drawing on the
   CPU) is not exposed.
+
+Two more come from the stack under the encoders, Mesa's VA driver and GStreamer 1.28's `va` plugin:
+
+- **H.265 widths that are not a multiple of 64.** `vah265enc` on Mesa 25.2.8 (radeonsi, as in `redstream:dev`)
+  signals them too wide (720×480 decodes 768 wide). `rdsh265enc` rewrites the SPS conformance window, so its
+  output decodes at the right size; bare `vah265enc` is affected.
+- **GStreamer 1.28's VA encoders.** They leak one `GstCaps` per frame-rate renegotiation. After a resolution change
+  they keep copying system-memory frames at the old size, so after a resize the bins write into VA's own surfaces
+  instead: correct, but slower.
 
 ## Getting started (development)
 
