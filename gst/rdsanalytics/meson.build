@@ -13,10 +13,21 @@ rdsanalytics_core_dep = declare_dependency(link_with : rdsanalytics_core,
   include_directories : include_directories('.'),
   dependencies : [dependency('glib-2.0'), rds_config_parse_dep, rdsanalytics_libm])
 
+# The overlays as display meta: libgstrds' meta types, so a static library of its own, linked by the plugin and its
+# tests, and the core stays GLib-only.
+rdsanalytics_draw = static_library('rdsanalytics-draw',
+  files('rds-analytics-draw.c'),
+  c_args : ['-DG_LOG_DOMAIN="rdsanalytics"'],
+  dependencies : [rds_dep, rdsanalytics_core_dep],
+  gnu_symbol_visibility : 'hidden',
+  pic : true)
+rdsanalytics_draw_dep = declare_dependency(link_with : rdsanalytics_draw,
+  dependencies : [rds_dep, rdsanalytics_core_dep])
+
 gstrdsanalytics = library('gstrdsanalytics',
   files('plugin.c', 'gstrdsanalytics.c'),
   c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdsanalytics"'],
-  dependencies : [rds_dep, rds_analytics_dep, gst_dep, gst_base_dep, rdsanalytics_core_dep],
+  dependencies : [rds_dep, rds_analytics_dep, gst_dep, gst_base_dep, rdsanalytics_core_dep, rdsanalytics_draw_dep],
   gnu_symbol_visibility : 'hidden',
   install_rpath : rds_install_rpath,
   install : true,

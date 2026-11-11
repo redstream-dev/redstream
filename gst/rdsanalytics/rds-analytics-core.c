@@ -114,13 +114,8 @@ rds_analytics_point_in_polygon (RdsAnalyticsPoint p, const RdsAnalyticsPoint * p
 #define EVICT_SWEEP_NS G_GUINT64_CONSTANT (1000000000)
 #define EVICT_SWEEP_FRAMES 30
 
-/* One rule, scaled to the mux output. */
-typedef struct
-{
-  gchar *label;
-  RdsAnalyticsPoint *points;
-  guint n_points;
-} CoreRule;
+/* One rule, scaled to the mux output: the config's type, so rds_analytics_core_get_rules can hand it out. */
+typedef RdsAnalyticsRule CoreRule;
 
 /* One enabled group. */
 typedef struct
@@ -953,6 +948,25 @@ rds_analytics_core_remove_stream (RdsAnalyticsCore * core, guint pad_index)
     st->lc_cum = NULL;
   }
   g_hash_table_remove (core->streams, GUINT_TO_POINTER (pad_index));
+}
+
+const RdsAnalyticsRule *
+rds_analytics_core_get_rules (const RdsAnalyticsCore * core, guint pad_index, RdsAnalyticsFeature feature,
+    guint * n_rules)
+{
+  const CoreRules *r;
+  const CoreGroup *g;
+
+  g_return_val_if_fail (n_rules != NULL, NULL);
+  *n_rules = 0;
+  g_return_val_if_fail (core != NULL, NULL);
+  g_return_val_if_fail (feature < RDS_ANALYTICS_N_FEATURES, NULL);
+
+  r = g_hash_table_lookup (core->rules, GUINT_TO_POINTER (pad_index));
+  if (r == NULL || (g = r->groups[feature]) == NULL)
+    return NULL;
+  *n_rules = g->n_rules;
+  return g->rules;
 }
 
 /* ------------------------------------------------------------------------------------------------------------ */

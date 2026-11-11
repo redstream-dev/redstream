@@ -1,7 +1,8 @@
 /* rdsanalytics: registration, the properties with their types, ranges, defaults and state flags, start errors (cpu);
  * and on scripted object meta in device-memory batches shaped as rdsstreammux makes them (gpu): pass-through, the
  * frame and object metas, pad_index against source_id, reloading config-file while playing, stream resets, partial
- * batches, sources removed and added at runtime, the untracked-object warning and a change of the mux output size.
+ * batches, sources removed and added at runtime, the untracked-object warning, a change of the mux output size and
+ * the display meta of each osd-mode.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 
@@ -934,6 +935,89 @@ test_out_size (void)
   gst_harness_teardown (h);
 }
 
+/* CONFIG with @property_extra in [property] in place of osd-mode=0. */
+static gchar *
+config_with (const gchar * property_extra)
+{
+  GString *s = g_string_new (CONFIG);
+
+  g_string_replace (s, "osd-mode=0\n", property_extra, 1);
+  return g_string_free (s, FALSE);
+}
+
+/* The frame's display metas, as one string per meta: "texts|lines", each text "s@x,y" and each line
+ * "x1,y1,x2,y2", ';'-separated, metas joined by " / ". */
+static gchar *
+display_string (RdsFrameMeta * fm)
+{
+  GString *s = g_string_new (NULL);
+
+  for (GList * l = fm->display_meta_list; l; l = l->next) {
+    const RdsDisplayMeta *dm = l->data;
+
+    if (s->len)
+      g_string_append (s, " / ");
+    for (guint i = 0; i < dm->num_labels; i++)
+      g_string_append_printf (s, "%s%s@%u,%u", i ? ";" : "", dm->text_params[i].display_text,
+          dm->text_params[i].x_offset, dm->text_params[i].y_offset);
+    g_string_append_c (s, '|');
+    for (guint i = 0; i < dm->num_lines; i++)
+      g_string_append_printf (s, "%s%u,%u,%u,%u", i ? ";" : "", dm->line_params[i].x1, dm->line_params[i].y1,
+          dm->line_params[i].x2, dm->line_params[i].y2);
+  }
+  return g_string_free (s, FALSE);
+}
+
+#define RF_LINES "0,0,320,0;320,0,320,480;320,480,0,480;0,480,0,0"
+#define DOWN_LINES "320,100,320,300;312,271,320,300;327,271,320,300;0,200,640,200"
+
+/* The overlays per osd-mode on a two-frame batch (stream 1 has no groups): none in mode 0, the count text alone in
+ * mode 0 with display-obj-cnt, the rules with their labels in mode 1, the counts and the objects' status text in
+ * mode 2 (DeepStream 8.0 behaviour; the field-by-field checks are analytics_draw's). */
+static void
+test_display (void)
+{
+  static const struct
+  {
+    const gchar *property;
+    const gchar *frame0, *frame1;
+    const gchar *obj_text;      /* the object in the ROI's text; NULL: none */
+  } cases[] = {
+    {"osd-mode=0\n", "", "", NULL},
+    {"osd-mode=0\ndisplay-obj-cnt=1\n", "Count for ClassId0=1@5,5|", "Count for ClassId0=1@5,5|", NULL},
+    {"osd-mode=1\n", "RF@0,0;Down @640,200|" RF_LINES ";" DOWN_LINES, "", NULL},
+    {"osd-mode=2\n", "RF=1@0,0;Down=0@640,200|" RF_LINES ";" DOWN_LINES, "", " ROI:RF"},
+  };
+
+  RDS_TEST_REQUIRE_GPU ();
+  for (guint c = 0; c < G_N_ELEMENTS (cases); c++) {
+    gchar *config = config_with (cases[c].property), *got;
+    GstHarness *h = harness_for (new_analytics (config), NULL);
+    GstBuffer *buf = new_batch (2, NULL);
+    RdsObjectMeta *in_roi = add_obj (buf, 0, 1, 0, 100, 300), *other = add_obj (buf, 1, 2, 0, 100, 300);
+
+    g_test_message ("%s", cases[c].property);
+    buf = run (h, buf);
+    got = display_string (nth_frame (buf, 0));
+    g_assert_cmpstr (got, ==, cases[c].frame0);
+    g_free (got);
+    got = display_string (nth_frame (buf, 1));
+    g_assert_cmpstr (got, ==, cases[c].frame1);
+    g_free (got);
+    g_assert_cmpstr (in_roi->text_params.display_text, ==, cases[c].obj_text);
+    if (cases[c].obj_text) {
+      g_assert_cmpuint (in_roi->text_params.x_offset, ==, 90);
+      g_assert_cmpuint (in_roi->text_params.y_offset, ==, 250);
+      g_assert_cmpfloat (in_roi->rect_params.border_color.green, ==, 1);
+      g_assert_cmpfloat (in_roi->rect_params.border_color.blue, ==, 1);
+    }
+    g_assert_null (other->text_params.display_text);
+    gst_buffer_unref (buf);
+    gst_harness_teardown (h);
+    g_free (config);
+  }
+}
+
 static void
 remove_dir (const gchar * dir)
 {
@@ -977,6 +1061,7 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/analytics/restart", test_restart);
   g_test_add_func ("/gpu/analytics/untracked-warning", test_untracked_warning);
   g_test_add_func ("/gpu/analytics/out-size", test_out_size);
+  g_test_add_func ("/gpu/analytics/display", test_display);
   /* gst_deinit stops GStreamer's task-pool threads before exit (see AGENTS.md) */
   ret = g_test_run ();
   gst_object_unref (dev_alloc);

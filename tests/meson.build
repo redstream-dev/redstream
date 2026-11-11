@@ -335,6 +335,11 @@ test('analytics_config', executable('analytics_config', 'check' / 'analytics_con
 test('analytics_core', executable('analytics_core', 'check' / 'analytics_core.c',
     dependencies : [rdsanalytics_core_dep]),
   suite : 'cpu', env : internal_test_env, protocol : 'tap')
+# The analytics overlays (osd-mode, display-obj-cnt): the display meta and object text built from the core's result
+# on scripted frames, field by field against DeepStream 8.0's dumps. Links the shared libgstrds, loads no plugin.
+test('analytics_draw', executable('analytics_draw', 'check' / 'analytics_draw.c',
+    dependencies : [rdsanalytics_draw_dep, gst_dep]),
+  suite : 'cpu', env : test_env, protocol : 'tap')
 # The analytics metas (libgstrds-analytics) through their C API: attach, read back, deep copies, release (leaks and
 # double frees show under ASan).
 test('analytics_meta', executable('analytics_meta', 'check' / 'analytics_meta.c',

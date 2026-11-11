@@ -3,7 +3,8 @@
  * documentation.
  *
  * An in-place GstBaseTransform in passthrough mode: buffers go downstream unchanged, with the results added to their
- * RdsBatchMeta as user metas (rds-analytics-meta.h). Pixels are never touched. The analytics themselves are the
+ * RdsBatchMeta as user metas (rds-analytics-meta.h) and display metas. Pixels are never touched: an OSD downstream
+ * draws the overlays. The analytics themselves are the
  * GLib-only core in rds-analytics-core; this file feeds it and writes its results.
  * - start (READY -> PAUSED) loads config-file, which is required even with enable=FALSE (DeepStream 8.0 behaviour;
  *   8.0 fails the state change without posting an ERROR, we post one: ours). The core is made on the first batch,
@@ -16,7 +17,8 @@
  *   unique-id is read per batch.
  * - Per batch, under the core lock and the batch meta lock: each frame meta in turn (partial batches and repeated
  *   streams included) goes through the core with its pad_index and buf_pts; then the frame gets its analytics frame
- *   meta, and each object with something to report its object info (DeepStream 8.0 behaviour).
+ *   meta, and each object with something to report its object info (DeepStream 8.0 behaviour); then the osd-mode
+ *   overlays as display meta, and in osd-mode 2 the objects' status text and border (rds-analytics-draw).
  * - Stream events (ours: 8.0 ignores them): rds-stream-reset resets the stream's state, rds-pad-deleted frees it
  *   (keeping its cumulative line-crossing counts). Every event still goes downstream.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
@@ -24,6 +26,7 @@
 
 #include "rds-analytics-config.h"
 #include "rds-analytics-core.h"
+#include "rds-analytics-draw.h"
 
 #include <rds/rds.h>
 #include <rds/rds-analytics-meta.h>
@@ -312,8 +315,9 @@ process_frame (GstRdsAnalytics * self, RdsFrameMeta * fm, guint uid)
 
   write_frame_meta (fm, &res, uid);
   write_obj_infos (self->obj_metas, &res, uid);
-  /* The display meta of this frame (osd-mode, display-obj-cnt) is built here, from the same res: its arrays are
-   * the core's and are valid only until the next rds_analytics_core_process_frame. */
+  /* the overlays (osd-mode, display-obj-cnt) from the same res, whose arrays are the core's and are valid only until
+   * the next rds_analytics_core_process_frame */
+  rds_analytics_draw_frame (fm, self->cfg, self->core, &res, (RdsObjectMeta * const *) self->obj_metas->pdata);
 }
 
 /* Passthrough with transform_ip, as in rdstracker: the buffer is never made writable; the shared RdsBatchMeta is
