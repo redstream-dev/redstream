@@ -524,6 +524,16 @@ test('element_enc_cpu', element_enc_exe, args : ['-p', '/cpu/enc'],
 test('element_enc', element_enc_exe, args : ['-p', '/gpu/enc'],
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
+# rdsh264enc / rdsh265enc in pipelines: a round trip per codec through rdsvideodec (frame count, PTS and every frame's
+# PSNR against the source), two sources through rdsstreammux and rdsstreamdemux into one encoder each (gpu); and (its
+# own entry, pipeline_enc_soak, also in the soak suite) 3000 1080p frames per codec with the host and GPU memory
+# check. All skip without the VA encoders.
+pipeline_enc_exe = executable('pipeline_enc', 'check' / 'pipeline_enc.c', dependencies : pipeline_deps)
+test('pipeline_enc', pipeline_enc_exe, args : ['-p', '/gpu/enc-pipeline'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
+test('pipeline_enc_soak', pipeline_enc_exe, args : ['-p', '/gpu/enc-soak'],
+  suite : ['gpu', 'soak'], env : test_env, protocol : 'tap', is_parallel : false, timeout : 600, depends : rds_plugins)
+
 # rdsvideosink: properties, forwarding and start errors (cpu); RDS frames into the inner sink, batched input (gpu).
 element_videosink_exe = executable('element_videosink', 'check' / 'element_videosink.c',
   dependencies : test_deps + [gst_video_dep])
