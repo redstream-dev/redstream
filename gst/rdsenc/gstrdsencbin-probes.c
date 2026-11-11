@@ -1,10 +1,12 @@
-/* Redstream: GstRdsEncBin's pad probes: the preferred profile and the level warning on the VA encoder's caps; filler
- * stripping, the H.265 conformance window, the input's timestamps, DELTA_UNIT, the framerate in the caps, batch
- * refusal and copy-meta on its stream. Locking: gstrdsencbin-private.h.
+/* Redstream: GstRdsEncBin's pad probes: the preferred profile and the level warning on the VA encoder's caps, the
+ * input size check on the bin's sink pad; filler stripping, the H.265 conformance window, the input's timestamps
+ * (on buffers, segments and force-key-unit events), DELTA_UNIT, the framerate in the caps, batch refusal and
+ * copy-meta on its stream. Locking: gstrdsencbin-private.h.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsencbin-private.h"
 
 #include <rds/rds.h>
+#include <gst/video/video.h>
 
 #include "rds-enc-caps.h"
 #include "rds-enc-props.h"
@@ -124,6 +126,134 @@ caps_event_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   return GST_PAD_PROBE_OK;
 }
 
+/* ---- the input size ---- */
+
+/* The sizes the VA encoder takes on system memory (its sink template's range: on this driver H.264 128..4096 on each
+ * side, H.265 width 130..8192 and height 128..4352), as the bin's sink pad (a ghost of rdsvideoconvert's) answers
+ * for them. Without this rdsvideoconvert, which takes 1..16384, would scale the frames to a size VA takes.
+ * - CAPS queries: the answer is limited to that range, so upstream picks a size VA takes (the pad template stays
+ *   rdsvideoconvert's).
+ * - Accept-caps: a size outside is refused, silently. GStreamer checks every CAPS event with an accept-caps query on
+ *   the pad it reaches, so caps outside, at the start or mid-stream, are not-negotiated, as with VA alone.
+ * - The warning naming the range, once per run (ours: VA posts nothing), comes when negotiation really fails: at a
+ *   CAPS event outside the range (event probes run before that accept-caps check), or at a CAPS query whose answer
+ *   the limit leaves empty (upstream caps that fix a size outside, as a capsfilter does: no CAPS event follows).
+ * Sizes inside, odd ones included, are accepted; VA codes an odd size as the next even one (DeepStream 8.0
+ * behaviour). Accept-caps and CAPS events are judged on fixed caps only, by the first structure's width and height;
+ * caps features are ignored on purpose, since rdsvideoconvert turns every memory it takes into VA's system memory. */
+
+typedef struct
+{
+  gint min_w, max_w, min_h, max_h;
+} SizeRange;
+
+/* The range, or FALSE when none is known (any size is left to VA). */
+static gboolean
+get_size_range (GstRdsEncBin * self, SizeRange * r)
+{
+  GstRdsEncBinPrivate *priv = PRIV (self);
+  gboolean known;
+
+  GST_OBJECT_LOCK (self);
+  known = priv->have_size_range;
+  *r = (SizeRange) { priv->min_width, priv->max_width, priv->min_height, priv->max_height };
+  GST_OBJECT_UNLOCK (self);
+  return known;
+}
+
+/* Fixed @caps whose (first structure's) size is outside the range; *@w x *@h is that size. */
+static gboolean
+size_outside (GstRdsEncBin * self, const GstCaps * caps, gint * w, gint * h, SizeRange * r)
+{
+  const GstStructure *st;
+
+  if (caps == NULL || !gst_caps_is_fixed (caps) || !get_size_range (self, r))
+    return FALSE;
+  st = gst_caps_get_structure (caps, 0);
+  if (!gst_structure_get_int (st, "width", w) || !gst_structure_get_int (st, "height", h))
+    return FALSE;
+  return *w < r->min_w || *w > r->max_w || *h < r->min_h || *h > r->max_h;
+}
+
+/* The warning, the first time in a run: @what is the size refused. */
+static void
+warn_size (GstRdsEncBin * self, const gchar * what, const SizeRange * r)
+{
+  GstRdsEncBinPrivate *priv = PRIV (self);
+  gboolean warn;
+
+  GST_OBJECT_LOCK (self);
+  warn = !priv->size_warned;
+  priv->size_warned = TRUE;
+  GST_OBJECT_UNLOCK (self);
+  if (warn)
+    g_warning ("%s: %s is outside the sizes the VA encoder takes for %s (width %d to %d, height %d to %d): not "
+        "negotiated", GST_OBJECT_NAME (self), what, GST_RDS_ENC_BIN_GET_CLASS (self)->info->codec_name, r->min_w,
+        r->max_w, r->min_h, r->max_h);
+}
+
+/* CAPS events into the bin: the warning (sink_probe). */
+static void
+check_caps_event (GstRdsEncBin * self, GstEvent * ev)
+{
+  GstCaps *caps;
+  SizeRange r;
+  gint w, h;
+  gchar *what;
+
+  gst_event_parse_caps (ev, &caps);
+  if (!size_outside (self, caps, &w, &h, &r))
+    return;
+  what = g_strdup_printf ("%dx%d", w, h);
+  warn_size (self, what, &r);
+  g_free (what);
+}
+
+/* Queries on the bin's sink pad: accept-caps refused outside the range (before rdsvideoconvert answers), CAPS
+ * answers limited to it (after). */
+static GstPadProbeReturn
+sink_query_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstRdsEncBin *self = user_data;
+  GstQuery *q = GST_PAD_PROBE_INFO_QUERY (info);
+  gboolean pull = (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_PULL) != 0;
+  GstCaps *caps, *limited, *filter;
+  SizeRange r;
+  gint w, h;
+  gchar *what;
+
+  if (GST_QUERY_TYPE (q) == GST_QUERY_ACCEPT_CAPS && !pull) {
+    gst_query_parse_accept_caps (q, &caps);
+    if (!size_outside (self, caps, &w, &h, &r))
+      return GST_PAD_PROBE_OK;
+    GST_DEBUG_OBJECT (self, "refusing %dx%d: outside %d..%d x %d..%d", w, h, r.min_w, r.max_w, r.min_h, r.max_h);
+    gst_query_set_accept_caps_result (q, FALSE);
+    return GST_PAD_PROBE_HANDLED;
+  }
+  if (GST_QUERY_TYPE (q) == GST_QUERY_CAPS && pull) {
+    gst_query_parse_caps_result (q, &caps);
+    if (caps == NULL || !get_size_range (self, &r))
+      return GST_PAD_PROBE_OK;
+    limited = rds_enc_caps_limit_size (caps, r.min_w, r.max_w, r.min_h, r.max_h);
+    GST_LOG_OBJECT (self, "caps %" GST_PTR_FORMAT " limited to %" GST_PTR_FORMAT, caps, limited);
+    if (gst_caps_is_empty (limited) && !gst_caps_is_empty (caps)) {
+      /* only sizes outside were asked for: name them from the filter when it fixes one */
+      gst_query_parse_caps (q, &filter);
+      if (filter != NULL && gst_caps_get_size (filter) > 0
+          && gst_structure_get_int (gst_caps_get_structure (filter, 0), "width", &w)
+          && gst_structure_get_int (gst_caps_get_structure (filter, 0), "height", &h))
+        what = g_strdup_printf ("%dx%d", w, h);
+      else
+        what = g_strdup ("the size asked for");
+      warn_size (self, what, &r);
+      g_free (what);
+    }
+    gst_query_set_caps_result (q, limited);
+    gst_caps_unref (limited);
+  }
+  return GST_PAD_PROBE_OK;
+}
+
 /* ---- the stream probes ---- */
 
 static void
@@ -178,7 +308,6 @@ void
 gst_rds_enc_bin_reset_probes (GstRdsEncBin * self, gboolean copy_meta)
 {
   GstRdsEncBinPrivate *priv = PRIV (self);
-
   GList *old;
 
   g_mutex_lock (&priv->probe_lock);
@@ -257,7 +386,8 @@ add_record (GstRdsEncBinPrivate * priv, MetaRecord * r)
 
 /* The bin's input, before the convert: a batch of more than one frame is an element error (ours: DeepStream 8.0
  * encodes the first frame only, silently). With copy-meta, the input metas are recorded here, on the original
- * buffer: the VA encoder sees the converted one. A flush drops the records. */
+ * buffer: the VA encoder sees the converted one. A flush drops the records. A CAPS event of a size VA doesn't take
+ * gives the size warning (see the input size). */
 static GstPadProbeReturn
 sink_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
@@ -271,6 +401,8 @@ sink_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_da
   if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_EVENT_BOTH) {
     if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_EVENT (info)) == GST_EVENT_FLUSH_STOP)
       clear_records (priv);
+    else if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_EVENT (info)) == GST_EVENT_CAPS)
+      check_caps_event (self, GST_PAD_PROBE_INFO_EVENT (info));
     return GST_PAD_PROBE_OK;
   }
   if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
@@ -397,6 +529,9 @@ va_sink_event_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointe
  * - CAPS: from here on the frames are those of the latest input caps (VA drains the older frames first); a framerate
  *   other than the input's is replaced by the input's (ours: VA keeps the old one after a frame-rate change, and
  *   when its caps don't change otherwise it sends none: then va_src_buffer_probe sends them).
+ * - force-key-unit (VA's, before the IDR frame it forced): its timestamp is the frame's PTS, shifted like the
+ *   buffers, and the shift is removed from it as from them; its stream time and running time VA computes against its
+ *   own (shifted) segment, so they are the input's already.
  * - EOS: every frame is out; the copy-meta records go. */
 static GstPadProbeReturn
 va_src_event_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
@@ -411,8 +546,9 @@ va_src_event_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer
   VideoSize v;
   guint b_frames;
   guint32 seqnum;
-  GstClockTime va_shift, shift;
-  gboolean again = FALSE, unshift;
+  GstClockTime va_shift, shift, ts, stream_time, running_time;
+  gboolean again = FALSE, unshift, all_headers;
+  guint count;
 
   switch (GST_EVENT_TYPE (ev)) {
     case GST_EVENT_SEGMENT:
@@ -479,6 +615,17 @@ va_src_event_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer
       g_mutex_lock (&priv->probe_lock);
       gst_caps_replace (&priv->out_caps, caps);
       g_mutex_unlock (&priv->probe_lock);
+      break;
+    case GST_EVENT_CUSTOM_DOWNSTREAM:
+      if (!gst_video_event_is_force_key_unit (ev) || !gst_video_event_parse_downstream_force_key_unit (ev, &ts,
+              &stream_time, &running_time, &all_headers, &count))
+        break;
+      g_mutex_lock (&priv->probe_lock);
+      shift = priv->shift;
+      g_mutex_unlock (&priv->probe_lock);
+      if (shift > 0 && GST_CLOCK_TIME_IS_VALID (ts))
+        out = gst_video_event_new_downstream_force_key_unit (rds_enc_ts_unshift (ts, shift), stream_time,
+            running_time, all_headers, count);
       break;
     case GST_EVENT_EOS:
       clear_records (priv);
@@ -642,4 +789,6 @@ gst_rds_enc_bin_add_probes (GstRdsEncBin * self, GstElement * encoder)
   gst_object_unref (pad);
   gst_pad_add_probe (priv->sink_ghost, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST
       | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM | GST_PAD_PROBE_TYPE_EVENT_FLUSH, sink_probe, self, NULL);
+  gst_pad_add_probe (priv->sink_ghost, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM | GST_PAD_PROBE_TYPE_PUSH
+      | GST_PAD_PROBE_TYPE_PULL, sink_query_probe, self, NULL);
 }

@@ -3,25 +3,29 @@
  *
  *   ghost sink pad -> rdsvideoconvert -> video/x-raw,format=NV12 -> vah26xenc -> capsfilter -> ghost src pad
  *
- * The frames, memory:RDS or system memory (ours: DeepStream 8.0 takes NVMM only), are converted to system-memory
- * NV12 and encoded by GStreamer's stock VA encoder. The inner elements are made when the bin first goes to READY, so
- * the elements always register and a missing VA encoder is an element error at start. Every property gst-inspect
- * shows for DeepStream 8.0's encoders keeps its name, type, range and default; the flags say what really happens
- * (ours: 8.0's are wrong both ways): bitrate, force-idr and force-intra are live, every other writable property is
- * read at READY to PAUSED (set later, it is stored with a warning and applied at the next start). The properties
- * the VA encoder has no counterpart for are stored and do nothing; a value other than the default logs one warning
- * per property (ours). Pad probes, not extra elements, shape the VA encoder's output: filler NAL units stripped, the
- * H.265 conformance window fixed, the input's timestamps and segment restored (without B frames), DELTA_UNIT set from
- * the picture type, the input's framerate kept in the caps, batches refused and, with copy-meta, the input's metas
- * copied over. Behaviour matching DeepStream 8.0 is marked "DeepStream 8.0 behaviour", our choices "ours"; every
- * such choice has a row in docs/compat-matrix.md. The pad probes are in gstrdsencbin-probes.c, the VA encoder's
- * configuration in gstrdsencbin-va.c, the shared struct and the locking rules in gstrdsencbin-private.h.
+ * The frames, memory:RDS or system memory (ours: DeepStream 8.0 takes NVMM only), are converted to system-memory NV12
+ * and encoded by GStreamer's stock VA encoder. The inner elements are made when the bin first goes to READY, so the
+ * elements always register and a missing VA encoder is an element error at start. Every property gst-inspect shows for
+ * DeepStream 8.0's encoders keeps its name, type, range and default; the flags say what really happens (ours: 8.0's are
+ * wrong both ways): bitrate, force-idr and force-intra are live, every other writable property is read at READY to
+ * PAUSED (set later, it is stored with a warning and applied at the next start); force-idr and force-intra send the VA
+ * encoder a force-key-unit event. The properties the VA encoder has no counterpart for are stored and do nothing; a
+ * value other than the default logs one warning per property (ours). Pad probes, not extra elements, shape the VA
+ * encoder's output: filler NAL units stripped, the H.265 conformance window fixed, the input's timestamps and segment
+ * restored (without B frames), DELTA_UNIT set from the picture type, the input's framerate kept in the caps, batches
+ * and sizes VA can't take refused and, with copy-meta, the input's metas copied over. Behaviour matching DeepStream 8.0
+ * is marked "DeepStream 8.0 behaviour", our choices "ours"; every such choice has a row in docs/compat-matrix.md. The
+ * pad probes are in gstrdsencbin-probes.c, the VA encoder's configuration in gstrdsencbin-va.c, the shared struct and
+ * the locking rules in gstrdsencbin-private.h.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsencbin.h"
 #include "gstrdsencbin-private.h"
 
+#include "rds-enc-caps.h"
 #include "rds-enc-props.h"
 #include "rds-video-convert-caps.h"
+
+#include <gst/video/video.h>
 
 GST_DEBUG_CATEGORY (gst_rds_enc_bin_debug);
 #define GST_CAT_DEFAULT gst_rds_enc_bin_debug
@@ -149,12 +153,18 @@ build_chain (GstRdsEncBin * self)
 
   gst_rds_enc_bin_add_probes (self, encoder);
 
+  pad = gst_element_get_static_pad (encoder, "sink");
+  caps = gst_pad_get_pad_template_caps (pad);
+  gst_object_unref (pad);
   GST_OBJECT_LOCK (self);
+  priv->have_size_range = rds_enc_caps_size_range (caps, &priv->min_width, &priv->max_width, &priv->min_height,
+      &priv->max_height);
   priv->convert = convert;
   priv->rawcaps = rawcaps;
   priv->encoder = encoder;
   priv->srccaps = srccaps;
   GST_OBJECT_UNLOCK (self);
+  gst_caps_unref (caps);
   return TRUE;
 }
 
@@ -183,6 +193,7 @@ reset_run (GstRdsEncBin * self)
   priv->b_frames_set = 0;
   priv->b_frames_warned = FALSE;
   priv->level_warned = FALSE;
+  priv->size_warned = FALSE;
   GST_OBJECT_UNLOCK (self);
   gst_rds_enc_bin_reset_probes (self, FALSE);
 }
@@ -222,6 +233,37 @@ is_started (GstRdsEncBin * self)
   return MAX (GST_STATE (self), MAX (GST_STATE_NEXT (self), GST_STATE_PENDING (self))) > GST_STATE_READY;
 }
 
+/* force-idr or force-intra (@what) set TRUE: the next frame the VA encoder takes becomes an IDR frame with parameter
+ * sets (force-intra too: VA can't force a non-IDR intra frame; ours). The request is an upstream force-key-unit event
+ * (all headers, running time NONE: the next frame) sent into the VA encoder's src pad. Upstream events aren't
+ * serialized, so the caller never waits for the streaming thread: a downstream one sent into VA's sink pad would
+ * take its stream lock, held while a frame is pushed, and block the caller as long as a prerolled sink holds that
+ * frame in PAUSED. VA makes the same frame the IDR either way. The event goes through min-force-key-unit-interval like
+ * any other. Before the start (NULL, READY) it does nothing: VA's pads are inactive, and the first frame is an IDR
+ * frame anyway (ours; DeepStream 8.0's flags say NULL or READY, but it acts on them in PLAYING). */
+static void
+request_key_unit (GstRdsEncBin * self, const gchar * what)
+{
+  GstRdsEncBinPrivate *priv = PRIV (self);
+  GstElement *encoder;
+  gboolean sent = FALSE;
+
+  g_mutex_lock (&priv->va_lock);
+  encoder = get_encoder (self);
+  if (encoder != NULL) {
+    GstPad *pad = gst_element_get_static_pad (encoder, "src");
+
+    sent = gst_pad_send_event (pad, gst_video_event_new_upstream_force_key_unit (GST_CLOCK_TIME_NONE, TRUE, 0));
+    gst_object_unref (pad);
+    gst_object_unref (encoder);
+  }
+  g_mutex_unlock (&priv->va_lock);
+  if (sent)
+    GST_DEBUG_OBJECT (self, "%s: the next frame is an IDR frame", what);
+  else
+    GST_DEBUG_OBJECT (self, "%s: not sent (not started or flushing)", what);
+}
+
 /* A QP string property's new value @s is well formed (NULL unsets it). */
 static gboolean
 qp_string_ok (guint prop_id, const gchar * s)
@@ -258,7 +300,8 @@ gst_rds_enc_bin_set_property (GObject * object, guint prop_id, const GValue * va
 
   /* force-idr and force-intra are requests, never stored: they read back FALSE */
   if (prop_id == PROP_FORCE_IDR || prop_id == PROP_FORCE_INTRA) {
-    GST_DEBUG_OBJECT (self, "%s %d", pspec->name, g_value_get_boolean (value));
+    if (g_value_get_boolean (value))
+      request_key_unit (self, pspec->name);
     return;
   }
 

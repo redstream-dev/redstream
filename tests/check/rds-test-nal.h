@@ -1,7 +1,8 @@
 /* A small Annex-B walker for the encoder tests, written separately from the plugin's own NAL code so it checks that
  * code independently: NAL units and access units of a byte stream, NAL types, the first slice's slice_type (H.264
- * and HEVC), the SPS profile_idc / level_idc and the SPS cropping (H.264 frame cropping, HEVC conformance window)
- * with the displayed size. Header-only (static inline functions); fails the test on a stream it can't read.
+ * and HEVC), the SPS profile_idc / level_idc, the SPS cropping (H.264 frame cropping, HEVC conformance window)
+ * with the displayed size, and the VUI's timing info. Header-only (static inline functions); fails the test on a
+ * stream it can't read.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_TEST_NAL_H
 #define RDS_TEST_NAL_H
@@ -156,7 +157,40 @@ typedef struct
   guint width, height;          /* displayed size */
   gsize window_bit;             /* HEVC: RBSP bit offset (header included) of conformance_window_flag */
   gsize tail_bit;               /* HEVC: RBSP bit offset just after the conformance window */
+  gboolean timing;              /* VUI timing info present */
+  guint num_units_in_tick, time_scale;  /* the VUI's (0 without timing info) */
 } RdsTestSps;
+
+/* The VUI fields before the timing info that H.264 and HEVC share: aspect ratio, overscan, video signal type,
+ * chroma location. */
+static inline void
+rds_test_vui_skip_common (RdsTestBits * b)
+{
+  if (rds_test_bit (b) && rds_test_bits (b, 8) == 255)  /* aspect_ratio_info_present_flag, aspect_ratio_idc */
+    (void) rds_test_bits (b, 32);       /* sar_width, sar_height */
+  if (rds_test_bit (b))         /* overscan_info_present_flag */
+    (void) rds_test_bit (b);
+  if (rds_test_bit (b)) {       /* video_signal_type_present_flag */
+    (void) rds_test_bits (b, 4);        /* video_format, video_full_range_flag */
+    if (rds_test_bit (b))       /* colour_description_present_flag */
+      (void) rds_test_bits (b, 24);
+  }
+  if (rds_test_bit (b)) {       /* chroma_loc_info_present_flag */
+    (void) rds_test_ue (b);
+    (void) rds_test_ue (b);
+  }
+}
+
+/* The timing info at @b (timing_info_present_flag first) into @sps. */
+static inline void
+rds_test_vui_timing (RdsTestBits * b, RdsTestSps * sps)
+{
+  sps->timing = rds_test_bit (b);
+  if (sps->timing) {
+    sps->num_units_in_tick = rds_test_bits (b, 32);
+    sps->time_scale = rds_test_bits (b, 32);
+  }
+}
 
 static inline void
 rds_test_h264_skip_scaling_list (RdsTestBits * b, guint n)
@@ -242,6 +276,10 @@ rds_test_h264_sps (const guint8 * nal, gsize size, RdsTestSps * sps)
     sub_w = sub_h = 1;
   else if (sps->chroma_format_idc == 2)
     sub_h = 1;
+  if (rds_test_bit (&b)) {      /* vui_parameters_present_flag */
+    rds_test_vui_skip_common (&b);
+    rds_test_vui_timing (&b, sps);
+  }
   unit_x = sps->chroma_format_idc == 0 ? 1 : sub_w;
   unit_y = (sps->chroma_format_idc == 0 ? 1 : sub_h) * (2 - frame_mbs_only);
   sps->width = sps->coded_width - unit_x * (sps->crop_left + sps->crop_right);
@@ -249,13 +287,61 @@ rds_test_h264_sps (const guint8 * nal, gsize size, RdsTestSps * sps)
   g_byte_array_unref (rbsp);
 }
 
-/* Parses an HEVC SPS NAL unit (2-byte header included) up to the conformance window. */
+/* HEVC scaling_list_data (). */
 static inline void
-rds_test_h265_sps (const guint8 * nal, gsize size, RdsTestSps * sps)
+rds_test_h265_skip_scaling_lists (RdsTestBits * b)
+{
+  for (guint size_id = 0; size_id < 4; size_id++) {
+    for (guint matrix_id = 0; matrix_id < 6; matrix_id += size_id == 3 ? 3 : 1) {
+      if (!rds_test_bit (b)) {  /* scaling_list_pred_mode_flag */
+        (void) rds_test_ue (b); /* scaling_list_pred_matrix_id_delta */
+        continue;
+      }
+      if (size_id > 1)
+        (void) rds_test_se (b); /* scaling_list_dc_coef_minus8 */
+      for (guint i = 0; i < MIN (64u, 1u << (4 + (size_id << 1))); i++)
+        (void) rds_test_se (b); /* scaling_list_delta_coef */
+    }
+  }
+}
+
+/* HEVC st_ref_pic_set (@idx) in an SPS; @num_delta_pocs holds NumDeltaPocs of the sets before it, and gets its own. */
+static inline void
+rds_test_h265_skip_st_ref_pic_set (RdsTestBits * b, guint idx, guint * num_delta_pocs)
+{
+  if (idx != 0 && rds_test_bit (b)) {   /* inter_ref_pic_set_prediction_flag (delta_idx_minus1 only in slices) */
+    guint n = 0;
+
+    (void) rds_test_bit (b);    /* delta_rps_sign */
+    (void) rds_test_ue (b);     /* abs_delta_rps_minus1 */
+    for (guint j = 0; j <= num_delta_pocs[idx - 1]; j++) {
+      gboolean used = rds_test_bit (b), use_delta = TRUE;      /* used_by_curr_pic_flag */
+
+      if (!used)
+        use_delta = rds_test_bit (b);   /* use_delta_flag */
+      n += used || use_delta;
+    }
+    num_delta_pocs[idx] = n;
+  } else {
+    guint neg = rds_test_ue (b), pos = rds_test_ue (b);
+
+    for (guint i = 0; i < neg + pos; i++) {
+      (void) rds_test_ue (b);   /* delta_poc_s0/s1_minus1 */
+      (void) rds_test_bit (b);  /* used_by_curr_pic_s0/s1_flag */
+    }
+    num_delta_pocs[idx] = neg + pos;
+  }
+}
+
+/* Parses an HEVC SPS NAL unit (2-byte header included) up to the conformance window, and with @vui on to the VUI's
+ * timing info. */
+static inline void
+rds_test_h265_sps_parse (const guint8 * nal, gsize size, RdsTestSps * sps, gboolean vui)
 {
   GByteArray *rbsp = rds_test_nal_rbsp (nal, size);
   RdsTestBits b = { rbsp->data, rbsp->len * 8, 16 };
-  guint max_sub, sub_profile[8] = { 0 }, sub_level[8] = { 0 }, sub_w = 2, sub_h = 2;
+  guint max_sub, sub_profile[8] = { 0 }, sub_level[8] = { 0 }, sub_w = 2, sub_h = 2, log2_poc_lsb, n;
+  guint num_delta_pocs[65] = { 0 };
 
   memset (sps, 0, sizeof (*sps));
   g_assert_cmpuint ((nal[0] >> 1) & 0x3f, ==, 33);
@@ -297,6 +383,51 @@ rds_test_h265_sps (const guint8 * nal, gsize size, RdsTestSps * sps)
     sps->crop_bottom = rds_test_ue (&b);
   }
   sps->tail_bit = b.at;
+  if (!vui)
+    goto done;
+
+  (void) rds_test_ue (&b);      /* bit_depth_luma_minus8 */
+  (void) rds_test_ue (&b);      /* bit_depth_chroma_minus8 */
+  log2_poc_lsb = rds_test_ue (&b) + 4;
+  for (guint i = rds_test_bit (&b) ? 0 : max_sub; i <= max_sub; i++) { /* sps_sub_layer_ordering_info_present_flag */
+    (void) rds_test_ue (&b);    /* sps_max_dec_pic_buffering_minus1 */
+    (void) rds_test_ue (&b);    /* sps_max_num_reorder_pics */
+    (void) rds_test_ue (&b);    /* sps_max_latency_increase_plus1 */
+  }
+  for (guint i = 0; i < 6; i++) /* coding and transform block sizes, transform hierarchy depths */
+    (void) rds_test_ue (&b);
+  if (rds_test_bit (&b) && rds_test_bit (&b))   /* scaling_list_enabled_flag, sps_scaling_list_data_present_flag */
+    rds_test_h265_skip_scaling_lists (&b);
+  (void) rds_test_bits (&b, 2); /* amp_enabled_flag, sample_adaptive_offset_enabled_flag */
+  if (rds_test_bit (&b)) {      /* pcm_enabled_flag */
+    (void) rds_test_bits (&b, 8);       /* pcm sample bit depths */
+    (void) rds_test_ue (&b);
+    (void) rds_test_ue (&b);
+    (void) rds_test_bit (&b);   /* pcm_loop_filter_disabled_flag */
+  }
+  n = rds_test_ue (&b);         /* num_short_term_ref_pic_sets */
+  g_assert_cmpuint (n, <=, 64);
+  for (guint i = 0; i < n; i++)
+    rds_test_h265_skip_st_ref_pic_set (&b, i, num_delta_pocs);
+  if (rds_test_bit (&b)) {      /* long_term_ref_pics_present_flag */
+    n = rds_test_ue (&b);       /* num_long_term_ref_pics_sps */
+    for (guint i = 0; i < n; i++) {
+      (void) rds_test_bits (&b, log2_poc_lsb);  /* lt_ref_pic_poc_lsb_sps */
+      (void) rds_test_bit (&b); /* used_by_curr_pic_lt_sps_flag */
+    }
+  }
+  (void) rds_test_bits (&b, 2); /* sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag */
+  if (rds_test_bit (&b)) {      /* vui_parameters_present_flag */
+    rds_test_vui_skip_common (&b);
+    (void) rds_test_bits (&b, 3);       /* neutral_chroma_indication_flag, field_seq_flag, frame_field_info_present */
+    if (rds_test_bit (&b)) {    /* default_display_window_flag */
+      for (guint i = 0; i < 4; i++)
+        (void) rds_test_ue (&b);
+    }
+    rds_test_vui_timing (&b, sps);
+  }
+
+done:
   if (sps->chroma_format_idc == 0 || sps->chroma_format_idc == 3)
     sub_w = sub_h = 1;
   else if (sps->chroma_format_idc == 2)
@@ -304,6 +435,20 @@ rds_test_h265_sps (const guint8 * nal, gsize size, RdsTestSps * sps)
   sps->width = sps->coded_width - sub_w * (sps->crop_left + sps->crop_right);
   sps->height = sps->coded_height - sub_h * (sps->crop_top + sps->crop_bottom);
   g_byte_array_unref (rbsp);
+}
+
+/* An HEVC SPS up to the conformance window (what follows it is not read: it may be any bits). */
+static inline void
+rds_test_h265_sps (const guint8 * nal, gsize size, RdsTestSps * sps)
+{
+  rds_test_h265_sps_parse (nal, size, sps, FALSE);
+}
+
+/* An HEVC SPS through the VUI's timing info: the whole SPS must be well formed. */
+static inline void
+rds_test_h265_sps_vui (const guint8 * nal, gsize size, RdsTestSps * sps)
+{
+  rds_test_h265_sps_parse (nal, size, sps, TRUE);
 }
 
 /* The RBSP bits of an HEVC SPS from just after its conformance window up to (not including) the

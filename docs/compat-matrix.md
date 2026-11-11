@@ -38,8 +38,8 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvdslogger` | `rdslogger` | supported | passthrough, any caps; prints each stream's frame rate to stdout in DeepStream 8.0's `**PERF` line format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
 | `nveglglessink` | `rdsvideosink` | supported | display bin: `rdsvideoconvert` to system-memory BGRx, then a stock GStreamer sink (`video-sink`, default `autovideosink`); one frame per buffer; properties and behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nv3dsink` | `rdsvideosink` | supported | as `nveglglessink` (nv3dsink's properties are a subset of nveglglessink's) | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
-| `nvv4l2h264enc` | `rdsh264enc` | in progress | a bin over the stock VA encoder `vah264enc` (VCN), through `rdsvideoconvert` to system-memory NV12; `memory:RDS` or system-memory input. Done: DeepStream 8.0's properties, applied to the VA encoder at start (`bitrate` live too), the preferred profile, B frames dropped for Baseline, the inner elements, the errors at start (no VA encoder, an unsupported profile), filler stripping, the input's timestamps, DELTA_UNIT, `copy-meta`, batch refusal, the framerate in the caps; H.265: the conformance window. Not yet: forced key frames; properties and stream behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html) |
-| `nvv4l2h265enc` | `rdsh265enc` | in progress | a bin over the stock VA encoder `vah265enc` (VCN), through `rdsvideoconvert` to system-memory NV12; `memory:RDS` or system-memory input. Done: DeepStream 8.0's properties, applied to the VA encoder at start (`bitrate` live too), the preferred profile, B frames dropped for Baseline, the inner elements, the errors at start (no VA encoder, an unsupported profile), filler stripping, the input's timestamps, DELTA_UNIT, `copy-meta`, batch refusal, the framerate in the caps; H.265: the conformance window. Not yet: forced key frames; properties and stream behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html) |
+| `nvv4l2h264enc` | `rdsh264enc` | in progress | a bin over the stock VA encoder `vah264enc` (VCN), through `rdsvideoconvert` to system-memory NV12; `memory:RDS` or system-memory input. Done: DeepStream 8.0's properties, applied to the VA encoder at start (`bitrate` live too), the preferred profile, B frames dropped for Baseline, the inner elements, the errors at start (no VA encoder, an unsupported profile), filler stripping, the input's timestamps, DELTA_UNIT, `copy-meta`, batch refusal, the framerate in the caps, forced key frames (`force-idr`, `force-intra`, force-key-unit events), resolution changes, VA's size limits; H.265: the conformance window. Properties and stream behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html) |
+| `nvv4l2h265enc` | `rdsh265enc` | in progress | a bin over the stock VA encoder `vah265enc` (VCN), through `rdsvideoconvert` to system-memory NV12; `memory:RDS` or system-memory input. Done: DeepStream 8.0's properties, applied to the VA encoder at start (`bitrate` live too), the preferred profile, B frames dropped for Baseline, the inner elements, the errors at start (no VA encoder, an unsupported profile), filler stripping, the input's timestamps, DELTA_UNIT, `copy-meta`, batch refusal, the framerate in the caps, forced key frames (`force-idr`, `force-intra`, force-key-unit events), resolution changes, VA's size limits; H.265: the conformance window. Properties and stream behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html) |
 
 ### `rdsurisrcbin` (`nvurisrcbin`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin))
 
@@ -1351,8 +1351,8 @@ downstream level into the stream).
 | `vbvbufsize` | uint | `0` | supported | bits: VA's `cpb-size` in kbit (0: VA's choice) |
 | `idrinterval` | uint | `256` | supported | VA's `key-int-max`; 0 means 256 (DeepStream 8.0 behaviour); above 1024, 1024 with a warning (ours) |
 | `iframeinterval` | uint | `4294967295` | supported | 0 and 4294967295: no I frames between IDR frames (DeepStream 8.0 behaviour; the docs say 30). Otherwise VA's `i-frames` = ⌈idrinterval / N⌉ − 1, which VA spaces evenly: the same frames as 8.0 when N divides idrinterval (ours) |
-| `force-idr` | boolean | `FALSE` | supported | TRUE makes the next frame an IDR frame with parameter sets; reads back FALSE. Changeable in PLAYING (DeepStream 8.0 behaviour; its flags say NULL or READY only) |
-| `force-intra` | boolean | `FALSE` | supported | as `force-idr`: the frame is an IDR frame too (ours: VA can't force a non-IDR intra frame) |
+| `force-idr` | boolean | `FALSE` | supported | TRUE makes the next frame the VA encoder takes an IDR frame (ours: DeepStream 8.0 forces the frame after the one being processed), and a force-key-unit event goes downstream before it. Changeable in PLAYING (DeepStream 8.0 behaviour; its flags say NULL or READY only) and PAUSED; `min-force-key-unit-interval` applies. The IDR frame has parameter sets and the property reads back FALSE (ours: DeepStream 8.0's forced IDR frame has none unless `insert-sps-pps`, and it reads back TRUE). In NULL or READY it does nothing, as the first frame is an IDR frame anyway (ours). The setter never waits for the stream: the request is an upstream force-key-unit event into the VA encoder |
+| `force-intra` | boolean | `FALSE` | supported | as `force-idr`: the frame is an IDR frame too (ours: VA can't force a non-IDR intra frame; DeepStream 8.0 gives an I frame, on H.265 one that is not a random access point) |
 | `profile` | enum `Baseline` (0), `Constrained-Baseline` (1), `Main` (2), `High` (4), `Constrained-High` (17), `High444` (7) | `Baseline` | supported | the preferred profile, used when downstream caps allow it; downstream caps that fix `profile` win (DeepStream 8.0 behaviour). A pad probe narrows VA's downstream caps query to it (VA takes the highest profile allowed, whatever the order of a list). Baseline and Constrained-Baseline give constrained-baseline, Main main, High and Constrained-High high (ours: 8.0 fails on the two Constrained values). `High444` is an error at start (READY to PAUSED) naming the profile (ours: VA has no High 4:4:4) |
 | `num-B-Frames` | uint 0..2 | `0` | supported | VA's `b-frames`. With a Baseline profile (from the property or from downstream caps): a warning and no B frames (ours: DeepStream 8.0 hangs, and VA alone writes B slices into the Baseline stream). When downstream allows Baseline and another profile and the property's isn't allowed, B frames pick the other (ours) |
 | `num-Ref-Frames` | uint 0..8 | `0` | supported | VA's `ref-frames` when above 0; 0 keeps VA's default, 3, the number DeepStream 8.0 uses |
@@ -1403,6 +1403,21 @@ Stream behaviour (pad probes on the inner elements):
 - **Framerate:** the output caps carry the input caps' framerate, from the first frame at a new rate (ours: VA restarts
   its sequence on a frame-rate change but keeps the old framerate in its caps, and sends none when nothing else
   changed).
+- **Force-key-unit events:** from either direction (an upstream one from downstream, a downstream one from upstream)
+  they pass the ghost pads and the inner elements to the VA encoder, which makes the next frame (or the frame at the
+  event's running time) an IDR frame with parameter sets, whatever `all-headers` says (ours: DeepStream 8.0 ignores
+  them). The VA encoder sends a downstream force-key-unit event before that frame; its timestamp is the frame's PTS,
+  in the output's time domain (without B frames the input's, like the buffers).
+- **Resolution change:** new input caps mid-stream renegotiate the inner converter and the VA encoder: the first frame
+  at the new size is an IDR frame with parameter sets and an SPS of the new size, and new output caps precede it
+  (DeepStream 8.0 behaviour for H.264; for H.265 ours, DeepStream 8.0 hangs).
+- **Sizes:** what the VA encoder takes on system memory, read from its sink template: here 128 to 4096 on each side
+  (DeepStream 8.0: width 145 and up, up to 4096×4096). The sink pad's caps queries answer only that range (its
+  template stays the converter's), and input caps outside are not-negotiated, at the start or mid-stream, with a
+  warning naming the range, once per run (ours: VA posts nothing, and without the check the inner converter would
+  scale the frames into the range).
+- **Odd sizes:** coded as the next even size, 1281×721 as 1282×722, the SPS cropping the coded picture to it
+  (DeepStream 8.0 behaviour: 4:2:0 crops in 2-pixel units); the output caps carry the input size.
 
 ### `rdsh265enc` (`nvv4l2h265enc`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html))
 
@@ -1414,7 +1429,9 @@ Stream behaviour as `rdsh264enc` (filler NAL units are type 38; VA on VCN 3 writ
 - **Conformance window:** the SPS before every IDR frame gets the window that crops the coded picture to the input
   size (rounded up to even), so the stream decodes at the input size (ours: VA on this Mesa pads the width to a
   multiple of 64 but computes the window from a multiple of 16, so 720x480 decodes 768 wide and 1366x768 1398 wide;
-  DeepStream 8.0's streams decode at the input size).
+  DeepStream 8.0's streams decode at the input size). After a resolution change, from the new size.
+- **Sizes:** width 130 to 8192, height 128 to 4352 (DeepStream 8.0: width 129 and up, up to 8192×8192); outside,
+  not-negotiated with the warning, as `rdsh264enc`.
 
 | Property | Type | Default | Status | Notes |
 |---|---|---|---|---|

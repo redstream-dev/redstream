@@ -1,5 +1,5 @@
-/* Redstream: the caps decisions of rdsh264enc and rdsh265enc: the preferred profile, the Baseline + B frames rule
- * and the downstream level check, on plain caps.
+/* Redstream: the caps decisions of rdsh264enc and rdsh265enc: the preferred profile, the Baseline + B frames rule,
+ * the downstream level check and the VA encoder's size range, on plain caps.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-enc-caps.h"
 
@@ -117,4 +117,79 @@ rds_enc_caps_level_refused (const GstCaps * caps, const GstCaps * allowed, gchar
     return FALSE;
   *wanted = want;
   return TRUE;
+}
+
+/* @v (an int or an int range) as [*min, *max]; FALSE for anything else. */
+static gboolean
+int_range (const GValue * v, gint * min, gint * max)
+{
+  if (v != NULL && G_VALUE_HOLDS_INT (v)) {
+    *min = *max = g_value_get_int (v);
+    return TRUE;
+  }
+  if (v != NULL && GST_VALUE_HOLDS_INT_RANGE (v)) {
+    *min = gst_value_get_int_range_min (v);
+    *max = gst_value_get_int_range_max (v);
+    return TRUE;
+  }
+  return FALSE;
+}
+
+gboolean
+rds_enc_caps_size_range (const GstCaps * templ, gint * min_width, gint * max_width, gint * min_height,
+    gint * max_height)
+{
+  if (gst_caps_is_any (templ))
+    return FALSE;
+  for (guint i = 0; i < gst_caps_get_size (templ); i++) {
+    const GstStructure *st = gst_caps_get_structure (templ, i);
+    GstCapsFeatures *f = gst_caps_get_features (templ, i);
+    gint w0, w1, h0, h1;
+
+    if (f != NULL && !gst_caps_features_is_equal (f, GST_CAPS_FEATURES_MEMORY_SYSTEM_MEMORY))
+      continue;
+    if (!int_range (gst_structure_get_value (st, "width"), &w0, &w1)
+        || !int_range (gst_structure_get_value (st, "height"), &h0, &h1))
+      continue;
+    *min_width = w0;
+    *max_width = w1;
+    *min_height = h0;
+    *max_height = h1;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/* Sets @field of @st to [@min, @max] (an int when they are equal). */
+static void
+set_int_range (GstStructure * st, const gchar * field, gint min, gint max)
+{
+  if (min == max)
+    gst_structure_set (st, field, G_TYPE_INT, min, NULL);
+  else
+    gst_structure_set (st, field, GST_TYPE_INT_RANGE, min, max, NULL);
+}
+
+GstCaps *
+rds_enc_caps_limit_size (const GstCaps * caps, gint min_width, gint max_width, gint min_height, gint max_height)
+{
+  GstCaps *res;
+
+  if (gst_caps_is_any (caps))
+    return gst_caps_new_any ();
+  res = gst_caps_new_empty ();
+  for (guint i = 0; i < gst_caps_get_size (caps); i++) {
+    const GstStructure *st = gst_caps_get_structure (caps, i);
+    GstCapsFeatures *f = gst_caps_get_features (caps, i);
+    GstStructure *lim = gst_structure_new_empty (gst_structure_get_name (st)), *got;
+
+    set_int_range (lim, "width", min_width, max_width);
+    set_int_range (lim, "height", min_height, max_height);
+    got = gst_structure_intersect (st, lim);
+
+    gst_structure_free (lim);
+    if (got != NULL)
+      res = gst_caps_merge_structure_full (res, got, f != NULL ? gst_caps_features_copy (f) : NULL);
+  }
+  return res;
 }

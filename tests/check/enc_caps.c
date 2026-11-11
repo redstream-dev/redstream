@@ -1,5 +1,6 @@
 /* rdsh264enc / rdsh265enc caps decisions on plain caps: the preferred profile against downstream answers, the
- * Baseline + B frames rule, and the downstream level check.
+ * Baseline + B frames rule, the downstream level check, the size range from the VA encoder's template and caps
+ * limited to it.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-enc-caps.h"
 
@@ -104,6 +105,81 @@ test_level (void)
   check_level ("video/x-h264, profile=(string)high", "video/x-h264, profile=(string)main", NULL);
 }
 
+/* rds_enc_caps_size_range on @templ: FALSE when @want is NULL, else the range "min_w max_w min_h max_h". */
+static void
+check_range (const gchar * templ, const gchar * want)
+{
+  GstCaps *t = gst_caps_from_string (templ);
+  gint r[4] = { -1, -1, -1, -1 };
+  gchar *got;
+
+  g_assert_cmpint (rds_enc_caps_size_range (t, &r[0], &r[1], &r[2], &r[3]), ==, want != NULL);
+  if (want != NULL) {
+    got = g_strdup_printf ("%d %d %d %d", r[0], r[1], r[2], r[3]);
+    g_assert_cmpstr (got, ==, want);
+    g_free (got);
+  } else {
+    for (guint i = 0; i < 4; i++)
+      g_assert_cmpint (r[i], ==, -1);
+  }
+  gst_caps_unref (t);
+}
+
+static void
+test_size_range (void)
+{
+  /* VA's templates: the system-memory structure's range */
+  check_range ("video/x-raw(memory:VAMemory), width=(int)[ 1, 2 ], height=(int)[ 1, 2 ], format=(string)NV12; "
+      "video/x-raw, width=(int)[ 128, 4096 ], height=(int)[ 128, 4096 ], format=(string)NV12", "128 4096 128 4096");
+  check_range ("video/x-raw(memory:SystemMemory), width=(int)[ 130, 8192 ], height=(int)[ 128, 4352 ]",
+      "130 8192 128 4352");
+  /* a fixed size is a range of one */
+  check_range ("video/x-raw, width=(int)640, height=(int)[ 16, 4096 ]", "640 640 16 4096");
+  /* no limits known */
+  check_range ("ANY", NULL);
+  check_range ("video/x-raw, format=(string)NV12", NULL);
+  check_range ("video/x-raw(memory:VAMemory), width=(int)[ 1, 2 ], height=(int)[ 1, 2 ]", NULL);
+}
+
+/* rds_enc_caps_limit_size on @in to 130..8192 x 128..4352, compared with @want. */
+static void
+check_limit (const gchar * in, const gchar * want)
+{
+  GstCaps *i = gst_caps_from_string (in), *w = gst_caps_from_string (want), *got;
+  gchar *s;
+
+  got = rds_enc_caps_limit_size (i, 130, 8192, 128, 4352);
+  s = gst_caps_to_string (got);
+  g_test_message ("%s -> %s", in, s);
+  g_assert_true (gst_caps_is_equal (got, w));
+  g_free (s);
+  gst_caps_unref (got);
+  gst_caps_unref (w);
+  gst_caps_unref (i);
+}
+
+static void
+test_limit_size (void)
+{
+  /* ranges narrowed, features kept, every structure */
+  check_limit ("video/x-raw(memory:RDS), format=(string)NV12, width=(int)[ 1, 16384 ], height=(int)[ 1, 16384 ]; "
+      "video/x-raw, format=(string)RGBA, width=(int)[ 1, 16384 ], height=(int)[ 1, 16384 ]",
+      "video/x-raw(memory:RDS), format=(string)NV12, width=(int)[ 130, 8192 ], height=(int)[ 128, 4352 ]; "
+      "video/x-raw, format=(string)RGBA, width=(int)[ 130, 8192 ], height=(int)[ 128, 4352 ]");
+  /* fixed sizes: kept inside, dropped outside */
+  check_limit ("video/x-raw, width=(int)1281, height=(int)721; video/x-raw, width=(int)129, height=(int)256; "
+      "video/x-raw, width=(int)256, height=(int)4353", "video/x-raw, width=(int)1281, height=(int)721");
+  check_limit ("video/x-raw, width=(int)8193, height=(int)256", "EMPTY");
+  /* an edge: a range of one becomes an int */
+  check_limit ("video/x-raw, width=(int)[ 8192, 9000 ], height=(int)[ 100, 128 ]",
+      "video/x-raw, width=(int)8192, height=(int)128");
+  /* no size fields: the ranges are added */
+  check_limit ("video/x-raw, format=(string)NV12",
+      "video/x-raw, format=(string)NV12, width=(int)[ 130, 8192 ], height=(int)[ 128, 4352 ]");
+  check_limit ("ANY", "ANY");
+  check_limit ("EMPTY", "EMPTY");
+}
+
 int
 main (int argc, char **argv)
 {
@@ -114,6 +190,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/enc-caps/preferred", test_preferred);
   g_test_add_func ("/cpu/enc-caps/b-frames", test_b_frames);
   g_test_add_func ("/cpu/enc-caps/level", test_level);
+  g_test_add_func ("/cpu/enc-caps/size-range", test_size_range);
+  g_test_add_func ("/cpu/enc-caps/limit-size", test_limit_size);
   ret = g_test_run ();
   gst_deinit ();
   return ret;

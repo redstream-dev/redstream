@@ -1,15 +1,16 @@
 /* rdsh264enc and rdsh265enc: registration, pads, every property's name, type, range, default and flags as
  * gst-inspect shows them for DeepStream 8.0's nvv4l2h264enc / nvv4l2h265enc, the enum types, the accepted no-ops'
  * warning, malformed QP strings, the inner chain, a missing VA encoder, one that doesn't link, the unsupported
- * profiles, what a start sets on the VA encoder, and the output probes on a stand-in's pushes: a buffer of filler
- * only dropped, a segment sent again (cpu; a stand-in element takes the VA encoder's factory name where the bin has
- * to reach READY); the preferred-profile caps answer of a started bin, with the stand-in (gpu: the start needs
- * rdsvideoconvert's GPU); per codec on the real VA encoders: a short encode,
- * properties set while PLAYING, GOP layouts and parameter sets, profiles and levels in the SPS and the caps, a
- * downstream level, CBR rates, a live bitrate change, B frames and Baseline, preset-id and gpu-id, and what the bin's
- * pad probes do: no filler, the H.265 size, input timestamps (also after a seek and with B frames), copy-meta,
- * memory:RDS and system-memory input, batch refusal, DELTA_UNIT, a frame-rate change (gpu, each skipped without its
- * VA encoder).
+ * profiles, what a start sets on the VA encoder, the output probes on a stand-in's pushes: a buffer of filler only
+ * dropped, a segment sent again; force-idr before the start, the input size limits from a stand-in's template
+ * (cpu; a stand-in element takes the VA encoder's factory name where the bin has to reach READY); the
+ * preferred-profile caps answer of a started bin, with the stand-in (gpu: the start needs rdsvideoconvert's GPU); per
+ * codec on the real VA encoders: a short encode, properties set while PLAYING, GOP layouts and parameter sets,
+ * profiles and levels in the SPS and the caps, a downstream level, CBR rates, a live bitrate change, B frames and
+ * Baseline, preset-id and gpu-id, and what the bin's pad probes do: no filler, the H.265 size, input timestamps (also
+ * after a seek and with B frames), copy-meta, memory:RDS and system-memory input, batch refusal, DELTA_UNIT, a
+ * frame-rate change; forced key frames (force-idr, force-intra, force-key-unit events both ways), a resolution change,
+ * VA's size limits and odd sizes (gpu, each skipped without its VA encoder).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-media.h"
@@ -98,6 +99,42 @@ rds_test_va_bad_src_class_init (RdsTestVaBadSrcClass * klass)
   gst_element_class_add_static_pad_template (ec, &stand_in_sink);
   gst_element_class_add_static_pad_template (ec, &bad_src);
   gst_element_class_set_static_metadata (ec, "VA encoder stand-in, audio out", "Codec/Encoder/Video",
+      "Does nothing", "Redstream contributors");
+}
+
+/* A stand-in whose sink template has a size range on system memory, as the VA encoders' (vah265enc's here), and
+ * another on a memory the bin doesn't use. */
+typedef struct
+{
+  GstElement parent;
+} RdsTestVaSized;
+typedef struct
+{
+  GstElementClass parent_class;
+} RdsTestVaSizedClass;
+
+static GType rds_test_va_sized_get_type (void);
+G_DEFINE_TYPE (RdsTestVaSized, rds_test_va_sized, GST_TYPE_ELEMENT);
+
+static GstStaticPadTemplate sized_sink = GST_STATIC_PAD_TEMPLATE ("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
+    GST_STATIC_CAPS ("video/x-raw(memory:VAMemory), format=NV12, width=[1,2], height=[1,2]; "
+        "video/x-raw, format=NV12, width=[130,8192], height=[128,4352]"));
+
+static void
+rds_test_va_sized_init (RdsTestVaSized * self)
+{
+  gst_element_add_pad (GST_ELEMENT (self), gst_pad_new_from_static_template (&sized_sink, "sink"));
+  gst_element_add_pad (GST_ELEMENT (self), gst_pad_new_from_static_template (&stand_in_src, "src"));
+}
+
+static void
+rds_test_va_sized_class_init (RdsTestVaSizedClass * klass)
+{
+  GstElementClass *ec = GST_ELEMENT_CLASS (klass);
+
+  gst_element_class_add_static_pad_template (ec, &sized_sink);
+  gst_element_class_add_static_pad_template (ec, &stand_in_src);
+  gst_element_class_set_static_metadata (ec, "VA encoder stand-in with VA's size range", "Codec/Encoder/Video",
       "Does nothing", "Redstream contributors");
 }
 
@@ -233,6 +270,7 @@ typedef enum
   VA_STAND_IN,
   VA_BAD_SRC,
   VA_PROPS,
+  VA_SIZED,
   VA_NONE,
 } VaMode;
 
@@ -245,7 +283,7 @@ is_stand_in (GstPluginFeature * f)
     return FALSE;
   t = gst_element_factory_get_element_type (GST_ELEMENT_FACTORY (f));
   return g_type_is_a (t, rds_test_va_stand_in_get_type ()) || g_type_is_a (t, rds_test_va_bad_src_get_type ())
-      || g_type_is_a (t, rds_test_va_props_get_type ());
+      || g_type_is_a (t, rds_test_va_props_get_type ()) || g_type_is_a (t, rds_test_va_sized_get_type ());
 }
 
 /* The stand-in of @mode for codec @i: a subtype per codec. An element class points at the factory it was first
@@ -254,14 +292,16 @@ is_stand_in (GstPluginFeature * f)
 static GType
 stand_in_type (VaMode mode, guint i)
 {
-  static GType types[3][G_N_ELEMENTS (codecs)];
-  static const gchar *names[3] = { "RdsTestVaStandIn", "RdsTestVaBadSrc", "RdsTestVaProps" };
-  guint k = mode == VA_STAND_IN ? 0 : mode == VA_BAD_SRC ? 1 : 2;
+  static GType types[4][G_N_ELEMENTS (codecs)];
+  static const gchar *names[4] = { "RdsTestVaStandIn", "RdsTestVaBadSrc", "RdsTestVaProps", "RdsTestVaSized" };
+  guint k = mode == VA_STAND_IN ? 0 : mode == VA_BAD_SRC ? 1 : mode == VA_PROPS ? 2 : 3;
 
-  g_assert_true (mode == VA_STAND_IN || mode == VA_BAD_SRC || mode == VA_PROPS);
+  g_assert_true (mode == VA_STAND_IN || mode == VA_BAD_SRC || mode == VA_PROPS || mode == VA_SIZED);
   if (types[k][i] == 0) {
-    GType parent = k == 0 ? rds_test_va_stand_in_get_type () : k == 1 ? rds_test_va_bad_src_get_type ()
-        : rds_test_va_props_get_type ();
+    GType parents[4] = { rds_test_va_stand_in_get_type (), rds_test_va_bad_src_get_type (),
+      rds_test_va_props_get_type (), rds_test_va_sized_get_type ()
+    };
+    GType parent = parents[k];
     GTypeQuery q;
     gchar *name = g_strdup_printf ("%s_%s", names[k], codecs[i].va_factory);
 
@@ -296,7 +336,7 @@ set_va (const Codec * c, VaMode mode)
     }
     gst_object_unref (f);
   }
-  if (mode == VA_STAND_IN || mode == VA_BAD_SRC || mode == VA_PROPS)
+  if (mode == VA_STAND_IN || mode == VA_BAD_SRC || mode == VA_PROPS || mode == VA_SIZED)
     g_assert_true (gst_element_register (NULL, c->va_factory, GST_RANK_NONE, stand_in_type (mode, i)));
   else if (mode == VA_REAL && real_va[i] != NULL) {
     g_assert_true (gst_registry_add_feature (reg, real_va[i]));
@@ -1460,6 +1500,118 @@ test_segment_again (void)
   harness_stop (&h, c);
 }
 
+/* force-idr and force-intra before the start do nothing (the first frame is an IDR frame anyway) and read back
+ * FALSE: without the chain (NULL) and with it (READY). */
+static void
+test_force_before_start (void)
+{
+  const Codec *c = &codecs[0];
+  GstElement *e = gst_element_factory_make (c->element, NULL);
+  gboolean idr = TRUE, intra = TRUE;
+
+  set_va (c, VA_STAND_IN);
+  g_object_set (e, "force-idr", TRUE, "force-intra", TRUE, NULL);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  g_object_set (e, "force-idr", TRUE, "force-intra", TRUE, NULL);
+  g_object_get (e, "force-idr", &idr, "force-intra", &intra, NULL);
+  g_assert_false (idr);
+  g_assert_false (intra);
+  gst_element_set_state (e, GST_STATE_NULL);
+  gst_object_unref (e);
+  set_va (c, VA_REAL);
+}
+
+/* The sink pad keeps rdsvideoconvert's template, but its caps query answers only sizes in the system-memory range of
+ * the VA encoder's sink template and its accept-caps refuses others, silently; sizes inside, odd ones included, are
+ * accepted. A CAPS event outside the range warns, naming the range, once per run; so does a caps query whose answer
+ * the limit empties. */
+static void
+test_size_accept_caps (void)
+{
+  const Codec *c = &codecs[1];
+  GstElement *e = gst_element_factory_make (c->element, NULL);
+  GstPad *pad = gst_element_get_static_pad (e, "sink"), *conv_pad;
+  GstElement *conv;
+  GstCaps *caps, *templ, *templ_filter;
+  static const gint ok[][2] = { {130, 128}, {8192, 4352}, {1281, 721} };
+  static const gint bad[][2] = { {129, 256}, {8193, 256}, {256, 127}, {256, 4353} };
+
+  set_va (c, VA_SIZED);
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  for (guint i = 0; i < G_N_ELEMENTS (ok); i++) {
+    caps = gst_caps_new_simple ("video/x-raw", "format", G_TYPE_STRING, "RGBA", "width", G_TYPE_INT, ok[i][0],
+        "height", G_TYPE_INT, ok[i][1], "framerate", GST_TYPE_FRACTION, 30, 1, NULL);
+    g_assert_true (gst_pad_query_accept_caps (pad, caps));
+    gst_caps_unref (caps);
+  }
+  /* refused without a warning (a warning would be fatal here) */
+  for (guint i = 0; i < G_N_ELEMENTS (bad); i++) {
+    caps = gst_caps_new_simple ("video/x-raw", "format", G_TYPE_STRING, "RGBA", "width", G_TYPE_INT, bad[i][0],
+        "height", G_TYPE_INT, bad[i][1], "framerate", GST_TYPE_FRACTION, 30, 1, NULL);
+    g_assert_false (gst_pad_query_accept_caps (pad, caps));
+    gst_caps_unref (caps);
+  }
+
+  /* the template unchanged, the caps query limited to the range */
+  conv = gst_bin_get_by_name (GST_BIN (e), "convert");
+  conv_pad = gst_element_get_static_pad (conv, "sink");
+  templ = gst_pad_get_pad_template_caps (pad);
+  caps = gst_pad_get_pad_template_caps (conv_pad);
+  g_assert_true (gst_caps_is_equal (templ, caps));
+  gst_caps_unref (caps);
+  gst_object_unref (conv_pad);
+  gst_object_unref (conv);
+  caps = gst_pad_query_caps (pad, NULL);
+  g_test_message ("caps query: %" GST_PTR_FORMAT, caps);
+  g_assert_false (gst_caps_is_empty (caps));
+  for (guint i = 0; i < gst_caps_get_size (caps); i++) {
+    const GstStructure *st = gst_caps_get_structure (caps, i);
+    const GValue *w = gst_structure_get_value (st, "width"), *h = gst_structure_get_value (st, "height");
+
+    g_assert_cmpint (gst_value_get_int_range_min (w), ==, 130);
+    g_assert_cmpint (gst_value_get_int_range_max (w), ==, 8192);
+    g_assert_cmpint (gst_value_get_int_range_min (h), ==, 128);
+    g_assert_cmpint (gst_value_get_int_range_max (h), ==, 4352);
+  }
+  gst_caps_unref (caps);
+  gst_caps_unref (templ);
+
+  /* CAPS events (the pad activated by hand): one warning for two refused ones */
+  g_assert_true (gst_pad_set_active (pad, TRUE));
+  (void) gst_pad_send_event (pad, gst_event_new_stream_start ("size"));
+  g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, "*129x256*H.265*width 130 to 8192, height 128 to 4352*");
+  for (guint i = 0; i < 2; i++) {
+    caps = gst_caps_new_simple ("video/x-raw", "format", G_TYPE_STRING, "RGBA", "width", G_TYPE_INT,
+        i == 0 ? 129 : 8193, "height", G_TYPE_INT, 256, "framerate", GST_TYPE_FRACTION, 30, 1, NULL);
+    g_assert_false (gst_pad_send_event (pad, gst_event_new_caps (caps)));
+    gst_caps_unref (caps);
+  }
+  g_test_assert_expected_messages ();
+  g_assert_true (gst_pad_set_active (pad, FALSE));
+  gst_element_set_state (e, GST_STATE_NULL);
+  gst_object_unref (pad);
+  gst_object_unref (e);
+
+  /* a caps query that the limit leaves empty (upstream fixed a size outside, as a capsfilter does) warns too, once:
+   * no CAPS event follows it */
+  e = gst_element_factory_make (c->element, NULL);
+  pad = gst_element_get_static_pad (e, "sink");
+  g_assert_cmpint (gst_element_set_state (e, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  templ_filter = gst_caps_from_string ("video/x-raw, width=(int)8193, height=(int)256");
+  g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, "*8193x256*H.265*");
+  for (guint i = 0; i < 2; i++) {
+    caps = gst_pad_query_caps (pad, templ_filter);
+    g_assert_true (gst_caps_is_empty (caps));
+    gst_caps_unref (caps);
+  }
+  g_test_assert_expected_messages ();
+  gst_caps_unref (templ_filter);
+  gst_element_set_state (e, GST_STATE_NULL);
+  gst_object_unref (pad);
+  gst_object_unref (e);
+  set_va (c, VA_REAL);
+}
+
 /* ---- gpu ---- */
 
 #define SMOKE_FRAMES 30
@@ -2009,6 +2161,7 @@ typedef struct
 {
   GstClockTime pts, duration;
   gint fps_n;                   /* the framerate numerator of its caps */
+  gint width;                   /* and its width */
 } InBuf;
 
 typedef struct
@@ -2020,10 +2173,22 @@ typedef struct
   gint source_id;               /* the batch meta's first frame's source_id; -1: no batch meta */
   guint meta_frames;
   gint fps_n;                   /* the framerate numerator of the caps it came with */
+  gboolean headers;             /* parameter sets in it */
 } OutBuf;
 
-/* What a run through the bin gave, seen just before the bin (input) and at the sink (output). */
+/* A force-key-unit event that left the bin. */
 typedef struct
+{
+  GstClockTime timestamp, stream_time, running_time;
+  gboolean all_headers;
+} OutFku;
+
+typedef struct _Run Run;
+/* Called just before input frame @frame reaches the bin, on the pad @pad that pushes it. */
+typedef void (*RunHook) (Run * r, GstPad * pad, guint frame);
+
+/* What a run through the bin gave, seen just before the bin (input) and at the sink (output). */
+struct _Run
 {
   gboolean hevc;
   gboolean tag;                 /* attach a batch meta (one frame, source_id = input index) to every input */
@@ -2037,13 +2202,19 @@ typedef struct
   GstElement *cf;
   GstCaps *change_caps;
   guint change_at;
-} Run;
+  RunHook hook;                 /* NULL: none */
+  GArray *fku;                  /* OutFku */
+  GstElement *enc;              /* the bin, during run_pipeline */
+  GstPad *sink_pad;             /* the sink's pad, during run_pipeline */
+  gint in_width;
+};
 
 static void
 run_clear (Run * r)
 {
   g_array_unref (r->in);
   g_array_unref (r->out);
+  g_array_unref (r->fku);
   g_byte_array_unref (r->data);
   gst_clear_caps (&r->first_caps);
   gst_clear_caps (&r->last_caps);
@@ -2052,14 +2223,16 @@ run_clear (Run * r)
 }
 
 static GstPadProbeReturn
-run_in_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+run_in_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
   Run *r = user_data;
 
   if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
     GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info);
-    InBuf ib = { GST_BUFFER_PTS (buf), GST_BUFFER_DURATION (buf), r->in_fps_n };
+    InBuf ib = { GST_BUFFER_PTS (buf), GST_BUFFER_DURATION (buf), r->in_fps_n, r->in_width };
 
+    if (r->hook != NULL)
+      r->hook (r, pad, r->in->len);
     if (r->change_caps != NULL && r->in->len == r->change_at)
       g_object_set (r->cf, "caps", r->change_caps, NULL);
     if (r->tag) {
@@ -2086,6 +2259,7 @@ run_in_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_
     } else if (GST_EVENT_TYPE (ev) == GST_EVENT_CAPS) {
       gst_event_parse_caps (ev, &caps);
       g_assert_true (gst_structure_get_fraction (gst_caps_get_structure (caps, 0), "framerate", &r->in_fps_n, &d));
+      g_assert_true (gst_structure_get_int (gst_caps_get_structure (caps, 0), "width", &r->in_width));
     }
   }
   return GST_PAD_PROBE_OK;
@@ -2101,7 +2275,7 @@ run_out_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user
     RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (buf);
     OutBuf ob = { GST_BUFFER_PTS (buf), GST_BUFFER_DTS (buf), GST_BUFFER_DURATION (buf),
       GST_BUFFER_FLAG_IS_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT), FALSE, GST_BUFFER_FLAG_IS_SET (buf,
-          GST_BUFFER_FLAG_DISCONT), G_MAXUINT, 0, -1, 0, 0
+          GST_BUFFER_FLAG_DISCONT), G_MAXUINT, 0, -1, 0, 0, FALSE
     };
     gint d;
     GstMapInfo map;
@@ -2114,6 +2288,7 @@ run_out_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user
     aus = rds_test_nal_aus (map.data, map.size, r->hevc);
     g_assert_cmpuint (aus->len, ==, 1);
     ob.idr = au_is_idr (&g_array_index (aus, RdsTestAu, 0), r->hevc);
+    ob.headers = au_has_parameter_sets (&g_array_index (aus, RdsTestAu, 0), r->hevc);
     ob.first_slice_type = g_array_index (aus, RdsTestAu, 0).first_slice_type;
     ob.filler = rds_test_nal_count (map.data, map.size, r->hevc, r->hevc ? 38 : 12);
     g_array_unref (aus);
@@ -2128,9 +2303,15 @@ run_out_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user
     GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info);
     GstCaps *caps;
 
+    OutFku fku;
+
     if (GST_EVENT_TYPE (ev) == GST_EVENT_SEGMENT) {
       gst_event_copy_segment (ev, &r->out_seg);
       r->out_segs++;
+    } else if (gst_video_event_is_force_key_unit (ev)) {
+      g_assert_true (gst_video_event_parse_downstream_force_key_unit (ev, &fku.timestamp, &fku.stream_time,
+              &fku.running_time, &fku.all_headers, NULL));
+      g_array_append_val (r->fku, fku);
     } else if (GST_EVENT_TYPE (ev) == GST_EVENT_CAPS) {
       gst_event_parse_caps (ev, &caps);
       if (r->first_caps == NULL)
@@ -2155,10 +2336,12 @@ run_pipeline (const Codec * c, const gchar * desc, Run * r, GstClockTime seek_to
   r->hevc = is_hevc (c);
   r->in = g_array_new (FALSE, FALSE, sizeof (InBuf));
   r->out = g_array_new (FALSE, FALSE, sizeof (OutBuf));
+  r->fku = g_array_new (FALSE, FALSE, sizeof (OutFku));
   r->data = g_byte_array_new ();
   if (r->change_caps != NULL)
     r->cf = gst_bin_get_by_name (GST_BIN (p), "cf");
   enc = gst_bin_get_by_name (GST_BIN (p), "enc");
+  r->enc = enc;
   pad = gst_element_get_static_pad (enc, "sink");
   peer = gst_pad_get_peer (pad);
   gst_pad_add_probe (peer, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, run_in_probe, r, NULL);
@@ -2167,7 +2350,7 @@ run_pipeline (const Codec * c, const gchar * desc, Run * r, GstClockTime seek_to
   sink = gst_bin_get_by_name (GST_BIN (p), "sink");
   pad = gst_element_get_static_pad (sink, "sink");
   gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, run_out_probe, r, NULL);
-  gst_object_unref (pad);
+  r->sink_pad = pad;
   if (GST_CLOCK_TIME_IS_VALID (seek_to)) {
     g_assert_cmpint (gst_element_set_state (p, GST_STATE_PAUSED), !=, GST_STATE_CHANGE_FAILURE);
     g_assert_cmpint (gst_element_get_state (p, NULL, NULL, RDS_TEST_MEDIA_TIMEOUT), ==, GST_STATE_CHANGE_SUCCESS);
@@ -2175,6 +2358,8 @@ run_pipeline (const Codec * c, const gchar * desc, Run * r, GstClockTime seek_to
             GST_SEEK_TYPE_SET, seek_to, GST_SEEK_TYPE_SET, seek_to + GST_SECOND));
   }
   run_to_eos (p);
+  r->enc = NULL;
+  gst_clear_object (&r->sink_pad);
   gst_object_unref (sink);
   gst_object_unref (enc);
   gst_object_unref (p);
@@ -2537,15 +2722,29 @@ test_delta_unit (gconstpointer data)
   run_clear (&r);
 }
 
-/* A frame-rate change mid-stream: the output caps follow from the first frame at the new rate (ours: VA keeps the
- * old framerate in its caps). */
+static GArray *sps_list (const GByteArray * data, gboolean hevc);
+
+/* The frame rate an SPS's VUI timing gives (H.264: time_scale / 2 num_units_in_tick, a field rate; HEVC:
+ * time_scale / vui_num_units_in_tick). */
+static gdouble
+sps_fps (const RdsTestSps * sps, gboolean hevc)
+{
+  g_assert_true (sps->timing);
+  g_assert_cmpuint (sps->num_units_in_tick, >, 0);
+  return (gdouble) sps->time_scale / (sps->num_units_in_tick * (hevc ? 1 : 2));
+}
+
+/* A frame-rate change mid-stream: the first frame at the new rate is an IDR frame with parameter sets, the new SPS's
+ * VUI timing has the new rate, and the output caps follow from that frame (ours: VA keeps the old framerate in its
+ * caps). */
 static void
 test_framerate_change (gconstpointer data)
 {
   const Codec *c = data;
   gchar *desc;
   Run r = { 0 };
-  gint n = 0, d = 0;
+  gint n = 0, d = 0, at = -1;
+  GArray *sps;
 
   if (!require_va (c))
     return;
@@ -2559,6 +2758,28 @@ test_framerate_change (gconstpointer data)
   /* no B frames: output i is input i */
   for (guint i = 0; i < r.out->len; i++)
     g_assert_cmpint (g_array_index (r.out, OutBuf, i).fps_n, ==, g_array_index (r.in, InBuf, i).fps_n);
+  for (guint i = 0; i < r.in->len && at < 0; i++) {
+    if (g_array_index (r.in, InBuf, i).fps_n == 15)
+      at = (gint) i;
+  }
+  g_test_message ("15 fps from frame %d", at);
+  g_assert_cmpint (at, >=, 40);
+  g_assert_cmpint (at, <, 50);
+  for (guint i = 0; i < r.out->len; i++) {
+    const OutBuf *ob = &g_array_index (r.out, OutBuf, i);
+
+    g_assert_cmpint (ob->idr, ==, i == 0 || i == (guint) at);
+    if (ob->idr)
+      g_assert_true (ob->headers);
+  }
+  sps = sps_list (r.data, r.hevc);
+  g_assert_cmpuint (sps->len, ==, 2);
+  g_test_message ("VUI timing %u/%u then %u/%u", g_array_index (sps, RdsTestSps, 0).num_units_in_tick,
+      g_array_index (sps, RdsTestSps, 0).time_scale, g_array_index (sps, RdsTestSps, 1).num_units_in_tick,
+      g_array_index (sps, RdsTestSps, 1).time_scale);
+  g_assert_cmpfloat (sps_fps (&g_array_index (sps, RdsTestSps, 0), r.hevc), ==, 30.0);
+  g_assert_cmpfloat (sps_fps (&g_array_index (sps, RdsTestSps, 1), r.hevc), ==, 15.0);
+  g_array_unref (sps);
   g_assert_cmpint (g_array_index (r.in, InBuf, 0).fps_n, ==, 30);
   g_assert_cmpint (g_array_index (r.in, InBuf, r.in->len - 1).fps_n, ==, 15);
   g_assert_true (gst_structure_get_fraction (gst_caps_get_structure (r.first_caps, 0), "framerate", &n, &d));
@@ -2568,6 +2789,329 @@ test_framerate_change (gconstpointer data)
   g_assert_cmpint (d, ==, 1);
   run_clear (&r);
   g_free (desc);
+}
+
+/* ---- gpu: forced key frames, renegotiation, sizes ---- */
+
+#define FORCE_AT 50
+#define FORCE_FRAMES 70
+
+typedef enum
+{
+  FORCE_IDR,                    /* the force-idr property */
+  FORCE_INTRA,                  /* the force-intra property */
+  FORCE_FROM_DOWNSTREAM,        /* an upstream force-key-unit event from the sink's pad */
+  FORCE_FROM_UPSTREAM,          /* a downstream force-key-unit event into the bin's sink pad */
+} ForceHow;
+
+static ForceHow force_how;
+
+/* RunHook: asks for a key frame, as force_how says, just before input frame FORCE_AT reaches the bin. */
+static void
+force_hook (Run * r, GstPad * pad, guint frame)
+{
+  if (frame != FORCE_AT)
+    return;
+  switch (force_how) {
+    case FORCE_IDR:
+      g_object_set (r->enc, "force-idr", TRUE, NULL);
+      break;
+    case FORCE_INTRA:
+      g_object_set (r->enc, "force-intra", TRUE, NULL);
+      break;
+    case FORCE_FROM_DOWNSTREAM:
+      g_assert_true (gst_pad_push_event (r->sink_pad, gst_video_event_new_upstream_force_key_unit
+              (GST_CLOCK_TIME_NONE, TRUE, 0)));
+      break;
+    case FORCE_FROM_UPSTREAM:
+      g_assert_true (gst_pad_push_event (pad, gst_video_event_new_downstream_force_key_unit (GST_CLOCK_TIME_NONE,
+                  GST_CLOCK_TIME_NONE, GST_CLOCK_TIME_NONE, TRUE, 0)));
+      break;
+  }
+}
+
+/* The frames are IDR frames exactly at 0 and @at (with parameter sets), and one force-key-unit event left the bin
+ * for frame @at, in the output's own time domain (no B frames: its timestamps are the input's). */
+static void
+check_forced (const Run * r, guint at)
+{
+  const OutBuf *forced = &g_array_index (r->out, OutBuf, at);
+  const OutFku *fku;
+
+  for (guint i = 0; i < r->out->len; i++) {
+    const OutBuf *ob = &g_array_index (r->out, OutBuf, i);
+
+    g_assert_cmpint (ob->idr, ==, i == 0 || i == at);
+    if (ob->idr)
+      g_assert_true (ob->headers);
+  }
+  g_assert_cmpuint (r->fku->len, ==, 1);
+  fku = &g_array_index (r->fku, OutFku, 0);
+  g_assert_cmpuint (fku->timestamp, ==, forced->pts);
+  g_assert_cmpuint (fku->timestamp, ==, g_array_index (r->in, InBuf, at).pts);
+  g_assert_cmpuint (fku->running_time, ==, gst_segment_to_running_time (&r->out_seg, GST_FORMAT_TIME, forced->pts));
+  g_assert_cmpuint (fku->stream_time, ==, gst_segment_to_stream_time (&r->out_seg, GST_FORMAT_TIME, forced->pts));
+  g_assert_true (fku->all_headers);
+}
+
+static void
+check_force (const Codec * c, ForceHow how)
+{
+  Run r = {.hook = force_hook };
+
+  force_how = how;
+  /* starting at 10 s, so VA's shift is not 1000 h and the segment doesn't start at 0 */
+  run_simple (c, "pattern=ball timestamp-offset=10000000000", "", FORCE_FRAMES, &r);
+  g_assert_cmpuint (r.out->len, ==, FORCE_FRAMES);
+  check_forced (&r, FORCE_AT);
+  run_clear (&r);
+}
+
+/* force-idr set before frame 50 (from a buffer probe in front of the bin) makes frame 50 an IDR frame with parameter
+ * sets, and no other. */
+static void
+test_force_idr (gconstpointer data)
+{
+  if (!require_va (data))
+    return;
+  check_force (data, FORCE_IDR);
+}
+
+/* force-intra too gives an IDR frame (ours: VA can't force a non-IDR intra frame). */
+static void
+test_force_intra (gconstpointer data)
+{
+  if (!require_va (data))
+    return;
+  check_force (data, FORCE_INTRA);
+}
+
+/* Force-key-unit events through the ghost pads: an upstream one sent from downstream and a downstream one sent into
+ * the bin's sink pad make the next frame an IDR frame with parameter sets. */
+static void
+test_force_key_unit (gconstpointer data)
+{
+  if (!require_va (data))
+    return;
+  check_force (data, FORCE_FROM_DOWNSTREAM);
+  check_force (data, FORCE_FROM_UPSTREAM);
+}
+
+/* The SPS sizes of @data in stream order. */
+static GArray *
+sps_list (const GByteArray * data, gboolean hevc)
+{
+  GArray *nals = rds_test_nal_split (data->data, data->len, hevc);
+  GArray *out = g_array_new (FALSE, FALSE, sizeof (RdsTestSps));
+
+  for (guint i = 0; i < nals->len; i++) {
+    const RdsTestNal *n = &g_array_index (nals, RdsTestNal, i);
+    RdsTestSps sps;
+
+    if (n->type != (hevc ? 33u : 7u))
+      continue;
+    if (hevc)
+      rds_test_h265_sps_vui (n->data, n->size, &sps);
+    else
+      rds_test_h264_sps (n->data, n->size, &sps);
+    g_array_append_val (out, sps);
+  }
+  g_array_unref (nals);
+  return out;
+}
+
+/* A resolution change from @w0x@h0 to @w1x@h1 at frame 30 of 60: the first frame at the new size is an IDR frame
+ * with parameter sets, the second SPS has the new size (H.265: exactly, with the conformance window fixed for the
+ * new size), and the output caps follow. */
+static void
+check_resize (const Codec * c, gint w0, gint h0, gint w1, gint h1)
+{
+  gchar *desc = g_strdup_printf ("videotestsrc num-buffers=60 pattern=ball ! capsfilter name=cf caps=video/x-raw,"
+      "width=%d,height=%d,framerate=30/1 ! %s name=enc ! fakesink name=sink", w0, h0, c->element);
+  Run r = { 0 };
+  GArray *sps;
+  gint at = -1, w = 0, h = 0;
+
+  r.change_caps = gst_caps_new_simple ("video/x-raw", "width", G_TYPE_INT, w1, "height", G_TYPE_INT, h1,
+      "framerate", GST_TYPE_FRACTION, 30, 1, NULL);
+  r.change_at = 30;
+  run_pipeline (c, desc, &r, GST_CLOCK_TIME_NONE);
+  g_assert_cmpuint (r.out->len, ==, 60);
+  for (guint i = 0; i < r.in->len && at < 0; i++) {
+    if (g_array_index (r.in, InBuf, i).width == w1)
+      at = (gint) i;
+  }
+  g_test_message ("%dx%d -> %dx%d from frame %d", w0, h0, w1, h1, at);
+  g_assert_cmpint (at, >=, 30);
+  g_assert_cmpint (at, <, 40);
+  for (guint i = 0; i < r.out->len; i++) {
+    const OutBuf *ob = &g_array_index (r.out, OutBuf, i);
+
+    g_assert_cmpint (ob->idr, ==, i == 0 || i == (guint) at);
+    if (ob->idr)
+      g_assert_true (ob->headers);
+  }
+  sps = sps_list (r.data, r.hevc);
+  g_assert_cmpuint (sps->len, ==, 2);
+  g_assert_cmpuint (g_array_index (sps, RdsTestSps, 0).width, ==, (guint) w0);
+  g_assert_cmpuint (g_array_index (sps, RdsTestSps, 0).height, ==, (guint) h0);
+  g_assert_cmpuint (g_array_index (sps, RdsTestSps, 1).width, ==, (guint) w1);
+  g_assert_cmpuint (g_array_index (sps, RdsTestSps, 1).height, ==, (guint) h1);
+  g_assert_true (gst_structure_get_int (gst_caps_get_structure (r.last_caps, 0), "width", &w));
+  g_assert_true (gst_structure_get_int (gst_caps_get_structure (r.last_caps, 0), "height", &h));
+  g_assert_cmpint (w, ==, w1);
+  g_assert_cmpint (h, ==, h1);
+  g_array_unref (sps);
+  run_clear (&r);
+  g_free (desc);
+}
+
+static void
+test_resize (gconstpointer data)
+{
+  const Codec *c = data;
+
+  if (!require_va (c))
+    return;
+  check_resize (c, 1280, 720, 640, 360);
+  if (is_hevc (c))
+    check_resize (c, 1366, 768, 720, 480);      /* widths VA's window gets wrong */
+}
+
+/* @w x @h is encoded: two frames, the SPS of the next even size, output caps of the input size. */
+static void
+check_size_ok (const Codec * c, gint w, gint h)
+{
+  gchar *desc = g_strdup_printf ("videotestsrc num-buffers=2 ! video/x-raw,width=%d,height=%d,framerate=30/1 ! "
+      "%s name=enc ! fakesink name=sink", w, h, c->element);
+  Run r = { 0 };
+  GArray *sps;
+  gint cw = 0, ch = 0;
+
+  run_pipeline (c, desc, &r, GST_CLOCK_TIME_NONE);
+  g_assert_cmpuint (r.out->len, ==, 2);
+  sps = sps_list (r.data, r.hevc);
+  g_assert_cmpuint (sps->len, ==, 1);
+  g_test_message ("%dx%d: SPS %ux%u", w, h, g_array_index (sps, RdsTestSps, 0).width,
+      g_array_index (sps, RdsTestSps, 0).height);
+  g_assert_cmpuint (g_array_index (sps, RdsTestSps, 0).width, ==, (guint) (w + 1) / 2 * 2);
+  g_assert_cmpuint (g_array_index (sps, RdsTestSps, 0).height, ==, (guint) (h + 1) / 2 * 2);
+  g_assert_true (gst_structure_get_int (gst_caps_get_structure (r.last_caps, 0), "width", &cw));
+  g_assert_true (gst_structure_get_int (gst_caps_get_structure (r.last_caps, 0), "height", &ch));
+  g_assert_cmpint (cw, ==, w);
+  g_assert_cmpint (ch, ==, h);
+  g_array_unref (sps);
+  run_clear (&r);
+  g_free (desc);
+}
+
+typedef struct
+{
+  GstElement *cf;
+  GstCaps *caps;
+  guint frames;
+} SizeChange;
+
+/* Before frame 10 the capsfilter gets the new caps. */
+static GstPadProbeReturn
+size_change_probe (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstPadProbeInfo * info, gpointer user_data)
+{
+  SizeChange *sc = user_data;
+
+  if (sc->frames++ == 10)
+    g_object_set (sc->cf, "caps", sc->caps, NULL);
+  return GST_PAD_PROBE_OK;
+}
+
+/* @w x @h is refused: not-negotiated, after one warning naming the codec's limits @limits. With @mid_stream, the
+ * stream starts at 256x256 and changes to @w x @h at frame 10. */
+static void
+check_size_refused (const Codec * c, gint w, gint h, const gchar * limits, gboolean mid_stream)
+{
+  gchar *desc = g_strdup_printf ("videotestsrc num-buffers=30 ! capsfilter name=cf caps=video/x-raw,width=%d,"
+      "height=%d,framerate=30/1 ! %s name=enc ! fakesink", mid_stream ? 256 : w, mid_stream ? 256 : h, c->element);
+  gchar *pattern = g_strdup_printf ("*%dx%d*%s*", w, h, limits), *text;
+  GstElement *p = gst_parse_launch (desc, NULL);
+  GstBus *bus = gst_element_get_bus (p);
+  GstMessage *m;
+  SizeChange sc = { gst_bin_get_by_name (GST_BIN (p), "cf"), NULL, 0 };
+  GstPad *pad = gst_element_get_static_pad (sc.cf, "src");
+
+  g_test_message ("%s%s", desc, mid_stream ? " (the size changes at frame 10)" : "");
+  if (mid_stream) {
+    sc.caps = gst_caps_new_simple ("video/x-raw", "width", G_TYPE_INT, w, "height", G_TYPE_INT, h, "framerate",
+        GST_TYPE_FRACTION, 30, 1, NULL);
+    gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, size_change_probe, &sc, NULL);
+  }
+  g_test_expect_message ("rdsenc", G_LOG_LEVEL_WARNING, pattern);
+  gst_element_set_state (p, GST_STATE_PLAYING);
+  m = gst_bus_timed_pop_filtered (bus, RDS_TEST_MEDIA_TIMEOUT, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+  g_assert_nonnull (m);
+  g_assert_cmpint (GST_MESSAGE_TYPE (m), ==, GST_MESSAGE_ERROR);
+  text = error_text (m);
+  g_assert_nonnull (strstr (text, "not-negotiated"));
+  gst_element_set_state (p, GST_STATE_NULL);
+  g_test_assert_expected_messages ();
+  if (mid_stream)
+    g_assert_cmpuint (sc.frames, >, 10);
+  gst_clear_caps (&sc.caps);
+  gst_object_unref (pad);
+  gst_object_unref (sc.cf);
+  g_free (text);
+  gst_message_unref (m);
+  gst_object_unref (bus);
+  gst_object_unref (p);
+  g_free (pattern);
+  g_free (desc);
+}
+
+/* VA's sizes: H.264 128..4096 on each side, at the start and mid-stream. */
+static void
+test_sizes_h264 (void)
+{
+  const Codec *c = &codecs[0];
+  const gchar *limits = "width 128 to 4096, height 128 to 4096";
+
+  if (!require_va (c))
+    return;
+  check_size_ok (c, 128, 256);
+  check_size_ok (c, 4096, 256);
+  check_size_ok (c, 256, 128);
+  check_size_ok (c, 256, 4096);
+  check_size_refused (c, 127, 256, limits, FALSE);
+  check_size_refused (c, 4097, 256, limits, FALSE);
+  check_size_refused (c, 256, 127, limits, FALSE);
+  check_size_refused (c, 256, 4097, limits, FALSE);
+  check_size_refused (c, 4097, 256, limits, TRUE);
+}
+
+/* H.265: width 130..8192, height 128..4352, at the start and mid-stream. */
+static void
+test_sizes_h265 (void)
+{
+  const Codec *c = &codecs[1];
+  const gchar *limits = "width 130 to 8192, height 128 to 4352";
+
+  if (!require_va (c))
+    return;
+  check_size_ok (c, 130, 256);
+  check_size_ok (c, 8192, 128);
+  check_size_ok (c, 256, 128);
+  check_size_ok (c, 256, 4352);
+  check_size_refused (c, 129, 256, limits, FALSE);
+  check_size_refused (c, 8193, 256, limits, FALSE);
+  check_size_refused (c, 256, 127, limits, FALSE);
+  check_size_refused (c, 256, 4353, limits, FALSE);
+  check_size_refused (c, 256, 4353, limits, TRUE);
+}
+
+/* An odd size is coded as the next even size (DeepStream 8.0 behaviour: 4:2:0 crops in 2-pixel units). */
+static void
+test_odd_size (gconstpointer data)
+{
+  if (!require_va (data))
+    return;
+  check_size_ok (data, 1281, 721);
 }
 
 int
@@ -2591,6 +3135,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/enc/configure", test_configure);
   g_test_add_func ("/cpu/enc/filler-only-dropped", test_filler_only_dropped);
   g_test_add_func ("/cpu/enc/segment-again", test_segment_again);
+  g_test_add_func ("/cpu/enc/force-before-start", test_force_before_start);
+  g_test_add_func ("/cpu/enc/size-accept-caps", test_size_accept_caps);
   g_test_add_func ("/gpu/enc/preferred-profile", test_preferred_profile);
   g_test_add_data_func ("/gpu/enc/smoke-h264", &codecs[0], test_smoke);
   g_test_add_data_func ("/gpu/enc/smoke-h265", &codecs[1], test_smoke);
@@ -2626,6 +3172,18 @@ main (int argc, char **argv)
   g_test_add_data_func ("/gpu/enc/delta-unit-h265", &codecs[1], test_delta_unit);
   g_test_add_data_func ("/gpu/enc/framerate-change-h264", &codecs[0], test_framerate_change);
   g_test_add_data_func ("/gpu/enc/framerate-change-h265", &codecs[1], test_framerate_change);
+  g_test_add_data_func ("/gpu/enc/force-idr-h264", &codecs[0], test_force_idr);
+  g_test_add_data_func ("/gpu/enc/force-idr-h265", &codecs[1], test_force_idr);
+  g_test_add_data_func ("/gpu/enc/force-intra-h264", &codecs[0], test_force_intra);
+  g_test_add_data_func ("/gpu/enc/force-intra-h265", &codecs[1], test_force_intra);
+  g_test_add_data_func ("/gpu/enc/force-key-unit-h264", &codecs[0], test_force_key_unit);
+  g_test_add_data_func ("/gpu/enc/force-key-unit-h265", &codecs[1], test_force_key_unit);
+  g_test_add_data_func ("/gpu/enc/resize-h264", &codecs[0], test_resize);
+  g_test_add_data_func ("/gpu/enc/resize-h265", &codecs[1], test_resize);
+  g_test_add_func ("/gpu/enc/sizes-h264", test_sizes_h264);
+  g_test_add_func ("/gpu/enc/sizes-h265", test_sizes_h265);
+  g_test_add_data_func ("/gpu/enc/odd-size-h264", &codecs[0], test_odd_size);
+  g_test_add_data_func ("/gpu/enc/odd-size-h265", &codecs[1], test_odd_size);
   ret = g_test_run ();
   gst_deinit ();
   return ret;

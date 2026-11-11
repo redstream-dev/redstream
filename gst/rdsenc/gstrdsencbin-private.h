@@ -99,17 +99,17 @@ typedef struct
 /* input segments waiting for their output segment; more than this means VA dropped some */
 #define MAX_PENDING_SEGMENTS 16
 
-/* Locking: the object lock guards the property values and the inner-element pointers. Forward a property to an
- * inner element or send it an event after unlocking, never under the object lock: take a reference with
- * get_encoder () (or the like) and drop the lock first. va_lock serialises the writes of the properties the VA
- * encoder takes while running (bitrate; the forced key frames will take it too) with the start's configure (), so
- * a live value set during a start is not overwritten by the start's older snapshot: a forward takes va_lock, reads
- * the latest stored value under the object lock, and sets it with only va_lock held. Lock order: va_lock, then the
- * object lock. The probes never take va_lock (they run inside the VA encoder's own calls). configure () holds
- * va_lock while it sets the children's properties and posts nothing then, so don't set this bin's properties from
- * its children's notify / deep-notify or from a sync bus handler while it starts. The chain, and the
- * probes on it, are made once, in build_chain; per-run state (what the probes measure or warn about once) is reset
- * at READY to PAUSED and PAUSED to READY, not there.
+/* Locking: the object lock guards the property values and the inner-element pointers. Forward a property to an inner
+ * element or send it an event after unlocking, never under the object lock: take a reference with get_encoder () (or
+ * the like) and drop the lock first. va_lock serialises what reaches the VA encoder while it runs (bitrate, and the
+ * force-key-unit events of force-idr and force-intra) with the start's configure (), so a live value set during a start
+ * is not overwritten by the start's older snapshot: a forward takes va_lock, reads the latest stored value under the
+ * object lock, and sets it (or sends the event) with only va_lock held. Lock order: va_lock, then the object lock. The
+ * probes never take va_lock (they run inside the VA encoder's own calls). configure () holds va_lock while it sets the
+ * children's properties and posts nothing then, so don't set this bin's properties from its children's notify /
+ * deep-notify or from a sync bus handler while it starts. The chain, and the probes on it, are made once, in
+ * build_chain; per-run state (what the probes measure or warn about once) is reset at READY to PAUSED and PAUSED to
+ * READY, not there.
  *
  * The stream probes (filler, timestamps, caps, batches, copy-meta) run on the streaming threads (upstream's at the
  * ghost sink pad, the VA encoder's at its pads) and keep their state under probe_lock, a leaf lock: no element, pad
@@ -125,6 +125,10 @@ struct _GstRdsEncBinPrivate
   GstElement *encoder;          /* vah264enc / vah265enc */
   GstElement *srccaps;          /* the codec's byte-stream caps */
   GstPad *sink_ghost, *src_ghost;
+  /* the sizes the VA encoder takes on system memory, from its sink template (have_size_range FALSE: none known, any
+   * size is left to it) */
+  gboolean have_size_range;
+  gint min_width, max_width, min_height, max_height;
 
   /* properties (object lock), indexed by property id */
   GValue values[N_PROPS];
@@ -136,6 +140,7 @@ struct _GstRdsEncBinPrivate
   guint b_frames_set;           /* what the VA encoder's b-frames was last set to */
   gboolean b_frames_warned;     /* the Baseline + B frames warning was given */
   gboolean level_warned;        /* the downstream level warning was given */
+  gboolean size_warned;         /* the input size warning was given */
 
   /* the stream probes' state (probe_lock), cleared at READY to PAUSED and PAUSED to READY */
   GMutex probe_lock;
