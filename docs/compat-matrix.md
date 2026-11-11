@@ -38,8 +38,8 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvdslogger` | `rdslogger` | supported | passthrough, any caps; prints each stream's frame rate to stdout in DeepStream 8.0's `**PERF` line format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
 | `nveglglessink` | `rdsvideosink` | supported | display bin: `rdsvideoconvert` to system-memory BGRx, then a stock GStreamer sink (`video-sink`, default `autovideosink`); one frame per buffer; properties and behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nv3dsink` | `rdsvideosink` | supported | as `nveglglessink` (nv3dsink's properties are a subset of nveglglessink's) | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
-| `nvv4l2h264enc` | `rdsh264enc` | in progress | a bin over the stock VA encoder `vah264enc` (VCN), through `rdsvideoconvert` to system-memory NV12; `memory:RDS` or system-memory input. Done: DeepStream 8.0's properties, applied to the VA encoder at start (`bitrate` live too), the preferred profile, B frames dropped for Baseline, the inner elements, the errors at start (no VA encoder, an unsupported profile). Not yet: filler stripping, input timestamps, `copy-meta`, forced key frames; properties below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html) |
-| `nvv4l2h265enc` | `rdsh265enc` | in progress | a bin over the stock VA encoder `vah265enc` (VCN), through `rdsvideoconvert` to system-memory NV12; `memory:RDS` or system-memory input. Done: DeepStream 8.0's properties, applied to the VA encoder at start (`bitrate` live too), the preferred profile, B frames dropped for Baseline, the inner elements, the errors at start (no VA encoder, an unsupported profile). Not yet: filler stripping, input timestamps, `copy-meta`, forced key frames; properties below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html) |
+| `nvv4l2h264enc` | `rdsh264enc` | in progress | a bin over the stock VA encoder `vah264enc` (VCN), through `rdsvideoconvert` to system-memory NV12; `memory:RDS` or system-memory input. Done: DeepStream 8.0's properties, applied to the VA encoder at start (`bitrate` live too), the preferred profile, B frames dropped for Baseline, the inner elements, the errors at start (no VA encoder, an unsupported profile), filler stripping, the input's timestamps, DELTA_UNIT, `copy-meta`, batch refusal, the framerate in the caps; H.265: the conformance window. Not yet: forced key frames; properties and stream behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html) |
+| `nvv4l2h265enc` | `rdsh265enc` | in progress | a bin over the stock VA encoder `vah265enc` (VCN), through `rdsvideoconvert` to system-memory NV12; `memory:RDS` or system-memory input. Done: DeepStream 8.0's properties, applied to the VA encoder at start (`bitrate` live too), the preferred profile, B frames dropped for Baseline, the inner elements, the errors at start (no VA encoder, an unsupported profile), filler stripping, the input's timestamps, DELTA_UNIT, `copy-meta`, batch refusal, the framerate in the caps; H.265: the conformance window. Not yet: forced key frames; properties and stream behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html) |
 
 ### `rdsurisrcbin` (`nvurisrcbin`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin))
 
@@ -1360,7 +1360,7 @@ downstream level into the stream).
 | `insert-aud` | boolean | `FALSE` | supported | VA's `aud` |
 | `min-force-key-unit-interval` | uint64 | `0` | supported | nanoseconds: passed to the VA encoder |
 | `qos` | boolean | `FALSE` | supported | passed to the VA encoder |
-| `copy-meta` | boolean | `FALSE` | supported | the input buffer's metas (`RdsBatchMeta` included) are copied onto the encoded buffer of the same frame. Buffer flags come from the encoder (ours: DeepStream 8.0 copies the input's flags too, clearing DELTA_UNIT on every buffer) |
+| `copy-meta` | boolean | `FALSE` | supported | TRUE: the metas of the element's input buffer (`RdsBatchMeta` included, deep-copied; metas tied to the memory left out) are copied onto the encoded buffer of the same frame, found by its input PTS, so B-frame reordering doesn't matter; an input frame's metas are kept until its output, a flush or EOS, or until 64 newer frames came in. FALSE: the encoded buffers carry no `RdsBatchMeta` (DeepStream 8.0 behaviour). Buffer flags come from the encoder (ours: DeepStream 8.0 copies the input's flags too, clearing DELTA_UNIT on every buffer) |
 | `gpu-id` | uint | `0` | supported | the inner `rdsvideoconvert`'s `gpu-id` |
 | `preset-id` | uint 1..7 | `1` | accepted no-op | VA's `target-usage` is always 1 (ours: the only setting that holds CBR at the target, and the fastest) |
 | `insert-sps-pps` | boolean | `FALSE` | accepted no-op | parameter sets always precede every IDR frame (ours) |
@@ -1386,10 +1386,35 @@ Pads: `sink` (a ghost pad of `rdsvideoconvert`'s): `memory:RDS` or system memory
 `stream-format=byte-stream`, `alignment=au`. Without `vah264enc` (no VA plugin, or a driver that can't encode H.264)
 the element still registers, and going to READY is an element error naming `vah264enc`. Rank none.
 
+Stream behaviour (pad probes on the inner elements):
+
+- **Filler:** filler NAL units (type 12) are removed from the output, so CBR's bitrate is a ceiling and easy content
+  comes out smaller (DeepStream 8.0 behaviour: its output has none). VA adds them once its rate-control buffer has
+  filled, a few seconds into a CBR stream.
+- **Timestamps:** VA moves PTS, DTS and the segment forward so that the first PTS is at least 1000 h (by 1000 h minus
+  the first PTS, measured again after a flush). Without B frames the bin removes that shift: output PTS = DTS = the
+  input PTS, durations and the segment are the input's (DeepStream 8.0 behaviour). With B frames VA's timestamps and
+  segment stay as they are (running time is the input's, PTS reordered, DTS increasing and below PTS), since removing
+  the shift would put the first DTS before 0 (ours: DeepStream 8.0 writes DTS = PTS and doesn't reorder PTS).
+- **DELTA_UNIT:** cleared on intra frames (IDR and I) and set on the others (DeepStream 8.0 behaviour; VA alone
+  clears it on IDR frames only). The first buffer is DISCONT.
+- **Batches:** a buffer whose `RdsBatchMeta` has more than one frame is an element error, "takes one frame per
+  buffer" (ours: DeepStream 8.0 encodes the first frame of the batch only, silently). Put a tiler or a demuxer first.
+- **Framerate:** the output caps carry the input caps' framerate, from the first frame at a new rate (ours: VA restarts
+  its sequence on a frame-rate change but keeps the old framerate in its caps, and sends none when nothing else
+  changed).
+
 ### `rdsh265enc` (`nvv4l2h265enc`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html))
 
 The same bin over `vah265enc`, with `video/x-h265` on `src`, and the same properties as `rdsh264enc` (from
 DeepStream 8.0's nvv4l2h265enc), except that it has no `disable-cabac` and its own `profile` enum.
+Stream behaviour as `rdsh264enc` (filler NAL units are type 38; VA on VCN 3 writes no B frames, but with
+`num-B-Frames` above 0 the timestamps keep VA's shift all the same), and:
+
+- **Conformance window:** the SPS before every IDR frame gets the window that crops the coded picture to the input
+  size (rounded up to even), so the stream decodes at the input size (ours: VA on this Mesa pads the width to a
+  multiple of 64 but computes the window from a multiple of 16, so 720x480 decodes 768 wide and 1366x768 1398 wide;
+  DeepStream 8.0's streams decode at the input size).
 
 | Property | Type | Default | Status | Notes |
 |---|---|---|---|---|

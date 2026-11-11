@@ -513,13 +513,14 @@ test('enc_caps', executable('enc_caps', 'check' / 'enc_caps.c', dependencies : [
 
 # rdsh264enc / rdsh265enc: registration, pads, DeepStream 8.0's properties and enums, no-op warnings, QP strings, the
 # inner chain, a missing VA encoder, the unsupported profiles, the VA properties a start sets and the preferred profile
-# (cpu); encodes through the bins: GOPs, profiles, levels, rates, B frames (gpu, skipped without the VA encoders).
+# (cpu); encodes through the bins: GOPs, profiles, levels, rates, B frames, no filler, the H.265 size, input
+# timestamps, copy-meta, input memory, batches, DELTA_UNIT, a frame-rate change (gpu, skipped without the VA encoders).
 element_enc_exe = executable('element_enc', 'check' / 'element_enc.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep])
 test('element_enc_cpu', element_enc_exe, args : ['-p', '/cpu/enc'],
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 test('element_enc', element_enc_exe, args : ['-p', '/gpu/enc'],
-  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120, depends : rds_plugins)
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
 
 # rdsvideosink: properties, forwarding and start errors (cpu); RDS frames into the inner sink, batched input (gpu).
 element_videosink_exe = executable('element_videosink', 'check' / 'element_videosink.c',

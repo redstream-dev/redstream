@@ -1,7 +1,8 @@
 /* rdsh264enc / rdsh265enc Annex-B helpers: filler stripping (positions, start-code lengths, both codecs, metas and
- * flags kept), the timestamp-shift removal on times and segments, and the H.265 SPS conformance-window fix on SPSs
- * captured from vah265enc (cpu); the test walker on streams from the VA encoders, filler stripping on a real CBR
- * stream, the VA encoders' measured shift and an encode → fix → decode round trip (gpu).
+ * flags kept), the timestamp-shift removal on times and segments, the H.265 SPS conformance-window fix on SPSs
+ * captured from vah265enc and intra access units on hand-coded slice headers (cpu); the test walker on streams from
+ * the VA encoders, filler stripping on a real CBR stream, the VA encoders' measured shift and an encode → fix →
+ * decode round trip (gpu).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-enc-nal.h"
 #include "rds-test-media.h"
@@ -1120,6 +1121,100 @@ test_gpu_sps_round_trip (void)
   g_ptr_array_unref (aus);
 }
 
+/* ------------------------------------------------------------------------------------------------------------ */
+/* Intra access units */
+
+/* Hand-coded slice headers (bit strings in the comments): H.264 first_mb_in_slice ue(0) "1", then slice_type; HEVC
+ * first_slice_segment_in_pic_flag "1", slice_pic_parameter_set_id ue(0) "1", num_extra_slice_header_bits reserved
+ * bits, then slice_type. Each AU is an AUD-less run of NAL units with 4-byte start codes. */
+static gboolean
+intra (RdsEncCodec codec, guint * extra, const guint8 * au, gsize size)
+{
+  return rds_enc_au_is_intra (au, size, codec, extra);
+}
+
+static void
+test_intra_h264 (void)
+{
+  /* SPS, PPS, IDR (type 5): I by the NAL type */
+  static const guint8 idr[] = { 0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0x88, 0x84 };
+  /* non-IDR (type 1), slice_type 7 (I, all slices) "0001000": 1 0001000 */
+  static const guint8 i7[] = { 0, 0, 0, 1, 0x41, 0x88, 0x84 };
+  /* slice_type 2 (I) "011": 1 011 0000 */
+  static const guint8 i2[] = { 0, 0, 1, 0x41, 0xb0, 0x80 };
+  /* slice_type 4 (SI) "00101": 1 00101 00 */
+  static const guint8 si[] = { 0, 0, 1, 0x41, 0x94, 0x80 };
+  /* slice_type 5 (P) "00110": 1 00110 10 */
+  static const guint8 p5[] = { 0, 0, 0, 1, 0x41, 0x9a, 0x80 };
+  /* slice_type 0 (P) "1": 1 1 */
+  static const guint8 p0[] = { 0, 0, 0, 1, 0x41, 0xc0 };
+  /* slice_type 1 (B) "010", non-reference: 1 010 */
+  static const guint8 b1[] = { 0, 0, 0, 1, 0x01, 0xa0 };
+  /* SEI (type 6) before an I slice */
+  static const guint8 sei_i[] = { 0, 0, 0, 1, 0x06, 0x05, 0x80, 0, 0, 0, 1, 0x41, 0x88, 0x84 };
+  /* only parameter sets, and a slice header cut short */
+  static const guint8 none[] = { 0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce };
+  static const guint8 cut[] = { 0, 0, 0, 1, 0x41, 0x00 };
+  /* a data partition A (type 2) whose header would read as I: not a slice here */
+  static const guint8 part[] = { 0, 0, 0, 1, 0x42, 0x88, 0x84 };
+  /* an I slice header followed by a long picture: only the header is read */
+  guint8 *big = g_malloc0 (1 << 20);
+  guint extra = 0;
+
+  g_assert_true (intra (RDS_ENC_CODEC_H264, &extra, idr, sizeof (idr)));
+  g_assert_true (intra (RDS_ENC_CODEC_H264, &extra, i7, sizeof (i7)));
+  g_assert_true (intra (RDS_ENC_CODEC_H264, &extra, i2, sizeof (i2)));
+  g_assert_true (intra (RDS_ENC_CODEC_H264, &extra, si, sizeof (si)));
+  g_assert_true (intra (RDS_ENC_CODEC_H264, &extra, sei_i, sizeof (sei_i)));
+  g_assert_false (intra (RDS_ENC_CODEC_H264, &extra, p5, sizeof (p5)));
+  g_assert_false (intra (RDS_ENC_CODEC_H264, &extra, p0, sizeof (p0)));
+  g_assert_false (intra (RDS_ENC_CODEC_H264, &extra, b1, sizeof (b1)));
+  g_assert_false (intra (RDS_ENC_CODEC_H264, &extra, none, sizeof (none)));
+  g_assert_false (intra (RDS_ENC_CODEC_H264, &extra, cut, sizeof (cut)));
+  g_assert_false (intra (RDS_ENC_CODEC_H264, &extra, NULL, 0));
+  g_assert_false (intra (RDS_ENC_CODEC_H264, &extra, part, sizeof (part)));
+  memcpy (big, i7, sizeof (i7));
+  memset (big + sizeof (i7), 0x55, (1 << 20) - sizeof (i7));
+  g_assert_true (intra (RDS_ENC_CODEC_H264, &extra, big, 1 << 20));
+  g_free (big);
+  g_assert_cmpuint (extra, ==, 0);
+}
+
+static void
+test_intra_h265 (void)
+{
+  /* IDR_W_RADL (19) and CRA (21): intra by the NAL type */
+  static const guint8 idr[] = { 0, 0, 0, 1, 0x26, 0x01, 0xa0 };
+  static const guint8 cra[] = { 0, 0, 0, 1, 0x2a, 0x01, 0xa0 };
+  /* TRAIL_R (1), no extra bits: slice_type 2 (I) "011": 1 1 011 000; 1 (P) "010": 1 1 010 000 */
+  static const guint8 i0[] = { 0, 0, 0, 1, 0x02, 0x01, 0xd8 };
+  static const guint8 p0[] = { 0, 0, 0, 1, 0x02, 0x01, 0xd0 };
+  /* with two extra bits "00": I 1 1 00 011 0 and P 1 1 00 010 0 */
+  static const guint8 i2[] = { 0, 0, 0, 1, 0x02, 0x01, 0xc6 };
+  static const guint8 p2[] = { 0, 0, 0, 1, 0x02, 0x01, 0xc4 };
+  /* PPS (34): pps id ue(0) "1", sps id ue(0) "1", dependent_slice_segments_enabled 0, output_flag_present 0,
+   * num_extra_slice_header_bits "010": 1 1 0 0 010 1; then the TRAIL_R I slice with two extra bits */
+  static const guint8 pps_i2[] = { 0, 0, 0, 1, 0x44, 0x01, 0xc5, 0x80, 0, 0, 0, 1, 0x02, 0x01, 0xc6 };
+  /* not the first slice segment of the picture: can't be read without the PPS's other fields */
+  static const guint8 later[] = { 0, 0, 0, 1, 0x02, 0x01, 0x58 };
+  guint extra = 0;
+
+  g_assert_true (intra (RDS_ENC_CODEC_H265, &extra, idr, sizeof (idr)));
+  g_assert_true (intra (RDS_ENC_CODEC_H265, &extra, cra, sizeof (cra)));
+  g_assert_true (intra (RDS_ENC_CODEC_H265, &extra, i0, sizeof (i0)));
+  g_assert_false (intra (RDS_ENC_CODEC_H265, &extra, p0, sizeof (p0)));
+  g_assert_false (intra (RDS_ENC_CODEC_H265, &extra, later, sizeof (later)));
+  g_assert_cmpuint (extra, ==, 0);
+  /* the PPS updates the extra bits before its slice is read, and they stay for the next AUs */
+  g_assert_true (intra (RDS_ENC_CODEC_H265, &extra, pps_i2, sizeof (pps_i2)));
+  g_assert_cmpuint (extra, ==, 2);
+  g_assert_true (intra (RDS_ENC_CODEC_H265, &extra, i2, sizeof (i2)));
+  g_assert_false (intra (RDS_ENC_CODEC_H265, &extra, p2, sizeof (p2)));
+  /* read with 0 extra bits, the same bytes give other slice types */
+  extra = 0;
+  g_assert_false (intra (RDS_ENC_CODEC_H265, &extra, i2, sizeof (i2)));
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1146,6 +1241,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/enc-nal/sps-emulation", test_sps_fix_emulation);
   g_test_add_func ("/cpu/enc-nal/sps-emulation-captured", test_sps_fix_emulation_captured);
   g_test_add_func ("/cpu/enc-nal/sps-buffer", test_sps_fix_buffer);
+  g_test_add_func ("/cpu/enc-nal/intra-h264", test_intra_h264);
+  g_test_add_func ("/cpu/enc-nal/intra-h265", test_intra_h265);
 
   g_test_add_func ("/gpu/enc-nal/walker-h264", test_gpu_walker_h264);
   g_test_add_func ("/gpu/enc-nal/walker-h265", test_gpu_walker_h265);

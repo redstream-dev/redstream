@@ -1,6 +1,7 @@
 /* Redstream: the Annex-B helpers of rdsh264enc and rdsh265enc: filler NAL stripping, the H.265 SPS
  * conformance-window fix (written from the H.265 specification, sections 7.3.2.2 and 7.3.3) and the removal of the
- * VA encoders' timestamp shift.
+ * VA encoders' timestamp shift; intra access units by their slice headers (H.264 section 7.3.3, H.265 sections
+ * 7.3.2.3 and 7.3.6.1).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-enc-nal.h"
 
@@ -458,4 +459,131 @@ rds_enc_h265_fix_sps_buffer (GstBuffer * in, guint width, guint height)
   g_array_unref (spans);
   gst_buffer_unmap (in, &map);
   return out != NULL ? out : gst_buffer_ref (in);
+}
+
+/* ------------------------------------------------------------------------------------------------------------ */
+/* Intra access units */
+
+/* Enough of a NAL unit's start for the PPS and slice header fields read here, without emulation prevention. */
+#define HEADER_PREFIX 32
+
+/* @r over the RBSP of the first bytes of NAL unit @nal (header included); @rbsp holds the bytes. */
+static void
+br_init_prefix (BitReader * r, GByteArray ** rbsp, const guint8 * nal, gsize size)
+{
+  *rbsp = nal_to_rbsp (nal, MIN (size, HEADER_PREFIX));
+  r->d = (*rbsp)->data;
+  r->bits = (gsize) (*rbsp)->len * 8;
+  r->pos = 0;
+  r->bad = FALSE;
+}
+
+/* HEVC PPS: num_extra_slice_header_bits, or -1 when cut short. */
+static gint
+h265_pps_extra_bits (const guint8 * nal, gsize size)
+{
+  GByteArray *rbsp;
+  BitReader r;
+  guint32 v;
+
+  br_init_prefix (&r, &rbsp, nal, size);
+  r.pos = 16;                   /* the NAL unit header */
+  (void) br_ue (&r);            /* pps_pic_parameter_set_id */
+  (void) br_ue (&r);            /* pps_seq_parameter_set_id */
+  (void) br_bits (&r, 2);       /* dependent_slice_segments_enabled_flag, output_flag_present_flag */
+  v = br_bits (&r, 3);
+  g_byte_array_unref (rbsp);
+  return r.bad ? -1 : (gint) v;
+}
+
+/* The slice_type of a first slice (H.264: modulo 5, so 0 P, 1 B, 2 I, 3 SP, 4 SI; HEVC: 0 B, 1 P, 2 I), or -1. */
+static gint
+slice_type (const guint8 * nal, gsize size, RdsEncCodec codec, guint type, guint extra_bits)
+{
+  GByteArray *rbsp;
+  BitReader r;
+  guint32 t;
+
+  br_init_prefix (&r, &rbsp, nal, size);
+  if (codec == RDS_ENC_CODEC_H264) {
+    r.pos = 8;
+    (void) br_ue (&r);          /* first_mb_in_slice */
+    t = br_ue (&r) % 5;
+  } else {
+    r.pos = 16;
+    if (br_bits (&r, 1) == 0)   /* first_slice_segment_in_pic_flag */
+      r.bad = TRUE;
+    if (type >= 16 && type <= 23)
+      (void) br_bits (&r, 1);   /* no_output_of_prior_pics_flag */
+    (void) br_ue (&r);          /* slice_pic_parameter_set_id */
+    (void) br_bits (&r, extra_bits);    /* slice_reserved_flag[] */
+    t = br_ue (&r);
+  }
+  g_byte_array_unref (rbsp);
+  return r.bad ? -1 : (gint) t;
+}
+
+/* The end of the NAL unit starting at @from: the next start code (or zero_byte before it), or @limit. */
+static gsize
+nal_end (const guint8 * data, gsize from, gsize limit)
+{
+  for (gsize end = from; end + 3 <= limit; end++) {
+    if (data[end] == 0 && data[end + 1] == 0 && data[end + 2] <= 1)
+      return end;
+  }
+  return limit;
+}
+
+gboolean
+rds_enc_au_is_intra (const guint8 * data, gsize size, RdsEncCodec codec, guint * hevc_extra_bits)
+{
+  gsize i = 0;
+
+  g_return_val_if_fail (data != NULL || size == 0, FALSE);
+  g_return_val_if_fail (hevc_extra_bits != NULL, FALSE);
+  /* the NAL units up to the first slice, whose header only is read: the picture's data is never scanned */
+  while (i + 3 <= size) {
+    const guint8 *nal;
+    gsize start;
+    guint type;
+    gint st;
+
+    if (data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1) {
+      i++;
+      continue;
+    }
+    start = i + 3;
+    if (start >= size)
+      break;
+    nal = data + start;
+    if (codec == RDS_ENC_CODEC_H264) {
+      type = nal[0] & 0x1f;
+      if (type == 5)
+        return TRUE;
+      if (type >= 2 && type <= 4)       /* data partitions: VA writes none */
+        return FALSE;
+      if (type == 1) {
+        st = slice_type (nal, nal_end (data, start, MIN (size, start + HEADER_PREFIX)) - start, codec, type, 0);
+        return st == 2 || st == 4;
+      }
+    } else {
+      type = (nal[0] >> 1) & 0x3f;
+      if (type >= 16 && type <= 23)
+        return TRUE;
+      if (type <= 31) {
+        st = slice_type (nal, nal_end (data, start, MIN (size, start + HEADER_PREFIX)) - start, codec, type,
+            *hevc_extra_bits);
+        return st == 2;
+      }
+      if (type == 34) {
+        gint extra = h265_pps_extra_bits (nal, nal_end (data, start, MIN (size, start + HEADER_PREFIX)) - start);
+
+        if (extra >= 0)
+          *hevc_extra_bits = (guint) extra;
+      }
+    }
+    /* a parameter set, SEI or delimiter: on to the next start code */
+    i = nal_end (data, start, size);
+  }
+  return FALSE;
 }

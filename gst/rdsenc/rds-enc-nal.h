@@ -1,6 +1,6 @@
 /* Redstream: the Annex-B helpers of rdsh264enc and rdsh265enc (plugin-internal, not installed): filler NAL
- * stripping, the H.265 SPS conformance-window fix and the removal of the VA encoders' timestamp shift. Buffers and
- * segments only, no element code, so the cpu tests link it without any plugin.
+ * stripping, the H.265 SPS conformance-window fix, the removal of the VA encoders' timestamp shift and telling intra
+ * access units. Buffers and segments only, no element code, so the cpu tests link it without any plugin.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_ENC_NAL_H
 #define RDS_ENC_NAL_H
@@ -76,6 +76,17 @@ G_GNUC_INTERNAL RdsEncSpsResult rds_enc_h265_fix_sps (const guint8 * nal, gsize 
  * and metas and every other byte unchanged. VA writes parameter sets only before IDRs, so the probe calls it only on
  * buffers without GST_BUFFER_FLAG_DELTA_UNIT. */
 G_GNUC_INTERNAL GstBuffer *rds_enc_h265_fix_sps_buffer (GstBuffer * in, guint width, guint height);
+
+/* Whether the Annex-B access unit @data (one picture) is intra coded, from its NAL unit types and its first slice
+ * header: an IDR picture (H.264 nal_unit_type 5), an IRAP picture (HEVC types 16..23), or a first slice of type I or
+ * SI (H.264 slice_type 2, 4, 7, 9; HEVC 2). An HEVC slice header has num_extra_slice_header_bits reserved bits, set
+ * by the PPS: *@hevc_extra_bits is the value of the last PPS seen, updated by a PPS in @data before its slices are
+ * read; keep it across access units (VA writes its one PPS only before IDRs). H.264 slices are nal_unit_type 1 and 5
+ * only. An AU without a slice, or whose first slice can't be read (cut short, an H.264 data partition, an HEVC first
+ * slice that is not the picture's first segment), is not intra. Only the first slice's header bytes are read, not the
+ * picture data. */
+G_GNUC_INTERNAL gboolean rds_enc_au_is_intra (const guint8 * data, gsize size, RdsEncCodec codec,
+    guint * hevc_extra_bits);
 
 G_END_DECLS
 

@@ -1,16 +1,20 @@
 /* rdsh264enc and rdsh265enc: registration, pads, every property's name, type, range, default and flags as
  * gst-inspect shows them for DeepStream 8.0's nvv4l2h264enc / nvv4l2h265enc, the enum types, the accepted no-ops'
  * warning, malformed QP strings, the inner chain, a missing VA encoder, one that doesn't link, the unsupported
- * profiles, what a start sets on the VA encoder and the preferred-profile caps answer (cpu; a stand-in element takes
- * the VA encoder's factory name where the bin has to reach READY); per codec on the real VA encoders: a short encode,
+ * profiles, what a start sets on the VA encoder, the preferred-profile caps answer, and the output probes on a
+ * stand-in's pushes: a buffer of filler only dropped, a segment sent again (cpu; a stand-in element takes the VA
+ * encoder's factory name where the bin has to reach READY); per codec on the real VA encoders: a short encode,
  * properties set while PLAYING, GOP layouts and parameter sets, profiles and levels in the SPS and the caps, a
- * downstream level, CBR rates, a live bitrate change, B frames and Baseline, preset-id and gpu-id (gpu, each skipped
- * without its VA encoder).
+ * downstream level, CBR rates, a live bitrate change, B frames and Baseline, preset-id and gpu-id, and what the bin's
+ * pad probes do: no filler, the H.265 size, input timestamps (also after a seek and with B frames), copy-meta,
+ * memory:RDS and system-memory input, batch refusal, DELTA_UNIT, a frame-rate change (gpu, each skipped without its
+ * VA encoder).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-media.h"
 #include "rds-test-nal.h"
 
+#include <rds/rds.h>
 #include <string.h>
 
 typedef struct
@@ -1256,6 +1260,198 @@ test_preferred_profile (void)
   check_profiles (1, 0, 0, "video/x-h265,profile=main-10", "main-10", 0, FALSE);
 }
 
+/* ---- the output probes on a stand-in VA encoder ---- */
+
+/* The bin in READY (its rdsvideoconvert needs a GPU to start) with the stand-in encoder and the src capsfilter
+ * started on their own: what is pushed from the stand-in's src pad goes through the bin's output probes to a test
+ * pad on the ghost src, and events sent to its sink pad go through the input probes and stop there. */
+typedef struct
+{
+  GstElement *e, *va, *out;
+  GstPad *va_sink, *va_src, *ghost, *sink;
+  GPtrArray *got;               /* buffers */
+  GArray *segs;                 /* GstSegment */
+} Harness;
+
+static GstFlowReturn
+harness_chain (GstPad * pad, G_GNUC_UNUSED GstObject * parent, GstBuffer * buf)
+{
+  Harness *h = g_object_get_data (G_OBJECT (pad), "harness");
+
+  g_ptr_array_add (h->got, buf);
+  return GST_FLOW_OK;
+}
+
+static gboolean
+harness_event (GstPad * pad, G_GNUC_UNUSED GstObject * parent, GstEvent * ev)
+{
+  Harness *h = g_object_get_data (G_OBJECT (pad), "harness");
+
+  if (GST_EVENT_TYPE (ev) == GST_EVENT_SEGMENT) {
+    GstSegment seg;
+
+    gst_event_copy_segment (ev, &seg);
+    g_array_append_val (h->segs, seg);
+  }
+  gst_event_unref (ev);
+  return TRUE;
+}
+
+static gboolean
+drop_event (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstObject * parent, GstEvent * ev)
+{
+  gst_event_unref (ev);
+  return TRUE;
+}
+
+static void
+harness_start (Harness * h, const Codec * c)
+{
+  GstCaps *caps;
+
+  set_va (c, VA_STAND_IN);
+  h->e = gst_element_factory_make (c->element, NULL);
+  h->got = g_ptr_array_new_with_free_func ((GDestroyNotify) gst_buffer_unref);
+  h->segs = g_array_new (FALSE, FALSE, sizeof (GstSegment));
+  g_assert_cmpint (gst_element_set_state (h->e, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  h->va = gst_bin_get_by_name (GST_BIN (h->e), "encoder");
+  h->out = gst_bin_get_by_name (GST_BIN (h->e), "srccaps");
+  h->ghost = gst_element_get_static_pad (h->e, "src");
+  h->sink = gst_pad_new ("sink", GST_PAD_SINK);
+  g_object_set_data (G_OBJECT (h->sink), "harness", h);
+  gst_pad_set_chain_function (h->sink, harness_chain);
+  gst_pad_set_event_function (h->sink, harness_event);
+  g_assert_cmpint (gst_pad_link (h->ghost, h->sink), ==, GST_PAD_LINK_OK);
+  gst_pad_set_active (h->sink, TRUE);
+  gst_pad_set_active (h->ghost, TRUE);
+  g_assert_cmpint (gst_element_set_state (h->out, GST_STATE_PAUSED), ==, GST_STATE_CHANGE_SUCCESS);
+  g_assert_cmpint (gst_element_set_state (h->va, GST_STATE_PAUSED), ==, GST_STATE_CHANGE_SUCCESS);
+  h->va_src = gst_element_get_static_pad (h->va, "src");
+  h->va_sink = gst_element_get_static_pad (h->va, "sink");
+  gst_pad_set_event_function (h->va_sink, drop_event);
+
+  g_assert_true (gst_pad_push_event (h->va_src, gst_event_new_stream_start ("harness")));
+  caps = gst_caps_new_simple (c->caps_name, "stream-format", G_TYPE_STRING, "byte-stream", "alignment",
+      G_TYPE_STRING, "au", "width", G_TYPE_INT, 320, "height", G_TYPE_INT, 240, NULL);
+  g_assert_true (gst_pad_push_event (h->va_src, gst_event_new_caps (caps)));
+  gst_caps_unref (caps);
+}
+
+static void
+harness_stop (Harness * h, const Codec * c)
+{
+  gst_element_set_state (h->va, GST_STATE_READY);
+  gst_element_set_state (h->out, GST_STATE_READY);
+  gst_pad_set_active (h->ghost, FALSE);
+  gst_pad_set_active (h->sink, FALSE);
+  gst_pad_unlink (h->ghost, h->sink);
+  gst_element_set_state (h->e, GST_STATE_NULL);
+  gst_object_unref (h->va_sink);
+  gst_object_unref (h->va_src);
+  gst_object_unref (h->sink);
+  gst_object_unref (h->ghost);
+  gst_object_unref (h->out);
+  gst_object_unref (h->va);
+  gst_object_unref (h->e);
+  g_ptr_array_unref (h->got);
+  g_array_unref (h->segs);
+  set_va (c, VA_REAL);
+}
+
+/* A TIME segment starting at @start, with @seqnum when not GST_SEQNUM_INVALID. */
+static GstEvent *
+segment_event (GstClockTime start, guint32 seqnum)
+{
+  GstSegment seg;
+  GstEvent *ev;
+
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  seg.start = seg.position = start;
+  seg.time = start;
+  ev = gst_event_new_segment (&seg);
+  if (seqnum != GST_SEQNUM_INVALID)
+    gst_event_set_seqnum (ev, seqnum);
+  return ev;
+}
+
+/* Pushes @n bytes on the stand-in encoder's src pad (the bin's output probe runs there). */
+static GstFlowReturn
+push_bytes (GstPad * va_src, const guint8 * bytes, gsize n)
+{
+  GstBuffer *buf = gst_buffer_new_memdup (bytes, n);
+
+  GST_BUFFER_PTS (buf) = 0;
+  GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
+  return gst_pad_push (va_src, buf);
+}
+
+/* A buffer of filler NAL units only is dropped; filler next to a slice is cut out and the slice kept. */
+static void
+test_filler_only_dropped (void)
+{
+  /* H.264: filler (12); a non-IDR P slice (slice_type 5) */
+  static const guint8 h264_filler[] = { 0, 0, 0, 1, 0x0c, 0xff, 0xff, 0x80, 0, 0, 0, 1, 0x0c, 0xff, 0x80 };
+  static const guint8 h264_slice[] = { 0, 0, 0, 1, 0x41, 0x9a, 0x80 };
+  static const guint8 h264_mixed[] = { 0, 0, 0, 1, 0x41, 0x9a, 0x80, 0, 0, 0, 1, 0x0c, 0xff, 0xff, 0x80 };
+  /* H.265: FD_NUT (38); a TRAIL_R P slice */
+  static const guint8 h265_filler[] = { 0, 0, 0, 1, 0x4c, 0x01, 0xff, 0xff, 0x80 };
+  static const guint8 h265_slice[] = { 0, 0, 0, 1, 0x02, 0x01, 0xd0, 0x80 };
+  static const guint8 h265_mixed[] = { 0, 0, 0, 1, 0x02, 0x01, 0xd0, 0x80, 0, 0, 0, 1, 0x4c, 0x01, 0xff, 0x80 };
+
+  for (guint i = 0; i < G_N_ELEMENTS (codecs); i++) {
+    const Codec *c = &codecs[i];
+    const guint8 *filler = i == 0 ? h264_filler : h265_filler, *slice = i == 0 ? h264_slice : h265_slice;
+    const guint8 *mixed = i == 0 ? h264_mixed : h265_mixed;
+    gsize filler_n = i == 0 ? sizeof (h264_filler) : sizeof (h265_filler);
+    gsize slice_n = i == 0 ? sizeof (h264_slice) : sizeof (h265_slice);
+    gsize mixed_n = i == 0 ? sizeof (h264_mixed) : sizeof (h265_mixed);
+    Harness h;
+
+    harness_start (&h, c);
+    g_assert_true (gst_pad_push_event (h.va_src, segment_event (0, GST_SEQNUM_INVALID)));
+    g_assert_cmpint (push_bytes (h.va_src, filler, filler_n), ==, GST_FLOW_OK);
+    g_assert_cmpuint (h.got->len, ==, 0);
+    g_assert_cmpint (push_bytes (h.va_src, slice, slice_n), ==, GST_FLOW_OK);
+    g_assert_cmpint (push_bytes (h.va_src, mixed, mixed_n), ==, GST_FLOW_OK);
+    g_assert_cmpuint (h.got->len, ==, 2);
+    for (guint k = 0; k < h.got->len; k++) {
+      GstBuffer *b = g_ptr_array_index (h.got, k);
+
+      g_assert_cmpuint (gst_buffer_get_size (b), ==, slice_n);
+      g_assert_cmpint (gst_buffer_memcmp (b, 0, slice, slice_n), ==, 0);
+      g_assert_true (GST_BUFFER_FLAG_IS_SET (b, GST_BUFFER_FLAG_DELTA_UNIT));
+    }
+    harness_stop (&h, c);
+  }
+}
+
+/* Each output segment is matched with the input segment it comes from; one sent again with the same seqnum (sticky
+ * events re-sent) takes none and keeps its shift. */
+static void
+test_segment_again (void)
+{
+  const Codec *c = &codecs[0];
+  const GstClockTime shift = 1000 * 3600 * GST_SECOND;
+  Harness h;
+  GstEvent *ev;
+
+  harness_start (&h, c);
+  /* VA's input: two segments queued before VA pushes the first output segment */
+  g_assert_true (gst_pad_send_event (h.va_sink, segment_event (0, GST_SEQNUM_INVALID)));
+  g_assert_true (gst_pad_send_event (h.va_sink, segment_event (5 * GST_SECOND, GST_SEQNUM_INVALID)));
+  /* VA's output for the first, shifted, then the same again */
+  ev = segment_event (shift, 1234);
+  g_assert_true (gst_pad_push_event (h.va_src, gst_event_copy (ev)));
+  g_assert_true (gst_pad_push_event (h.va_src, ev));
+  /* then for the second: VA's shift is the one it measured on the first frame */
+  g_assert_true (gst_pad_push_event (h.va_src, segment_event (5 * GST_SECOND + shift, 1235)));
+  g_assert_cmpuint (h.segs->len, ==, 3);
+  g_assert_cmpuint (g_array_index (h.segs, GstSegment, 0).start, ==, 0);
+  g_assert_cmpuint (g_array_index (h.segs, GstSegment, 1).start, ==, 0);
+  g_assert_cmpuint (g_array_index (h.segs, GstSegment, 2).start, ==, 5 * GST_SECOND);
+  harness_stop (&h, c);
+}
+
 /* ---- gpu ---- */
 
 #define SMOKE_FRAMES 30
@@ -1794,6 +1990,578 @@ test_inner_settings (gconstpointer data)
   g_free (desc);
 }
 
+/* ---- gpu: what the bin's pad probes do to the VA encoders' output ---- */
+
+#define SW 320
+#define SH 240
+#define HOUR (3600 * GST_SECOND)
+#define FRAME_DUR (GST_SECOND / FPS)
+
+typedef struct
+{
+  GstClockTime pts, duration;
+  gint fps_n;                   /* the framerate numerator of its caps */
+} InBuf;
+
+typedef struct
+{
+  GstClockTime pts, dts, duration;
+  gboolean delta, idr, discont;
+  guint first_slice_type;
+  guint filler;                 /* filler NAL units */
+  gint source_id;               /* the batch meta's first frame's source_id; -1: no batch meta */
+  guint meta_frames;
+  gint fps_n;                   /* the framerate numerator of the caps it came with */
+} OutBuf;
+
+/* What a run through the bin gave, seen just before the bin (input) and at the sink (output). */
+typedef struct
+{
+  gboolean hevc;
+  gboolean tag;                 /* attach a batch meta (one frame, source_id = input index) to every input */
+  GArray *in, *out;             /* InBuf, OutBuf */
+  GByteArray *data;
+  GstSegment in_seg, out_seg;
+  guint in_segs, out_segs;
+  gint in_fps_n;
+  GstCaps *first_caps, *last_caps;
+  /* a caps change before input frame change_at: cf's caps become change_caps */
+  GstElement *cf;
+  GstCaps *change_caps;
+  guint change_at;
+} Run;
+
+static void
+run_clear (Run * r)
+{
+  g_array_unref (r->in);
+  g_array_unref (r->out);
+  g_byte_array_unref (r->data);
+  gst_clear_caps (&r->first_caps);
+  gst_clear_caps (&r->last_caps);
+  gst_clear_caps (&r->change_caps);
+  gst_clear_object (&r->cf);
+}
+
+static GstPadProbeReturn
+run_in_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  Run *r = user_data;
+
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info);
+    InBuf ib = { GST_BUFFER_PTS (buf), GST_BUFFER_DURATION (buf), r->in_fps_n };
+
+    if (r->change_caps != NULL && r->in->len == r->change_at)
+      g_object_set (r->cf, "caps", r->change_caps, NULL);
+    if (r->tag) {
+      RdsBatchMeta *bm = rds_create_batch_meta (1);
+      RdsFrameMeta *fm = rds_acquire_frame_meta_from_pool (bm);
+
+      buf = gst_buffer_make_writable (buf);
+      fm->source_id = r->in->len;
+      fm->frame_num = (gint) r->in->len;
+      rds_add_frame_meta_to_batch (bm, fm);
+      g_assert_nonnull (rds_buffer_add_batch_meta (buf, bm));
+      GST_PAD_PROBE_INFO_DATA (info) = buf;
+    }
+    g_array_append_val (r->in, ib);
+  } else {
+    GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info);
+
+    GstCaps *caps;
+    gint d;
+
+    if (GST_EVENT_TYPE (ev) == GST_EVENT_SEGMENT) {
+      gst_event_copy_segment (ev, &r->in_seg);
+      r->in_segs++;
+    } else if (GST_EVENT_TYPE (ev) == GST_EVENT_CAPS) {
+      gst_event_parse_caps (ev, &caps);
+      g_assert_true (gst_structure_get_fraction (gst_caps_get_structure (caps, 0), "framerate", &r->in_fps_n, &d));
+    }
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn
+run_out_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  Run *r = user_data;
+
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info);
+    RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (buf);
+    OutBuf ob = { GST_BUFFER_PTS (buf), GST_BUFFER_DTS (buf), GST_BUFFER_DURATION (buf),
+      GST_BUFFER_FLAG_IS_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT), FALSE, GST_BUFFER_FLAG_IS_SET (buf,
+          GST_BUFFER_FLAG_DISCONT), G_MAXUINT, 0, -1, 0, 0
+    };
+    gint d;
+    GstMapInfo map;
+    GArray *aus;
+
+    g_assert_nonnull (r->last_caps);
+    g_assert_true (gst_structure_get_fraction (gst_caps_get_structure (r->last_caps, 0), "framerate", &ob.fps_n, &d));
+    g_assert_true (gst_buffer_map (buf, &map, GST_MAP_READ));
+    g_byte_array_append (r->data, map.data, map.size);
+    aus = rds_test_nal_aus (map.data, map.size, r->hevc);
+    g_assert_cmpuint (aus->len, ==, 1);
+    ob.idr = au_is_idr (&g_array_index (aus, RdsTestAu, 0), r->hevc);
+    ob.first_slice_type = g_array_index (aus, RdsTestAu, 0).first_slice_type;
+    ob.filler = rds_test_nal_count (map.data, map.size, r->hevc, r->hevc ? 38 : 12);
+    g_array_unref (aus);
+    gst_buffer_unmap (buf, &map);
+    if (bm != NULL) {
+      ob.meta_frames = bm->num_frames_in_batch;
+      if (bm->frame_meta_list != NULL)
+        ob.source_id = (gint) ((RdsFrameMeta *) bm->frame_meta_list->data)->source_id;
+    }
+    g_array_append_val (r->out, ob);
+  } else {
+    GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info);
+    GstCaps *caps;
+
+    if (GST_EVENT_TYPE (ev) == GST_EVENT_SEGMENT) {
+      gst_event_copy_segment (ev, &r->out_seg);
+      r->out_segs++;
+    } else if (GST_EVENT_TYPE (ev) == GST_EVENT_CAPS) {
+      gst_event_parse_caps (ev, &caps);
+      if (r->first_caps == NULL)
+        r->first_caps = gst_caps_ref (caps);
+      gst_caps_replace (&r->last_caps, caps);
+    }
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+/* Runs @desc (an element named "enc", the bin; one named "sink") to EOS into @r; @r->tag, change_* set by the
+ * caller (with change_caps, the capsfilter is the element named "cf"). With @seek_to valid, the pipeline is
+ * prerolled, then a flushing seek to [@seek_to, @seek_to + 1 s) is made before playing. */
+static void
+run_pipeline (const Codec * c, const gchar * desc, Run * r, GstClockTime seek_to)
+{
+  GstElement *p = gst_parse_launch (desc, NULL), *enc, *sink;
+  GstPad *pad, *peer;
+
+  g_assert_nonnull (p);
+  g_test_message ("%s", desc);
+  r->hevc = is_hevc (c);
+  r->in = g_array_new (FALSE, FALSE, sizeof (InBuf));
+  r->out = g_array_new (FALSE, FALSE, sizeof (OutBuf));
+  r->data = g_byte_array_new ();
+  if (r->change_caps != NULL)
+    r->cf = gst_bin_get_by_name (GST_BIN (p), "cf");
+  enc = gst_bin_get_by_name (GST_BIN (p), "enc");
+  pad = gst_element_get_static_pad (enc, "sink");
+  peer = gst_pad_get_peer (pad);
+  gst_pad_add_probe (peer, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, run_in_probe, r, NULL);
+  gst_object_unref (peer);
+  gst_object_unref (pad);
+  sink = gst_bin_get_by_name (GST_BIN (p), "sink");
+  pad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, run_out_probe, r, NULL);
+  gst_object_unref (pad);
+  if (GST_CLOCK_TIME_IS_VALID (seek_to)) {
+    g_assert_cmpint (gst_element_set_state (p, GST_STATE_PAUSED), !=, GST_STATE_CHANGE_FAILURE);
+    g_assert_cmpint (gst_element_get_state (p, NULL, NULL, RDS_TEST_MEDIA_TIMEOUT), ==, GST_STATE_CHANGE_SUCCESS);
+    g_assert_true (gst_element_seek (p, 1.0, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE,
+            GST_SEEK_TYPE_SET, seek_to, GST_SEEK_TYPE_SET, seek_to + GST_SECOND));
+  }
+  run_to_eos (p);
+  gst_object_unref (sink);
+  gst_object_unref (enc);
+  gst_object_unref (p);
+}
+
+/* @frames of videotestsrc @src at SWxSH, 30 fps, through @c's element with @props. */
+static void
+run_simple (const Codec * c, const gchar * src, const gchar * props, guint frames, Run * r)
+{
+  gchar *desc = g_strdup_printf ("videotestsrc num-buffers=%u %s ! video/x-raw,width=%d,height=%d,framerate=%d/1 ! "
+      "%s name=enc %s ! fakesink name=sink", frames, src, SW, SH, FPS, c->element, props);
+
+  run_pipeline (c, desc, r, GST_CLOCK_TIME_NONE);
+  g_free (desc);
+}
+
+/* CBR on easy content pads with filler NAL units once VA's buffer has filled (a few seconds in): the bare VA encoder
+ * with the settings the bin gives it writes some, the bin lets none out. */
+static void
+test_no_filler (gconstpointer data)
+{
+  const Codec *c = data;
+  Run r = { 0 }, va = { 0 };
+  gchar *props = g_strdup_printf ("bitrate=4000000 ! %s", c->caps_name), *desc;
+  guint va_filler = 0;
+
+  if (!require_va (c)) {
+    g_free (props);
+    return;
+  }
+  desc = g_strdup_printf ("videotestsrc num-buffers=300 pattern=ball ! video/x-raw,format=NV12,width=%d,height=%d,"
+      "framerate=%d/1 ! %s name=enc rate-control=cbr bitrate=4000 target-usage=1 key-int-max=256 ! %s,"
+      "stream-format=byte-stream,alignment=au ! fakesink name=sink", SW, SH, FPS, c->va_factory, c->caps_name);
+  run_pipeline (c, desc, &va, GST_CLOCK_TIME_NONE);
+  for (guint i = 0; i < va.out->len; i++)
+    va_filler += g_array_index (va.out, OutBuf, i).filler;
+  g_test_message ("%s alone: %u filler NAL units in %u frames", c->va_factory, va_filler, va.out->len);
+  g_assert_cmpuint (va_filler, >, 0);
+
+  run_simple (c, "pattern=ball", props, 300, &r);
+  g_assert_cmpuint (r.out->len, ==, 300);
+  for (guint i = 0; i < r.out->len; i++)
+    g_assert_cmpuint (g_array_index (r.out, OutBuf, i).filler, ==, 0);
+  g_assert_cmpuint (rds_test_nal_count (r.data->data, r.data->len, r.hevc, r.hevc ? 38 : 12), ==, 0);
+  run_clear (&va);
+  run_clear (&r);
+  g_free (desc);
+  g_free (props);
+}
+
+/* H.265 at widths that are not multiples of 64: the SPS and the decoder give the exact size (ours: VA's window
+ * alone decodes 768 and 1398 wide). */
+static void
+check_h265_size (gint w, gint h)
+{
+  const Codec *c = &codecs[1];
+  gchar *desc = g_strdup_printf ("videotestsrc num-buffers=10 pattern=ball ! video/x-raw,width=%d,height=%d,"
+      "framerate=30/1 ! %s name=enc ! fakesink name=sink", w, h, c->element);
+  gchar *dec = g_strdup_printf ("appsrc name=src caps=video/x-h265,stream-format=byte-stream format=bytes ! "
+      "h265parse ! vah265dec ! video/x-raw ! appsink name=sink sync=false");
+  Run r = { 0 };
+  RdsTestSps sps;
+  GArray *nals;
+  GstElement *p, *src, *sink;
+  GstSample *s;
+  const GstStructure *st;
+  gint dw = 0, dh = 0;
+
+  run_pipeline (c, desc, &r, GST_CLOCK_TIME_NONE);
+  g_assert_cmpuint (r.out->len, ==, 10);
+  nals = rds_test_nal_split (r.data->data, r.data->len, TRUE);
+  for (guint i = 0; i < nals->len; i++) {
+    const RdsTestNal *n = &g_array_index (nals, RdsTestNal, i);
+
+    if (n->type == 33) {
+      rds_test_h265_sps (n->data, n->size, &sps);
+      g_assert_cmpuint (sps.width, ==, (guint) w);
+      g_assert_cmpuint (sps.height, ==, (guint) h);
+    }
+  }
+  g_array_unref (nals);
+
+  p = gst_parse_launch (dec, NULL);
+  src = gst_bin_get_by_name (GST_BIN (p), "src");
+  sink = gst_bin_get_by_name (GST_BIN (p), "sink");
+  g_assert_cmpint (gst_element_set_state (p, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  g_assert_cmpint (gst_app_src_push_buffer (GST_APP_SRC (src), gst_buffer_new_memdup (r.data->data, r.data->len)),
+      ==, GST_FLOW_OK);
+  g_assert_cmpint (gst_app_src_end_of_stream (GST_APP_SRC (src)), ==, GST_FLOW_OK);
+  s = rds_test_pull (p, sink);
+  g_assert_nonnull (s);
+  st = gst_caps_get_structure (gst_sample_get_caps (s), 0);
+  g_assert_true (gst_structure_get_int (st, "width", &dw));
+  g_assert_true (gst_structure_get_int (st, "height", &dh));
+  g_test_message ("%dx%d decodes %dx%d", w, h, dw, dh);
+  g_assert_cmpint (dw, ==, w);
+  g_assert_cmpint (dh, ==, h);
+  gst_sample_unref (s);
+  gst_element_set_state (p, GST_STATE_NULL);
+  gst_object_unref (sink);
+  gst_object_unref (src);
+  gst_object_unref (p);
+  run_clear (&r);
+  g_free (dec);
+  g_free (desc);
+}
+
+static void
+test_h265_size (void)
+{
+  if (!require_va (&codecs[1]) || !rds_test_have_element ("vah265dec")) {
+    g_test_skip ("no ROCm device, VA encoder or vah265dec");
+    return;
+  }
+  check_h265_size (720, 480);
+  check_h265_size (1366, 768);
+}
+
+/* Without B frames, output PTS = DTS = input PTS and the duration and segment are the input's (DeepStream 8.0
+ * behaviour): VA's shift (up to 1000 h) is removed. Only the first buffer is DISCONT. */
+static void
+check_unshifted (const Run * r)
+{
+  g_assert_cmpuint (r->out->len, ==, r->in->len);
+  g_assert_cmpuint (r->out_segs, >=, 1);
+  g_assert_true (gst_segment_is_equal (&r->in_seg, &r->out_seg));
+  for (guint i = 0; i < r->out->len; i++) {
+    const InBuf *ib = &g_array_index (r->in, InBuf, i);
+    const OutBuf *ob = &g_array_index (r->out, OutBuf, i);
+
+    g_assert_cmpuint (ob->pts, ==, ib->pts);
+    g_assert_cmpuint (ob->dts, ==, ib->pts);
+    g_assert_cmpuint (ob->duration, ==, ib->duration);
+    g_assert_cmpint (ob->discont, ==, i == 0);
+  }
+}
+
+static void
+test_timestamps (gconstpointer data)
+{
+  const Codec *c = data;
+  static const GstClockTime starts[] = { 0, 10 * GST_SECOND, 2000 * HOUR };
+
+  if (!require_va (c))
+    return;
+  for (guint i = 0; i < G_N_ELEMENTS (starts); i++) {
+    gchar *src = g_strdup_printf ("pattern=ball timestamp-offset=%" G_GUINT64_FORMAT, starts[i]);
+    Run r = { 0 };
+
+    run_simple (c, src, "", 30, &r);
+    g_assert_cmpuint (g_array_index (r.in, InBuf, 0).pts, ==, starts[i]);
+    check_unshifted (&r);
+    run_clear (&r);
+    g_free (src);
+  }
+}
+
+/* A flushing seek: VA measures a new shift after the flush; the output still has the input's timestamps and
+ * segment. */
+static void
+test_timestamps_seek (gconstpointer data)
+{
+  const Codec *c = data;
+  gchar *desc;
+  Run r = { 0 };
+  const InBuf *last_in;
+  const OutBuf *last_out;
+
+  if (!require_va (c))
+    return;
+  desc = g_strdup_printf ("videotestsrc pattern=ball ! video/x-raw,width=%d,height=%d,framerate=%d/1 ! %s name=enc "
+      "! fakesink name=sink", SW, SH, FPS, c->element);
+  run_pipeline (c, desc, &r, 5 * GST_SECOND);
+  g_assert_cmpuint (r.out_segs, >=, 2);
+  g_assert_cmpuint (r.out_seg.start, ==, 5 * GST_SECOND);
+  g_assert_true (gst_segment_is_equal (&r.in_seg, &r.out_seg));
+  for (guint i = 0; i < r.out->len; i++) {
+    const OutBuf *ob = &g_array_index (r.out, OutBuf, i);
+
+    g_assert_cmpuint (ob->pts, ==, ob->dts);
+    g_assert_cmpuint (ob->pts, <, 10 * GST_SECOND);
+  }
+  /* the last second is all there, as given */
+  last_in = &g_array_index (r.in, InBuf, r.in->len - 1);
+  last_out = &g_array_index (r.out, OutBuf, r.out->len - 1);
+  g_assert_cmpuint (last_out->pts, ==, last_in->pts);
+  g_assert_cmpuint (last_out->pts, >=, 5 * GST_SECOND + GST_SECOND - 2 * FRAME_DUR);
+  g_free (desc);
+  run_clear (&r);
+}
+
+/* Index of the input frame with PTS @pts, or -1. */
+static gint
+input_index (const Run * r, GstClockTime pts)
+{
+  for (guint i = 0; i < r->in->len; i++) {
+    if (g_array_index (r->in, InBuf, i).pts == pts)
+      return (gint) i;
+  }
+  return -1;
+}
+
+/* H.264 Main with B frames: VA's timestamps stay (ours: removing the shift would put the first DTS below 0); the
+ * output PTS are the input's, reordered, plus the shift VA put on the segment, and DTS increases. */
+static void
+test_b_frames_timestamps (void)
+{
+  const Codec *c = &codecs[0];
+  Run r = { 0 };
+  GstClockTime shift;
+  gboolean reordered = FALSE;
+  guint64 seen = 0;
+
+  if (!require_va (c))
+    return;
+  run_simple (c, "pattern=ball", "profile=2 num-B-Frames=2", 60, &r);
+  g_assert_cmpuint (r.out->len, ==, 60);
+  shift = r.out_seg.start - r.in_seg.start;
+  g_assert_cmpuint (shift, ==, 1000 * HOUR);
+  for (guint i = 0; i < r.out->len; i++) {
+    const OutBuf *ob = &g_array_index (r.out, OutBuf, i);
+    gint k = input_index (&r, ob->pts - shift);
+
+    g_assert_cmpint (k, >=, 0);
+    g_assert_cmpint (k, <, 64);
+    g_assert_false (seen & (G_GUINT64_CONSTANT (1) << k));
+    seen |= G_GUINT64_CONSTANT (1) << k;
+    if (i > 0) {
+      const OutBuf *prev = &g_array_index (r.out, OutBuf, i - 1);
+
+      g_assert_cmpuint (ob->dts, >, prev->dts);
+      reordered |= ob->pts < prev->pts;
+    }
+    g_assert_cmpuint (ob->dts, <=, ob->pts);
+  }
+  g_assert_true (reordered);
+  run_clear (&r);
+}
+
+/* copy-meta: the input's batch meta reaches the output buffer of the same frame (with B frames too); without it
+ * (the default, DeepStream 8.0 behaviour) no output has one. */
+static void
+check_copy_meta (const Codec * c, const gchar * props, gboolean copy)
+{
+  Run r = {.tag = TRUE };
+  GstClockTime shift;
+
+  run_simple (c, "pattern=ball", props, 40, &r);
+  g_assert_cmpuint (r.out->len, ==, 40);
+  shift = r.out_seg.start - r.in_seg.start;
+  for (guint i = 0; i < r.out->len; i++) {
+    const OutBuf *ob = &g_array_index (r.out, OutBuf, i);
+
+    if (!copy) {
+      g_assert_cmpint (ob->source_id, ==, -1);
+      continue;
+    }
+    g_assert_cmpuint (ob->meta_frames, ==, 1);
+    g_assert_cmpint (ob->source_id, ==, input_index (&r, ob->pts - shift));
+  }
+  run_clear (&r);
+}
+
+static void
+test_copy_meta (gconstpointer data)
+{
+  const Codec *c = data;
+
+  if (!require_va (c))
+    return;
+  check_copy_meta (c, "", FALSE);
+  check_copy_meta (c, "copy-meta=true", TRUE);
+  if (!is_hevc (c))
+    check_copy_meta (c, "copy-meta=true profile=2 num-B-Frames=2", TRUE);
+}
+
+/* memory:RDS NV12 and RGBA, and system memory, all encode. */
+static void
+test_inputs (gconstpointer data)
+{
+  const Codec *c = data;
+  static const gchar *const ins[] = {
+    "! rdsvideoconvert ! video/x-raw(memory:RDS),format=NV12",
+    "! rdsvideoconvert ! video/x-raw(memory:RDS),format=RGBA",
+    ",format=RGBA",
+    ",format=NV12",
+  };
+
+  if (!require_va (c))
+    return;
+  for (guint i = 0; i < G_N_ELEMENTS (ins); i++) {
+    gchar *desc = g_strdup_printf ("videotestsrc num-buffers=10 ! video/x-raw,width=%d,height=%d,framerate=%d/1%s%s "
+        "! %s name=enc ! fakesink name=sink", SW, SH, FPS, ins[i][0] == '!' ? " " : "", ins[i], c->element);
+    Run r = { 0 };
+
+    run_pipeline (c, desc, &r, GST_CLOCK_TIME_NONE);
+    g_assert_cmpuint (r.out->len, ==, 10);
+    g_assert_true (g_array_index (r.out, OutBuf, 0).idr);
+    run_clear (&r);
+    g_free (desc);
+  }
+}
+
+/* A batch of two frames is an element error (ours: DeepStream 8.0 encodes the first frame only, silently). */
+static void
+test_batch_rejected (void)
+{
+  const Codec *c = &codecs[0];
+  gchar *desc;
+  GstElement *p;
+  GstBus *bus;
+  GstMessage *m;
+  GError *err = NULL;
+
+  if (!require_va (c))
+    return;
+  desc = g_strdup_printf ("rdsstreammux name=m batch-size=2 width=%d height=%d ! %s name=enc ! fakesink "
+      "videotestsrc num-buffers=10 ! video/x-raw,width=%d,height=%d,framerate=%d/1 ! m.sink_0 "
+      "videotestsrc num-buffers=10 ! video/x-raw,width=%d,height=%d,framerate=%d/1 ! m.sink_1", SW, SH, c->element,
+      SW, SH, FPS, SW, SH, FPS);
+  p = gst_parse_launch (desc, NULL);
+  g_assert_nonnull (p);
+  bus = gst_element_get_bus (p);
+  gst_element_set_state (p, GST_STATE_PLAYING);
+  m = gst_bus_timed_pop_filtered (bus, RDS_TEST_MEDIA_TIMEOUT, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+  g_assert_nonnull (m);
+  g_assert_cmpint (GST_MESSAGE_TYPE (m), ==, GST_MESSAGE_ERROR);
+  g_assert_cmpstr (GST_MESSAGE_SRC_NAME (m), ==, "enc");
+  gst_message_parse_error (m, &err, NULL);
+  g_assert_error (err, GST_STREAM_ERROR, GST_STREAM_ERROR_WRONG_TYPE);
+  g_assert_nonnull (strstr (err->message, "one frame"));
+  g_clear_error (&err);
+  gst_message_unref (m);
+  gst_element_set_state (p, GST_STATE_NULL);
+  gst_object_unref (bus);
+  gst_object_unref (p);
+  g_free (desc);
+}
+
+/* DELTA_UNIT is clear on the IDR and I frames and set on every other frame. */
+static void
+test_delta_unit (gconstpointer data)
+{
+  const Codec *c = data;
+  Run r = { 0 };
+  guint intra = 0;
+
+  if (!require_va (c))
+    return;
+  run_simple (c, "pattern=ball", "idrinterval=30 iframeinterval=10", 60, &r);
+  g_assert_cmpuint (r.out->len, ==, 60);
+  for (guint i = 0; i < r.out->len; i++) {
+    const OutBuf *ob = &g_array_index (r.out, OutBuf, i);
+    gboolean is_intra = ob->idr || ob->first_slice_type == RDS_TEST_H264_SLICE_I;
+
+    intra += is_intra;
+    g_assert_cmpint (ob->delta, ==, !is_intra);
+  }
+  g_assert_cmpuint (intra, ==, 6);      /* 2 IDR, 4 I */
+  run_clear (&r);
+}
+
+/* A frame-rate change mid-stream: the output caps follow from the first frame at the new rate (ours: VA keeps the
+ * old framerate in its caps). */
+static void
+test_framerate_change (gconstpointer data)
+{
+  const Codec *c = data;
+  gchar *desc;
+  Run r = { 0 };
+  gint n = 0, d = 0;
+
+  if (!require_va (c))
+    return;
+  desc = g_strdup_printf ("videotestsrc num-buffers=80 pattern=ball ! capsfilter name=cf caps=video/x-raw,width=%d,"
+      "height=%d,framerate=30/1 ! %s name=enc ! fakesink name=sink", SW, SH, c->element);
+  r.change_caps = gst_caps_new_simple ("video/x-raw", "width", G_TYPE_INT, SW, "height", G_TYPE_INT, SH,
+      "framerate", GST_TYPE_FRACTION, 15, 1, NULL);
+  r.change_at = 40;
+  run_pipeline (c, desc, &r, GST_CLOCK_TIME_NONE);
+  g_assert_cmpuint (r.out->len, ==, 80);
+  /* no B frames: output i is input i */
+  for (guint i = 0; i < r.out->len; i++)
+    g_assert_cmpint (g_array_index (r.out, OutBuf, i).fps_n, ==, g_array_index (r.in, InBuf, i).fps_n);
+  g_assert_cmpint (g_array_index (r.in, InBuf, 0).fps_n, ==, 30);
+  g_assert_cmpint (g_array_index (r.in, InBuf, r.in->len - 1).fps_n, ==, 15);
+  g_assert_true (gst_structure_get_fraction (gst_caps_get_structure (r.first_caps, 0), "framerate", &n, &d));
+  g_assert_cmpint (n, ==, 30);
+  g_assert_true (gst_structure_get_fraction (gst_caps_get_structure (r.last_caps, 0), "framerate", &n, &d));
+  g_assert_cmpint (n, ==, 15);
+  g_assert_cmpint (d, ==, 1);
+  run_clear (&r);
+  g_free (desc);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1814,6 +2582,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/enc/unsupported-profile", test_unsupported_profile);
   g_test_add_func ("/cpu/enc/configure", test_configure);
   g_test_add_func ("/cpu/enc/preferred-profile", test_preferred_profile);
+  g_test_add_func ("/cpu/enc/filler-only-dropped", test_filler_only_dropped);
+  g_test_add_func ("/cpu/enc/segment-again", test_segment_again);
   g_test_add_data_func ("/gpu/enc/smoke-h264", &codecs[0], test_smoke);
   g_test_add_data_func ("/gpu/enc/smoke-h265", &codecs[1], test_smoke);
   g_test_add_data_func ("/gpu/enc/set-while-playing-h264", &codecs[0], test_set_while_playing);
@@ -1831,6 +2601,23 @@ main (int argc, char **argv)
   g_test_add_func ("/gpu/enc/b-frames-h264", test_b_frames);
   g_test_add_data_func ("/gpu/enc/inner-settings-h264", &codecs[0], test_inner_settings);
   g_test_add_data_func ("/gpu/enc/inner-settings-h265", &codecs[1], test_inner_settings);
+  g_test_add_data_func ("/gpu/enc/no-filler-h264", &codecs[0], test_no_filler);
+  g_test_add_data_func ("/gpu/enc/no-filler-h265", &codecs[1], test_no_filler);
+  g_test_add_func ("/gpu/enc/h265-size", test_h265_size);
+  g_test_add_data_func ("/gpu/enc/timestamps-h264", &codecs[0], test_timestamps);
+  g_test_add_data_func ("/gpu/enc/timestamps-h265", &codecs[1], test_timestamps);
+  g_test_add_data_func ("/gpu/enc/timestamps-seek-h264", &codecs[0], test_timestamps_seek);
+  g_test_add_data_func ("/gpu/enc/timestamps-seek-h265", &codecs[1], test_timestamps_seek);
+  g_test_add_func ("/gpu/enc/b-frames-timestamps-h264", test_b_frames_timestamps);
+  g_test_add_data_func ("/gpu/enc/copy-meta-h264", &codecs[0], test_copy_meta);
+  g_test_add_data_func ("/gpu/enc/copy-meta-h265", &codecs[1], test_copy_meta);
+  g_test_add_data_func ("/gpu/enc/inputs-h264", &codecs[0], test_inputs);
+  g_test_add_data_func ("/gpu/enc/inputs-h265", &codecs[1], test_inputs);
+  g_test_add_func ("/gpu/enc/batch-rejected", test_batch_rejected);
+  g_test_add_data_func ("/gpu/enc/delta-unit-h264", &codecs[0], test_delta_unit);
+  g_test_add_data_func ("/gpu/enc/delta-unit-h265", &codecs[1], test_delta_unit);
+  g_test_add_data_func ("/gpu/enc/framerate-change-h264", &codecs[0], test_framerate_change);
+  g_test_add_data_func ("/gpu/enc/framerate-change-h265", &codecs[1], test_framerate_change);
   ret = g_test_run ();
   gst_deinit ();
   return ret;

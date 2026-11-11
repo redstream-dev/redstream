@@ -11,9 +11,9 @@ rdsenc_props_dep = declare_dependency(link_with : rdsenc_props,
   include_directories : include_directories('.'),
   dependencies : [dependency('glib-2.0')])
 
-# The Annex-B helpers (filler stripping, the H.265 SPS window fix, the timestamp shift) and the caps decisions (the
-# preferred profile, Baseline + B frames, the downstream level): GStreamer core only, so the cpu tests link it without
-# any plugin.
+# The Annex-B helpers (filler stripping, the H.265 SPS window fix, the timestamp shift, intra pictures) and the caps
+# decisions (the preferred profile, Baseline + B frames, the downstream level): GStreamer core only, so the cpu tests
+# link it without any plugin.
 rdsenc_gst = static_library('rdsenc-gst',
   files('rds-enc-nal.c', 'rds-enc-caps.c'),
   c_args : ['-DG_LOG_DOMAIN="rdsenc"'],

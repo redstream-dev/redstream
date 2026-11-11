@@ -10,8 +10,11 @@
  * (ours: 8.0's are wrong both ways): bitrate, force-idr and force-intra are live, every other writable property is
  * read at READY to PAUSED (set later, it is stored with a warning and applied at the next start). The properties
  * the VA encoder has no counterpart for are stored and do nothing; a value other than the default logs one warning
- * per property (ours). Behaviour matching DeepStream 8.0 is marked "DeepStream 8.0 behaviour", our choices "ours";
- * every such choice has a row in docs/compat-matrix.md.
+ * per property (ours). Pad probes, not extra elements, shape the VA encoder's output: filler NAL units stripped, the
+ * H.265 conformance window fixed, the input's timestamps and segment restored (without B frames), DELTA_UNIT set from
+ * the picture type, the input's framerate kept in the caps, batches refused and, with copy-meta, the input's metas
+ * copied over. Behaviour matching DeepStream 8.0 is marked "DeepStream 8.0 behaviour", our choices "ours"; every
+ * such choice has a row in docs/compat-matrix.md.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsencbin.h"
 #include "gstrdsencbin-private.h"
@@ -93,6 +96,24 @@ G_STATIC_ASSERT (PROP_DEVICE - PROP_NOOP_FIRST <= 32);
 
 typedef struct _GstRdsEncBinPrivate GstRdsEncBinPrivate;
 
+/* What the probes keep of a video caps (0: unknown). */
+typedef struct
+{
+  gint width, height, fps_n, fps_d;
+} VideoSize;
+
+/* copy-meta: one input buffer's metas, kept on an empty buffer. */
+typedef struct
+{
+  GstClockTime pts;
+  GstBuffer *metas;
+} MetaRecord;
+
+/* copy-meta keeps an input frame's metas until its output, or until 64 newer frames came in. */
+#define MAX_RECORD_AGE 64
+/* input segments waiting for their output segment; more than this means VA dropped some */
+#define MAX_PENDING_SEGMENTS 16
+
 /* Locking: the object lock guards the property values and the inner-element pointers. Forward a property to an
  * inner element or send it an event after unlocking, never under the object lock: take a reference with
  * get_encoder () (or the like) and drop the lock first. va_lock serialises the writes of the properties the VA
@@ -103,7 +124,12 @@ typedef struct _GstRdsEncBinPrivate GstRdsEncBinPrivate;
  * va_lock while it sets the children's properties and posts nothing then, so don't set this bin's properties from
  * its children's notify / deep-notify or from a sync bus handler while it starts. The chain, and the
  * probes on it, are made once, in build_chain; per-run state (what the probes measure or warn about once) is reset
- * at READY to PAUSED and PAUSED to READY, not there. */
+ * at READY to PAUSED and PAUSED to READY, not there.
+ *
+ * The stream probes (filler, timestamps, caps, batches, copy-meta) run on the streaming threads (upstream's at the
+ * ghost sink pad, the VA encoder's at its pads) and keep their state under probe_lock, a leaf lock: no element, pad
+ * or meta lock is taken while it is held (metas are copied, and records freed, after it is dropped), and nothing is
+ * pushed or posted under it. They read b_frames_set under the object lock first, never both at once. */
 struct _GstRdsEncBinPrivate
 {
   GMutex va_lock;
@@ -125,6 +151,22 @@ struct _GstRdsEncBinPrivate
   guint b_frames_set;           /* what the VA encoder's b-frames was last set to */
   gboolean b_frames_warned;     /* the Baseline + B frames warning was given */
   gboolean level_warned;        /* the downstream level warning was given */
+
+  /* the stream probes' state (probe_lock), cleared at READY to PAUSED and PAUSED to READY */
+  GMutex probe_lock;
+  gboolean copy_meta;           /* copy-meta read at the start */
+  GQueue in_segments;           /* GstSegment *: TIME segments the VA encoder received and hasn't pushed yet */
+  GstSegment last_in_segment;   /* the latest one, for an output segment without its own (format UNDEFINED: none) */
+  guint32 out_seqnum;           /* the seqnum of VA's last output segment (GST_SEQNUM_INVALID: none) */
+  guint64 out_start;            /* and its start, as VA sent it */
+  GstClockTime va_shift;        /* VA's timestamp shift on the current output segment */
+  GstClockTime shift;           /* what the src probe removes: va_shift without B frames, else 0 */
+  VideoSize in_size;            /* the VA encoder's input caps */
+  GstClockTime in_since;        /* input PTS of the first frame with in_size (NONE: none yet, or out_size is it) */
+  VideoSize out_size;           /* the input caps of the frames now leaving it */
+  GstCaps *out_caps;            /* the last caps that left the VA encoder, as they left it */
+  guint hevc_extra_bits;        /* num_extra_slice_header_bits of the last PPS */
+  GQueue records;               /* MetaRecord *, copy-meta: the input metas by PTS, oldest first */
 };
 
 G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (GstRdsEncBin, gst_rds_enc_bin, GST_TYPE_BIN);
@@ -338,6 +380,502 @@ caps_event_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   return GST_PAD_PROBE_OK;
 }
 
+/* ---- the stream probes ---- */
+
+static void
+meta_record_free (gpointer p)
+{
+  MetaRecord *r = p;
+
+  gst_buffer_unref (r->metas);
+  g_free (r);
+}
+
+/* probe_lock held: takes every record out, to be freed with free_records once the lock is dropped (freeing a record
+ * frees its metas). */
+static GList *
+steal_records (GstRdsEncBinPrivate * priv)
+{
+  GList *l = priv->records.head;
+
+  g_queue_init (&priv->records);
+  return l;
+}
+
+static void
+free_records (GList * l)
+{
+  g_list_free_full (l, meta_record_free);
+}
+
+/* Drops every record (a flush, EOS). */
+static void
+clear_records (GstRdsEncBinPrivate * priv)
+{
+  GList *l;
+
+  g_mutex_lock (&priv->probe_lock);
+  l = steal_records (priv);
+  g_mutex_unlock (&priv->probe_lock);
+  free_records (l);
+}
+
+/* probe_lock held */
+static void
+clear_segments (GstRdsEncBinPrivate * priv)
+{
+  g_queue_clear_full (&priv->in_segments, (GDestroyNotify) gst_segment_free);
+  gst_segment_init (&priv->last_in_segment, GST_FORMAT_UNDEFINED);
+  priv->out_seqnum = GST_SEQNUM_INVALID;
+}
+
+/* Clears the probes' state, for a new run (READY to PAUSED, PAUSED to READY). */
+static void
+reset_probes (GstRdsEncBin * self, gboolean copy_meta)
+{
+  GstRdsEncBinPrivate *priv = PRIV (self);
+
+  GList *old;
+
+  g_mutex_lock (&priv->probe_lock);
+  priv->copy_meta = copy_meta;
+  old = steal_records (priv);
+  clear_segments (priv);
+  priv->va_shift = 0;
+  priv->shift = 0;
+  priv->in_size = (VideoSize) { 0 };
+  priv->in_since = GST_CLOCK_TIME_NONE;
+  priv->out_size = (VideoSize) { 0 };
+  gst_clear_caps (&priv->out_caps);
+  priv->hevc_extra_bits = 0;
+  g_mutex_unlock (&priv->probe_lock);
+  free_records (old);
+}
+
+static VideoSize
+video_size (const GstCaps * caps)
+{
+  const GstStructure *st = gst_caps_get_structure (caps, 0);
+  VideoSize v = { 0 };
+
+  (void) gst_structure_get_int (st, "width", &v.width);
+  (void) gst_structure_get_int (st, "height", &v.height);
+  if (!gst_structure_get_fraction (st, "framerate", &v.fps_n, &v.fps_d))
+    v.fps_n = v.fps_d = 0;
+  return v;
+}
+
+/* The frames in @buf by its batch meta (1 without one). */
+static guint
+batch_frames (GstBuffer * buf)
+{
+  RdsBatchMeta *bm = gst_buffer_get_rds_batch_meta (buf);
+  guint n;
+
+  if (bm == NULL)
+    return 1;
+  rds_acquire_meta_lock (bm);
+  n = bm->num_frames_in_batch;
+  rds_release_meta_lock (bm);
+  return n;
+}
+
+/* copy-meta: a record of @buf's metas, copied as gst_buffer_copy_into copies them (each meta's transform with the copy
+ * quark, so RdsBatchMeta is deep-copied under its own lock; metas tied to the memory are left out); NULL without a
+ * PTS. Called without probe_lock. */
+static MetaRecord *
+new_record (GstBuffer * buf)
+{
+  MetaRecord *r;
+
+  if (!GST_BUFFER_PTS_IS_VALID (buf))
+    return NULL;
+  r = g_new (MetaRecord, 1);
+  r->pts = GST_BUFFER_PTS (buf);
+  r->metas = gst_buffer_new ();
+  gst_buffer_copy_into (r->metas, buf, GST_BUFFER_COPY_META, 0, (gsize) - 1);
+  return r;
+}
+
+/* Keeps @r, dropping records more than MAX_RECORD_AGE frames older than it (freed after the lock is dropped). */
+static void
+add_record (GstRdsEncBinPrivate * priv, MetaRecord * r)
+{
+  GList *evicted = NULL;
+
+  g_mutex_lock (&priv->probe_lock);
+  g_queue_push_tail (&priv->records, r);
+  while (g_queue_get_length (&priv->records) > MAX_RECORD_AGE + 1)
+    evicted = g_list_prepend (evicted, g_queue_pop_head (&priv->records));
+  g_mutex_unlock (&priv->probe_lock);
+  free_records (evicted);
+}
+
+/* The bin's input, before the convert: a batch of more than one frame is an element error (ours: DeepStream 8.0
+ * encodes the first frame only, silently). With copy-meta, the input metas are recorded here, on the original
+ * buffer: the VA encoder sees the converted one. A flush drops the records. */
+static GstPadProbeReturn
+sink_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstRdsEncBin *self = user_data;
+  GstRdsEncBinPrivate *priv = PRIV (self);
+  GstBufferList *list = NULL;
+  GstBuffer *buf = NULL;
+  guint n = 0, len;
+  gboolean copy_meta;
+
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_EVENT_BOTH) {
+    if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_EVENT (info)) == GST_EVENT_FLUSH_STOP)
+      clear_records (priv);
+    return GST_PAD_PROBE_OK;
+  }
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+    list = GST_PAD_PROBE_INFO_BUFFER_LIST (info);
+    len = gst_buffer_list_length (list);
+  } else {
+    buf = GST_PAD_PROBE_INFO_BUFFER (info);
+    len = 1;
+  }
+  for (guint i = 0; i < len; i++)
+    n = MAX (n, batch_frames (list != NULL ? gst_buffer_list_get (list, i) : buf));
+  if (n > 1) {
+    GST_ELEMENT_ERROR (self, STREAM, WRONG_TYPE, ("%s takes one frame per buffer: add a tiler or a demuxer "
+            "before it", GST_RDS_ENC_BIN_GET_CLASS (self)->info->element), ("%u frames in the buffer", n));
+    gst_mini_object_unref (GST_PAD_PROBE_INFO_DATA (info));
+    GST_PAD_PROBE_INFO_DATA (info) = NULL;
+    GST_PAD_PROBE_INFO_FLOW_RETURN (info) = GST_FLOW_ERROR;
+    return GST_PAD_PROBE_HANDLED;
+  }
+
+  g_mutex_lock (&priv->probe_lock);
+  copy_meta = priv->copy_meta;
+  g_mutex_unlock (&priv->probe_lock);
+  if (!copy_meta)
+    return GST_PAD_PROBE_OK;
+  for (guint i = 0; i < len; i++) {
+    MetaRecord *r = new_record (list != NULL ? gst_buffer_list_get (list, i) : buf);
+
+    if (r != NULL)
+      add_record (priv, r);
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+/* gst_buffer_foreach_meta: removes the unlocked metas of API @api (a GType as a pointer; NULL: all). */
+static gboolean
+remove_meta (GstBuffer * buf, GstMeta ** meta, gpointer api)
+{
+  if (!GST_META_FLAG_IS_SET (*meta, GST_META_FLAG_LOCKED)
+      && (api == NULL || (*meta)->info->api == GPOINTER_TO_SIZE (api))) {
+    GST_TRACE ("removing %s from %" GST_PTR_FORMAT, g_type_name ((*meta)->info->api), buf);
+    *meta = NULL;
+  }
+  return TRUE;
+}
+
+static gboolean
+same_size (const VideoSize * a, const VideoSize * b)
+{
+  return a->width == b->width && a->height == b->height && a->fps_n == b->fps_n && a->fps_d == b->fps_d;
+}
+
+/* The VA encoder's input buffers (converted, so the bin's own input is never touched):
+ * - the batch meta is removed: VA's base class copies a frame's untagged metas onto its output, which would
+ *   deep-copy RdsBatchMeta for every frame, and without copy-meta the output has none (DeepStream 8.0 behaviour);
+ *   with copy-meta the output gets the bin's input metas (set_metas);
+ * - the PTS of the first frame of new caps, from which output frames have them. */
+static GstPadProbeReturn
+va_sink_buffer_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstRdsEncBinPrivate *priv = PRIV (GST_RDS_ENC_BIN (user_data));
+  GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info);
+
+  if (gst_buffer_get_meta (buf, RDS_META_API_TYPE) != NULL) {
+    buf = gst_buffer_make_writable (buf);
+    gst_buffer_foreach_meta (buf, remove_meta, GSIZE_TO_POINTER (RDS_META_API_TYPE));
+    GST_PAD_PROBE_INFO_DATA (info) = buf;
+  }
+
+  g_mutex_lock (&priv->probe_lock);
+  if (!GST_CLOCK_TIME_IS_VALID (priv->in_since) && !same_size (&priv->in_size, &priv->out_size))
+    priv->in_since = GST_BUFFER_PTS_IS_VALID (buf) ? GST_BUFFER_PTS (buf) : 0;
+  g_mutex_unlock (&priv->probe_lock);
+  return GST_PAD_PROBE_OK;
+}
+
+/* The VA encoder's input events: its segments (for the shift) and caps (the size and frame rate the output gets). */
+static GstPadProbeReturn
+va_sink_event_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstRdsEncBinPrivate *priv = PRIV (GST_RDS_ENC_BIN (user_data));
+  GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info);
+  const GstSegment *seg;
+  GstCaps *caps;
+
+  switch (GST_EVENT_TYPE (ev)) {
+    case GST_EVENT_SEGMENT:
+      gst_event_parse_segment (ev, &seg);
+      if (seg->format != GST_FORMAT_TIME)
+        break;
+      g_mutex_lock (&priv->probe_lock);
+      g_queue_push_tail (&priv->in_segments, gst_segment_copy (seg));
+      while (g_queue_get_length (&priv->in_segments) > MAX_PENDING_SEGMENTS)
+        gst_segment_free (g_queue_pop_head (&priv->in_segments));
+      g_mutex_unlock (&priv->probe_lock);
+      break;
+    case GST_EVENT_CAPS:
+      gst_event_parse_caps (ev, &caps);
+      g_mutex_lock (&priv->probe_lock);
+      priv->in_size = video_size (caps);
+      priv->in_since = GST_CLOCK_TIME_NONE;
+      g_mutex_unlock (&priv->probe_lock);
+      break;
+    case GST_EVENT_FLUSH_STOP:
+      /* the VA encoder drops the segments it holds, and measures its shift again */
+      g_mutex_lock (&priv->probe_lock);
+      clear_segments (priv);
+      g_mutex_unlock (&priv->probe_lock);
+      break;
+    default:
+      break;
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+/* The VA encoder's output events.
+ * - SEGMENT: VA shifts its timestamps and segment so that the first PTS is at least 1000 h (by 1000 h minus the
+ *   first PTS after a start or a flush); the shift is measured against the input segment this one comes from.
+ *   Without B frames (b-frames as applied for this run is 0) it is removed from the segment and, in the buffer
+ *   probe, from every PTS and DTS, so the output has the input's timestamps and segment (DeepStream 8.0 behaviour).
+ *   With B frames VA's segment and timestamps stay: removing the shift would put the first DTS before 0 (ours:
+ *   DeepStream 8.0 writes DTS = PTS there). A segment with the seqnum of the previous one is that one sent again
+ *   (sticky events re-sent): it takes no input segment from the queue.
+ * - CAPS: from here on the frames are those of the latest input caps (VA drains the older frames first); a framerate
+ *   other than the input's is replaced by the input's (ours: VA keeps the old one after a frame-rate change, and
+ *   when its caps don't change otherwise it sends none: then va_src_buffer_probe sends them).
+ * - EOS: every frame is out; the copy-meta records go. */
+static GstPadProbeReturn
+va_src_event_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstRdsEncBin *self = user_data;
+  GstRdsEncBinPrivate *priv = PRIV (self);
+  GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info), *out = NULL;
+  const GstSegment *seg;
+  GstSegment in, fixed;
+  GstSegment *queued;
+  GstCaps *caps;
+  VideoSize v;
+  guint b_frames;
+  guint32 seqnum;
+  GstClockTime va_shift, shift;
+  gboolean again = FALSE, unshift;
+
+  switch (GST_EVENT_TYPE (ev)) {
+    case GST_EVENT_SEGMENT:
+      gst_event_parse_segment (ev, &seg);
+      if (seg->format != GST_FORMAT_TIME)
+        break;
+      GST_OBJECT_LOCK (self);
+      b_frames = priv->b_frames_set;
+      GST_OBJECT_UNLOCK (self);
+      seqnum = gst_event_get_seqnum (ev);
+      g_mutex_lock (&priv->probe_lock);
+      if (seqnum != GST_SEQNUM_INVALID && seqnum == priv->out_seqnum) {
+        /* the same segment again (the pad re-sending its sticky events): no input segment of its own, same shift;
+         * rewritten only if it is VA's and not already ours */
+        again = TRUE;
+        unshift = priv->shift > 0 && seg->start == priv->out_start;
+      } else {
+        queued = g_queue_pop_head (&priv->in_segments);
+        if (queued != NULL) {
+          priv->last_in_segment = *queued;
+          gst_segment_free (queued);
+        }
+        in = priv->last_in_segment;
+        priv->va_shift = in.format == GST_FORMAT_TIME ? rds_enc_segment_shift (&in, seg) : 0;
+        priv->shift = b_frames == 0 ? priv->va_shift : 0;
+        priv->out_seqnum = seqnum;
+        priv->out_start = seg->start;
+        unshift = priv->shift > 0;
+      }
+      va_shift = priv->va_shift;
+      shift = priv->shift;
+      g_mutex_unlock (&priv->probe_lock);
+      if (unshift) {
+        fixed = *seg;
+        rds_enc_segment_unshift (&fixed, shift);
+        out = gst_event_new_segment (&fixed);
+      }
+      GST_DEBUG_OBJECT (self, "output segment %" GST_SEGMENT_FORMAT "%s: VA's shift %" GST_TIME_FORMAT ", removed %"
+          GST_TIME_FORMAT, seg, again ? " (again)" : "", GST_TIME_ARGS (va_shift), GST_TIME_ARGS (unshift ? shift : 0));
+      break;
+    case GST_EVENT_CAPS:
+      gst_event_parse_caps (ev, &caps);
+      g_mutex_lock (&priv->probe_lock);
+      priv->out_size = priv->in_size;
+      priv->in_since = GST_CLOCK_TIME_NONE;
+      v = priv->out_size;
+      g_mutex_unlock (&priv->probe_lock);
+      if (v.fps_d > 0) {
+        const GstStructure *st = gst_caps_get_structure (caps, 0);
+        gint n, d;
+
+        if (!gst_structure_get_fraction (st, "framerate", &n, &d) || n != v.fps_n || d != v.fps_d) {
+          GstCaps *c = gst_caps_copy (caps);
+
+          gst_caps_set_simple (c, "framerate", GST_TYPE_FRACTION, v.fps_n, v.fps_d, NULL);
+          GST_DEBUG_OBJECT (self, "VA's caps %" GST_PTR_FORMAT " get the input's framerate %d/%d", caps, v.fps_n,
+              v.fps_d);
+          out = gst_event_new_caps (c);
+          gst_caps_unref (c);
+        }
+      }
+      if (out != NULL)
+        gst_event_parse_caps (out, &caps);
+      g_mutex_lock (&priv->probe_lock);
+      gst_caps_replace (&priv->out_caps, caps);
+      g_mutex_unlock (&priv->probe_lock);
+      break;
+    case GST_EVENT_EOS:
+      clear_records (priv);
+      break;
+    default:
+      break;
+  }
+  if (out != NULL) {
+    gst_event_set_seqnum (out, gst_event_get_seqnum (ev));
+    gst_event_unref (ev);
+    GST_PAD_PROBE_INFO_DATA (info) = out;
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+/* copy-meta: the output buffer @buf (writable) gets the metas the bin's input buffer of the same frame had, and no
+ * other. The record is found by the frame's input PTS @in_pts (the output PTS without VA's shift, so B-frame
+ * reordering doesn't matter); with two inputs of the same PTS, the first record matching is used. With no record
+ * (an input without PTS) the buffer keeps what VA gave it. Without copy-meta nothing is done: the batch meta was
+ * removed before VA (va_sink_buffer_probe). */
+static void
+set_metas (GstRdsEncBinPrivate * priv, GstBuffer * buf, GstClockTime in_pts)
+{
+  MetaRecord *rec = NULL;
+
+  if (!GST_CLOCK_TIME_IS_VALID (in_pts))
+    return;
+  g_mutex_lock (&priv->probe_lock);
+  if (priv->copy_meta) {
+    for (GList * l = priv->records.head; l != NULL; l = l->next) {
+      MetaRecord *r = l->data;
+
+      if (r->pts == in_pts) {
+        rec = r;
+        g_queue_delete_link (&priv->records, l);
+        break;
+      }
+    }
+  }
+  g_mutex_unlock (&priv->probe_lock);
+  if (rec == NULL)
+    return;
+  gst_buffer_foreach_meta (buf, remove_meta, NULL);
+  gst_buffer_copy_into (buf, rec->metas, GST_BUFFER_COPY_META, 0, (gsize) - 1);
+  meta_record_free (rec);
+}
+
+/* The VA encoder's output buffers, one access unit each:
+ * - filler NAL units stripped (DeepStream 8.0 behaviour: its output has none, so CBR is a ceiling); a buffer of
+ *   filler only is dropped;
+ * - H.265: the SPS conformance window set from the input size (ours: VA on this Mesa decodes too wide when the width
+ *   is not a multiple of 64), on the buffers VA marks as key units (it writes parameter sets only before IDRs);
+ * - DELTA_UNIT cleared on intra pictures (IDR and I) and set on the others (DeepStream 8.0 behaviour: VA marks only
+ *   its IDRs);
+ * - the timestamp shift removed (va_src_event_probe), duration kept;
+ * - caps with the new framerate pushed before the first frame of a frame-rate change VA sent no caps for;
+ * - with copy-meta, the input's metas (set_metas). Buffer flags stay the encoder's with copy-meta too (ours:
+ *   DeepStream 8.0 copies the input's flags, clearing DELTA_UNIT everywhere). */
+static GstPadProbeReturn
+va_src_buffer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  GstRdsEncBin *self = user_data;
+  GstRdsEncBinPrivate *priv = PRIV (self);
+  RdsEncCodec codec = GST_RDS_ENC_BIN_GET_CLASS (self)->info->codec;
+  GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info), *res;
+  GstClockTime shift, va_shift;
+  GstCaps *new_caps = NULL;
+  VideoSize v;
+  guint extra;
+  gboolean intra = FALSE, mapped;
+  GstMapInfo map;
+
+  res = rds_enc_strip_filler (buf, codec);
+  gst_buffer_unref (buf);
+  buf = res;
+  GST_PAD_PROBE_INFO_DATA (info) = buf;
+  if (gst_buffer_get_size (buf) == 0)
+    return GST_PAD_PROBE_DROP;
+
+  g_mutex_lock (&priv->probe_lock);
+  shift = priv->shift;
+  va_shift = priv->va_shift;
+  extra = priv->hevc_extra_bits;
+  /* the first frame of new input caps that VA sent no caps event for (a frame-rate change only) */
+  if (GST_CLOCK_TIME_IS_VALID (priv->in_since) && priv->out_caps != NULL && GST_BUFFER_PTS_IS_VALID (buf)
+      && rds_enc_ts_unshift (GST_BUFFER_PTS (buf), va_shift) >= priv->in_since) {
+    priv->out_size = priv->in_size;
+    priv->in_since = GST_CLOCK_TIME_NONE;
+    if (priv->out_size.fps_d > 0) {
+      new_caps = gst_caps_copy (priv->out_caps);
+      gst_caps_set_simple (new_caps, "framerate", GST_TYPE_FRACTION, priv->out_size.fps_n, priv->out_size.fps_d,
+          NULL);
+      if (gst_caps_is_equal (new_caps, priv->out_caps))
+        gst_clear_caps (&new_caps);
+    }
+  }
+  v = priv->out_size;
+  g_mutex_unlock (&priv->probe_lock);
+  if (new_caps != NULL) {
+    /* Pushed on VA's src pad from inside its own buffer probe: the push runs on this streaming thread, which holds
+     * the pad's stream lock (recursive), and the pad's object lock is not held during probes. The event goes through
+     * va_src_event_probe (re-entered here, no lock of ours held), which finds the framerate already right. */
+    GST_DEBUG_OBJECT (self, "new input framerate %d/%d without new caps from VA: sending %" GST_PTR_FORMAT, v.fps_n,
+        v.fps_d, new_caps);
+    if (!gst_pad_push_event (pad, gst_event_new_caps (new_caps)))
+      GST_DEBUG_OBJECT (self, "downstream refused the caps with the new framerate");
+    gst_caps_unref (new_caps);
+  }
+
+  if (codec == RDS_ENC_CODEC_H265 && !GST_BUFFER_FLAG_IS_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT) && v.width > 0
+      && v.height > 0) {
+    res = rds_enc_h265_fix_sps_buffer (buf, (guint) v.width, (guint) v.height);
+    gst_buffer_unref (buf);
+    buf = res;
+  }
+
+  mapped = gst_buffer_map (buf, &map, GST_MAP_READ);
+  if (mapped) {
+    intra = rds_enc_au_is_intra (map.data, map.size, codec, &extra);
+    gst_buffer_unmap (buf, &map);
+    g_mutex_lock (&priv->probe_lock);
+    priv->hevc_extra_bits = extra;
+    g_mutex_unlock (&priv->probe_lock);
+  }
+
+  buf = gst_buffer_make_writable (buf);
+  if (mapped) {
+    if (intra)
+      GST_BUFFER_FLAG_UNSET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
+    else
+      GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
+  }
+  set_metas (priv, buf, rds_enc_ts_unshift (GST_BUFFER_PTS (buf), va_shift));
+  if (shift > 0) {
+    GST_BUFFER_PTS (buf) = rds_enc_ts_unshift (GST_BUFFER_PTS (buf), shift);
+    GST_BUFFER_DTS (buf) = rds_enc_ts_unshift (GST_BUFFER_DTS (buf), shift);
+  }
+  GST_PAD_PROBE_INFO_DATA (info) = buf;
+  return GST_PAD_PROBE_OK;
+}
+
 /* Makes and links the inner elements and points the ghost pads at them, once. FALSE (with an element error naming
  * what is missing): nothing is left in the bin. Called with the state lock held. */
 static gboolean
@@ -406,7 +944,16 @@ build_chain (GstRdsEncBin * self)
   gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM | GST_PAD_PROBE_TYPE_PULL, caps_query_probe, self,
       NULL);
   gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, caps_event_probe, self, NULL);
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, va_src_event_probe, self, NULL);
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, va_src_buffer_probe, self, NULL);
   gst_object_unref (pad);
+  pad = gst_element_get_static_pad (encoder, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM | GST_PAD_PROBE_TYPE_EVENT_FLUSH, va_sink_event_probe,
+      self, NULL);
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, va_sink_buffer_probe, self, NULL);
+  gst_object_unref (pad);
+  gst_pad_add_probe (priv->sink_ghost, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST
+      | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM | GST_PAD_PROBE_TYPE_EVENT_FLUSH, sink_probe, self, NULL);
 
   GST_OBJECT_LOCK (self);
   priv->convert = convert;
@@ -457,7 +1004,7 @@ typedef struct
 {
   guint bitrate, control_rate, maxbitrate, vbvbufsize, idrinterval, iframeinterval, b_frames, ref_frames, gpu_id;
   gchar *constqp, *qp_range;
-  gboolean disable_cabac, insert_aud, qos;
+  gboolean disable_cabac, insert_aud, qos, copy_meta;
   guint64 min_fku_interval;
   gint profile;
   GstElement *encoder, *convert;
@@ -493,6 +1040,7 @@ configure (GstRdsEncBin * self)
   st.disable_cabac = info->has_cabac && g_value_get_boolean (&priv->values[PROP_DISABLE_CABAC]);
   st.insert_aud = g_value_get_boolean (&priv->values[PROP_INSERT_AUD]);
   st.qos = g_value_get_boolean (&priv->values[PROP_QOS]);
+  st.copy_meta = g_value_get_boolean (&priv->values[PROP_COPY_META]);
   st.min_fku_interval = g_value_get_uint64 (&priv->values[PROP_MIN_FORCE_KEY_UNIT_INTERVAL]);
   st.profile = g_value_get_enum (&priv->values[PROP_PROFILE]);
   st.encoder = gst_object_ref (priv->encoder);
@@ -561,6 +1109,7 @@ configure (GstRdsEncBin * self)
   priv->b_frames_warned = FALSE;
   priv->level_warned = FALSE;
   GST_OBJECT_UNLOCK (self);
+  reset_probes (self, st.copy_meta);
   ok = TRUE;
 
 out:
@@ -576,7 +1125,7 @@ out:
   return ok;
 }
 
-/* Clears the per-run state (PAUSED to READY). */
+/* Clears the per-run state (PAUSED to READY, or a failed start). */
 static void
 reset_run (GstRdsEncBin * self)
 {
@@ -589,6 +1138,7 @@ reset_run (GstRdsEncBin * self)
   priv->b_frames_warned = FALSE;
   priv->level_warned = FALSE;
   GST_OBJECT_UNLOCK (self);
+  reset_probes (self, FALSE);
 }
 
 static GstStateChangeReturn
@@ -762,6 +1312,10 @@ gst_rds_enc_bin_finalize (GObject * object)
     if (G_IS_VALUE (&priv->values[i]))
       g_value_unset (&priv->values[i]);
   }
+  free_records (steal_records (priv));
+  g_queue_clear_full (&priv->in_segments, (GDestroyNotify) gst_segment_free);
+  gst_clear_caps (&priv->out_caps);
+  g_mutex_clear (&priv->probe_lock);
   g_mutex_clear (&priv->va_lock);
   G_OBJECT_CLASS (gst_rds_enc_bin_parent_class)->finalize (object);
 }
@@ -769,7 +1323,13 @@ gst_rds_enc_bin_finalize (GObject * object)
 static void
 gst_rds_enc_bin_init (GstRdsEncBin * self)
 {
-  g_mutex_init (&PRIV (self)->va_lock);
+  GstRdsEncBinPrivate *priv = PRIV (self);
+
+  g_mutex_init (&priv->va_lock);
+  g_mutex_init (&priv->probe_lock);
+  g_queue_init (&priv->in_segments);
+  g_queue_init (&priv->records);
+  gst_segment_init (&priv->last_in_segment, GST_FORMAT_UNDEFINED);
 }
 
 static void
