@@ -493,6 +493,10 @@ test('element_compat_matrix', executable('element_compat_matrix', 'check' / 'ele
       '-DRDS_COMPAT_MATRIX="@0@"'.format(meson.project_source_root() / 'docs' / 'compat-matrix.md')]),
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
+# rdsh264enc / rdsh265enc property mapping and QP string parsers, on their own (GLib only, no GStreamer).
+test('enc_props', executable('enc_props', 'check' / 'enc_props.c', dependencies : [rdsenc_props_dep]),
+  suite : 'cpu', env : internal_test_env, protocol : 'tap')
+
 # rdsvideosink: properties, forwarding and start errors (cpu); RDS frames into the inner sink, batched input (gpu).
 element_videosink_exe = executable('element_videosink', 'check' / 'element_videosink.c',
   dependencies : test_deps + [gst_video_dep])

@@ -8,6 +8,7 @@ subdir('rdstiler')
 subdir('rdssink')
 subdir('rdsurisrcbin')
 subdir('rdsanalytics')
+subdir('rdsenc')
 if rds_infer_enabled
   subdir('rdsinfer')
 endif
