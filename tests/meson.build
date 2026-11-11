@@ -666,6 +666,15 @@ test('rds_test3_analytics',
     rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
   suite : ['gpu', 'yolo'], env : test_env, is_parallel : false, timeout : 900, depends : rds_plugins)
 
+# rds-test3 --output end to end on the street clip: H.264 into an .mp4 and H.265 into an .mkv, then an .mp4 stopped by
+# SIGINT; each file's container, codec, duration and decoded frame count (gpu; skips as rds_test3_run does, and without
+# the VA encoders). About 2 min; never in parallel with the other YOLO11n tests.
+test('rds_test3_output',
+  find_program('samples/rds_test3_output.sh'),
+  args : [rds_test3_exe, meson.project_source_root(), meson.current_build_dir(),
+    rds_infer_enabled ? 'infer' : '', rds_tracker_enabled ? 'tracker' : '', rds_osd_enabled ? 'osd' : ''],
+  suite : ['gpu', 'yolo'], env : test_env, is_parallel : false, timeout : 900, depends : rds_plugins)
+
 # rds-test2's dry run: the compat mapping (the two nvinfer, the tracker), the default configs and their options;
 # gst-inspect-1.0 as for rds-test3.
 test('rds_test2_dry_run',

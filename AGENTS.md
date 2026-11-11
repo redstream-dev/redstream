@@ -320,9 +320,9 @@ samples/rds-test2/ clean-room sample with a secondary classifier: YOLO11n, NvSOR
                    (per-frame object, vehicle and labelled counts, label totals; --dry-run, --no-display,
                    --pgie-config, --sgie-config, --tracker-config)
 samples/rds-test3/ clean-room test3-style multi-stream sample (end to end: nvurisrcbin sources, per-frame counts, tiler,
-                   OSD, display; --dry-run, --no-display, --pgie-config, --tracker-config, --analytics-config (with
-                   rds_test3_analytics_config.txt, our analytics config for the street clip), the RTSP options;
-                   Ctrl-C stops with an EOS)
+                   OSD, display; --dry-run, --no-display, --output and --codec (encode to an .mp4 or .mkv),
+                   --pgie-config, --tracker-config, --analytics-config (with rds_test3_analytics_config.txt, our
+                   analytics config for the street clip), the RTSP options; Ctrl-C stops with an EOS)
 samples/tracker/   our IOU and NvSORT low-level tracker configs for rdstracker (tuned on the street clip)
 tools/rds-compile/ rds-compile: pre-builds rdsinfer's programs (every program of a dynamic batch) with its config
                    parser and engine set (exit 2: all up to date)

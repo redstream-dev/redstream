@@ -1,14 +1,22 @@
 /* rds-test3: multi-stream detection sample in the style of a DeepStream application.
  * Built against Redstream's compat header, so DeepStream factory names are remapped at runtime.
  *
- *   rds-test3 [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE] [--analytics-config FILE]
- *             [--rtsp-reconnect-interval S] [--rtsp-reconnect-attempts N] [--select-rtp-protocol P] URI [URI...]
+ *   rds-test3 [--dry-run] [--no-display] [--output FILE [--codec h264|h265]] [--pgie-config FILE]
+ *             [--tracker-config FILE] [--analytics-config FILE] [--rtsp-reconnect-interval S]
+ *             [--rtsp-reconnect-attempts N] [--select-rtp-protocol P] URI [URI...]
  *
  * --pgie-config defaults to rds_test3_pgie_config.yml in this sample's source directory. --tracker-config adds a
  * tracker (nvtracker, with that low-level config file) after the primary detector; without it there is none, as in
  * DeepStream's test3. --analytics-config adds the analytics (nvdsanalytics, with that config file) after the
  * tracker, or after the primary detector without one (direction and line crossing then skip the untracked objects);
  * without it there is none. --no-display replaces the display sink with "fakesink sync=false" (as fast as it goes).
+ * --output FILE encodes the OSD's output into FILE instead of displaying it: nvvideoconvert, nvv4l2h264enc (or
+ * nvv4l2h265enc with --codec h265), the stock parser, qtmux for a .mp4 or matroskamux for a .mkv (any other extension
+ * is refused), and filesink, as fast as it goes. --output wins over --no-display. At the end of the streams (or after
+ * Ctrl-C) the app waits for the EOS to reach the file sink, so the muxer has finished the file. When it stops without
+ * that EOS (an error, the EOS timeout below, a second Ctrl-C) it prints "<file> is not finished (no end of stream)";
+ * after the EOS timeout it then exits with 1. An unfinished .mp4 has no index, an .mkv stays mostly readable: .mkv is
+ * the safer container when a run may be cut short.
  *
  * Each URI is an nvurisrcbin (file, RTSP, anything GStreamer has a source for), its source-id the URI's position, its
  * vsrc_0 linked to the muxer's sink_<position>. For RTSP URIs, --rtsp-reconnect-interval (seconds, default 0: no
@@ -69,29 +77,94 @@
 #define DEFAULT_PGIE_CONFIG RDS_TEST3_SOURCE_DIR "/rds_test3_pgie_config.yml"
 
 /* DeepStream factory names, as a DeepStream app would write them, in pipeline order; the tracker only with
- * --tracker-config, the analytics only with --analytics-config, and fakesink instead of the display sink with
- * --no-display. */
+ * --tracker-config, the analytics only with --analytics-config. The sink comes after them: the display sink, fakesink
+ * with --no-display, or with --output the encoding chain (the stock parser, muxer and file sink keep their names). */
 static const gchar *all_factories[] = {
   "nvstreammux", "nvinfer", "nvtracker", "nvdsanalytics", "nvmultistreamtiler", "nvvideoconvert", "nvdsosd",
-  "nveglglessink",
 };
 
-#define MAX_FACTORIES G_N_ELEMENTS (all_factories)
+/* the longest sink part: the encoding chain */
+#define MAX_FACTORIES (G_N_ELEMENTS (all_factories) + 5)
+
+/* What --output writes: the encoder (a DeepStream name), parser and muxer. */
+typedef struct
+{
+  const gchar *file;            /* NULL: no --output */
+  const gchar *codec;
+  const gchar *encoder;
+  const gchar *parser;
+  const gchar *muxer;
+} OutputOptions;
 
 /* The factories of this run into @names; returns how many. */
 static guint
-pipeline_factories (gboolean tracker, gboolean analytics, gboolean display, const gchar ** names)
+pipeline_factories (gboolean tracker, gboolean analytics, gboolean display, const OutputOptions * output,
+    const gchar ** names)
 {
   guint n = 0;
 
-  for (gsize i = 0; i < MAX_FACTORIES; i++) {
+  for (gsize i = 0; i < G_N_ELEMENTS (all_factories); i++) {
     if (!tracker && strcmp (all_factories[i], "nvtracker") == 0)
       continue;
     if (!analytics && strcmp (all_factories[i], "nvdsanalytics") == 0)
       continue;
-    names[n++] = !display && strcmp (all_factories[i], "nveglglessink") == 0 ? "fakesink" : all_factories[i];
+    names[n++] = all_factories[i];
+  }
+  if (output->file) {
+    /* as DeepStream apps do: a converter in front of the encoder (here it passes the OSD's RGBA through, and the
+     * encoder converts) */
+    names[n++] = "nvvideoconvert";
+    names[n++] = output->encoder;
+    names[n++] = output->parser;
+    names[n++] = output->muxer;
+    names[n++] = "filesink";
+  } else {
+    names[n++] = display ? "nveglglessink" : "fakesink";
   }
   return n;
+}
+
+/* Fills @output from --output and --codec; FALSE with a message on stderr when they are not usable. */
+static gboolean
+parse_output_options (const gchar * file, const gchar * codec, OutputOptions * output)
+{
+  memset (output, 0, sizeof (*output));
+  if (file == NULL) {
+    if (codec != NULL) {
+      g_printerr ("--codec needs --output\n");
+      return FALSE;
+    }
+    return TRUE;
+  }
+  if (!*file) {
+    g_printerr ("--output needs a file\n");
+    return FALSE;
+  }
+  output->file = file;
+  output->codec = codec ? codec : "h264";
+  if (strcmp (output->codec, "h264") == 0) {
+    output->encoder = "nvv4l2h264enc";
+    output->parser = "h264parse";
+  } else if (strcmp (output->codec, "h265") == 0) {
+    output->encoder = "nvv4l2h265enc";
+    output->parser = "h265parse";
+  } else {
+    g_printerr ("--codec: %s is neither h264 nor h265\n", output->codec);
+    return FALSE;
+  }
+
+  gchar *lower = g_ascii_strdown (file, -1);
+
+  if (g_str_has_suffix (lower, ".mp4"))
+    output->muxer = "qtmux";
+  else if (g_str_has_suffix (lower, ".mkv"))
+    output->muxer = "matroskamux";
+  g_free (lower);
+  if (output->muxer == NULL) {
+    g_printerr ("--output: %s has neither a .mp4 nor a .mkv extension\n", file);
+    return FALSE;
+  }
+  return TRUE;
 }
 
 /* Class ids counted per frame; -1 when the label file doesn't name the class. */
@@ -300,6 +373,8 @@ typedef struct
   GPtrArray *mux_pads;          /* the muxer's sink pad of each source */
   gint stopping;                /* atomic: Ctrl-C came */
   guint eos_timeout;
+  const gchar *output_file;     /* --output, or NULL */
+  gboolean eos;                 /* the EOS reached the sinks */
 } BusState;
 
 static void
@@ -327,6 +402,9 @@ on_eos_timeout (gpointer user_data)
 
   g_printerr ("No end of stream within %d s: stopping anyway\n", EOS_TIMEOUT_S);
   state->eos_timeout = 0;
+  /* with --output the file is left unfinished: a failure */
+  if (state->output_file)
+    state->error = TRUE;
   g_main_loop_quit (state->loop);
   return G_SOURCE_REMOVE;
 }
@@ -383,6 +461,7 @@ on_bus_message (GstBus * bus G_GNUC_UNUSED, GstMessage * msg, gpointer user_data
   switch (GST_MESSAGE_TYPE (msg)) {
     case GST_MESSAGE_EOS:
       g_print ("End of stream\n");
+      state->eos = TRUE;
       g_main_loop_quit (state->loop);
       break;
     case GST_MESSAGE_ELEMENT:
@@ -431,10 +510,11 @@ typedef struct
 
 static int
 run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const gchar * tracker_config,
-    const gchar * analytics_config, gboolean display, const SourceOptions * opts)
+    const gchar * analytics_config, gboolean display, const OutputOptions * output, const SourceOptions * opts)
 {
   const gchar *factories[MAX_FACTORIES];
-  guint n_factories = pipeline_factories (tracker_config != NULL, analytics_config != NULL, display, factories);
+  guint n_factories = pipeline_factories (tracker_config != NULL, analytics_config != NULL, display, output,
+      factories);
   GstElement *elements[MAX_FACTORIES];
   GstElement *pipeline = gst_pipeline_new ("rds-test3");
 
@@ -451,7 +531,9 @@ run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const
         g_printerr ("Redstream was built without rdsinfer (-Dinfer: needs MIGraphX, libyaml and json-glib)\n");
       else if (g_strcmp0 (name, "rdstracker") == 0)
         g_printerr ("Redstream was built without rdstracker (-Dtracker: needs libyaml)\n");
-      else if (g_str_has_prefix (name, "rds"))
+      else if (!g_str_has_prefix (name, "rds"))
+        g_printerr ("A stock GStreamer plugin is missing (gst-plugins-good or -bad)\n");
+      else
         g_printerr ("Is GST_PLUGIN_PATH_1_0 set to the build tree's gst/ directory?\n");
       gst_object_unref (pipeline);
       return 1;
@@ -474,7 +556,9 @@ run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const
   if (analytics)
     g_object_set (analytics, "config-file", analytics_config, NULL);
   g_object_set (tiler, "rows", rows, "columns", cols, "width", TILED_WIDTH, "height", TILED_HEIGHT, NULL);
-  if (!display)
+  if (output->file)
+    g_object_set (element_for (factories, elements, n_factories, "filesink"), "location", output->file, NULL);
+  else if (!display)
     g_object_set (element_for (factories, elements, n_factories, "fakesink"), "sync", FALSE, NULL);
 
   CountOptions count_opts = { lookup_counted_classes (pgie_config), analytics != NULL };
@@ -484,7 +568,7 @@ run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const
   gst_object_unref (count_pad);
 
   BusState state = { g_main_loop_new (NULL, FALSE), FALSE, pipeline,
-    g_ptr_array_new_with_free_func (gst_object_unref), FALSE, 0
+    g_ptr_array_new_with_free_func (gst_object_unref), FALSE, 0, output->file, FALSE
   };
 
   for (guint i = 0; i < num_sources; i++) {
@@ -532,6 +616,9 @@ run_pipeline (gchar ** uris, guint num_sources, const gchar * pgie_config, const
   /* from here a Ctrl-C ends the process, also should stopping hang */
   g_source_remove (sigint);
   gst_element_set_state (pipeline, GST_STATE_NULL);
+  /* an error, the EOS timeout or a second Ctrl-C: the muxer never finished the file (an .mp4 has no index then) */
+  if (output->file && !state.eos)
+    g_printerr ("%s is not finished (no end of stream)\n", output->file);
 
   if (state.eos_timeout)
     g_source_remove (state.eos_timeout);
@@ -547,12 +634,18 @@ main (int argc, char **argv)
 {
   gboolean dry_run = FALSE, no_display = FALSE;
   SourceOptions opts = { -1, G_MININT, -1 };
-  gchar *pgie_config = NULL, *tracker_config = NULL, *analytics_config = NULL;
+  OutputOptions output;
+  gchar *pgie_config = NULL, *tracker_config = NULL, *analytics_config = NULL, *output_file = NULL, *codec = NULL;
   gchar **uris = NULL;
   GOptionEntry entries[] = {
     {"dry-run", 0, 0, G_OPTION_ARG_NONE, &dry_run, "Print the element mapping and exit", NULL},
     {"no-display", 0, 0, G_OPTION_ARG_NONE, &no_display, "Use fakesink (sync=false) instead of the display sink",
         NULL},
+    {"output", 0, 0, G_OPTION_ARG_FILENAME, &output_file,
+        "Encode into this file instead of displaying (.mp4: qtmux, .mkv: matroskamux); wins over --no-display. "
+          ".mkv is the safer container if a run may be cut short (an unfinished .mp4 has no index)",
+        "FILE"},
+    {"codec", 0, 0, G_OPTION_ARG_STRING, &codec, "The codec of --output: h264 (default) or h265", "CODEC"},
     {"pgie-config", 0, 0, G_OPTION_ARG_FILENAME, &pgie_config,
         "Primary inference config file (default: " DEFAULT_PGIE_CONFIG ")", "FILE"},
     {"tracker-config", 0, 0, G_OPTION_ARG_FILENAME, &tracker_config,
@@ -572,7 +665,7 @@ main (int argc, char **argv)
   };
   GOptionContext *ctx = g_option_context_new ("- Redstream multi-stream detection sample");
   GError *err = NULL;
-  int ret;
+  int ret = 1;
 
   g_option_context_add_main_entries (ctx, entries, NULL);
   g_option_context_add_group (ctx, gst_init_get_option_group ());
@@ -586,20 +679,16 @@ main (int argc, char **argv)
 
   guint num_sources = uris ? g_strv_length (uris) : 0;
   if (num_sources == 0) {
-    g_printerr ("Usage: %s [--dry-run] [--no-display] [--pgie-config FILE] [--tracker-config FILE] "
-        "[--analytics-config FILE] [--rtsp-reconnect-interval S] [--rtsp-reconnect-attempts N] "
-        "[--select-rtp-protocol P] URI [URI...]\n",
+    g_printerr ("Usage: %s [--dry-run] [--no-display] [--output FILE [--codec h264|h265]] [--pgie-config FILE] "
+        "[--tracker-config FILE] [--analytics-config FILE] [--rtsp-reconnect-interval S] "
+        "[--rtsp-reconnect-attempts N] [--select-rtp-protocol P] URI [URI...]\n",
         argv[0]);
-    return 1;
+    goto out;
   }
   if (opts.rtp_protocol >= 0 && opts.rtp_protocol != 0 && opts.rtp_protocol != 1 && opts.rtp_protocol != 2
       && opts.rtp_protocol != 4 && opts.rtp_protocol != 7 && opts.rtp_protocol != 10 && opts.rtp_protocol != 20) {
     g_printerr ("--select-rtp-protocol: %d is none of 0, 1, 2, 4, 7, 10 and 20\n", opts.rtp_protocol);
-    g_strfreev (uris);
-    g_free (pgie_config);
-    g_free (tracker_config);
-    g_free (analytics_config);
-    return 1;
+    goto out;
   }
   /* the config-file options, given with an empty file name */
   const struct
@@ -613,32 +702,36 @@ main (int argc, char **argv)
   for (gsize i = 0; i < G_N_ELEMENTS (file_options); i++) {
     if (file_options[i].value && !*file_options[i].value) {
       g_printerr ("%s needs a file\n", file_options[i].name);
-      g_strfreev (uris);
-      g_free (pgie_config);
-      g_free (tracker_config);
-      g_free (analytics_config);
-      return 1;
+      goto out;
     }
+  }
+  if (!parse_output_options (output_file, codec, &output)) {
+    goto out;
   }
 
   if (dry_run) {
     const gchar *factories[MAX_FACTORIES];
-    guint n = pipeline_factories (tracker_config != NULL, analytics_config != NULL, !no_display, factories);
+    guint n = pipeline_factories (tracker_config != NULL, analytics_config != NULL, !no_display, &output, factories);
 
     g_print ("sources: %u\n", num_sources);
     g_print ("pgie config: %s\n", pgie_config ? pgie_config : DEFAULT_PGIE_CONFIG);
+    if (output.file)
+      g_print ("output: %s (%s, %s)\n", output.file, output.codec, output.muxer);
     g_print ("nvurisrcbin -> %s\n", rds_compat_map_factory_name ("nvurisrcbin"));
     for (guint i = 0; i < n; i++)
       g_print ("%s -> %s\n", factories[i], rds_compat_map_factory_name (factories[i]));
     ret = 0;
   } else {
     ret = run_pipeline (uris, num_sources, pgie_config ? pgie_config : DEFAULT_PGIE_CONFIG, tracker_config,
-        analytics_config, !no_display, &opts);
+        analytics_config, !no_display, &output, &opts);
   }
 
+out:
   g_strfreev (uris);
   g_free (pgie_config);
   g_free (tracker_config);
   g_free (analytics_config);
+  g_free (output_file);
+  g_free (codec);
   return ret;
 }

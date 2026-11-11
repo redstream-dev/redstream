@@ -146,6 +146,15 @@ GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 \
 ```
 
 `--no-display` runs to a fakesink as fast as it can; `GST_DEBUG=rdstracker:5` adds the tracker's per-frame log.
+`--output FILE` encodes the tiled, annotated frames into a file instead (`rdsvideoconvert` → `rdsh264enc` →
+`h264parse` → `qtmux` for `.mp4`, `matroskamux` for `.mkv`; `--codec h265` for `rdsh265enc` and `h265parse`), and
+wins over `--no-display`; the file is finished at the end of the streams or on Ctrl-C:
+
+```bash
+GST_PLUGIN_PATH_1_0=build/gst build/samples/rds-test3/rds-test3 --output out.mp4 \
+  --tracker-config samples/tracker/config_tracker_NvSORT.yml file://$PWD/.cache/media/crosswalk-720p.h264
+```
+
 From the dev container, a window needs the X11 socket and credentials; add these to `docker run`:
 
 ```bash
