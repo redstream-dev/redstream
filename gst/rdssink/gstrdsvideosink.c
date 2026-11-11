@@ -14,6 +14,8 @@
 
 #include <rds/rds.h>
 
+#include "rds-video-convert-caps.h"
+
 GST_DEBUG_CATEGORY_STATIC (gst_rds_video_sink_debug);
 #define GST_CAT_DEFAULT gst_rds_video_sink_debug
 
@@ -89,14 +91,9 @@ struct _GstRdsVideoSink
   gint child_error;             /* atomic: a child posted an error during the current state change */
 };
 
-/* the formats rdsvideoconvert takes, memory:RDS or system memory */
-#define RDS_VIDEO_SINK_FIELDS \
-  "format = (string) { NV12, I420, RGBA, BGRA, RGBx, BGRx, RGB, BGR, GRAY8 }, width = (int) [ 1, 16384 ], " \
-  "height = (int) [ 1, 16384 ], framerate = (fraction) [ 0/1, 2147483647/1 ]"
-
+/* what rdsvideoconvert takes, memory:RDS or system memory */
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/x-raw(" RDS_CAPS_FEATURE_MEMORY_RDS "), " RDS_VIDEO_SINK_FIELDS "; video/x-raw, "
-        RDS_VIDEO_SINK_FIELDS));
+    GST_STATIC_CAPS (RDS_VIDEO_CONVERT_CAPS));
 
 G_DEFINE_TYPE (GstRdsVideoSink, gst_rds_video_sink, GST_TYPE_BIN);
 GST_ELEMENT_REGISTER_DEFINE (rdsvideosink, "rdsvideosink", GST_RANK_NONE, GST_TYPE_RDS_VIDEO_SINK);

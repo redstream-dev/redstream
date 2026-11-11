@@ -19,6 +19,7 @@
 #include <rds/rds.h>
 
 #include "rds-enc-props.h"
+#include "rds-video-convert-caps.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_rds_enc_bin_debug);
 #define GST_CAT_DEFAULT gst_rds_enc_bin_debug
@@ -116,14 +117,9 @@ G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (GstRdsEncBin, gst_rds_enc_bin, GST_TYPE_BIN
 
 #define PRIV(self) ((GstRdsEncBinPrivate *) gst_rds_enc_bin_get_instance_private (self))
 
-/* the formats rdsvideoconvert takes, memory:RDS or system memory */
-#define RDS_ENC_SINK_FIELDS \
-  "format = (string) { NV12, I420, RGBA, BGRA, RGBx, BGRx, RGB, BGR, GRAY8 }, width = (int) [ 1, 16384 ], " \
-  "height = (int) [ 1, 16384 ], framerate = (fraction) [ 0/1, 2147483647/1 ]"
-
+/* what rdsvideoconvert takes, memory:RDS or system memory */
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("video/x-raw(" RDS_CAPS_FEATURE_MEMORY_RDS "), " RDS_ENC_SINK_FIELDS "; video/x-raw, "
-        RDS_ENC_SINK_FIELDS));
+    GST_STATIC_CAPS (RDS_VIDEO_CONVERT_CAPS));
 
 /* ---- enums (DeepStream 8.0's values and nicks; type names and descriptions are ours) ---- */
 

@@ -4,7 +4,7 @@
 gstrdssink = library('gstrdssink',
   files('plugin.c', 'gstrdslogger.c', 'gstrdsvideosink.c'),
   c_args : rds_plugin_c_args + ['-DG_LOG_DOMAIN="rdssink"'],
-  dependencies : [rds_dep, gst_dep, gst_base_dep],
+  dependencies : [rds_dep, gst_dep, gst_base_dep, rds_plugin_headers_dep],
   gnu_symbol_visibility : 'hidden',
   install_rpath : rds_install_rpath,
   install : true,

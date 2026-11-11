@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsvideoconvert.h"
 #include "rds-video-util.h"
+#include "rds-video-convert-caps.h"
 
 #include <gst/video/video.h>
 #include <rds/rds.h>
@@ -78,13 +79,6 @@ struct _GstRdsVideoConvert
   RdsBufSurface *in_stage;      /* device copies of system-memory frames (created on first use) */
   RdsBufSurface *out_stage;
 };
-
-#define RDS_VIDEO_CONVERT_FORMATS "{ NV12, I420, RGBA, BGRA, RGBx, BGRx, RGB, BGR, GRAY8 }"
-#define RDS_VIDEO_CONVERT_FIELDS \
-  "format = (string) " RDS_VIDEO_CONVERT_FORMATS ", width = (int) [ 1, 16384 ], height = (int) [ 1, 16384 ], " \
-  "framerate = (fraction) [ 0/1, 2147483647/1 ]"
-#define RDS_VIDEO_CONVERT_CAPS \
-  "video/x-raw(" RDS_CAPS_FEATURE_MEMORY_RDS "), " RDS_VIDEO_CONVERT_FIELDS "; video/x-raw, " RDS_VIDEO_CONVERT_FIELDS
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
     GST_STATIC_CAPS (RDS_VIDEO_CONVERT_CAPS));

@@ -293,7 +293,8 @@ gst/rdsurisrcbin/  libgstrdsurisrcbin plugin: rdsurisrcbin (gstrdsurisrcbin.c: a
                    gstreamer-rtsp; always built
 gst/common/        static rds-plugin-common, shared by the plugins: rds-keyfile-yaml (YAML config -> GKeyFile, with the
                    OpenCV-style "%YAML:1.0" line), rds-config-parse (number and bool parsing for the key tables),
-                   rds-object-style.h (the drawing defaults of the object metas rdsinfer and rdstracker create).
+                   rds-object-style.h (the drawing defaults of the object metas rdsinfer and rdstracker create),
+                   rds-video-convert-caps.h (rdsvideoconvert's caps, shared with the bins that wrap it).
                    rds-config-parse is a separate static library, always built; rds-plugin-common (the YAML
                    reader) only when libyaml is found
 gst/rdstracker/    libgstrdstracker plugin: rdstracker (gstrdstracker.c: write-back of IDs and boxes, created and
