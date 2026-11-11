@@ -497,6 +497,16 @@ test('element_compat_matrix', executable('element_compat_matrix', 'check' / 'ele
 test('enc_props', executable('enc_props', 'check' / 'enc_props.c', dependencies : [rdsenc_props_dep]),
   suite : 'cpu', env : internal_test_env, protocol : 'tap')
 
+# rdsh264enc / rdsh265enc Annex-B helpers and the test NAL walker: filler stripping, the timestamp shift and the H.265
+# SPS window fix on captured SPSs (cpu); the walker on VA-encoded streams, filler in a real CBR stream, VA's measured
+# shift and an encode -> fix -> decode round trip (gpu, skipped without the VA encoders). No plugin of ours.
+enc_nal_exe = executable('enc_nal', 'check' / 'enc_nal.c',
+  dependencies : [rdsenc_nal_dep, gst_app_dep, gst_video_dep])
+test('enc_nal_cpu', enc_nal_exe, args : ['-p', '/cpu/enc-nal'],
+  suite : 'cpu', env : test_env, protocol : 'tap')
+test('enc_nal', enc_nal_exe, args : ['-p', '/gpu/enc-nal'],
+  suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 120)
+
 # rdsvideosink: properties, forwarding and start errors (cpu); RDS frames into the inner sink, batched input (gpu).
 element_videosink_exe = executable('element_videosink', 'check' / 'element_videosink.c',
   dependencies : test_deps + [gst_video_dep])
