@@ -247,12 +247,27 @@ GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/cross
 | `nvdsanalytics` | `rdsanalytics` | works (ROI filtering, overcrowding, direction, line crossing) |
 | `nveglglessink`, `nv3dsink` | `rdsvideosink` | works |
 | `nvdslogger` | `rdslogger` | works |
-| `nvv4l2h264enc`, `nvv4l2h265enc` | `rdsh264enc`, `rdsh265enc` | planned |
+| `nvv4l2h264enc`, `nvv4l2h265enc` | `rdsh264enc`, `rdsh265enc` | in design (over the VA-API encoders; frames go through system memory for now, see "Zero-copy and where it stops") |
 | Audio batching in `nvstreammux` / `nvstreamdemux` | audio in `rdsstreammux` / `rdsstreamdemux` | on request |
 | `nvinferaudio` | `rdsinferaudio` (MIGraphX) | on request |
 | `nvdsaudiotemplate` | `rdsaudiotemplate` | on request |
 | `NvDsBatchMeta`, `NvDsObjectMeta`, … | `Rds*` + `rds/rds_compat.h` | works |
 | TensorRT `.engine` | MIGraphX `.mxr` (compiled from ONNX, cached) | works |
+
+### Zero-copy and where it stops
+
+From decode to the last analytics element, frames stay in GPU memory (`memory:RDS`): `rdsvideodec` decodes into
+GPU surfaces, and batching, inference, tracking, analytics, tiling and on-screen display all work on them in place
+or GPU to GPU. Frames leave the GPU only where a stock GStreamer element takes over:
+
+- **Encoding (`rdsh264enc`, `rdsh265enc`, in design).** These will be bins over GStreamer's VA-API encoders
+  (`vah264enc`, `vah265enc`). Those encoders take NV12 in system memory or AMD-tiled VA surfaces, but Redstream's GPU
+  surfaces are linear, so the bins convert to NV12 on the GPU and then copy each frame to system memory. On the
+  Ryzen 7000 iGPU that costs about 1.4 ms per 1080p frame, against 7–11 ms for the encode itself (and on an APU the
+  "system memory" is the same DRAM). A zero-copy path, with the GPU writing straight into linear VA surfaces, is
+  planned behind the same elements.
+- **Display (`rdsvideosink`).** It converts on the GPU, then hands system-memory frames to a stock video sink.
+- **`rdsosd process-mode=0`.** That mode draws on the CPU by design. The default mode draws on the GPU.
 
 ## Roadmap
 
