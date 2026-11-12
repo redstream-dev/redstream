@@ -1,7 +1,8 @@
 /* rdsh264enc / rdsh265enc Annex-B helpers: filler stripping (positions, start-code lengths, both codecs, metas and
  * flags kept), the timestamp-shift removal on times and segments, the H.265 SPS conformance-window fix on SPSs
  * captured from vah265enc, intra access units on hand-coded slice headers, and the level strings and the level
- * rewrite on parameter sets captured from vah264enc and vah265enc (cpu); the test walker on streams from
+ * rewrite on parameter sets captured from vah264enc and vah265enc, and every helper on every prefix of those and on
+ * fixed-seed random buffers, which must neither crash nor read out of bounds (cpu); the test walker on streams from
  * the VA encoders, filler stripping on a real CBR stream, the VA encoders' measured shift and an encode → fix →
  * decode round trip (gpu).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
@@ -1696,6 +1697,207 @@ test_intra_h265 (void)
   g_assert_false (intra (RDS_ENC_CODEC_H265, &extra, i2, sizeof (i2)));
 }
 
+/* ------------------------------------------------------------------------------------------------------------ */
+/* Truncated and random input */
+
+/* Every helper that reads an Annex-B buffer or a NAL unit, on @size bytes copied into an allocation of exactly that
+ * size (so a read past the end is a heap overflow under ASan). Results aren't checked, only that nothing crashes or
+ * reads out of bounds; a FIXED result's output goes through the same helper again. */
+static void
+feed_annex_b (const guint8 * data, gsize size)
+{
+  static const RdsEncCodec codecs[] = { RDS_ENC_CODEC_H264, RDS_ENC_CODEC_H265 };
+  guint8 *copy = g_memdup2 (data, size);
+
+  for (guint c = 0; c < G_N_ELEMENTS (codecs); c++) {
+    /* an empty buffer has no memory at all */
+    GstBuffer *in = size > 0 ? gst_buffer_new_memdup (data, size) : gst_buffer_new (), *out;
+    guint extra = 0;
+
+    out = rds_enc_strip_filler (in, codecs[c]);
+    gst_buffer_unref (out);
+    out = rds_enc_set_level_buffer (in, codecs[c], "5.1");
+    gst_buffer_unref (out);
+    out = rds_enc_set_level_buffer (in, codecs[c], "1b");
+    gst_buffer_unref (out);
+    if (codecs[c] == RDS_ENC_CODEC_H265) {
+      out = rds_enc_h265_fix_parameter_sets (in, 720, 480, "5.1");
+      gst_buffer_unref (out);
+      out = rds_enc_h265_fix_parameter_sets (in, 1, 1, NULL);
+      gst_buffer_unref (out);
+      out = rds_enc_h265_fix_sps_buffer (in, 8192, 4352);
+      gst_buffer_unref (out);
+    }
+    (void) rds_enc_au_is_intra (copy, size, codecs[c], &extra);
+    extra = 7;
+    (void) rds_enc_au_is_intra (copy, size, codecs[c], &extra);
+    gst_buffer_unref (in);
+  }
+  g_free (copy);
+}
+
+static guint fuzz_fixed;         /* FIXED results of feed_nal, to show that the input reached the rewrites */
+
+static void
+feed_nal (const guint8 * data, gsize size)
+{
+  static const RdsEncCodec codecs[] = { RDS_ENC_CODEC_H264, RDS_ENC_CODEC_H265 };
+  guint8 *copy = g_memdup2 (data, size), *out = NULL, *again = NULL;
+  gsize out_size = 0, again_size = 0;
+
+  if (rds_enc_h265_fix_sps (copy, size, 720, 480, &out, &out_size) == RDS_ENC_SPS_FIXED) {
+    fuzz_fixed++;
+    (void) rds_enc_h265_fix_sps (out, out_size, 720, 480, &again, &again_size);
+    g_clear_pointer (&again, g_free);
+    g_clear_pointer (&out, g_free);
+  }
+  if (rds_enc_h265_fix_sps (copy, size, 2, 2, &out, &out_size) == RDS_ENC_SPS_FIXED)
+    g_clear_pointer (&out, g_free);
+  for (guint c = 0; c < G_N_ELEMENTS (codecs); c++) {
+    if (rds_enc_set_level (copy, size, codecs[c], "6.2", &out, &out_size) == RDS_ENC_SPS_FIXED) {
+      fuzz_fixed++;
+      if (rds_enc_set_level (out, out_size, codecs[c], "1b", &again, &again_size) == RDS_ENC_SPS_FIXED)
+        g_clear_pointer (&again, g_free);
+      g_clear_pointer (&out, g_free);
+    }
+  }
+  g_free (copy);
+}
+
+/* @nals (NULL-terminated pairs of data and size) as an Annex-B access unit, 4-byte start codes. */
+static GByteArray *
+annex_b (const guint8 * first, gsize first_size, ...)
+{
+  static const guint8 sc[] = { 0, 0, 0, 1 };
+  GByteArray *a = g_byte_array_new ();
+  const guint8 *nal = first;
+  gsize size = first_size;
+  va_list ap;
+
+  va_start (ap, first_size);
+  while (nal != NULL) {
+    g_byte_array_append (a, sc, sizeof (sc));
+    g_byte_array_append (a, nal, size);
+    nal = va_arg (ap, const guint8 *);
+    if (nal != NULL)
+      size = va_arg (ap, gsize);
+  }
+  va_end (ap);
+  return a;
+}
+
+/* Every prefix of every captured parameter set (as a NAL unit and as an Annex-B buffer) and of access units built
+ * from them, from 0 bytes to the whole. */
+static void
+test_fuzz_prefixes (void)
+{
+  static const guint8 h265_pps[] = { 0x44, 0x01, 0xc1, 0x73, 0xd1, 0x89 };
+  static const guint8 h265_idr[] = { 0x26, 0x01, 0xa0, 0x00, 0x05 };
+  static const struct
+  {
+    const guint8 *data;
+    gsize size;
+  } nals[] = {
+    {sps_720x480, sizeof (sps_720x480)}, {sps_1366x768, sizeof (sps_1366x768)},
+    {sps_1000x600, sizeof (sps_1000x600)}, {sps_1280x720, sizeof (sps_1280x720)},
+    {h264_sps_1920x1080, sizeof (h264_sps_1920x1080)}, {h264_sps_1281x721, sizeof (h264_sps_1281x721)},
+    {h264_sps_high_720p, sizeof (h264_sps_high_720p)}, {h264_sps_cb_720p, sizeof (h264_sps_cb_720p)},
+    {vps_1280x720, sizeof (vps_1280x720)},
+  };
+  GByteArray *aus[4];
+  guint fed = 0;
+
+  fuzz_fixed = 0;
+
+  aus[0] = annex_b (h264_sps_high_720p, sizeof (h264_sps_high_720p), h264_pps, sizeof (h264_pps), h264_fill,
+      sizeof (h264_fill), h264_idr, sizeof (h264_idr), NULL);
+  aus[1] = annex_b (h264_sps_cb_720p, sizeof (h264_sps_cb_720p), h264_pps, sizeof (h264_pps), h264_idr,
+      sizeof (h264_idr), NULL);
+  aus[2] = annex_b (vps_1280x720, sizeof (vps_1280x720), sps_1366x768, sizeof (sps_1366x768), h265_pps,
+      sizeof (h265_pps), h265_fill, sizeof (h265_fill), h265_idr, sizeof (h265_idr), NULL);
+  aus[3] = annex_b (vps_1280x720, sizeof (vps_1280x720), sps_720x480, sizeof (sps_720x480), h265_pps,
+      sizeof (h265_pps), h265_idr, sizeof (h265_idr), NULL);
+  for (guint i = 0; i < G_N_ELEMENTS (nals); i++) {
+    GByteArray *a = annex_b (nals[i].data, nals[i].size, NULL);
+
+    for (gsize n = 0; n <= nals[i].size; n++, fed++)
+      feed_nal (nals[i].data, n);
+    for (gsize n = 0; n <= a->len; n++, fed++)
+      feed_annex_b (a->data, n);
+    g_byte_array_unref (a);
+  }
+  for (guint i = 0; i < G_N_ELEMENTS (aus); i++) {
+    for (gsize n = 0; n <= aus[i]->len; n++, fed++)
+      feed_annex_b (aus[i]->data, n);
+    g_byte_array_unref (aus[i]);
+  }
+  g_test_message ("%u prefixes, %u parameter sets rewritten", fed, fuzz_fixed);
+  g_assert_cmpuint (fuzz_fixed, >, 0);
+}
+
+/* Random buffers from a fixed seed: plain random bytes; random bytes with start codes and NAL headers of the types
+ * the helpers look for (SPS, PPS, VPS, slices, filler); and the captured parameter sets with a few bytes changed. */
+static void
+test_fuzz_random (void)
+{
+  static const guint8 h264_types[] = { 1, 5, 6, 7, 8, 9, 12 };
+  static const guint8 h265_types[] = { 0, 1, 2, 19, 20, 21, 32, 33, 34, 38, 39 };
+  const guint8 *sets[] = { sps_720x480, sps_1366x768, h264_sps_1920x1080, h264_sps_cb_720p, vps_1280x720 };
+  const gsize set_sizes[] = { sizeof (sps_720x480), sizeof (sps_1366x768), sizeof (h264_sps_1920x1080),
+    sizeof (h264_sps_cb_720p), sizeof (vps_1280x720)
+  };
+  GRand *rand = g_rand_new_with_seed (20261112);
+  const guint rounds = 3000;
+
+  fuzz_fixed = 0;
+
+  for (guint r = 0; r < rounds; r++) {
+    gsize size = (gsize) g_rand_int_range (rand, 0, 160);
+    guint8 *buf = g_malloc (MAX (size, 1));
+    guint kind = r % 3;
+
+    for (gsize i = 0; i < size; i++)
+      buf[i] = (guint8) g_rand_int_range (rand, 0, 256);
+    if (kind == 1) {
+      /* start codes and NAL headers every few bytes; zero runs too */
+      for (gsize i = 0; i + 5 < size; i += (gsize) g_rand_int_range (rand, 4, 24)) {
+        gboolean hevc = g_rand_boolean (rand);
+
+        buf[i] = buf[i + 1] = 0;
+        buf[i + 2] = 1;
+        if (hevc) {
+          buf[i + 3] = (guint8) (h265_types[g_rand_int_range (rand, 0, G_N_ELEMENTS (h265_types))] << 1);
+          buf[i + 4] = 1;
+        } else {
+          buf[i + 3] = 0x60 | h264_types[g_rand_int_range (rand, 0, G_N_ELEMENTS (h264_types))];
+        }
+        if (g_rand_int_range (rand, 0, 4) == 0 && i + 8 < size)
+          buf[i + 5] = buf[i + 6] = buf[i + 7] = 0;
+      }
+    } else if (kind == 2) {
+      /* a captured parameter set, a few bytes changed, cut at a random length */
+      guint s = (guint) g_rand_int_range (rand, 0, G_N_ELEMENTS (sets));
+      gsize n = MIN (size, set_sizes[s]);
+
+      memcpy (buf, sets[s], n);
+      size = n;
+      for (guint k = g_rand_int_range (rand, 1, 4); k > 0 && n > 0; k--)
+        buf[g_rand_int_range (rand, 0, (gint32) n)] = (guint8) g_rand_int_range (rand, 0, 256);
+      {
+        GByteArray *a = annex_b (buf, size, NULL);
+
+        feed_annex_b (a->data, a->len);
+        g_byte_array_unref (a);
+      }
+    }
+    feed_nal (buf, size);
+    feed_annex_b (buf, size);
+    g_free (buf);
+  }
+  g_rand_free (rand);
+  g_test_message ("%u random buffers, %u parameter sets rewritten", rounds, fuzz_fixed);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1730,6 +1932,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/enc-nal/level-with-window", test_level_with_window);
   g_test_add_func ("/cpu/enc-nal/intra-h264", test_intra_h264);
   g_test_add_func ("/cpu/enc-nal/intra-h265", test_intra_h265);
+  g_test_add_func ("/cpu/enc-nal/fuzz-prefixes", test_fuzz_prefixes);
+  g_test_add_func ("/cpu/enc-nal/fuzz-random", test_fuzz_random);
 
   g_test_add_func ("/gpu/enc-nal/walker-h264", test_gpu_walker_h264);
   g_test_add_func ("/gpu/enc-nal/walker-h265", test_gpu_walker_h265);

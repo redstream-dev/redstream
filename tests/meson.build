@@ -498,7 +498,8 @@ test('enc_props', executable('enc_props', 'check' / 'enc_props.c', dependencies 
   suite : 'cpu', env : internal_test_env, protocol : 'tap')
 
 # rdsh264enc / rdsh265enc Annex-B helpers and the test NAL walker: filler stripping, the timestamp shift, the H.265
-# SPS window fix on captured SPSs, the level strings and the level rewrite on captured SPSs and VPSs (cpu); the walker
+# SPS window fix on captured SPSs, the level strings and the level rewrite on captured SPSs and VPSs, every helper on
+# every prefix of those and on fixed-seed random buffers (no crash, no read out of bounds under ASan) (cpu); the walker
 # on VA-encoded streams, filler in a real CBR stream, VA's measured shift and an encode -> fix -> decode round trip
 # (gpu, skipped without the VA encoders). No plugin of ours.
 enc_nal_exe = executable('enc_nal', 'check' / 'enc_nal.c',
