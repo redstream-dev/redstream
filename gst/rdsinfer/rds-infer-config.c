@@ -1,6 +1,6 @@
 /* Redstream: the rdsinfer config parser. One table lists every nvinfer config key with its type, range, default
- * and status; it drives parsing, the supported-value checks and the warnings (and the compat matrix is written from
- * it). YAML files are read into a GKeyFile first, so both formats go through the same typed parser.
+ * and status; it drives parsing, the supported-value checks and the warnings (and docs/elements/rdsinfer-config.md
+ * is written from it). YAML files are read into a GKeyFile first, so both formats go through the same typed parser.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-infer-config.h"
 #include "rds-config-parse.h"

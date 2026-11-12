@@ -334,11 +334,11 @@ gst/rdsenc/        libgstrdsenc plugin (plugin.c): rdsh264enc and rdsh265enc, on
                    QP string parsers) are what the cpu tests link. Always built; at run time it needs the stock `va`
                    plugin (vah264enc, vah265enc) and a Mesa VA driver that encodes: without them the elements
                    register, and going to READY is an error naming the missing encoder
-docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its rdsinfer,
-                   rdstracker and rdsanalytics config-key tables must match the key tables: the infer_config,
-                   tracker_config and analytics_config tests check every row; element_compat_matrix checks the tiler,
-                   OSD, logger, sink, URI source bin, analytics and encoder property tables against the elements'
-                   properties)
+docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its
+                   rdstracker and rdsanalytics config-key tables, and elements/rdsinfer-config.md's, must match the key
+                   tables: the infer_config, tracker_config and analytics_config tests check every row;
+                   element_compat_matrix checks the tiler, OSD, logger, sink, URI source bin, analytics and encoder
+                   property tables against the elements' properties)
 samples/rds-test2/ clean-room sample with a secondary classifier: YOLO11n, NvSORT, YOLO11n-cls on the vehicles
                    (per-frame object, vehicle and labelled counts, label totals; --dry-run, --no-display,
                    --pgie-config, --sgie-config, --tracker-config)
@@ -479,8 +479,8 @@ meson test -C build-rel --print-errorlogs
   `tests/meson.build`.
 - The compat-matrix lints (`/cpu/infer-config/compat-matrix`, `/cpu/tracker-config/compat-matrix`) run only in
   builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
-  check the rdsinfer key tables in `docs/compat-matrix.md`. `/cpu/analytics-config/compat-matrix` (rdsanalytics is
-  always built) runs in every build. A new or changed config key needs its row there; the
+  check the rdsinfer key tables in `docs/elements/rdsinfer-config.md`. `/cpu/analytics-config/compat-matrix`
+  (rdsanalytics is always built) runs in every build. A new or changed config key needs its row there; the
   test's message prints the expected row. `/cpu/elements/compat-matrix` does the same for the property tables of
   `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger`, `rdsvideosink`, `rdsurisrcbin`, `rdsanalytics`,
   `rdsh264enc` and `rdsh265enc`:

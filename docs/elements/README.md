@@ -33,10 +33,14 @@ The Description column uses these words from the compatibility matrix:
   described on the element's page.
 - **accepted**: stored and read back, and does what the row says rather than what DeepStream does with it.
 
+Behaviour tables have the columns `| Behaviour | Status | Notes |`. A status is "matches nvX (DeepStream 8.0)", observed
+DeepStream 8.0 behaviour where NVIDIA's docs are silent, or "ours", where Redstream decides.
+
 ## Elements
 
 | Element | Purpose | DeepStream |
 |---|---|---|
+| [`rdsinfer`](rdsinfer.md) | runs an ONNX model with MIGraphX: detectors, classifiers, tensor output; config keys on [rdsinfer-config](rdsinfer-config.md) | `nvinfer` |
 | [`rdslogger`](rdslogger.md) | prints each stream's frame rate to stdout | `nvdslogger` |
 | [`rdsmultistreamtiler`](rdsmultistreamtiler.md) | composes a batch into one tiled frame, with the metadata scaled into the tiles | `nvmultistreamtiler` |
 | [`rdsosd`](rdsosd.md) | draws boxes, labels, display meta and the clock on RGBA frames, on the GPU or the CPU | `nvdsosd` |

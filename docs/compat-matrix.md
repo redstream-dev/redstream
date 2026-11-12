@@ -30,7 +30,7 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvvideoconvert` | `rdsvideoconvert` | supported | single frames (batch size 1); `memory:RDS` and system memory on either side; properties below, behaviour on [its page](elements/rdsvideoconvert.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideoconvert) |
 | `nvstreammux` | `rdsstreammux` | supported | the default (scaling) mux only; the new mux is not implemented yet. GstAggregator-based; properties below, behaviour on [its page](elements/rdsstreammux.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreammux) |
 | `nvstreamdemux` | `rdsstreamdemux` | supported | zero-copy read-only views of the batch slots; properties below, behaviour on [its page](elements/rdsstreamdemux.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreamdemux) |
-| `nvinfer` | `rdsinfer` | supported | primary detector only (`process-mode=1`, `network-type` 0 or 100) on MIGraphX; nvinfer config files (key file or YAML); properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
+| `nvinfer` | `rdsinfer` | supported | primary and secondary detectors, secondary classifiers and tensor-output networks (`network-type` 0, 1 and 100) on MIGraphX; nvinfer config files (key file or YAML); properties below, behaviour on [its page](elements/rdsinfer.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
 | `nvtracker` | `rdstracker` | supported | the IOU and NvSORT trackers of NvMultiObjectTracker, on the CPU, with its YAML config files; NvDCF and NvDeepSORT configs run as NvSORT. Matches observed DeepStream 8.0 behaviour where the docs are silent; properties, config keys and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker) |
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | supported | NV12 and RGBA `memory:RDS` batches into one tiled frame of the same format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties below, behaviour on [its page](elements/rdsmultistreamtiler.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
 | `nvdsosd` | `rdsosd` | supported | RGBA `memory:RDS` frames (single or batched), drawn on the GPU (`process-mode` 1, the default) or the CPU (`process-mode=0`), the same pixels either way, in the geometry of DeepStream 8.0's default GPU mode (Pango for text); masks and blur not yet; optional (`-Dosd`, needs cairo and pangocairo); properties below, behaviour on [its page](elements/rdsosd.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
@@ -301,364 +301,34 @@ Names, types and defaults as DeepStream 8.0's nveglglessink has them (nv3dsink's
 
 ### `rdsinfer` (`nvinfer`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvinfer.html))
 
-Names and types as on NVIDIA's nvinfer page (checked 2026-10-24). As documented, a property set explicitly overrides
-the config file; in Redstream that holds also when it is set to its default value. All properties can be changed
-only in NULL or READY: the config is read and the engine built or loaded when the element starts (READY to PAUSED),
-and every error there fails the state change with a message naming the file (or `element property`), the key and
-the value. Defaults are those of the config keys (**ours**, NVIDIA documents none) and apply only when the property
-is set.
+Reference: [rdsinfer](elements/rdsinfer.md); its config file and every config key:
+[rdsinfer-config](elements/rdsinfer-config.md).
 
-| Property | Type | Default | Status | Notes |
-|---|---|---|---|---|
-| `config-file-path` | string | none | supported | required; `.yml`/`.yaml` is read as YAML, anything else as a key file |
-| `unique-id` | uint | `1` (ours) | supported | overrides `gie-unique-id`; range 0..`G_MAXUINT` as documented (the config key starts at 1) |
-| `process-mode` | uint | `1` | supported | overrides `process-mode`; `2`: secondary mode, see "Secondary mode" (classifiers run only there) |
-| `infer-on-gie-id` | int | `-1` | supported | -1..`G_MAXINT` (DeepStream 8.0's type and default: -1 is every GIE); overrides `operate-on-gie-id`; a warning when set in primary mode |
-| `infer-on-class-ids` | string | none | supported | colon-separated class ids (`1:2:4`; `-1` in it: every class, DeepStream 8.0 behaviour); overrides `operate-on-class-ids`; a warning when set in primary mode |
-| `filter-out-class-ids` | string | none | supported | semicolon-separated class ids (`1;2`); replaces the file's list (an empty string clears it) |
-| `model-engine-file` | string | none | supported | a compiled MIGraphX program (`.mxr`), loaded when its manifest matches the model and the device, else rebuilt into the cache name; used as given (a config-file value is relative to the config file). A TensorRT `.engine` is ignored with a warning. Changing it while PLAYING (on-the-fly model update) is not supported |
-| `batch-size` | uint | `1` (ours) | supported | 1..1024. Primary mode: frames of a batch go to the network image of their slot (`batch_id`); a frame in a slot at or above `batch-size` is an error. Secondary mode: objects inferred together, see "Secondary mode" |
-| `dynamic-batch` | boolean | `FALSE` (ours) | supported | ours (nvinfer has no such property); overrides the config key: also compile programs for the powers of two below `batch-size` (4: 1, 2, 4; 6: 1, 2, 4, 6) and run each chunk on the smallest that holds its highest image. Primary mode: the highest occupied slot (`batch_id`) decides, not the number of frames, so one frame in slot 3 runs on the batch-4 program. Secondary mode: a chunk's objects take images 0 to n-1, so the object count decides. `batch-size` keeps its meaning, the most images one run takes. A model with a fixed batch dimension falls back to the `batch-size` program alone, with a warning at start. With `batch-size` 1 it has no effect: there is no smaller program. Costs and caching: see "Models and compiled programs"; changeable only in NULL or READY |
-| `interval` | int | `0` (ours) | supported | 0..32: infer one batch, skip the next `interval` (they pass with `bInferDone` FALSE and no objects); the count restarts at start and after a flush (ours); ignored in secondary mode, with a warning (DeepStream 8.0 behaviour) |
-| `gpu-id` | uint | `0` | supported | the GPU for preprocessing and inference; the batch must be in GPU memory on it |
-| `output-tensor-meta` | boolean | `FALSE` | supported | one `RdsInferTensorMeta` per inferred frame, or per object in secondary mode (also always with `network-type=100`), see "Tensor output meta" |
-| `raw-output-file-write` | boolean | `FALSE` | accepted no-op | not implemented; a warning (once per element) when set |
-| `raw-output-generated-callback` | pointer | NULL | accepted no-op | the callback's signature isn't documented; a warning (once per element) when set |
-| `raw-output-generated-userdata` | pointer | NULL | accepted no-op |  |
-| `output-instance-mask` | boolean | `FALSE` | unsupported | `TRUE` fails at start (instance segmentation is not implemented) |
-| `input-tensor-meta` | boolean | `FALSE` | unsupported | `TRUE` fails at start (preprocessed tensor input is not implemented) |
-| `crop-objects-to-roi-boundary` | boolean | `FALSE` | accepted no-op | applies to preprocessed-tensor ROIs; a warning when `TRUE` |
-| `clip-object-outside-roi` | boolean | `FALSE` | accepted no-op | applies to preprocessed-tensor ROIs; a warning when `TRUE` |
-
+Names and types as on NVIDIA's nvinfer page (checked 2026-10-24); the defaults are ours (NVIDIA documents none).
 Not implemented: `classifier-type`, and the TensorRT-only `strongly-typed` and `dynamic-properties`.
 
-Config file paths: `onnx-file`, `model-engine-file`, `labelfile-path` and `custom-lib-path` from the file are relative
-to the config file's directory (documented for YAML, ours for key files). That includes a bare `custom-lib-path`
-name (no `/`): it is the file next to the config, not a library searched on the loader path. Use an absolute path
-(as NVIDIA's docs ask) for a library elsewhere.
-
-Pads: `sink` and `src`, `video/x-raw(memory:RDS)` NV12, RGBA, BGRA, RGBx or BGRx batches with an `RdsBatchMeta`
-(from `rdsstreammux`); buffers pass through unchanged (metadata only, pixels are never written). A buffer without
-batch meta is an error.
-
-#### Detector output (object meta)
-
-- Boxes are in the batch frame's pixels (the mux's `width`×`height`); `maintain-aspect-ratio` / `symmetric-padding`
-  scaling is undone (ours: the scaled frame sits at the top-left, or centred with `symmetric-padding`).
-  `detector_bbox_info.org_bbox_coords` is the unclipped box and `rect_params` the box clipped to the frame
-  (documented).
-- Fields set: `unique_component_id` (`gie-unique-id`), `class_id`, `confidence`, `object_id` =
-  `UNTRACKED_OBJECT_ID`, `obj_label` (the label, truncated to 127 bytes), `parent` NULL. Drawing defaults (ours):
-  `rect_params` border 3 px red, no background; `text_params` the label at the box's top-left, 20 px above it
-  (clamped to 0), "Serif" 10, white on black.
-- Frames that were inferred get `bInferDone` TRUE (primary mode). The post-processing order and NMS are under
-  "Detection post-processing". A secondary detector's objects are under "Secondary mode".
-- A parse function that returns `false` or throws: that frame gets no objects, and the element posts one warning
-  (then logs at debug level); the stream goes on. Invalid objects from a parser (class id out of range, non-finite
-  values, empty boxes) are dropped, and a non-zero `rotation_angle` is ignored: one warning each.
-
-#### Tensor output meta
-
-One `RdsUserMeta` per inferred frame on `frame_user_meta_list` (in secondary mode per inferred object, on its
-`obj_user_meta_list`), `meta_type` `RDS_INFER_TENSOR_OUTPUT_META` (`NVDSINFER_TENSOR_OUTPUT_META`), data
-`RdsInferTensorMeta`. `out_buf_ptrs_host[i]` (pinned host memory) and `out_buf_ptrs_dev[i]` point at the frame's (or
-object's) slice of output layer `i`, whose dims in `output_layers_info` are those of one image, without the batch;
-the `buffer` pointers in `output_layers_info` are NULL (documented: not valid there). The buffers stay valid as long as the meta exists, in
-copies too (`rdsstreamdemux` outputs, `rds_batch_meta_copy`), also after the element has stopped. They are
-refcounted and reused once the last meta pointing at them is gone, so `tensor-meta-pool-size` has no effect. The
-element keeps as many as the most it had in use lately (during the last 256 to 512 batches, or chunks of
-`batch-size` objects in secondary mode), and at least 4 (`rdsstreammux`'s default `buffer-pool-size`); the rest are
-freed (ours).
-
-#### Processing
-
-One batch at a time, synchronously (ours; nvinfer's threading isn't documented): preprocessing and inference on the
-element's own non-blocking stream, one synchronization per batch (per chunk of `batch-size` objects in secondary
-mode), parsing on the CPU. Slots without a frame (a partial batch) and unused images of a chunk are zeroed, not
-inferred on stale pixels (with `dynamic-batch`, those of the program that runs). The batch's metadata lock is held
-only to read the frame list and to add the results, never during GPU work; results for a frame or object removed in
-between are dropped, also when the metadata pool gave its address to a new one.
-
-#### Secondary mode
-
-`process-mode=2` infers on the objects that upstream elements added (no primary `rdsinfer` is needed). Each row is
-**DeepStream 8.0 behaviour** (observed where the docs are silent) or **ours** (where 8.0 settles nothing, crashes or
-is inconsistent).
-
-Keys and properties: `process-mode` is a property and a config key; `infer-on-gie-id` and `infer-on-class-ids` are
-properties that override the config keys `operate-on-gie-id` and `operate-on-class-ids`;
-`input-object-min/max-width/height`, `secondary-reinfer-interval` and the classifier keys (`classifier-threshold`,
-`classifier-type`, `parse-classifier-func-name`, `classifier-async-mode`) are config keys only, as in DeepStream 8.0,
-which has no properties for them. Their rows are in "Config keys: `[property]`".
-
-| Topic | Source | Behaviour |
+| Property | Status | Difference |
 |---|---|---|
-| Which frames | DeepStream 8.0 behaviour | every frame of every batch, with `bInferDone` TRUE or FALSE; `interval` is ignored (a warning when set). `bInferDone` is never set or cleared |
-| Which objects | DeepStream 8.0 behaviour | `operate-on-gie-id` (-1: every GIE, this element's own id included; 0 is a real id), `operate-on-class-ids` (empty: every class) and `input-object-min/max-width/height` (inclusive, on the float `rect_params` size, 0: no limit); objects added by this element in the same buffer are not inferred on |
-| Class id -1, negative class ids | ours, DeepStream 8.0 behaviour | `-1` in `operate-on-class-ids` in the config file is every class, as the property's `-1` is in 8.0 (8.0 aborts on the config value); with a class list set, an object with a negative `class_id` is not selected (8.0 aborts); with no list it is (DeepStream 8.0 behaviour) |
-| Crop | DeepStream 8.0 behaviour | the object's `rect_params` (`detector_bbox_info` and `tracker_bbox_info` are not used): origin floored, then rounded up to even (11 → 12, 43.7 → 44), size floored, then down to even, at least 2 (15.6 → 14, 1 → 2); a side under 1 pixel is skipped; overflow past the right or bottom edge is clipped and the rest stretched to the network |
-| Crop outside the frame | ours | a negative origin, a box larger than the frame or wholly outside it is clipped too (8.0 fails the pipeline); a crop with less than 2 pixels left is skipped (logged at debug level). The origin is aligned before the clip |
-| Crop in the network input | DeepStream 8.0 behaviour | stretched to the network, or with `maintain-aspect-ratio` scaled by min(W/w, H/h) with the scaled size floored to even (24×16 into 16×16 is 16×10), at the top-left, or with `symmetric-padding` at floor((net − exact scaled size) / 2); padding is pixel value 0 before normalisation. The crop is resampled to 8 bits, then normalised as in primary mode |
-| Scaling filter | ours | `scaling-filter` defaults to 1 (bilinear) in both modes (8.0's default is nearest). Nearest samples at pixel centres, as `rds_buf_surf_transform` does: a 32-pixel crop into 16 reads columns 1, 3, 5, … (8.0 reads 0, 2, 4, …), so nearest-filter inputs can differ from 8.0's by one source pixel. `scaling-filter=3` works (bilinear; 8.0 fails the pipeline) |
-| Batching | DeepStream 8.0 behaviour | objects in frame list order, then object list order, in chunks of `batch-size` that continue across the frames of a batch but never across batches: 10 objects at `batch-size` 4 run as 4, 4, 2; two batches of 5 as 4, 1 and 4, 1 |
-| Chunk size | ours | the compiled program has a fixed batch of `batch-size` images: a chunk with fewer objects runs them all the same, its unused images zeroed, so a chunk costs nearly as much with few objects as when full (8.0 rebuilds the model for 1 to `batch-size` images and runs the actual count). With `dynamic-batch`, a chunk of n objects runs on the smallest program of at least n images, so smaller chunks cost less: 5 objects at `batch-size` 4 run as 4, then 1 on the batch-1 program. The results per object are the same, up to float rounding between programs |
-| Tensor meta | DeepStream 8.0 behaviour | one per inferred object (a detector's parents and classified objects included), on the object's `obj_user_meta_list`; none on the frame or the batch (see "Per-object cache"). `unique_id` is the `gie-unique-id`, the layer dims are those of one object (no batch), the host and device pointers point at the object's slice, `network_info` is the network's size and `maintain_aspect_ratio` / `symmetric_padding` the config's values |
-| Detector objects (children) | DeepStream 8.0 behaviour | per crop, with the class attributes' thresholds, NMS per class (never across crops), `detected-min/max-*` in frame pixels and `filter-out-class-ids`; `parent` is the cropped object, `unique_component_id` this element's `gie-unique-id`, `class_id`, `confidence`, `obj_label` and the text from the parser and label file, `object_id` untracked |
-| Detector thresholds | DeepStream 8.0 behaviour | the class attributes' defaults are those of the key table in both modes: `pre-cluster-threshold` 0.2, as in 8.0 |
-| Child geometry | ours | network → crop → frame pixels with one consistent mapping; `rect_params` clipped to the frame, `detector_bbox_info` the unclipped box (8.0 maps with the unaligned parent origin, so it can be a pixel off, doesn't clip, and moves negative coordinates to the parent's origin without shrinking the box). A child wholly outside its crop is dropped; one partly outside keeps its part inside the frame |
-| Child order | ours | appended to the frame's object list after the existing objects, crop by crop (8.0 prepends) |
-| Detector chains | DeepStream 8.0 behaviour | a second `rdsinfer` with `infer-on-gie-id` = the detector's `gie-unique-id` infers on its children |
-| `roi-top-offset`, `roi-bottom-offset` | DeepStream 8.0 behaviour, ours | applied to the children with the child's class attributes, in crop pixels (frame pixels from the top of the aligned crop the parent was sampled from): a child is kept when its top − the crop's top ≥ `roi-top-offset` (DeepStream 8.0 behaviour) and its bottom − the crop's top ≤ the crop's height − `roi-bottom-offset` (ours: 8.0 compares with the frame's height minus the offset); a `roi-bottom-offset` of the crop's height or more drops every child of that crop (ours). Boundaries included, each offset only when set. The parents are never filtered (DeepStream 8.0 behaviour); no warning |
-| Parser returns false | ours | one warning per element, that object gets no children but its tensor meta is still attached (as in primary mode), the other objects are unaffected (8.0 crashes) |
-| Classifiers (`network-type=1`) | ours | secondary mode only for now: a classifier in primary mode fails at start; see "Classifier output (classifier meta)" and "Per-object cache" |
-
-#### Classifier output (classifier meta)
-
-A classifier (`network-type=1`, `process-mode=2`) attaches what it finds to each object it infers on. Each row is
-**DeepStream 8.0 behaviour** (observed where the docs are silent) or **ours**.
-
-| Topic | Source | Behaviour |
-|---|---|---|
-| Built-in parser | DeepStream 8.0 behaviour | without `parse-classifier-func-name`: per output layer the argmax of its values, ties to the lowest class index; no softmax (the value is the probability as it is: 200/256 gives 0.78125, an already softmaxed model's values pass through) |
-| `classifier-threshold` | DeepStream 8.0 behaviour | strictly above: 0.5 rejects 0.5 and keeps 0.50390625; the default 0 gives nothing for an all-zero output. A layer below it is left out; with none left, the object gets no classifier meta at all (not an empty one) |
-| Classifier meta | DeepStream 8.0 behaviour | one `RdsClassifierMeta` per object and classifier: `num_labels` the labels attached, `unique_component_id` the `gie-unique-id`, `classifier_type` the `classifier-type` (NULL if unset; interned, not owned) |
-| Meta order | ours | appended to the object's `classifier_meta_list`, after the metas of earlier classifiers (8.0 prepends) |
-| Labels | DeepStream 8.0 behaviour | one `RdsLabelInfo` per output layer kept: `result_label` the label, `result_class_id` the argmax, `label_id` the output layer, `result_prob` the raw value |
-| Label order | ours | in output-layer order (8.0 prepends) |
-| `num_classes` | ours | the layer's class count (8.0 sets 0); 0 for a custom parser's attribute whose `attributeIndex` is not an output layer |
-| Long labels | ours | a label longer than `result_label` (127 bytes) is truncated there and kept whole in `pResult_label`; otherwise `pResult_label` is NULL (8.0 never sets it) |
-| Label file gaps | ours | an argmax past the layer's labels, a layer without a line and no label file all attach the meta with an empty label (8.0 attaches nothing for the first and the last, an empty label for the second); start warns when there is no label file, or one whose line or label counts don't fit the output layers |
-| Display text | DeepStream 8.0 behaviour | `text_params.display_text` gets `" "` and then `"<label> "` per label attached (`"T"` becomes `"T red "`, NULL becomes `" blue "`, a second classifier makes it `"T red  x "`); with a custom parser `" "` and its description (`"T desc"`); unchanged when nothing is attached. `obj_label` is never changed |
-| Empty description | ours | a custom parser that returns attributes but leaves `descString` empty (length 0) attaches the classifier meta with its labels and leaves the display text unchanged (`"T"` stays `"T"`, NULL stays NULL; 8.0 attaches nothing then, not even the labels, and caches that for a tracked object). A description of one space is not empty: `"T"` becomes `"T  "` (DeepStream 8.0 behaviour) |
-| Description without attributes | ours | a custom parser that sets `descString` but returns no attributes attaches nothing: no classifier meta, and the display text is unchanged (8.0 not observed) |
-| Custom parser | DeepStream 8.0 behaviour | `parse-classifier-func-name` in `custom-lib-path`, called once per object with that object's output layers (dims without the batch), the network info and `classifier-threshold`; each attribute becomes a label (`attributeLabel` → `result_label`, `attributeValue` → `result_class_id`, `attributeIndex` → `label_id`, `attributeConfidence` → `result_prob`), not thresholded again. rdsinfer frees the `attributeLabel`s |
-| Custom parser label | ours | a NULL `attributeLabel` is an empty label |
-| Unknown parse function | DeepStream 8.0 behaviour, ours | a `parse-classifier-func-name` the library doesn't have fails start (DeepStream 8.0 behaviour); the error names the key (ours) |
-| Parser returns false or throws | ours | one warning per element; that object gets no new classifier meta (a tracked object keeps its stored result, if any, see "Per-object cache"), the others are unaffected (8.0 crashes) |
-| Tensor meta | DeepStream 8.0 behaviour | with `output-tensor-meta=1` a classified object gets its tensor meta too; it doesn't change the classification |
-| Chained classifiers | DeepStream 8.0 behaviour | a second classifier on the same objects attaches its own meta to each |
-
-#### Per-object cache
-
-In secondary mode a classifier keeps each tracked object's last result, keyed by `source_id` and `object_id`, and
-infers the object again only when it is due. Each row is **DeepStream 8.0 behaviour** (observed) or **ours**.
-
-| Topic | Source | Behaviour |
-|---|---|---|
-| What is cached | DeepStream 8.0 behaviour | classifiers (`network-type=1`) on tracked objects only. Untracked objects (`RDS_UNTRACKED_OBJECT_ID`) are inferred every frame; tensor-only networks (`network-type=100`) infer every object every time |
-| Keys | DeepStream 8.0 behaviour | `(source_id, object_id)`: the same id in two streams has two entries |
-| New id | DeepStream 8.0 behaviour | inferred on its first frame; an id seen before gets its stored result back (until it is evicted) |
-| Growth | DeepStream 8.0 behaviour | inferred again when the `rect_params` area is above 1.2 × the area at its last inference, strictly (1.2 × no, 1.2001 × yes); shrinking or moving never re-infers and keeps the reference area. A class change keeps the result |
-| Growth comparison | ours | exact (5 × area > 6 × last area in double precision); 8.0 compares in float, which may round the other way in rare cases |
-| `secondary-reinfer-interval` | DeepStream 8.0 behaviour | unset (-1): never on time; 0: every frame; N: every N + 1 frames, counted from the object's own last inference (growth restarts the count) |
-| Interval count | ours | counted in the frames in which the object was selected (8.0 runs had one source and the object in every frame) |
-| Cached frames | DeepStream 8.0 behaviour | the stored result is attached again: identical classifier meta and label infos, the same `display_text` append; no tensor meta, even with `output-tensor-meta=1` |
-| Empty result | DeepStream 8.0 behaviour | a result below `classifier-threshold` (no labels) is cached like any other: the object gets nothing until growth or the interval infers it again |
-| Parser failure | ours | the object's entry is left as it was before the inference, and on that frame the object gets the stored result (classifier meta and display text) instead of nothing, plus its tensor meta from the failed inference; a new id has no stored result, gets no classifier meta and is tried again on its next frame; an object with a stored result keeps it and stays due until an inference succeeds |
-| Same id twice in a batch | ours | inferred once; the other object gets the result stored before this batch, if any (none for a new id) |
-| Eviction | ours | an entry not seen for 30 frames of its own source is dropped (8.0 keeps every entry: results came back after 1000 absent frames). Each source counts its own frames, one per frame of it in a batch, so a source that sends no frames keeps its entries; seen means present in the source's frame, selected or not (an object filtered out by class, size or an empty crop is kept) |
-| Stream events | ours | a source's `rds-stream-eos` or `rds-stream-reset` drops that source's entries and restarts its frame count; FLUSH_STOP and stopping the element drop every entry. A result whose request is stale (`seq` and epoch per request) is neither stored nor attached: what an object gets is always what its entry holds |
-| Secondary detectors | DeepStream 8.0 behaviour | no cache of detections; with `secondary-reinfer-interval` set, a tracked parent is inferred only when due by the same rules (new id, growth, interval) and gets no children (and no tensor meta) on the other frames. Unset: every frame |
-| `classifier-async-mode=1` | ours | warns at start and runs synchronously: results are in the same buffer, also for untracked objects (8.0 attaches them from the next frame on and never to untracked objects) |
-
-#### Config files
-
-The config file has nvinfer's groups: `[property]` (required), `[class-attrs-all]` and `[class-attrs-<id>]`.
-- A file ending in `.yml` or `.yaml` is YAML, anything else a GLib key file. In YAML the groups are top-level
-  mappings (`property:`, `class-attrs-all:`, ...), values are scalars, and a sequence (`offsets: [77.5, 21.2, 11.8]`)
-  is the same as the key file's `;`-separated list (ours: the docs show the layout only by example).
-- `[class-attrs-<id>]` overrides `[class-attrs-all]` key by key; the other keys of that class keep the
-  `[class-attrs-all]` values (ours). An id at or above `num-detected-classes` is an error.
-- Keys are in the tables below with the parser's own types, ranges and defaults; the defaults are ours (NVIDIA
-  documents none). **supported**: used; **accepted no-op**: one warning per key, then ignored (values outside the
-  range or the accepted values are still errors); **unsupported**: an error whenever the key is set (to a non-empty value). A key that is
-  in no table is a warning, not an error: the docs list legacy keys, so a typo can't be told from one of those.
-- Errors name the file, the key (`GROUP:KEY` outside `[property]`) and the value: `FILE:KEY: VALUE: reason`.
-- `onnx-file` is required, also with `model-engine-file` (a compiled program is checked against its model). For a
-  detector (`network-type=0`), so are `num-detected-classes` and `parse-bbox-func-name`: nvinfer's internal resnet
-  parser, which it uses when `parse-bbox-func-name` is unset, is not available, so name `RdsInferParseYolo` (built
-  in) or a function in `custom-lib-path`.
-- Label file (`labelfile-path`): one label per line, or all of them on one `;`-separated line; whitespace, CRs and
-  trailing blank lines are ignored. Fewer labels than classes is a warning (the rest get empty labels), and so are
-  more (the extra ones are ignored).
-- A classifier's label file (`network-type=1`) has another form (DeepStream 8.0 behaviour): line i has the labels of
-  output layer i, `;`-separated and not trimmed; one trailing `;` on a line is ignored (`a;b;` is `a`, `b`), an empty
-  label elsewhere is kept (`a;;b`), and an empty line is a layer without labels. Only the CR of a CRLF line end and
-  trailing blank lines are left out.
-  Without `labelfile-path`, a warning: the classifier output gets empty labels (ours). A file with a line count other
-  than the network's output layers, or a line whose label count isn't its layer's class count, is one warning at
-  start, and its labels are used as they are (ours).
-- Keys the mode or the network type doesn't use are a warning when set to something other than their default: the
-  secondary-mode keys (`operate-on-*`, `input-object-*`, `secondary-reinfer-interval`, `classifier-async-mode`) in
-  primary mode, the classifier keys outside classifiers, and `interval` in secondary mode (DeepStream 8.0 behaviour:
-  it is ignored there). `roi-top-offset` and `roi-bottom-offset` apply in both modes (in secondary mode from the
-  crop's edges, see "Secondary mode") and never warn.
-
-#### Config keys: `[property]`
-
-| Key | Type | Default | Range | Status | Notes |
-|---|---|---|---|---|---|
-| `onnx-file` | path | none |  | supported | the model; see "Models and compiled programs" |
-| `model-engine-file` | path | none |  | supported | a compiled MIGraphX program (`.mxr`), see "Models and compiled programs" |
-| `labelfile-path` | path | none |  | supported | see "Config files" |
-| `infer-dims` | dims | none | 1..2147483647 | supported | `C;H;W` of one input image (also for `network-input-order=1`); required when the model's height or width is symbolic |
-| `output-blob-names` | string list | none |  | accepted no-op | all outputs are passed to the parser and to the tensor meta |
-| `batch-size` | uint | `1` (ours) | 1..1024 | supported | the program is compiled for this batch size (with `dynamic-batch`, the largest program of the set); the model's batch dimension must be symbolic or equal to it |
-| `dynamic-batch` | bool | `0` (ours) |  | supported | ours (nvinfer has no such key): as the property |
-| `network-mode` | int | `0` (ours) | 0..3 | supported | accepted values: 0, 2 (FP32, FP16; inputs and outputs stay FP32). INT8 (1) and BEST (3) fail at start |
-| `network-type` | int | `0` (ours) | 0..100 | supported | accepted values: 0, 1, 100 (detector; classifier, in secondary mode only; no post-processing, tensor meta only). A classifier in primary mode and segmentation (2, 3) fail at start |
-| `process-mode` | int | `1` (ours) | 1..2 | supported | 1 primary, 2 secondary (see "Secondary mode"; classifiers run only there) |
-| `gie-unique-id` | uint | `1` (ours) | >= 1 | supported | the objects' `unique_component_id` and the tensor meta's `unique_id` |
-| `interval` | uint | `0` (ours) | 0..32 | supported | as the property |
-| `output-tensor-meta` | bool | `0` (ours) |  | supported | as the property |
-| `net-scale-factor` | float | `1.0` (ours) | > 0 | supported | input = `net-scale-factor` × (pixel − `offsets[c]`), pixels 0..255 (documented) |
-| `offsets` | float list | none | >= 0 | supported | one per input channel (a count that doesn't match is an error); unset: 0 |
-| `model-color-format` | int | `0` (ours) | 0..2 | supported | 0 RGB, 1 BGR, 2 GRAY (ours: the Y plane of NV12 frames, BT.601 luma of RGB frames) |
-| `network-input-order` | int | `0` (ours) | 0..1 | supported | 0 NCHW, 1 NHWC |
-| `maintain-aspect-ratio` | bool | `0` (ours) |  | supported | scale = min(W/w, H/h), the scaled size rounded to nearest (on crops in secondary mode: floored to even, see "Secondary mode"); padding is pixel value 0 before normalisation (ours) |
-| `symmetric-padding` | bool | `0` (ours) |  | supported | with `maintain-aspect-ratio`: the scaled frame is centred (offset rounded down); without it, at the top-left |
-| `scaling-filter` | int | `1` (ours) | 0..6 | supported | the `RdsBufSurfTransform_Inter` values: 1 (bilinear) and 2-4 sample bilinearly, the others nearest, as in `rds_buf_surf_transform` (nearest at pixel centres, see "Secondary mode") |
-| `num-detected-classes` | uint | none | 1..65536 | supported | required for detectors |
-| `cluster-mode` | int | `2` (ours) | 0..4 | supported | accepted values: 2, 4 (NMS, none). GroupRectangles (0), DBSCAN (1) and hybrid (3) fail at start |
-| `parse-bbox-func-name` | string | none |  | supported | required for detectors: `RdsInferParseYolo` (built in) or a function in `custom-lib-path` |
-| `custom-lib-path` | path | none |  | supported | a parser library, see "nvinfer custom parser ABI"; relative to the config file's directory, a bare name too |
-| `filter-out-class-ids` | uint list | none | >= 0 | supported | objects of these classes are dropped |
-| `operate-on-gie-id` | int | `-1` (ours) | >= -1 | supported | secondary mode: infer on the objects of this GIE; -1 or unset: every GIE, this element's own id included (DeepStream 8.0 behaviour); 0 is a real id |
-| `operate-on-class-ids` | int list | none | >= -1 | supported | secondary mode: infer on objects of these classes; unset: every class; a `-1` in the list: every class (ours) |
-| `input-object-min-width` | uint | none | >= 0 | supported | secondary mode: objects narrower are skipped; inclusive, 0: no limit (DeepStream 8.0 behaviour); above a set `input-object-max-width` is an error |
-| `input-object-min-height` | uint | none | >= 0 | supported | secondary mode: as `input-object-min-width`, for the height |
-| `input-object-max-width` | uint | none | >= 0 | supported | secondary mode: objects wider are skipped; inclusive, 0: no limit (DeepStream 8.0 behaviour) |
-| `input-object-max-height` | uint | none | >= 0 | supported | secondary mode: as `input-object-max-width`, for the height |
-| `secondary-reinfer-interval` | int | `-1` (ours) | >= -1 | supported | secondary mode: unset (-1) never reinfers an object, 0 every frame, N every N + 1 frames (DeepStream 8.0 behaviour) |
-| `classifier-threshold` | float | `0` (ours) | >= 0 | supported | classifiers: a label needs a probability strictly above it; unset: 0 (DeepStream 8.0 behaviour) |
-| `classifier-type` | string | none |  | supported | classifiers: the classifier meta's type name; letters, digits, `_` and `-` |
-| `parse-classifier-func-name` | string | none |  | supported | classifiers: a parse function in `custom-lib-path` (required with it); unset: the built-in argmax parser (see "Classifier output (classifier meta)") |
-| `classifier-async-mode` | bool | none |  | supported | secondary classifiers: `1` runs synchronously all the same, with a warning (ours) |
-| `gpu-id` | uint | none | >= 0 | accepted no-op | the GPU is chosen with the element's `gpu-id` property |
-| `workspace-size` | uint | none | >= 0 | accepted no-op | a TensorRT setting |
-| `force-implicit-batch-dim` | bool | none |  | accepted no-op | a TensorRT setting |
-| `enable-dla` | bool | none |  | accepted no-op | accepted values: 0; DLA is a Jetson unit |
-| `use-dla-core` | int | none | >= 0 | accepted no-op | DLA is a Jetson unit |
-| `tensor-meta-pool-size` | uint | none | >= 1 | accepted no-op | tensor output buffers are allocated as needed |
-| `scaling-compute-hw` | int | none | 0..2 | accepted no-op | accepted values: 0, 1 (always the GPU); VIC (2) is a Jetson unit |
-| `crop-objects-to-roi-boundary` | bool | none |  | accepted no-op | applies to preprocessed-tensor ROIs |
-| `is-classifier` | bool | none |  | accepted no-op | accepted values: 0; legacy key, use `network-type=1` |
-| `enable-dbscan` | bool | none |  | accepted no-op | accepted values: 0; deprecated, use `cluster-mode=2` |
-| `int8-calib-file` | string | none |  | accepted no-op | INT8 only |
-| `output-instance-mask` | bool | none |  | accepted no-op | accepted values: 0; instance segmentation |
-| `input-tensor-from-meta` | bool | none |  | accepted no-op | accepted values: 0; preprocessed tensor input |
-| `model-file` | string | none |  | unsupported | Caffe; use `onnx-file` |
-| `proto-file` | string | none |  | unsupported | Caffe; use `onnx-file` |
-| `mean-file` | string | none |  | unsupported | use `offsets` |
-| `tlt-encoded-model` | string | none |  | unsupported | encoded TAO models; export to ONNX |
-| `tlt-model-key` | string | none |  | unsupported | encoded TAO models; export to ONNX |
-| `uff-input-dims` | string | none |  | unsupported | UFF; use `onnx-file` and `infer-dims` |
-| `uff-input-blob-name` | string | none |  | unsupported | UFF; use `onnx-file` |
-| `uff-input-order` | string | none |  | unsupported | UFF; use `network-input-order` |
-| `engine-create-func-name` | string | none |  | unsupported | custom TensorRT engine builders |
-| `custom-network-config` | string | none |  | unsupported | custom TensorRT engine builders |
-| `layer-device-precision` | string | none |  | unsupported | a TensorRT setting; use `network-mode` |
-| `output-io-formats` | string | none |  | unsupported | a TensorRT setting; inputs and outputs are FP32 |
-| `parse-bbox-instance-mask-func-name` | string | none |  | unsupported | instance segmentation |
-| `parse-segmentation-func-name` | string | none |  | unsupported | segmentation |
-| `segmentation-threshold` | string | none |  | unsupported | segmentation |
-| `segmentation-output-order` | string | none |  | unsupported | segmentation |
-
-#### Config keys: `[class-attrs-all]`, `[class-attrs-<id>]`
-
-| Key | Type | Default | Range | Status | Notes |
-|---|---|---|---|---|---|
-| `threshold` | float | none | >= 0 | supported | legacy name of `pre-cluster-threshold`, which wins if both are set |
-| `pre-cluster-threshold` | float | `0.2` (ours) | >= 0 | supported | objects with a lower confidence are dropped before clustering; the default is DeepStream 8.0's |
-| `post-cluster-threshold` | float | `0.0` (ours) | >= 0 | supported | objects with a lower confidence are dropped after clustering |
-| `nms-iou-threshold` | float | `0.45` (ours) | >= 0 | supported | `cluster-mode=2`: a box is suppressed when its IoU with a kept box of its class is above it |
-| `topk` | int | `-1` (ours) | >= -1 | supported | `cluster-mode=2`: the best K per class and frame after NMS; -1 keeps all, 0 none |
-| `roi-top-offset` | uint | `0` (ours) | 0..2147483647 | supported | rows ignored at the top of the frame: objects whose top is above it are dropped, a top exactly at it is kept (DeepStream 8.0 behaviour); 0: no test. In secondary mode from the top of the crop (see "Secondary mode") |
-| `roi-bottom-offset` | uint | `0` (ours) | 0..2147483647 | supported | the same from the bottom: objects whose bottom (top + height) is below the frame's height minus it are dropped, a bottom exactly there is kept (DeepStream 8.0 behaviour); 0: no test. The frame's height or more drops every object of the class (ours: 8.0 then skips the test). In secondary mode from the bottom of the crop (see "Secondary mode") |
-| `detected-min-w` | uint | `0` (ours) | 0..2147483647 | supported | narrower objects are dropped |
-| `detected-min-h` | uint | `0` (ours) | 0..2147483647 | supported | lower objects are dropped |
-| `detected-max-w` | uint | `0` (ours) | 0..2147483647 | supported | wider objects are dropped; 0: no maximum |
-| `detected-max-h` | uint | `0` (ours) | 0..2147483647 | supported | taller objects are dropped; 0: no maximum |
-| `eps` | float | none | >= 0 | accepted no-op | DBSCAN only |
-| `group-threshold` | int | none | >= 0 | accepted no-op | GroupRectangles only |
-| `minBoxes` | int | none | >= 0 | accepted no-op | DBSCAN only |
-| `dbscan-min-score` | float | none | >= 0 | accepted no-op | DBSCAN only |
-
-#### Detection post-processing
-
-The docs list the steps but not their order. rdsinfer runs them per frame, in this order (ours), each with the
-object's class attributes:
-
-1. parser output: objects with a class id at or above `num-detected-classes`, non-finite values or an empty box are
-   dropped (one warning per element), and so are those below `pre-cluster-threshold`;
-2. `cluster-mode=2`: greedy NMS per class, highest confidence first (ties: the parser's order); an object is
-   suppressed when its IoU with a kept one is strictly above `nms-iou-threshold`;
-3. `cluster-mode=2`: `topk`;
-4. `post-cluster-threshold`;
-5. mapping from network-input pixels to frame pixels (undoing `maintain-aspect-ratio` / `symmetric-padding`);
-6. `filter-out-class-ids`;
-7. `roi-top-offset` / `roi-bottom-offset`, each when set: top ≥ `roi-top-offset` and top + height ≤ frame height −
-   `roi-bottom-offset`, boundaries included (DeepStream 8.0 behaviour); a `roi-bottom-offset` of the frame height or
-   more drops everything (ours);
-8. `detected-min-*` / `detected-max-*`, on the unclipped size in frame pixels;
-9. clipping to the frame gives `rect_params`; an object whose clipped box is empty is dropped.
-
-The built-in `RdsInferParseYolo` (ours) reads an Ultralytics YOLOv8/YOLO11 detection output: one FP32 layer of
-`[4 + classes, anchors]` per image, or transposed `[anchors, 4 + classes]` (told apart by which side is
-`4 + num-detected-classes`). Rows 0-3 are centre x, centre y, width and height in network-input pixels; each anchor
-gives at most one object, its best class (no objectness score). Another output layout fails at start.
-
-#### Models and compiled programs
-
-- Models are ONNX (`onnx-file`) with one float NCHW input (NHWC with `network-input-order=1`) whose batch dimension
-  is symbolic or equal to `batch-size`. A symbolic height or width needs `infer-dims`. ONNX models that keep weights
-  in external data files are not supported (an error at start): export them with the weights inside the `.onnx`.
-- The first start compiles the model with MIGraphX for the batch size, input size, GPU and precision, which takes
-  minutes on a small GPU (see `rds-compile` below to do it ahead of time). The compiled program is saved as
-  `<onnx stem>_b<batch>_<C>x<H>x<W>_<gfx>_<fp32|fp16>.mxr` next to the ONNX file, or in
-  `$XDG_CACHE_HOME/redstream/` when that directory isn't writable. `<gfx>` is the GPU's own architecture (from the
-  kernel driver's topology, so `HSA_OVERRIDE_GFX_VERSION` doesn't change it), e.g. `gfx1036`.
-- Each program has a manifest, `<program>.mxr.json`: the ONNX file's SHA-256, the MIGraphX and HIP runtime versions,
-  the GPU architecture and `HSA_OVERRIDE_GFX_VERSION`, the precision, the input name and shape, the output shapes and
-  the compile options. A program is loaded only when its manifest matches what would be compiled now; otherwise it
-  is rebuilt, and the element's log says why. Both files are written through temporary files and renames.
-- Lookup: `model-engine-file`, then the cache name next to the model, then in `$XDG_CACHE_HOME/redstream/`. A stale
-  `model-engine-file` is never overwritten: the rebuilt program goes to the cache name, and later starts load that
-  copy with a warning that `model-engine-file` doesn't match. A TensorRT `.engine` file is ignored with a warning.
-- With `dynamic-batch` (ours), every program of the set is compiled or loaded at start: the `batch-size` one first,
-  then the smaller ones in descending order. Each is an ordinary cache entry with its own `_b<N>_` name and
-  manifest. All or nothing: a program that fails fails the start, and the error names its size (`batch 2 program:
-  ...`). `model-engine-file` applies to the `batch-size` program only; the smaller ones always use their cache names.
-  Each extra program costs a compile on a cold cache (YOLO11n on the gfx1036 iGPU: about 1.5 min per size) and its
-  own GPU memory (about 80–115 MB each; MIGraphX 2.18 can't share weights between programs). The programs are
-  different kernels, so their results agree with the `batch-size` program's only up to float rounding (YOLO11n: at
-  most 1.13e-6 in confidence and 1.22e-4 px in the boxes). MIGraphX's own dynamic shapes are not used: in 2.18 they
-  compile every size anyway, copy the weights for each, and don't parse YOLO11n.
-- The element runs the program once on start (a warm-up), so the first batch isn't slower than the rest.
-
-#### Pre-building programs: `rds-compile` (`trtexec`)
-
-The element compiles the model on its first start, which takes minutes on a small GPU. `rds-compile` does it ahead
-of time with the element's own config parser and engine, so the program lands where the element looks for it:
-
-```bash
-rds-compile -c CONFIG [-b BATCH] [--fp16|--fp32] [-g GPU] [--dynamic-batch] [-o OUT.mxr] [--force]
-```
-
-- `-b`, `--fp16`/`--fp32`, `-g` and `--dynamic-batch` override `batch-size`, `network-mode`, `gpu-id` and
-  `dynamic-batch` (sets it to 1); `--fp16` with `--fp32` is an error. Without `-o` the program is looked up and
-  written like the element does (`model-engine-file`, then the cache name next to the ONNX file, then
-  `$XDG_CACHE_HOME/redstream/`). `-o` looks up and writes only that file, with its manifest next to it as
-  `OUT.mxr.json` (an unwritable directory is an error before building); point `model-engine-file` at it.
-- With `dynamic-batch`, every program of the set is built (one per power of two below `batch-size`, plus
-  `batch-size`); those already up to date are loaded, not rebuilt. The up-to-date check is the element's own open:
-  it briefly loads every program onto the GPU (YOLO11n: about 80–115 MB each). `-o` places only the `batch-size`
-  program; the smaller ones always use their cache names. A model with a fixed batch dimension builds the
-  `batch-size` program alone, with the element's warning.
-- Prints each program's path on stdout, one per line in ascending batch size (the `batch-size` one last); the build
-  reasons, warnings and errors (with the element's messages) on stderr.
-- Exit status: 0 built (at least one program), 1 error, 2 already up to date (the element would load every
-  program; `--force` rebuilds them all).
+| `config-file-path` | supported | required |
+| `unique-id` | supported | |
+| `process-mode` | supported | |
+| `infer-on-gie-id` | supported | DeepStream 8.0's type and default |
+| `infer-on-class-ids` | supported | |
+| `filter-out-class-ids` | supported | |
+| `model-engine-file` | supported | a MIGraphX `.mxr`; a TensorRT `.engine` is ignored |
+| `batch-size` | supported | a compiled program runs all `batch-size` images |
+| `dynamic-batch` | ours | smaller programs for partial chunks |
+| `interval` | supported | |
+| `gpu-id` | supported | |
+| `output-tensor-meta` | supported | |
+| `raw-output-file-write` | accepted no-op | |
+| `raw-output-generated-callback` | accepted no-op | |
+| `raw-output-generated-userdata` | accepted no-op | |
+| `output-instance-mask` | unsupported | `true` fails at start |
+| `input-tensor-meta` | unsupported | `true` fails at start |
+| `crop-objects-to-roi-boundary` | accepted no-op | |
+| `clip-object-outside-roi` | accepted no-op | |
+| `qos` | supported | GstBaseTransform's |
 
 ### `rdstracker` (`nvtracker`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker))
 

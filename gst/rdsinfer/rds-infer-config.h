@@ -128,7 +128,7 @@ typedef enum
   RDS_INFER_KEY_REJECTED,               /* an error whenever it is set */
 } RdsInferKeyStatus;
 
-/* One key of the table, as text (for the compat matrix). */
+/* One key of the table, as text (for docs/elements/rdsinfer-config.md). */
 typedef struct
 {
   const gchar *group;           /* "property" or "class-attrs" (both [class-attrs-all] and [class-attrs-<id>]) */

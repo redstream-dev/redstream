@@ -14,7 +14,7 @@ Our own tiny models (a few hundred bytes each), so the rdsinfer tests run offlin
 | `fixeddet.onnx` | `images` float `[batch, 3, 64, 64]` (batch symbolic) | `output0 [batch, 6, 8]`: a 2-class detector in the YOLO layout `[4 + classes, anchors]` (cx, cy, w, h in network pixels, then the class scores) whose output is the same constant for every image |
 
 `fixeddet`'s boxes, and what the built-in YOLO parser (`num-detected-classes=2`) and the default
-`pre-cluster-threshold` (0.25) make of them, in network pixels; the other anchors are all zero, every other score is
+`pre-cluster-threshold` (0.2) make of them, in network pixels; the other anchors are all zero, every other score is
 0.05 or less, and no two boxes overlap, so NMS keeps all six:
 
 | Anchor | cx, cy, w, h | Scores (class 0, 1) | Detection: class, confidence, left, top, width, height |

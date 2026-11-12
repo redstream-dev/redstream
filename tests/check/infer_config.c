@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-infer-config.h"
 #include "rds-keyfile-yaml.h"
+#include "rds-md.h"
 
 #include <glib/gstdio.h>
 #include <string.h>
@@ -1238,34 +1239,34 @@ test_key_table (void)
   g_hash_table_unref (keys);
 }
 
-/* docs/compat-matrix.md lists every config key in the two "Config keys" tables, with the table's type, default,
- * range, status and accepted values; and nothing else there. Rows are
+/* docs/elements/rdsinfer-config.md lists every config key in the two "Config keys" tables, with the table's type,
+ * default, range, status and accepted values; and nothing else there. Rows are
  * "| `KEY` | TYPE | `DEFAULT` (ours) or none | RANGE or empty | STATUS | notes |". */
 typedef struct
 {
   GHashTable *rows;             /* "group/name" -> gchar ** cells (name, type, default, range, status, notes) */
   guint n_bad;
-} MatrixCheck;
+} DocCheck;
 
-static const gchar *const matrix_status[] = {
+static const gchar *const doc_status[] = {
   [RDS_INFER_KEY_SUPPORTED] = "supported",
   [RDS_INFER_KEY_NOOP] = "accepted no-op",
   [RDS_INFER_KEY_REJECTED] = "unsupported",
 };
 
 static void
-check_matrix_key (const RdsInferKeyDesc * key, gpointer user_data)
+check_doc_key (const RdsInferKeyDesc * key, gpointer user_data)
 {
-  MatrixCheck *mc = user_data;
+  DocCheck *mc = user_data;
   gchar *id = g_strconcat (key->group, "/", key->name, NULL);
   gchar *def = key->default_value ? g_strdup_printf ("`%s` (ours)", key->default_value) : g_strdup ("none");
   gchar **cells = g_hash_table_lookup (mc->rows, id);
   const gchar *range = key->range ? key->range : "";
-  const gchar *status = matrix_status[key->status];
+  const gchar *status = doc_status[key->status];
 
   if (!cells || strcmp (cells[1], key->type) != 0 || strcmp (cells[2], def) != 0 || strcmp (cells[3], range) != 0
       || strcmp (cells[4], status) != 0 || (key->accepted && !strstr (cells[5], key->accepted))) {
-    g_test_message ("compat matrix, [%s] keys: %s %s; expected: | `%s` | %s | %s | %s | %s | %s%s%s%s |",
+    g_test_message ("rdsinfer-config.md, [%s] keys: %s %s; expected: | `%s` | %s | %s | %s | %s | %s%s%s%s |",
         key->group, key->name, cells ? "differs" : "is missing", key->name, key->type, def, range, status,
         key->accepted ? "accepted values: " : "", key->accepted ? key->accepted : "",
         key->accepted && key->note ? "; " : "", key->note ? key->note : "");
@@ -1276,24 +1277,23 @@ check_matrix_key (const RdsInferKeyDesc * key, gpointer user_data)
   g_free (id);
 }
 
+/* The key rows of the "Config keys" tables in @text, into mc->rows; malformed and duplicate rows count in
+ * mc->n_bad. */
 static void
-test_compat_matrix (void)
+read_config_doc (const gchar * text, DocCheck * mc)
 {
-  MatrixCheck mc = { g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_strfreev), 0 };
-  gchar *text = NULL, **lines;
+  gchar **lines = g_strsplit (text, "\n", -1);
   const gchar *group = NULL;
-  GHashTableIter it;
-  gpointer id;
-  GError *err = NULL;
+  gchar fence = 0;
+  guint fence_len = 0;
 
-  g_file_get_contents (RDS_COMPAT_MATRIX, &text, NULL, &err);
-  g_assert_no_error (err);
-  g_assert_nonnull (text);
-  lines = g_strsplit (text, "\n", -1);
   for (guint i = 0; lines[i]; i++) {
     gchar **cells, *id;
 
-    if (lines[i][0] == '#') {
+    if (rds_md_fence_line (lines[i], &fence, &fence_len))
+      continue;
+    /* a "#" or "##" heading starts or ends a group; "###" subheadings stay in it */
+    if (lines[i][0] == '#' && !g_str_has_prefix (lines[i], "###")) {
       group = strstr (lines[i], "Config keys: `[property]`") ? "property"
           : strstr (lines[i], "Config keys: `[class-attrs-all]`") ? "class-attrs" : NULL;
       continue;
@@ -1305,30 +1305,73 @@ test_compat_matrix (void)
     for (guint c = 0; cells[c]; c++)
       g_strstrip (cells[c]);
     if (g_strv_length (cells) != 7 || !g_str_has_prefix (cells[0], "`") || !g_str_has_suffix (cells[0], "`")) {
-      g_test_message ("compat-matrix.md:%u: %s: expected 6 cells, the first a `key`", i + 1, lines[i]);
-      mc.n_bad++;
+      g_test_message ("rdsinfer-config.md:%u: %s: expected 6 cells, the first a `key`", i + 1, lines[i]);
+      mc->n_bad++;
       g_strfreev (cells);
       continue;
     }
     cells[0][strlen (cells[0]) - 1] = '\0';
     id = g_strconcat (group, "/", cells[0] + 1, NULL);
-    if (g_hash_table_contains (mc.rows, id)) {
-      g_test_message ("compat-matrix.md:%u: %s: duplicate row", i + 1, lines[i]);
-      mc.n_bad++;
+    if (g_hash_table_contains (mc->rows, id)) {
+      g_test_message ("rdsinfer-config.md:%u: %s: duplicate row", i + 1, lines[i]);
+      mc->n_bad++;
       g_free (id);
       g_strfreev (cells);
       continue;
     }
-    g_hash_table_insert (mc.rows, id, cells);
+    g_hash_table_insert (mc->rows, id, cells);
   }
-  rds_infer_config_foreach_key (check_matrix_key, &mc);
+  g_strfreev (lines);
+}
+
+/* The parser keeps a group across "###" subheadings and reads nothing inside code fences (CommonMark, rds-md.h). */
+static void
+test_config_doc_parse (void)
+{
+  DocCheck mc = { g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_strfreev), 0 };
+  const gchar *doc =
+      "## Config keys: `[property]`\n"
+      "| Key | Type | Default | Range | Status | Notes |\n|---|---|---|---|---|---|\n"
+      "| `a` | int | none | | supported | |\n"
+      "### A subgroup\n"
+      "| `b` | int | none | | supported | |\n"
+      "```yaml\n# a comment, not a heading\n| `fenced` | int | none | | supported | |\n```\n"
+      "| `c` | int | none | | supported | |\n"
+      "## Config keys: `[class-attrs-all]`, `[class-attrs-<id>]`\n"
+      "| `d` | float | none | | supported | |\n"
+      "## Something else\n"
+      "| `e` | int | none | | supported | |\n";
+
+  read_config_doc (doc, &mc);
+  g_assert_cmpuint (mc.n_bad, ==, 0);
+  g_assert_cmpuint (g_hash_table_size (mc.rows), ==, 4);
+  g_assert_true (g_hash_table_contains (mc.rows, "property/a"));
+  g_assert_true (g_hash_table_contains (mc.rows, "property/b"));
+  g_assert_true (g_hash_table_contains (mc.rows, "property/c"));
+  g_assert_true (g_hash_table_contains (mc.rows, "class-attrs/d"));
+  g_hash_table_unref (mc.rows);
+}
+
+static void
+test_config_doc (void)
+{
+  DocCheck mc = { g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_strfreev), 0 };
+  gchar *text = NULL;
+  GHashTableIter it;
+  gpointer id;
+  GError *err = NULL;
+
+  g_file_get_contents (RDS_CONFIG_DOC, &text, NULL, &err);
+  g_assert_no_error (err);
+  g_assert_nonnull (text);
+  read_config_doc (text, &mc);
+  rds_infer_config_foreach_key (check_doc_key, &mc);
   g_hash_table_iter_init (&it, mc.rows);
   while (g_hash_table_iter_next (&it, &id, NULL)) {
-    g_test_message ("compat matrix: %s is not in the key table", (const gchar *) id);
+    g_test_message ("rdsinfer-config.md: %s is not in the key table", (const gchar *) id);
     mc.n_bad++;
   }
   g_assert_cmpuint (mc.n_bad, ==, 0);
-  g_strfreev (lines);
   g_free (text);
   g_hash_table_unref (mc.rows);
 }
@@ -1404,7 +1447,8 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-config/engine-error", test_engine_error);
   g_test_add_func ("/cpu/infer-config/validate", test_validate);
   g_test_add_func ("/cpu/infer-config/key-table", test_key_table);
-  g_test_add_func ("/cpu/infer-config/compat-matrix", test_compat_matrix);
+  g_test_add_func ("/cpu/infer-config/config-doc-parse", test_config_doc_parse);
+  g_test_add_func ("/cpu/infer-config/compat-matrix", test_config_doc);
   g_test_add_func ("/cpu/infer-config/sample-test3", test_sample_test3);
   return g_test_run ();
 }
