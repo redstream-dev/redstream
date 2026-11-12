@@ -5,7 +5,7 @@
  *
  * Property names, types and defaults follow nvdslogger as gst-inspect shows it for DeepStream 8.0 (identity's
  * properties plus fps-measurement-interval-sec). Behaviour the docs leave open matches DeepStream 8.0 ("DeepStream
- * 8.0 behaviour") except where marked "ours"; every such choice has a row in docs/compat-matrix.md.
+ * 8.0 behaviour") except where marked "ours"; every such choice is listed in docs/elements/rdslogger.md.
  *
  * Timing: a periodic clock id on the pipeline clock fires at every interval boundary of running time (one interval
  * after PLAYING starts, then every interval). The first boundary only starts the count, so the first line comes two

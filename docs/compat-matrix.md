@@ -35,7 +35,7 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | supported | NV12 and RGBA `memory:RDS` batches into one tiled frame of the same format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
 | `nvdsosd` | `rdsosd` | supported | RGBA `memory:RDS` frames (single or batched), drawn on the GPU (`process-mode` 1, the default) or the CPU (`process-mode=0`), the same pixels either way, in the geometry of DeepStream 8.0's default GPU mode (Pango for text); masks and blur not yet; optional (`-Dosd`, needs cairo and pangocairo); properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
 | `nvdsanalytics` | `rdsanalytics` | supported | memory:RDS batches, any format; ROI filtering, overcrowding, direction (with STOPPED) and line crossing on the CPU, with DeepStream-shaped frame and object metas (`rds/rds-analytics-meta.h`, libgstrds-analytics) and nvdsanalytics config files; matches observed DeepStream 8.0 behaviour where the docs are silent, except where 8.0 is clearly broken; properties, behaviour, drawing and config keys below. The `osd-mode` overlays are display meta, drawn by `rdsosd` | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsanalytics) |
-| `nvdslogger` | `rdslogger` | supported | passthrough, any caps; prints each stream's frame rate to stdout in DeepStream 8.0's `**PERF` line format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
+| `nvdslogger` | `rdslogger` | supported | passthrough, any caps; prints each stream's frame rate to stdout in DeepStream 8.0's `**PERF` line format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties below, behaviour on [its page](elements/rdslogger.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
 | `nveglglessink` | `rdsvideosink` | supported | display bin: `rdsvideoconvert` to system-memory BGRx, then a stock GStreamer sink (`video-sink`, default `autovideosink`); one frame per buffer; properties and behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nv3dsink` | `rdsvideosink` | supported | as `nveglglessink` (nv3dsink's properties are a subset of nveglglessink's) | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nvv4l2h264enc` | `rdsh264enc` | supported | a bin over the stock VA encoder `vah264enc` (VCN): `rdsvideoconvert` to system-memory NV12, a queue, then VA on a thread of its own; `memory:RDS` or system-memory input, one frame per buffer; DeepStream 8.0's properties; properties and stream behaviour below | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html) |
@@ -449,46 +449,32 @@ where the docs are silent, or **ours**: where 8.0 settles nothing or is clearly 
 
 ### `rdslogger` (`nvdslogger`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger.md))
 
+Reference: [rdslogger](elements/rdslogger.md).
+
 Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0 (the 8.0 guide has no page for
 the element; the 9.2 page lists `show-fps`, `show-latency` and an underscored interval name that 8.0 does not have).
 DeepStream 8.0's nvdslogger has identity's properties plus the interval.
 
-| Property | Type | Default | Status | Notes |
-|---|---|---|---|---|
-| `fps-measurement-interval-sec` | uint | `5` | supported | seconds of running time per printed rate; 0: nothing printed. Changeable while playing (restarts the measurement) |
-| `silent` | boolean | `TRUE` | supported | `FALSE` adds two lines per buffer (below) |
-| `signal-handoffs` | boolean | `TRUE` | supported | emits `handoff` (identity's signature) for every buffer |
-| `last-message` | string, read-only | NULL | accepted | always NULL |
-| `qos` | boolean | `FALSE` | supported | GstBaseTransform's |
-| `check-imperfect-offset`, `check-imperfect-timestamp`, `drop-allocation`, `dump`, `single-segment`, `sync` | boolean | `FALSE` | accepted no-op | a non-default value logs one warning per property |
-| `datarate` | int 0..2147483647 | `0` | accepted no-op | as above |
-| `drop-buffer-flags` | flags `GstBufferFlags` | `0` | accepted no-op | as above |
-| `drop-probability` | float 0..1 | `0` | accepted no-op | as above |
-| `error-after` | int | `-1` | accepted no-op | as above |
-| `latency`, `sleep-time` | uint | `0` | accepted no-op | as above |
-| `ts-offset` | int64 | `0` | accepted no-op | as above |
-
-Pads: `sink` and `src`, ANY caps; buffers pass through untouched.
-
-#### Logging behaviour
-
-Each row is either **matches nvdslogger (DeepStream 8.0)**: observed DeepStream 8.0 behaviour where the docs are
-silent, or **ours**: where 8.0 settles nothing or is clearly broken.
-
-| Behaviour | Status | Notes |
+| Property | Status | Difference |
 |---|---|---|
-| Output | matches nvdslogger (DeepStream 8.0) | stdout (`g_print`), one line per interval: `**PERF : ` then `FPS_<source_id> (<rate>)` and a tab per stream, then a newline (`**PERF : FPS_0 (29.97)\tFPS_1 (30.00)\t`); printed whatever `silent` is |
-| Rate format | matches nvdslogger (DeepStream 8.0) | two decimals, always with `.` (ours: whatever the locale) |
-| Streams | matches nvdslogger (DeepStream 8.0) | one entry per `source_id` of the frame metas, by ascending id, listed from the stream's first frame on and kept after its `rds-stream-eos` (0.00 from then on); forgotten when the element goes back to READY |
-| Timing | matches nvdslogger (DeepStream 8.0) | a periodic id on the pipeline clock fires at every interval of running time from PLAYING; the first one only starts the count, so the first line comes two intervals in; paused, no time passes. A run shorter than two intervals prints nothing |
-| Rate value | ours | frames counted since the previous line / the interval (8.0's numbers drift above the true rate for a while after a stream joins or leaves) |
-| `fps-measurement-interval-sec=0` | ours | nothing printed (8.0 prints `FPS_0 (0.00)` in a busy loop) |
-| Interval changed while playing | ours | the measurement restarts: one interval to start the count, then a line every interval |
-| Flushes | ours | change nothing, also when they reset the running time (a seek, a looped clip): the boundaries are kept in clock time, and the frames counted before the flush count in the current interval |
-| A buffer without batch meta | ours | one frame of stream 0 |
-| No stream seen yet | ours | nothing printed |
-| `silent=false` | matches nvdslogger (DeepStream 8.0) | per buffer `<name> BUF_PTS : <pts> element time <running time now> elem-buf=<now − pts, ms> ms buf=<address> buffer_pts_to_running_time = <pts running time>rdslogger base time = <base time>buffer dur <duration>` (no separators before `rdslogger` and `buffer dur`, as in 8.0, whose label reads `nvdslogger base time`), then `BUFFER PTS is lesser than ELEMENT TIME, IT's LATE` or `BUFFER PTS is greater than ELEMENT TIME, IT's EARLY` (ours: only the LATE line was observed in 8.0, so the EARLY wording is inferred; equal counts as early); without a clock or PTS, the times print as `99:99:99.999999999` and the second line is left out (ours) |
-| Latency output | ours | none (8.0 printed none either without `NVDS_ENABLE_LATENCY_MEASUREMENT`) |
+| `fps-measurement-interval-sec` | supported | `0` prints nothing (8.0 busy-loops); a change while playing restarts the measurement |
+| `silent` | supported | |
+| `signal-handoffs` | supported | |
+| `last-message` | accepted | always NULL |
+| `qos` | supported | |
+| `check-imperfect-offset` | accepted no-op | a non-default value logs one warning |
+| `check-imperfect-timestamp` | accepted no-op | as above |
+| `datarate` | accepted no-op | as above |
+| `drop-allocation` | accepted no-op | as above |
+| `drop-buffer-flags` | accepted no-op | as above |
+| `drop-probability` | accepted no-op | as above |
+| `dump` | accepted no-op | as above |
+| `error-after` | accepted no-op | as above |
+| `latency` | accepted no-op | as above |
+| `single-segment` | accepted no-op | as above |
+| `sleep-time` | accepted no-op | as above |
+| `sync` | accepted no-op | as above |
+| `ts-offset` | accepted no-op | as above |
 
 ### `rdsvideosink` (`nveglglessink`, `nv3dsink`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html))
 

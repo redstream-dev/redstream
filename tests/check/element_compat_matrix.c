@@ -10,9 +10,14 @@
  *
  * An element's table is the one under the "### `<element>` (" heading; its rows start with "| `" and the first cell
  * names one or more properties in backticks ("`x-clock-offset`, `y-clock-offset`").
+ *
+ * Each factory with a reference page (rds-element-pages.h) also needs a link to it, "](elements/<page>)", in its
+ * section: the lines from its heading to the next heading, outside code fences.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include <gst/gst.h>
 #include <string.h>
+
+#include "rds-element-pages.h"
 
 static const gchar *const elements[] = { "rdsmultistreamtiler", "rdsosd", "rdslogger", "rdsvideosink", "rdsurisrcbin",
   "rdsanalytics", "rdsh264enc", "rdsh265enc"
@@ -59,6 +64,32 @@ matrix_properties (gchar ** lines, const gchar * element)
   }
   g_free (heading);
   return names;
+}
+
+/* Whether the section under the "### `<element>` (" heading links to `page` in docs/elements/. */
+static gboolean
+section_links_page (gchar ** lines, const gchar * element, const gchar * page)
+{
+  gchar *heading = g_strdup_printf ("### `%s` (", element);
+  gchar *link = g_strdup_printf ("](elements/%s)", page);
+  gboolean in_section = FALSE, found = FALSE;
+  gchar fence = 0;
+  guint fence_len = 0;
+
+  for (guint i = 0; lines[i] && !found; i++) {
+    if (rds_md_fence_line (lines[i], &fence, &fence_len))
+      continue;
+    if (lines[i][0] == '#') {
+      if (in_section)
+        break;
+      in_section = g_str_has_prefix (lines[i], heading);
+      continue;
+    }
+    found = in_section && strstr (lines[i], link) != NULL;
+  }
+  g_free (link);
+  g_free (heading);
+  return found;
 }
 
 /* The row a property needs, for the failure message: name, value type, default; status and notes left to fill. */
@@ -134,7 +165,14 @@ test_compat_matrix (void)
     g_hash_table_unref (rows);
     gst_object_unref (el);
   }
-  g_test_message ("%u properties checked", n_checked);
+  for (guint e = 0; e < G_N_ELEMENTS (rds_element_pages); e++) {
+    if (!section_links_page (lines, rds_element_pages[e].factory, rds_element_pages[e].page)) {
+      g_test_message ("compat matrix: the \"### `%s` (\" section has no link to elements/%s",
+          rds_element_pages[e].factory, rds_element_pages[e].page);
+      n_bad++;
+    }
+  }
+  g_test_message ("%u properties checked, %u page links", n_checked, (guint) G_N_ELEMENTS (rds_element_pages));
   g_assert_cmpuint (n_bad, ==, 0);
   g_strfreev (lines);
   g_free (text);
