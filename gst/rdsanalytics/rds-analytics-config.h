@@ -50,7 +50,7 @@ typedef enum
   RDS_ANALYTICS_KEY_NOOP,               /* accepted and ignored */
 } RdsAnalyticsKeyStatus;
 
-/* One key of the table, as text (for the compat matrix). */
+/* One key of the table, as text (for docs/elements/rdsanalytics-config.md). */
 typedef struct
 {
   const gchar *groups;          /* "property", or the features it is valid in: "roi-filtering, overcrowding" */

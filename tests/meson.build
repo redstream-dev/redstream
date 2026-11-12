@@ -325,10 +325,11 @@ if rds_tracker_enabled
 endif
 
 # The rdsanalytics config parser on its own (temporary key files), with the key table and its rows in
-# docs/compat-matrix.md. It uses no GStreamer, so it gets the environment without plugin paths.
+# docs/elements/rdsanalytics-config.md. It uses no GStreamer, so it gets the environment without plugin paths.
 test('analytics_config', executable('analytics_config', 'check' / 'analytics_config.c',
     dependencies : [rdsanalytics_core_dep],
-    c_args : ['-DRDS_COMPAT_MATRIX="@0@"'.format(meson.project_source_root() / 'docs' / 'compat-matrix.md')]),
+    c_args : ['-DRDS_CONFIG_DOC="@0@"'.format(
+      meson.project_source_root() / 'docs' / 'elements' / 'rdsanalytics-config.md')]),
   suite : 'cpu', env : internal_test_env, protocol : 'tap')
 # The analytics core on scripted objects: rule scaling, the reference point and the inside test (with DeepStream
 # 8.0's observed results on the same boxes), ROI filtering, overcrowding and the object counts.

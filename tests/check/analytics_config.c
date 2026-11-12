@@ -1,7 +1,8 @@
 /* rdsanalytics config parser: defaults, every key, the rules, class-id, the errors, skipped groups and unknown keys,
- * the key table and its rows in docs/compat-matrix.md.
+ * the key table and its rows in docs/elements/rdsanalytics-config.md.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-analytics-config.h"
+#include "rds-md.h"
 
 #include <glib/gstdio.h>
 #include <string.h>
@@ -701,36 +702,36 @@ test_key_table (void)
   g_hash_table_unref (kw.names);
 }
 
-/* docs/compat-matrix.md lists every config key in the "rdsanalytics config keys" table, with the table's groups,
- * type, default, range, status and note; and nothing else there. Rows are
+/* docs/elements/rdsanalytics-config.md lists every config key in the "rdsanalytics config keys" table, with the
+ * table's groups, type, default, range, status and note; and nothing else there. Rows are
  * "| `KEY` | GROUPS | TYPE | `DEFAULT`, `DEFAULT` (ours), required or none | RANGE or empty | STATUS | notes |". */
 typedef struct
 {
   GHashTable *rows;             /* "groups.name" -> gchar ** cells (name, groups, type, default, range, status,
                                  * notes) */
   guint n_bad;
-} AnalyticsMatrixCheck;
+} AnalyticsDocCheck;
 
-static const gchar *const analytics_matrix_status[] = {
+static const gchar *const analytics_doc_status[] = {
   [RDS_ANALYTICS_KEY_SUPPORTED] = "supported",
   [RDS_ANALYTICS_KEY_NOOP] = "accepted no-op",
 };
 
 static void
-check_matrix_key (const RdsAnalyticsKeyDesc * key, gpointer user_data)
+check_doc_key (const RdsAnalyticsKeyDesc * key, gpointer user_data)
 {
-  AnalyticsMatrixCheck *mc = user_data;
+  AnalyticsDocCheck *mc = user_data;
   gchar *id = g_strconcat (key->groups, ".", key->name, NULL);
   gchar *def = key->default_value ? g_strdup_printf ("`%s`%s", key->default_value, key->default_ours ? " (ours)" : "")
       : g_strdup (key->required ? "required" : "none");
   gchar **cells = g_hash_table_lookup (mc->rows, id);
   const gchar *range = key->range ? key->range : "";
-  const gchar *status = analytics_matrix_status[key->status];
+  const gchar *status = analytics_doc_status[key->status];
 
   if (!cells || strcmp (cells[1], key->groups) != 0 || strcmp (cells[2], key->type) != 0
       || strcmp (cells[3], def) != 0 || strcmp (cells[4], range) != 0 || strcmp (cells[5], status) != 0
       || (key->note && !strstr (cells[6], key->note))) {
-    g_test_message ("compat matrix, rdsanalytics config keys: %s %s; expected: | `%s` | %s | %s | %s | %s | %s | %s |",
+    g_test_message ("rdsanalytics-config.md, config keys: %s %s; expected: | `%s` | %s | %s | %s | %s | %s | %s |",
         id, cells ? "differs" : "is missing", key->name, key->groups, key->type, def, range, status,
         key->note ? key->note : "");
     mc->n_bad++;
@@ -740,60 +741,76 @@ check_matrix_key (const RdsAnalyticsKeyDesc * key, gpointer user_data)
   g_free (id);
 }
 
-static void
-test_compat_matrix (void)
+/* "## rdsanalytics config keys" -> "" (the group is a cell of the row); NULL for any other heading. */
+static gchar *
+doc_table (const gchar * line)
 {
-  AnalyticsMatrixCheck mc = { g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_strfreev),
+  return strstr (line, "rdsanalytics config keys") ? g_strdup ("") : NULL;
+}
+
+/* The key rows of the "rdsanalytics config keys" table in @text, into mc->rows; errors count in mc->n_bad. */
+static void
+read_config_doc (const gchar * text, AnalyticsDocCheck * mc)
+{
+  static const RdsMdKeyTable table = { "rdsanalytics-config.md", 7, 1, doc_table };
+
+  mc->n_bad += rds_md_read_key_rows (text, &table, mc->rows);
+}
+
+/* The parser keeps the table across "###" subheadings and reads nothing inside code fences (CommonMark, rds-md.h). */
+static void
+test_config_doc_parse (void)
+{
+  AnalyticsDocCheck mc = { g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_strfreev),
     0
   };
-  gchar *text = NULL, **lines;
-  gboolean in_table = FALSE;
+  const gchar *doc =
+      "## rdsanalytics config keys\n"
+      "| `a` | property | int | `0` | | supported | |\n"
+      "### A subgroup\n"
+      "| `b` | property | int | `0` | | supported | |\n"
+      "```ini\n# a comment, not a heading\n| `fenced` | property | int | `0` | | supported | |\n```\n"
+      "| `c` | property | int | `0` | | supported | |\n"
+      "## Something else\n"
+      "| `d` | property | int | `0` | | supported | |\n";
+
+  read_config_doc (doc, &mc);
+  g_assert_cmpuint (mc.n_bad, ==, 0);
+  g_assert_cmpuint (g_hash_table_size (mc.rows), ==, 3);
+  g_assert_true (g_hash_table_contains (mc.rows, "property.a"));
+  g_assert_true (g_hash_table_contains (mc.rows, "property.b"));
+  g_assert_true (g_hash_table_contains (mc.rows, "property.c"));
+  g_hash_table_remove_all (mc.rows);
+  /* a key section under a "###" heading is an error */
+  read_config_doc ("## Something else\n### rdsanalytics config keys\n| `a` | property | int | `0` | | supported | |\n",
+      &mc);
+  g_assert_cmpuint (mc.n_bad, ==, 1);
+  g_assert_cmpuint (g_hash_table_size (mc.rows), ==, 0);
+  g_hash_table_unref (mc.rows);
+}
+
+static void
+test_config_doc (void)
+{
+  AnalyticsDocCheck mc = { g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_strfreev),
+    0
+  };
+  gchar *text = NULL;
   GHashTableIter it;
   gpointer id;
   GError *err = NULL;
 
-  g_file_get_contents (RDS_COMPAT_MATRIX, &text, NULL, &err);
+  g_file_get_contents (RDS_CONFIG_DOC, &text, NULL, &err);
   g_assert_no_error (err);
   g_assert_nonnull (text);
-  lines = g_strsplit (text, "\n", -1);
-  for (guint i = 0; lines[i]; i++) {
-    gchar **cells, *id;
-
-    if (lines[i][0] == '#') {
-      in_table = strstr (lines[i], "rdsanalytics config keys") != NULL;
-      continue;
-    }
-    if (!in_table || !g_str_has_prefix (lines[i], "| `"))
-      continue;
-    /* "| a | b |" splits into "", " a ", " b ", "" */
-    cells = g_strsplit (lines[i] + 1, "|", -1);
-    for (guint c = 0; cells[c]; c++)
-      g_strstrip (cells[c]);
-    if (g_strv_length (cells) != 8 || !g_str_has_prefix (cells[0], "`") || !g_str_has_suffix (cells[0], "`")) {
-      g_test_message ("compat-matrix.md:%u: %s: expected 7 cells, the first a `key`", i + 1, lines[i]);
-      mc.n_bad++;
-      g_strfreev (cells);
-      continue;
-    }
-    cells[0][strlen (cells[0]) - 1] = '\0';
-    id = g_strconcat (cells[1], ".", cells[0] + 1, NULL);
-    if (g_hash_table_contains (mc.rows, id)) {
-      g_test_message ("compat-matrix.md:%u: %s: duplicate row", i + 1, lines[i]);
-      mc.n_bad++;
-      g_free (id);
-      g_strfreev (cells);
-      continue;
-    }
-    g_hash_table_insert (mc.rows, id, cells);
-  }
-  rds_analytics_config_foreach_key (check_matrix_key, &mc);
+  read_config_doc (text, &mc);
+  rds_analytics_config_foreach_key (check_doc_key, &mc);
   g_hash_table_iter_init (&it, mc.rows);
   while (g_hash_table_iter_next (&it, &id, NULL)) {
-    g_test_message ("compat matrix: %s is not in the key table", (const gchar *) id);
+    g_test_message ("rdsanalytics-config.md: %s is not in the key table", (const gchar *) id);
     mc.n_bad++;
   }
   g_assert_cmpuint (mc.n_bad, ==, 0);
-  g_strfreev (lines);
   g_free (text);
   g_hash_table_unref (mc.rows);
 }
@@ -813,6 +830,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-config/skipped-groups", test_skipped_groups);
   g_test_add_func ("/cpu/analytics-config/unknown-keys", test_unknown_keys);
   g_test_add_func ("/cpu/analytics-config/key-table", test_key_table);
-  g_test_add_func ("/cpu/analytics-config/compat-matrix", test_compat_matrix);
+  g_test_add_func ("/cpu/analytics-config/config-doc-parse", test_config_doc_parse);
+  g_test_add_func ("/cpu/analytics-config/compat-matrix", test_config_doc);
   return g_test_run ();
 }

@@ -334,9 +334,10 @@ gst/rdsenc/        libgstrdsenc plugin (plugin.c): rdsh264enc and rdsh265enc, on
                    QP string parsers) are what the cpu tests link. Always built; at run time it needs the stock `va`
                    plugin (vah264enc, vah265enc) and a Mesa VA driver that encodes: without them the elements
                    register, and going to READY is an error naming the missing encoder
-docs/              compat-matrix.md: what the compat header and the elements map, with status and sources (its
-                   rdsanalytics config-key tables, and elements/rdsinfer-config.md's and rdstracker-config.md's, must
-                   match the key tables: the infer_config, tracker_config and analytics_config tests check every row;
+docs/              compat-matrix.md: what the compat header and the elements map, with status and sources;
+                   elements/: a reference page per element. The config-key tables of elements/rdsinfer-config.md,
+                   rdstracker-config.md and rdsanalytics-config.md must match the key tables: the infer_config,
+                   tracker_config and analytics_config tests check every row;
                    element_compat_matrix checks the tiler, OSD, logger, sink, URI source bin, analytics and encoder
                    property tables against the elements' properties)
 samples/rds-test2/ clean-room sample with a secondary classifier: YOLO11n, NvSORT, YOLO11n-cls on the vehicles
@@ -480,8 +481,8 @@ meson test -C build-rel --print-errorlogs
 - The compat-matrix lints (`/cpu/infer-config/compat-matrix`, `/cpu/tracker-config/compat-matrix`) run only in
   builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
   check the rdsinfer key tables in `docs/elements/rdsinfer-config.md` (the tracker's are in
-  `docs/elements/rdstracker-config.md`). `/cpu/analytics-config/compat-matrix`
-  (rdsanalytics is always built) runs in every build. A new or changed config key needs its row there; the
+  `docs/elements/rdstracker-config.md`). `/cpu/analytics-config/compat-matrix` (rdsanalytics is always built)
+  checks `docs/elements/rdsanalytics-config.md` in every build. A new or changed config key needs its row there; the
   test's message prints the expected row. `/cpu/elements/compat-matrix` does the same for the property tables of
   `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger`, `rdsvideosink`, `rdsurisrcbin`, `rdsanalytics`,
   `rdsh264enc` and `rdsh265enc`:
@@ -490,10 +491,9 @@ meson test -C build-rel --print-errorlogs
 - **Tracker, analytics, tiler, OSD, logger, sink and encoder behaviour.** Where NVIDIA's docs are silent,
   `rdstracker`, `rdsanalytics`, `rdsmultistreamtiler`, `rdsosd`, `rdslogger`, `rdsvideosink`, `rdsh264enc` and
   `rdsh265enc` match observed DeepStream 8.0 behaviour, except where 8.0 is clearly broken; there they do the sane
-  thing. Code comments say "DeepStream 8.0 behaviour" or "ours", and every such choice has a row in the compat
-  matrix's behaviour tables ("Analytics element behaviour", "Analytics behaviour", "Analytics drawing behaviour"),
-  in the analytics config section and key table, or in the encoders' property tables and stream behaviour lists; the
-  tracker's, tiler's, OSD's, logger's and sink's are on their pages in `docs/elements/`: keep them in step.
+  thing. Code comments say "DeepStream 8.0 behaviour" or "ours", and every such choice has a row in the behaviour
+  tables on the element pages in `docs/elements/` (the analytics config's in `rdsanalytics-config.md`), or in the
+  encoders' property tables and stream behaviour lists in the compat matrix: keep them in step.
 - **Analytics metas (C++).** `RdsAnalyticsFrameMeta` and `RdsAnalyticsObjInfo` are C++ structs (std::string,
   std::vector, std::unordered_map) with libstdc++'s layout, so code that reads their fields must be built with the
   same `_GLIBCXX_USE_CXX11_ABI` as libgstrds-analytics (the default). Include `rds/rds-analytics-meta.h` at file

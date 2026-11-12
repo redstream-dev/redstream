@@ -40,6 +40,7 @@ DeepStream 8.0 behaviour where NVIDIA's docs are silent, or "ours", where Redstr
 
 | Element | Purpose | DeepStream |
 |---|---|---|
+| [`rdsanalytics`](rdsanalytics.md) | ROI filtering, overcrowding, direction and line crossing, with DeepStream-shaped metas; config keys on [rdsanalytics-config](rdsanalytics-config.md) | `nvdsanalytics` |
 | [`rdsinfer`](rdsinfer.md) | runs an ONNX model with MIGraphX: detectors, classifiers, tensor output; config keys on [rdsinfer-config](rdsinfer-config.md) | `nvinfer` |
 | [`rdslogger`](rdslogger.md) | prints each stream's frame rate to stdout | `nvdslogger` |
 | [`rdsmultistreamtiler`](rdsmultistreamtiler.md) | composes a batch into one tiled frame, with the metadata scaled into the tiles | `nvmultistreamtiler` |

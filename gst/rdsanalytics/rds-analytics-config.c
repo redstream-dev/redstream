@@ -1,6 +1,6 @@
 /* Redstream: the rdsanalytics config parser. One table lists every key nvdsanalytics reads with its groups, type,
- * range, default, status and the struct field it fills; it drives parsing and the compat matrix. The file is a GLib
- * key file: [property], then [<feature>-stream-<n>] groups whose labelled rule keys (roi-<label>,
+ * range, default, status and the struct field it fills; it drives parsing and docs/elements/rdsanalytics-config.md.
+ * The file is a GLib key file: [property], then [<feature>-stream-<n>] groups whose labelled rule keys (roi-<label>,
  * line-crossing-<label>, direction-<label>) are kept in file order.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-analytics-config.h"

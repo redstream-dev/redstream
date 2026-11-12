@@ -34,7 +34,7 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvtracker` | `rdstracker` | supported | the IOU and NvSORT trackers of NvMultiObjectTracker, on the CPU, with its YAML config files; NvDCF and NvDeepSORT configs run as NvSORT. Matches observed DeepStream 8.0 behaviour where the docs are silent; properties below, config keys and behaviour on [its page](elements/rdstracker.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker) |
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | supported | NV12 and RGBA `memory:RDS` batches into one tiled frame of the same format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties below, behaviour on [its page](elements/rdsmultistreamtiler.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
 | `nvdsosd` | `rdsosd` | supported | RGBA `memory:RDS` frames (single or batched), drawn on the GPU (`process-mode` 1, the default) or the CPU (`process-mode=0`), the same pixels either way, in the geometry of DeepStream 8.0's default GPU mode (Pango for text); masks and blur not yet; optional (`-Dosd`, needs cairo and pangocairo); properties below, behaviour on [its page](elements/rdsosd.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
-| `nvdsanalytics` | `rdsanalytics` | supported | memory:RDS batches, any format; ROI filtering, overcrowding, direction (with STOPPED) and line crossing on the CPU, with DeepStream-shaped frame and object metas (`rds/rds-analytics-meta.h`, libgstrds-analytics) and nvdsanalytics config files; matches observed DeepStream 8.0 behaviour where the docs are silent, except where 8.0 is clearly broken; properties, behaviour, drawing and config keys below. The `osd-mode` overlays are display meta, drawn by `rdsosd` | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsanalytics) |
+| `nvdsanalytics` | `rdsanalytics` | supported | memory:RDS batches, any format; ROI filtering, overcrowding, direction (with STOPPED) and line crossing on the CPU, with DeepStream-shaped frame and object metas (`rds/rds-analytics-meta.h`, libgstrds-analytics) and nvdsanalytics config files; matches observed DeepStream 8.0 behaviour where the docs are silent, except where 8.0 is clearly broken; properties below, behaviour, drawing and config keys on [its page](elements/rdsanalytics.md). The `osd-mode` overlays are display meta, drawn by `rdsosd` | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsanalytics) |
 | `nvdslogger` | `rdslogger` | supported | passthrough, any caps; prints each stream's frame rate to stdout in DeepStream 8.0's `**PERF` line format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties below, behaviour on [its page](elements/rdslogger.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
 | `nveglglessink` | `rdsvideosink` | supported | display bin: `rdsvideoconvert` to system-memory BGRx, then a stock GStreamer sink (`video-sink`, default `autovideosink`); one frame per buffer; properties below, behaviour on [its page](elements/rdsvideosink.md) | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nv3dsink` | `rdsvideosink` | supported | as `nveglglessink` (nv3dsink's properties are a subset of nveglglessink's) | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
@@ -359,142 +359,17 @@ only; NvDCF and NvDeepSORT configs run as NvSORT.
 
 ### `rdsanalytics` (`nvdsanalytics`) properties ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsanalytics))
 
+Reference: [rdsanalytics](elements/rdsanalytics.md); its config file and every config key:
+[rdsanalytics-config](elements/rdsanalytics-config.md).
+
 Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0's nvdsanalytics.
 
-| Property | Type | Default | Status | Notes |
-|---|---|---|---|---|
-| `config-file` | string | NULL | supported | required, also with `enable=FALSE`: without one, or with a file that fails, the start fails with an ERROR naming the property, the file or the key (ours: DeepStream 8.0 fails the state change too, but posts no ERROR). Settable in any state (DeepStream 8.0 behaviour): set while started, the file is loaded and checked at once and applies from the next buffer, with every stream's state reset, the cumulative counts included (DeepStream 8.0 behaviour); a file that fails then posts an ERROR, so an application that stops on ERROR stops there; otherwise the old config, its state and the property's old value stay (ours) |
-| `enable` | boolean | `TRUE` | supported | NULL/READY only (DeepStream 8.0 behaviour). `FALSE`: pass-through with no meta at all, as `[property] enable=0` (DeepStream 8.0 behaviour) |
-| `unique-id` | uint 0..4294967295 | `17` | supported | written to the `unique_id` of both metas; read per batch |
-| `qos` | boolean | `FALSE` | accepted | GstBaseTransform's; the element never drops buffers |
-
-#### Analytics element behaviour
-
-Each row is **DeepStream 8.0 behaviour** (observed with scripted object meta) or **ours** (where 8.0 settles nothing
-or is clearly broken).
-
-| Behaviour | Status | Notes |
+| Property | Status | Difference |
 |---|---|---|
-| Streams | DeepStream 8.0 behaviour | keyed by the frame meta's `pad_index`, not `source_id`; a new `pad_index` gets fresh state. `rdsstreammux` writes the sink pad's number to both, and its stream events carry the same number, so an event's id is the `pad_index` |
-| Frames | DeepStream 8.0 behaviour | every frame meta of a batch is processed in batch order, partial batches and two frames of one stream included; every frame gets a frame meta, also on a stream without groups (empty maps, `objCnt` filled) |
-| Object info | DeepStream 8.0 behaviour | only on objects with something to report (an ROI, overcrowding or line label, a direction or STOPPED) |
-| Object box | ours (8.0 undetermined: the observed runs set both boxes equal) | the analytics use the object's `rect_params`, not `detector_bbox_info` |
-| Frame size | DeepStream 8.0 behaviour | the rules are scaled from `config-width` x `config-height` to the batch surface's size, the mux output. Ours: when that size changes, the rules are scaled again and every stream's state resets, the cumulative counts included, with a warning |
-| `rds-stream-reset` | ours | clears the stream's histories, STOPPED state, "already counted" flags, objCnt window and untracked warning; its cumulative line-crossing counts stay. DeepStream 8.0 ignores the event |
-| `rds-pad-deleted` | ours | frees the stream's state but keeps its cumulative line-crossing counts, so a source added later on that pad starts fresh and continues them. `rds-stream-eos` alone changes nothing (a stream that restarts on its pad comes with a stream reset). A batch already in flight with that pad's frames can arrive after the event and recreate the stream's state, taking back its kept cumulative counts: harmless (ours). DeepStream 8.0 ignores these events |
-
-#### Analytics behaviour
-
-What the analytics compute, per frame of a stream. Each row is **DeepStream 8.0 behaviour** (observed with scripted
-object meta, the docs being silent) or **ours** (where 8.0 settles nothing or is clearly broken). Terms: a stream's
-**history** of an object is its list of points; **n** is the object's observations so far minus 1; **d** is the
-newest point minus the history's reference.
-
-| Behaviour | Status | Notes |
-|---|---|---|
-| Rule scaling | DeepStream 8.0 behaviour | every vertex scaled from `config-width` x `config-height` to the mux output, x and y separately, and truncated to an integer |
-| Scaling arithmetic | ours | `v * out / cfg` in 64-bit integers, multiplied first: equal to 8.0's float result while `v * out` is under 2^24; whether 8.0 divides first is not known |
-| Object point | DeepStream 8.0 behaviour | one point per object, its box's bottom centre floored: (floor(left + width/2), floor(top + height)); the rest of the box is ignored. The sums are in float (ours: 8.0's precision is unknown; its observed boxes give the same points either way) |
-| Inside test | DeepStream 8.0 behaviour | the crossing number on the integer point and vertices: an edge toggles when `(yi > Py) != (yj > Py)` and Px is left of the crossing, truncated. Even-odd for self-intersecting polygons, left and top edges in, right and bottom out, whatever the vertex order |
-| ROI filtering | DeepStream 8.0 behaviour | an object of the group's classes gets the label of every ROI its point is in (`roiStatus`, ` ROI:<label>` in `objStatus`) and is counted in `objInROIcnt`; with `inverse-roi=1` the objects outside, and those are counted |
-| `objInROIcnt` | DeepStream 8.0 behaviour | every ROI-filtering label, then every overcrowding label, with 0 from the first frame. A group with `enable=0` adds nothing, not even its zeros |
-| `class-id` | DeepStream 8.0 behaviour | unset, empty, -1 or a list holding -1: every class. Objects of other classes get none of the group's labels, and no object info for it |
-| Overcrowding | DeepStream 8.0 behaviour | `ocStatus` is TRUE when the ROI's count on this frame is at least `object-threshold` and above 0 (`time-threshold` has no effect). The object's `ocStatus` lists the overcrowding ROIs it is in, whatever the status; overcrowding never appears in `objStatus` |
-| `objCnt` | DeepStream 8.0 behaviour | per class, every object whatever the groups and filters: the mode of the per-frame count over the frames whose PTS is within `obj-cnt-win-in-ms` of this one, both ends included. A frame without the class counts 0. Also on streams without groups |
-| `objCnt` ties | ours | the count seen most recently. 8.0 has no stable order (it chose the newest in 35 of 48 tied frames) |
-| `objCnt` window | ours | frames before a class was first seen count 0 for it; at most 9000 frames; a PTS that goes back or is missing restarts the window |
-| History | DeepStream 8.0 behaviour | on a stream with a direction or line-crossing group, per (pad_index, object id): one point per frame the object is in (frames it misses don't count), x clamped at 0. The window is the last 50 points; the reference is the integer-truncated mean of its oldest 2 points, or of its oldest 4 once it is full |
-| One id twice in a frame | ours | each object adds its own point to the shared history |
-| History eviction | ours | a history unseen for more than 30 s of PTS is dropped, so an id seen again later starts afresh and can be counted again. Without usable PTS (none, or gone back) the limit is 900 of the stream's frames, and after 7200 frames it goes whatever the PTS (a frozen PTS). Histories are swept once a second of PTS and every 30 frames, so one can outlive its age by up to a sweep. 8.0's limit is unknown (it kept a history across a 30-frame absence, as this does) |
-| Direction | DeepStream 8.0 behaviour | from n = 10, when \|d\| >= 55 px: every direction rule whose vector is within 60° of d (cos >= 0.5), in config order, as ` DIR:<label> ` pieces in `dirStatus` and `objStatus`. A zero vector never matches. `mode` is ignored |
-| STOPPED | DeepStream 8.0 behaviour | only with a direction group, from n = 50: when the window's population standard deviations are σx <= 20 and σy <= 0.1·√h, the object is STOPPED: ` STOPPED ` in `objStatus` and no direction |
-| STOPPED limit | ours | h is the current box height (8.0's is undetermined), and 0.1 is the coefficient that best fits 8.0's runs (each measured limit within 0.5 % of it) |
-| Direction `class-id` | ours | objects of other classes get no direction or STOPPED, as for the other groups (not observed on 8.0), but still build their history, which line crossing shares |
-| Line crossing | DeepStream 8.0 behaviour | "past" is the side of the line the rule's vector points to. The reference must be strictly before the line, and the newest point on or past it (`loose`) or strictly past it (`balanced`, `strict`). Then d must be within the mode's angle of the vector and long enough: `loose` under 90° and 32 px from n = 3, `balanced` under 60° and 55 px from n = 10, `strict` 78 px from n = 20. Any other `mode` reads as `loose` |
-| Strict angle | ours | cos > 0.8 (under 36.87°). 8.0 counted a d 36.24° off the vector and not one at exactly cos = 0.8, so its limit is in [36.24°, 36.87°) (the docs give none; 36° would count two of 8.0's crossings late) |
-| `extended` | DeepStream 8.0 behaviour | 0: the crossing must hit the segment, lengthened by half the box width at each end, strictly; 1: anywhere on the infinite line |
-| Segment hit | ours | with the current box's width (8.0's observed boxes kept theirs); on a slanted segment, the point where reference → newest meets the line, projected on it (8.0 was observed only on horizontal segments crossed straight down) |
-| Line sides | ours | exact integer cross products: a point exactly on a slanted line is on it, and counts on that frame in `loose` mode (8.0's float slope counts it a frame later). A vector parallel to its line, a zero vector or a line of one point never counts |
-| Line-crossing reference | ours | the mean of the oldest 4 points once the window is full, as for direction (8.0's runs can't tell 2 from 4 there) |
-| Counting | DeepStream 8.0 behaviour | an object counts once per line, never against the vector, and never when already past the line at n <= 1. `lcStatus` and ` LC:<label> ` appear on the counting frame only; `objLCCurrCnt` is that frame's count, `objLCCumCnt` the stream's total. No STOPPED gate. Objects of other classes than `class-id`'s are not counted |
-| `objStatus` | DeepStream 8.0 behaviour | ` ROI:<l>` per ROI, ` DIR:<l> ` per direction, ` LC:<l> ` per line counted, then ` STOPPED `; `""` when none |
-| Untracked objects | ours | objects without a tracker id count for the ROIs, overcrowding and `objCnt`; direction and line crossing skip them, with one `GST_WARNING` per stream (again after a stream reset). 8.0 turns direction and line crossing off for the stream for good |
-| Config reload | DeepStream 8.0 behaviour | every stream's state resets, the cumulative counts included (see `config-file`) |
-| Stream reset and removal | ours | see `rds-stream-reset` and `rds-pad-deleted` under "Analytics element behaviour". 8.0 ignores stream events, so a source re-added on a pad inherits the old state |
-| Config errors | ours | 8.0 crashes, reads garbage or silently misbehaves on: an empty value, a line crossing without exactly 8 values, an ROI with an odd count, a `config-width` or `config-height` of 0, a label used twice in a group or by both the roi-filtering and overcrowding groups of a stream. All are start errors naming the key (see "Analytics config files") |
-| Class -1 in `display-obj-cnt` | ours | printed `ClassId-1`, not 8.0's `ClassId4294967295` (see "Analytics drawing behaviour") |
-
-#### Analytics drawing behaviour
-
-`rdsanalytics` never draws pixels: it attaches display metas (and, in `osd-mode=2`, writes the objects' text and
-border) for `rdsosd` or any OSD downstream. Each row is **DeepStream 8.0 behaviour** (observed in its display-meta
-dumps) or **ours**.
-
-| Behaviour | Status | Notes |
-|---|---|---|
-| Elements | DeepStream 8.0 behaviour | lines and texts only, no rects, arrows or circles: every line `line_width` 2, every text `font_name` "Serif" at `display-font-size` on black (`set_bg_clr` 1, `text_bg_clr` (0,0,0,1)); coordinates truncated to integers |
-| `osd-mode=0` | DeepStream 8.0 behaviour | no display meta, objects untouched (only `display-obj-cnt`'s text) |
-| `osd-mode=1` | DeepStream 8.0 behaviour | ROI-filtering polygons yellow (1,1,0,1), overcrowding polygons orange (1,0.5,0,1), one line per edge with the closing edge last, label `<label>` at the first vertex; direction rules red (1,0,0,1): the vector and two arrowhead lines, label `<label>` at the start point; line-crossing rules green (0,1,0,1): the direction vector with its arrowhead, then the line, label `"<label> "` (a trailing space) at the line's second point. Only enabled groups are drawn. Objects untouched |
-| Arrowheads | DeepStream 8.0 behaviour | two lines ending at the tip, 15 % of the vector's length, at −15° then +15° from the vector (200 px east from (100,650): (271,657) and (271,642) to (300,650)); a vector of zero length gives three lines on its point |
-| `osd-mode=2` labels | DeepStream 8.0 behaviour | as `osd-mode=1`, with `<label>=<objInROIcnt>`, `<label> OverCrowding=<True/False>, Count=<n>` and `<label>=<objLCCumCnt>`; direction labels unchanged |
-| `osd-mode=2` objects | DeepStream 8.0 behaviour | each object with an object info gets `text_params` = its objStatus (an overcrowding-only object: `""`), replacing any text it had, at (left, top − 10), white (1,1,1,1) on black, Serif at `display-font-size`. Its border turns cyan (0,1,1,1) when it has an ROI-filtering or line-crossing label on this frame; a direction, STOPPED or overcrowding alone leave it as it was. Objects without an object info are untouched |
-| `display-obj-cnt=1` | DeepStream 8.0 behaviour | in every `osd-mode`, the first text: `Count for ClassId<c>=<n> ClassId<c>=<n> …` from `objCnt` (sorted by the class id as unsigned, so −1 last) at (5,5), yellow |
-| Class −1 in `display-obj-cnt` | ours | printed `ClassId-1` (8.0 prints `ClassId4294967295`). With no class seen yet the text is `Count for` (8.0 not observed) |
-| Order | DeepStream 8.0 behaviour | texts: `display-obj-cnt`'s, then the rules' labels; texts and lines in config order: ROI filtering, overcrowding, direction, line crossing, each group's rules in key order |
-| Lines per display meta | DeepStream 8.0 behaviour | at most 15 lines per display meta, then the next one; every text in the first |
-| Texts per display meta | ours | past 16 (`RDS_MAX_ELEMENTS_IN_DISPLAY_META`) texts, the next display meta (8.0 not observed with that many) |
-| Display meta list | ours | a display meta is acquired only when something goes in it, and appended to `display_meta_list` in the order they fill. 8.0 adds an extra empty one after a full one and prepends them, the newest first |
-| Negative coordinates | ours | 0 (an arrowhead off the frame's top or left, an object whose top is under 10 px); the fields are unsigned (8.0 not observed) |
-| Drawn by `rdsosd` | ours | "Serif" is fontconfig's serif (DejaVu Serif in `redstream:dev`), not nvdsosd's font, so the glyphs and text boxes differ. Lines are drawn as `rdsosd` draws any line (the behaviour rows on [its page](elements/rdsosd.md)): width 2 is drawn 1 px wide, as in nvdsosd, and the diagonal arrowheads have hard edges where nvdsosd smooths them slightly |
-
-#### Analytics config files
-
-- The `config-file` is a GLib key file. `[property]` is required, with `enable`, `config-width` and `config-height`.
-  The feature groups are `[roi-filtering-stream-<n>]`, `[overcrowding-stream-<n>]`, `[line-crossing-stream-<n>]`
-  and `[direction-detection-stream-<n>]`, where `<n>` is the frame meta's `pad_index` (DeepStream 8.0 behaviour).
-- The docs also spell three groups without `stream` (`[overcrowding-<n>]`, ...): such a group, and
-  `[roi-filtering-<n>]`, is skipped with a log line naming it (DeepStream 8.0 behaviour). Any other unknown group is
-  skipped with a log line too (ours).
-- Unknown keys are ignored silently in `[property]` and with a log line in feature groups (DeepStream 8.0
-  behaviour). A key of another feature (`time-threshold` outside overcrowding, `roi-<label>` in a line-crossing
-  group) is an unknown key.
-- Rules (`roi-<label>`, `line-crossing-<label>`, `direction-<label>`) keep their order in the file. A feature group
-  without a rule is an error (DeepStream 8.0 behaviour). Lists are `;`-separated; a trailing `;` is accepted.
-- Defaults are DeepStream 8.0 behaviour (observed: the docs give none) unless marked "(ours)". **supported**: used;
-  **accepted no-op**: read, type-checked and ignored.
-- Errors name the file, the group and the key: `FILE:[GROUP] KEY: VALUE: reason`. Besides wrong types and ranges,
-  these are errors (ours, where 8.0 crashes, reads garbage or silently misbehaves): an empty value (except
-  `class-id`), a `config-width` or `config-height` of 0, an ROI with an odd count or fewer than 3 points, a line
-  crossing without exactly 8 values, a direction without exactly 4, negative or non-integer coordinates (fatal in
-  8.0 too), an empty list item (`1;;2`), a label used twice in one group or in both the
-  roi-filtering and the overcrowding group of a stream, an empty label, and a stream number that is
-  not one: not a decimal number without leading zeros (`-stream-00`, `-stream-007`), or above 4294967295. So two
-  spellings never name one stream. `class-id=` and `class-id=;` mean every class; `mode=` in a direction group is
-  accepted.
-- Key-file locale suffixes (`roi-A[fr]`) are not read: such a key is an unknown key (ours).
-
-#### rdsanalytics config keys
-
-| Key | Groups | Type | Default | Range | Status | Notes |
-|---|---|---|---|---|---|---|
-| `enable` | property | bool | required |  | supported | 0: pass-through, no meta (DeepStream 8.0 behaviour) |
-| `config-width` | property | uint | required | >= 1 | supported | the frame size the rule coordinates are in; they are scaled to the mux output. 0 is an error (ours): 8.0 accepts it and every scaled coordinate becomes garbage |
-| `config-height` | property | uint | required | >= 1 | supported | as config-width |
-| `osd-mode` | property | uint | `2` | 0..2 | supported | 0: no overlay, 1: the rules and their labels, 2: also the counts and statuses |
-| `display-font-size` | property | uint | `12` | >= 0 | supported | 0 reads as 12 (DeepStream 8.0 behaviour); no upper bound (ours) |
-| `obj-cnt-win-in-ms` | property | uint | `50` (ours) | 1..1000000000 | supported | undocumented: the PTS window of objCnt (the per-class count's mode over the window); the default is ours, within the 33-100 ms measured on DeepStream 8.0 |
-| `display-obj-cnt` | property | bool | `0` |  | supported | undocumented: 1 draws the per-class object counts, in every osd-mode (DeepStream 8.0 behaviour) |
-| `enable` | roi-filtering, overcrowding, line-crossing, direction-detection | bool | `1` (ours) |  | supported | 0: the feature is off for the stream, and its labels are absent from the metas (DeepStream 8.0 behaviour); 8.0's behaviour without the key is unknown |
-| `class-id` | roi-filtering, overcrowding, line-crossing, direction-detection | int list | none | >= -1 | supported | the classes the group's rules apply to; unset, empty or a list holding -1: every class (DeepStream 8.0 behaviour) |
-| `inverse-roi` | roi-filtering | bool | `0` |  | supported | 1: the labels go on the objects outside each ROI, and those are counted (DeepStream 8.0 behaviour) |
-| `object-threshold` | overcrowding | uint | `0` | >= 0 | supported | overcrowded when the ROI's count is at least this and above 0 (DeepStream 8.0 behaviour); unset flags from a count of 1, as in 8.0 |
-| `time-threshold` | overcrowding | uint | `0` | >= 0 | accepted no-op | undocumented; accepted with no effect, as in DeepStream 8.0. In the other feature groups it is an unknown key |
-| `mode` | line-crossing | string | `loose` |  | supported | strict, balanced or loose; any other value reads as loose (DeepStream 8.0 behaviour). Matching is case-sensitive (ours: `Strict` reads as loose; 8.0 not observed) |
-| `mode` | direction-detection | string | none |  | accepted no-op | accepted and ignored, as in DeepStream 8.0 |
-| `extended` | line-crossing | bool | `0` |  | supported | 0: the crossing must hit the segment, 1: the infinite line (DeepStream 8.0 behaviour) |
-| `roi-<label>` | roi-filtering, overcrowding | polygon | none | >= 0 | supported | x1;y1;x2;y2;... in order around the polygon, at least 3 points; integers >= 0. A label used by both the roi-filtering and the overcrowding group of a stream is an error (ours): both go in `objInROIcnt`, where 8.0 lets one count overwrite the other. Direction and line-crossing labels are independent. Fewer than 3 points or an odd count is an error (ours): 8.0 accepts them (an ROI that never matches, a missing y read as 0) |
-| `line-crossing-<label>` | line-crossing | line | none | >= 0 | supported | 8 integers >= 0: the direction vector (x1;y1;x2;y2), then the line's two ends. Another count is an error (ours): 8.0 reads a short line as garbage and ignores extra values |
-| `direction-<label>` | direction-detection | vector | none | >= 0 | supported | 4 integers >= 0: the vector from (x1;y1) to (x2;y2). Another count is an error (ours): 8.0 reads a missing value as 0 |
+| `config-file` | supported | a failing file posts an ERROR; a reload while playing keeps the old config when the new one fails |
+| `enable` | supported | |
+| `unique-id` | supported | |
+| `qos` | accepted | GstBaseTransform's; never drops buffers |
 
 ### `rdsh264enc` (`nvv4l2h264enc`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html))
 
