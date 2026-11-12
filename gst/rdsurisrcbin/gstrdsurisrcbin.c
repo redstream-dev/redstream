@@ -71,8 +71,8 @@
  *     stopping a hanging session short
  *
  * The properties are nvurisrcbin's, with the names, types, ranges, defaults and NULL-or-READY flags of DeepStream 8.0
- * behaviour, where those differ from NVIDIA's nvurisrcbin pages (docs/compat-matrix.md lists each one and its
- * status). Going from NULL to READY checks the settings:
+ * behaviour, where those differ from NVIDIA's nvurisrcbin pages (docs/elements/rdsurisrcbin.md lists each one and
+ * its status). Going from NULL to READY checks the settings:
  *
  *   - uri: set, a valid URI, and a scheme some source element handles; else an error naming the property
  *   - smart-record: anything but smart-rec-disable is an error (smart record is not implemented)
