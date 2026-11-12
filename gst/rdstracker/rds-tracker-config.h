@@ -71,7 +71,7 @@ typedef enum
   RDS_TRACKER_KEY_DEPRECATED,           /* an old name: accepted and ignored, with a warning whenever set */
 } RdsTrackerKeyStatus;
 
-/* One key of the table, as text (for the compat matrix). */
+/* One key of the table, as text (for docs/elements/rdstracker-config.md). */
 typedef struct
 {
   const gchar *section;         /* "BaseConfig", ...; the model inference keys are "ReID, PoseEstimator" */

@@ -1,6 +1,6 @@
 /* Redstream: the rdstracker config parser. One table lists every documented NvMultiObjectTracker config key with its
  * section, type, range, default, status and the tracker types that use it; it drives parsing, the warnings and the
- * compat matrix. The YAML file is read into a GKeyFile first (sections become groups).
+ * docs/elements/rdstracker-config.md. The YAML file is read into a GKeyFile first (sections become groups).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-tracker-config.h"
 #include "rds-config-parse.h"

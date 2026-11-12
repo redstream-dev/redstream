@@ -46,6 +46,7 @@ DeepStream 8.0 behaviour where NVIDIA's docs are silent, or "ours", where Redstr
 | [`rdsosd`](rdsosd.md) | draws boxes, labels, display meta and the clock on RGBA frames, on the GPU or the CPU | `nvdsosd` |
 | [`rdsstreamdemux`](rdsstreamdemux.md) | splits batches back into one stream per source, without copying | `nvstreamdemux` |
 | [`rdsstreammux`](rdsstreammux.md) | batches frames from several sources into fixed-size `memory:RDS` slots | `nvstreammux` |
+| [`rdstracker`](rdstracker.md) | gives each stream's objects tracking IDs: IOU and NvSORT on the CPU; config keys on [rdstracker-config](rdstracker-config.md) | `nvtracker` |
 | [`rdsurisrcbin`](rdsurisrcbin.md) | decodes a file or RTSP URI to `memory:RDS` frames, with RTSP reconnection | `nvurisrcbin` |
 | [`rdsvideoconvert`](rdsvideoconvert.md) | converts, scales and crops single frames on the GPU | `nvvideoconvert` |
 | [`rdsvideodec`](rdsvideodec.md) | decodes H.264 and H.265 with rocDecode into `memory:RDS` | `nvv4l2decoder` |

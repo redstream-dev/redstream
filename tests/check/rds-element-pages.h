@@ -25,4 +25,5 @@ static const RdsElementPage rds_element_pages[] = {
   {"rdsmultistreamtiler", "rdsmultistreamtiler.md", FALSE},
   {"rdsosd", "rdsosd.md", TRUE},
   {"rdsinfer", "rdsinfer.md", FALSE},
+  {"rdstracker", "rdstracker.md", FALSE},
 };

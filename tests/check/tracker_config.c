@@ -1,8 +1,9 @@
 /* rdstracker config parser: the YAML corpus (tests/check/tracker-configs), defaults, every key's type and range,
- * errors, warnings, the key table and its rows in docs/compat-matrix.md.
+ * errors, warnings, the key table and its rows in docs/elements/rdstracker-config.md.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-tracker-config.h"
 #include "rds-keyfile-yaml.h"
+#include "rds-md.h"
 
 #include <glib/gstdio.h>
 #include <string.h>
@@ -690,9 +691,9 @@ test_key_table (void)
   g_hash_table_unref (kw.names);
 }
 
-/* docs/compat-matrix.md lists every config key in the "Tracker config keys" tables, one table per section (the
- * heading names it in backticks, `ReID`, `PoseEstimator` for the model inference keys), with the table's type,
- * default, range, trackers, status and note; and nothing else there. Rows are
+/* docs/elements/rdstracker-config.md lists every config key in the "Tracker config keys" tables, one table per
+ * section (the heading names it in backticks, `ReID`, `PoseEstimator` for the model inference keys), with the
+ * table's type, default, range, trackers, status and note; and nothing else there. Rows are
  * "| `KEY` | TYPE | `DEFAULT`, `DEFAULT` (ours), none or see notes (ours) | RANGE or empty | TRACKERS | STATUS |
  * notes |". */
 typedef struct
@@ -700,9 +701,9 @@ typedef struct
   GHashTable *rows;             /* "section.name" -> gchar ** cells (name, type, default, range, trackers, status,
                                  * notes) */
   guint n_bad;
-} TrackerMatrixCheck;
+} TrackerDocCheck;
 
-static const gchar *const tracker_matrix_status[] = {
+static const gchar *const tracker_doc_status[] = {
   [RDS_TRACKER_KEY_SUPPORTED] = "supported",
   [RDS_TRACKER_KEY_NOOP] = "accepted no-op",
   [RDS_TRACKER_KEY_IGNORED] = "ignored",
@@ -710,22 +711,22 @@ static const gchar *const tracker_matrix_status[] = {
 };
 
 static void
-check_matrix_key (const RdsTrackerKeyDesc * key, gpointer user_data)
+check_doc_key (const RdsTrackerKeyDesc * key, gpointer user_data)
 {
-  TrackerMatrixCheck *mc = user_data;
+  TrackerDocCheck *mc = user_data;
   gchar *id = g_strconcat (key->section, ".", key->name, NULL);
   gchar *def = key->default_value ? g_strdup_printf ("`%s`%s", key->default_value, key->default_ours ? " (ours)" : "")
       : g_strdup (key->default_ours ? "see notes (ours)" : "none");
   gchar **cells = g_hash_table_lookup (mc->rows, id);
   const gchar *range = key->range ? key->range : "";
-  const gchar *status = tracker_matrix_status[key->status];
+  const gchar *status = tracker_doc_status[key->status];
 
   if (!cells || strcmp (cells[1], key->type) != 0 || strcmp (cells[2], def) != 0 || strcmp (cells[3], range) != 0
       || strcmp (cells[4], key->trackers) != 0 || strcmp (cells[5], status) != 0
       || (key->note && !strstr (cells[6], key->note))) {
-    g_test_message ("compat matrix, %s keys: %s %s; expected: | `%s` | %s | %s | %s | %s | %s | %s |", key->section,
-        key->name, cells ? "differs" : "is missing", key->name, key->type, def, range, key->trackers, status,
-        key->note ? key->note : "");
+    g_test_message ("rdstracker-config.md, %s keys: %s %s; expected: | `%s` | %s | %s | %s | %s | %s | %s |",
+        key->section, key->name, cells ? "differs" : "is missing", key->name, key->type, def, range, key->trackers,
+        status, key->note ? key->note : "");
     mc->n_bad++;
   }
   g_hash_table_remove (mc->rows, id);
@@ -733,9 +734,9 @@ check_matrix_key (const RdsTrackerKeyDesc * key, gpointer user_data)
   g_free (id);
 }
 
-/* "#### Tracker config keys: `A`, `B` (...)" -> "A, B"; NULL for any other heading. */
+/* "## Tracker config keys: `A`, `B` (...)" -> "A, B"; NULL for any other heading. */
 static gchar *
-matrix_section (const gchar * line)
+doc_section (const gchar * line)
 {
   const gchar *p = strstr (line, "Tracker config keys:");
   GString *sec;
@@ -754,59 +755,65 @@ matrix_section (const gchar * line)
   return g_string_free (sec, FALSE);
 }
 
+/* The key rows of the "Tracker config keys" tables in @text, into mc->rows; errors count in mc->n_bad. */
 static void
-test_compat_matrix (void)
+read_config_doc (const gchar * text, TrackerDocCheck * mc)
 {
-  TrackerMatrixCheck mc = { g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_strfreev), 0 };
-  gchar *text = NULL, **lines, *section = NULL;
+  static const RdsMdKeyTable table = { "rdstracker-config.md", 7, -1, doc_section };
+
+  mc->n_bad += rds_md_read_key_rows (text, &table, mc->rows);
+}
+
+/* The parser keeps a section across "###" subheadings and reads nothing inside code fences (CommonMark, rds-md.h). */
+static void
+test_config_doc_parse (void)
+{
+  TrackerDocCheck mc = { g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_strfreev), 0 };
+  const gchar *doc =
+      "## Tracker config keys: `BaseConfig`\n"
+      "| `a` | int | `0` | | IOU, NvSORT | supported | |\n"
+      "### A subgroup\n"
+      "| `b` | int | `0` | | IOU, NvSORT | supported | |\n"
+      "```yaml\n# a comment, not a heading\n| `fenced` | int | `0` | | IOU | supported | |\n```\n"
+      "| `c` | int | `0` | | IOU, NvSORT | supported | |\n"
+      "## Something else\n"
+      "| `d` | int | `0` | | IOU | supported | |\n";
+
+  read_config_doc (doc, &mc);
+  g_assert_cmpuint (mc.n_bad, ==, 0);
+  g_assert_cmpuint (g_hash_table_size (mc.rows), ==, 3);
+  g_assert_true (g_hash_table_contains (mc.rows, "BaseConfig.a"));
+  g_assert_true (g_hash_table_contains (mc.rows, "BaseConfig.b"));
+  g_assert_true (g_hash_table_contains (mc.rows, "BaseConfig.c"));
+  g_hash_table_remove_all (mc.rows);
+  /* a key section under a "###" heading is an error */
+  read_config_doc ("## Something else\n### Tracker config keys: `BaseConfig`\n"
+      "| `a` | int | `0` | | IOU, NvSORT | supported | |\n", &mc);
+  g_assert_cmpuint (mc.n_bad, ==, 1);
+  g_assert_cmpuint (g_hash_table_size (mc.rows), ==, 0);
+  g_hash_table_unref (mc.rows);
+}
+
+static void
+test_config_doc (void)
+{
+  TrackerDocCheck mc = { g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_strfreev), 0 };
+  gchar *text = NULL;
   GHashTableIter it;
   gpointer id;
   GError *err = NULL;
 
-  g_file_get_contents (RDS_COMPAT_MATRIX, &text, NULL, &err);
+  g_file_get_contents (RDS_CONFIG_DOC, &text, NULL, &err);
   g_assert_no_error (err);
   g_assert_nonnull (text);
-  lines = g_strsplit (text, "\n", -1);
-  for (guint i = 0; lines[i]; i++) {
-    gchar **cells, *id;
-
-    if (lines[i][0] == '#') {
-      g_free (section);
-      section = matrix_section (lines[i]);
-      continue;
-    }
-    if (!section || !g_str_has_prefix (lines[i], "| `"))
-      continue;
-    /* "| a | b |" splits into "", " a ", " b ", "" */
-    cells = g_strsplit (lines[i] + 1, "|", -1);
-    for (guint c = 0; cells[c]; c++)
-      g_strstrip (cells[c]);
-    if (g_strv_length (cells) != 8 || !g_str_has_prefix (cells[0], "`") || !g_str_has_suffix (cells[0], "`")) {
-      g_test_message ("compat-matrix.md:%u: %s: expected 7 cells, the first a `key`", i + 1, lines[i]);
-      mc.n_bad++;
-      g_strfreev (cells);
-      continue;
-    }
-    cells[0][strlen (cells[0]) - 1] = '\0';
-    id = g_strconcat (section, ".", cells[0] + 1, NULL);
-    if (g_hash_table_contains (mc.rows, id)) {
-      g_test_message ("compat-matrix.md:%u: %s: duplicate row", i + 1, lines[i]);
-      mc.n_bad++;
-      g_free (id);
-      g_strfreev (cells);
-      continue;
-    }
-    g_hash_table_insert (mc.rows, id, cells);
-  }
-  rds_tracker_config_foreach_key (check_matrix_key, &mc);
+  read_config_doc (text, &mc);
+  rds_tracker_config_foreach_key (check_doc_key, &mc);
   g_hash_table_iter_init (&it, mc.rows);
   while (g_hash_table_iter_next (&it, &id, NULL)) {
-    g_test_message ("compat matrix: %s is not in the key table", (const gchar *) id);
+    g_test_message ("rdstracker-config.md: %s is not in the key table", (const gchar *) id);
     mc.n_bad++;
   }
   g_assert_cmpuint (mc.n_bad, ==, 0);
-  g_free (section);
-  g_strfreev (lines);
   g_free (text);
   g_hash_table_unref (mc.rows);
 }
@@ -831,6 +838,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/tracker-config/quiet-keys", test_quiet_keys);
   g_test_add_func ("/cpu/tracker-config/bom", test_bom);
   g_test_add_func ("/cpu/tracker-config/key-table", test_key_table);
-  g_test_add_func ("/cpu/tracker-config/compat-matrix", test_compat_matrix);
+  g_test_add_func ("/cpu/tracker-config/config-doc-parse", test_config_doc_parse);
+  g_test_add_func ("/cpu/tracker-config/compat-matrix", test_config_doc);
   return g_test_run ();
 }

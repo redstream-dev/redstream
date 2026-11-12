@@ -1244,7 +1244,7 @@ test_key_table (void)
  * "| `KEY` | TYPE | `DEFAULT` (ours) or none | RANGE or empty | STATUS | notes |". */
 typedef struct
 {
-  GHashTable *rows;             /* "group/name" -> gchar ** cells (name, type, default, range, status, notes) */
+  GHashTable *rows;             /* "group.name" -> gchar ** cells (name, type, default, range, status, notes) */
   guint n_bad;
 } DocCheck;
 
@@ -1258,7 +1258,7 @@ static void
 check_doc_key (const RdsInferKeyDesc * key, gpointer user_data)
 {
   DocCheck *mc = user_data;
-  gchar *id = g_strconcat (key->group, "/", key->name, NULL);
+  gchar *id = g_strconcat (key->group, ".", key->name, NULL);
   gchar *def = key->default_value ? g_strdup_printf ("`%s` (ours)", key->default_value) : g_strdup ("none");
   gchar **cells = g_hash_table_lookup (mc->rows, id);
   const gchar *range = key->range ? key->range : "";
@@ -1277,51 +1277,22 @@ check_doc_key (const RdsInferKeyDesc * key, gpointer user_data)
   g_free (id);
 }
 
-/* The key rows of the "Config keys" tables in @text, into mc->rows; malformed and duplicate rows count in
- * mc->n_bad. */
+/* "## Config keys: `[property]`" -> "property", "## Config keys: `[class-attrs-all]` ..." -> "class-attrs"; NULL
+ * for any other heading. */
+static gchar *
+doc_group (const gchar * line)
+{
+  return g_strdup (strstr (line, "Config keys: `[property]`") ? "property"
+      : strstr (line, "Config keys: `[class-attrs-all]`") ? "class-attrs" : NULL);
+}
+
+/* The key rows of the "Config keys" tables in @text, into mc->rows; errors count in mc->n_bad. */
 static void
 read_config_doc (const gchar * text, DocCheck * mc)
 {
-  gchar **lines = g_strsplit (text, "\n", -1);
-  const gchar *group = NULL;
-  gchar fence = 0;
-  guint fence_len = 0;
+  static const RdsMdKeyTable table = { "rdsinfer-config.md", 6, -1, doc_group };
 
-  for (guint i = 0; lines[i]; i++) {
-    gchar **cells, *id;
-
-    if (rds_md_fence_line (lines[i], &fence, &fence_len))
-      continue;
-    /* a "#" or "##" heading starts or ends a group; "###" subheadings stay in it */
-    if (lines[i][0] == '#' && !g_str_has_prefix (lines[i], "###")) {
-      group = strstr (lines[i], "Config keys: `[property]`") ? "property"
-          : strstr (lines[i], "Config keys: `[class-attrs-all]`") ? "class-attrs" : NULL;
-      continue;
-    }
-    if (!group || !g_str_has_prefix (lines[i], "| `"))
-      continue;
-    /* "| a | b |" splits into "", " a ", " b ", "" */
-    cells = g_strsplit (lines[i] + 1, "|", -1);
-    for (guint c = 0; cells[c]; c++)
-      g_strstrip (cells[c]);
-    if (g_strv_length (cells) != 7 || !g_str_has_prefix (cells[0], "`") || !g_str_has_suffix (cells[0], "`")) {
-      g_test_message ("rdsinfer-config.md:%u: %s: expected 6 cells, the first a `key`", i + 1, lines[i]);
-      mc->n_bad++;
-      g_strfreev (cells);
-      continue;
-    }
-    cells[0][strlen (cells[0]) - 1] = '\0';
-    id = g_strconcat (group, "/", cells[0] + 1, NULL);
-    if (g_hash_table_contains (mc->rows, id)) {
-      g_test_message ("rdsinfer-config.md:%u: %s: duplicate row", i + 1, lines[i]);
-      mc->n_bad++;
-      g_free (id);
-      g_strfreev (cells);
-      continue;
-    }
-    g_hash_table_insert (mc->rows, id, cells);
-  }
-  g_strfreev (lines);
+  mc->n_bad += rds_md_read_key_rows (text, &table, mc->rows);
 }
 
 /* The parser keeps a group across "###" subheadings and reads nothing inside code fences (CommonMark, rds-md.h). */
@@ -1345,10 +1316,15 @@ test_config_doc_parse (void)
   read_config_doc (doc, &mc);
   g_assert_cmpuint (mc.n_bad, ==, 0);
   g_assert_cmpuint (g_hash_table_size (mc.rows), ==, 4);
-  g_assert_true (g_hash_table_contains (mc.rows, "property/a"));
-  g_assert_true (g_hash_table_contains (mc.rows, "property/b"));
-  g_assert_true (g_hash_table_contains (mc.rows, "property/c"));
-  g_assert_true (g_hash_table_contains (mc.rows, "class-attrs/d"));
+  g_assert_true (g_hash_table_contains (mc.rows, "property.a"));
+  g_assert_true (g_hash_table_contains (mc.rows, "property.b"));
+  g_assert_true (g_hash_table_contains (mc.rows, "property.c"));
+  g_assert_true (g_hash_table_contains (mc.rows, "class-attrs.d"));
+  g_hash_table_remove_all (mc.rows);
+  /* a key section under a "###" heading is an error */
+  read_config_doc ("## Something else\n### Config keys: `[property]`\n| `a` | int | none | | supported | |\n", &mc);
+  g_assert_cmpuint (mc.n_bad, ==, 1);
+  g_assert_cmpuint (g_hash_table_size (mc.rows), ==, 0);
   g_hash_table_unref (mc.rows);
 }
 
