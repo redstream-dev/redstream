@@ -523,7 +523,7 @@ test('enc_keyunits', executable('enc_keyunits', 'check' / 'enc_keyunits.c', depe
 # and the input size check (cpu); encodes through the bins: GOPs, profiles, levels (a downstream one written into the
 # stream, also over a renegotiation), rates, B frames, no filler, the H.265 size, input timestamps, copy-meta, input
 # memory, VA's plain input and own thread, latency, batches, DELTA_UNIT, a frame-rate change, forced key frames, a
-# resolution change, size limits and odd sizes (gpu, skipped without the VA encoders).
+# resolution change, size limits, odd sizes and a restart at another size (gpu, skipped without the VA encoders).
 element_enc_exe = executable('element_enc', 'check' / 'element_enc.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep])
 test('element_enc_cpu', element_enc_exe, args : ['-p', '/cpu/enc'],

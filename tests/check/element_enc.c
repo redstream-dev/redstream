@@ -10,8 +10,8 @@
  * pad probes do: no filler, the H.265 size, input timestamps (also after a seek and with B frames), copy-meta,
  * memory:RDS and system-memory input, VA's input in plain memory on a thread of its own, the latency, batch refusal,
  * DELTA_UNIT, a frame-rate change; forced key frames (force-idr, also in PAUSED with the queue full, force-intra,
- * force-key-unit events both ways), resolution changes (also there and back), VA's size limits and odd sizes (gpu, each
- * skipped without its VA encoder).
+ * force-key-unit events both ways), resolution changes (also there and back), VA's size limits, odd sizes and a
+ * restart of the same bin at another size (gpu, each skipped without its VA encoder).
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "rds-test-util.h"
 #include "rds-test-media.h"
@@ -3657,6 +3657,144 @@ test_odd_size (gconstpointer data)
   check_size_ok (data, 1281, 721);
 }
 
+/* One run of a restart test: the bin's output and what reached the VA encoder. */
+typedef struct
+{
+  GArray *pts, *dts;            /* GstClockTime, per output buffer */
+  GByteArray *data;
+  guint va_frames, va_plain;    /* frames into the VA encoder, those in plain system memory */
+} RestartRun;
+
+static GstPadProbeReturn
+restart_out_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  RestartRun *rr = *(RestartRun **) user_data;
+  GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info);
+  GstClockTime pts = GST_BUFFER_PTS (buf), dts = GST_BUFFER_DTS (buf);
+  GstMapInfo map;
+
+  g_array_append_val (rr->pts, pts);
+  g_array_append_val (rr->dts, dts);
+  g_assert_true (gst_buffer_map (buf, &map, GST_MAP_READ));
+  g_byte_array_append (rr->data, map.data, map.size);
+  gst_buffer_unmap (buf, &map);
+  return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn
+restart_va_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  RestartRun *rr = *(RestartRun **) user_data;
+  GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info);
+
+  rr->va_frames++;
+  if (gst_memory_is_type (gst_buffer_peek_memory (buf, 0), GST_ALLOCATOR_SYSMEM))
+    rr->va_plain++;
+  return GST_PAD_PROBE_OK;
+}
+
+/* Plays the pipeline @p to EOS, then takes it back to READY; any warning or error on the bus fails. */
+static void
+restart_play (GstElement * p)
+{
+  GstBus *bus = gst_element_get_bus (p);
+  GstMessage *m;
+
+  g_assert_cmpint (gst_element_set_state (p, GST_STATE_PLAYING), !=, GST_STATE_CHANGE_FAILURE);
+  m = gst_bus_timed_pop_filtered (bus, RDS_TEST_MEDIA_TIMEOUT, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING |
+      GST_MESSAGE_EOS);
+  g_assert_nonnull (m);
+  if (GST_MESSAGE_TYPE (m) != GST_MESSAGE_EOS)
+    g_error ("%s", error_text (m));
+  gst_message_unref (m);
+  g_assert_cmpint (gst_element_set_state (p, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  m = gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR | GST_MESSAGE_WARNING);
+  if (m != NULL)
+    g_error ("%s", error_text (m));
+  gst_object_unref (bus);
+}
+
+/* One bin, two runs: PLAYING to EOS, READY, PLAYING again with num-B-Frames back to 0 and the input at another size.
+ * The first run, with B frames, keeps VA's timestamp shift; the second has the input's timestamps again, the VA
+ * encoder gets plain memory again from its first frame (VA makes its copy pool once per start, at the run's first
+ * size), nothing warns, and the stream decodes to every frame at the new size. */
+static void
+test_restart (gconstpointer data)
+{
+  const Codec *c = data;
+  const guint frames = 30;
+  gchar *desc;
+  GstElement *p, *enc, *va, *cf, *sink;
+  GstPad *pad;
+  RestartRun runs[2], *cur = &runs[0];
+  GstCaps *caps;
+  gint w = 0, h = 0;
+
+  if (!require_va (c))
+    return;
+  desc = g_strdup_printf ("videotestsrc num-buffers=%u pattern=ball ! capsfilter name=cf caps=video/x-raw,width=1280,"
+      "height=720,framerate=30/1 ! %s name=enc %s num-B-Frames=1 ! fakesink name=sink", frames, c->element,
+      is_hevc (c) ? "" : "profile=4");
+  g_test_message ("%s", desc);
+  p = gst_parse_launch (desc, NULL);
+  g_assert_nonnull (p);
+  for (guint i = 0; i < 2; i++)
+    runs[i] = (RestartRun) {
+    g_array_new (FALSE, FALSE, sizeof (GstClockTime)), g_array_new (FALSE, FALSE, sizeof (GstClockTime)),
+          g_byte_array_new (), 0, 0};
+  enc = gst_bin_get_by_name (GST_BIN (p), "enc");
+  cf = gst_bin_get_by_name (GST_BIN (p), "cf");
+  sink = gst_bin_get_by_name (GST_BIN (p), "sink");
+  pad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, restart_out_probe, &cur, NULL);
+  gst_object_unref (pad);
+  g_assert_cmpint (gst_element_set_state (p, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
+  va = gst_bin_get_by_name (GST_BIN (enc), "encoder");
+  pad = gst_element_get_static_pad (va, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, restart_va_probe, &cur, NULL);
+  gst_object_unref (pad);
+
+  restart_play (p);
+  g_object_set (enc, "num-B-Frames", 0u, NULL);
+  caps = gst_caps_from_string ("video/x-raw,width=640,height=360,framerate=30/1");
+  g_object_set (cf, "caps", caps, NULL);
+  gst_caps_unref (caps);
+  cur = &runs[1];
+  restart_play (p);
+  gst_element_set_state (p, GST_STATE_NULL);
+
+  for (guint i = 0; i < 2; i++)
+    g_test_message ("run %u: %u frames out, first PTS %" GST_TIME_FORMAT "; %u of %u into VA in plain memory", i,
+        runs[i].pts->len, GST_TIME_ARGS (runs[i].pts->len > 0 ? g_array_index (runs[i].pts, GstClockTime, 0) : 0),
+        runs[i].va_plain, runs[i].va_frames);
+  g_assert_cmpuint (runs[0].pts->len, ==, frames);
+  g_assert_cmpuint (g_array_index (runs[0].pts, GstClockTime, 0), >=, HOUR);
+  g_assert_cmpuint (runs[1].pts->len, ==, frames);
+  for (guint i = 0; i < frames; i++) {
+    g_assert_cmpuint (g_array_index (runs[1].pts, GstClockTime, i), ==, gst_util_uint64_scale (i, GST_SECOND, 30));
+    g_assert_cmpuint (g_array_index (runs[1].dts, GstClockTime, i), ==, gst_util_uint64_scale (i, GST_SECOND, 30));
+  }
+  for (guint i = 0; i < 2; i++) {
+    g_assert_cmpuint (runs[i].va_frames, ==, frames);
+    g_assert_cmpuint (runs[i].va_plain, ==, frames);
+  }
+  g_assert_cmpuint (decode_stream (c, runs[1].data, &w, &h), ==, frames);
+  g_assert_cmpint (w, ==, 640);
+  g_assert_cmpint (h, ==, 360);
+
+  for (guint i = 0; i < 2; i++) {
+    g_array_unref (runs[i].pts);
+    g_array_unref (runs[i].dts);
+    g_byte_array_unref (runs[i].data);
+  }
+  gst_object_unref (va);
+  gst_object_unref (sink);
+  gst_object_unref (cf);
+  gst_object_unref (enc);
+  gst_object_unref (p);
+  g_free (desc);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -3733,6 +3871,8 @@ main (int argc, char **argv)
   g_test_add_data_func ("/gpu/enc/resize-back-h265", &codecs[1], test_resize_back);
   g_test_add_data_func ("/gpu/enc/level-renegotiation-h264", &codecs[0], test_level_renegotiation);
   g_test_add_data_func ("/gpu/enc/level-renegotiation-h265", &codecs[1], test_level_renegotiation);
+  g_test_add_data_func ("/gpu/enc/restart-h264", &codecs[0], test_restart);
+  g_test_add_data_func ("/gpu/enc/restart-h265", &codecs[1], test_restart);
   g_test_add_func ("/gpu/enc/sizes-h264", test_sizes_h264);
   g_test_add_func ("/gpu/enc/sizes-h265", test_sizes_h265);
   g_test_add_data_func ("/gpu/enc/odd-size-h264", &codecs[0], test_odd_size);
