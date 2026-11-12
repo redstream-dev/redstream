@@ -1413,7 +1413,8 @@ Stream behaviour (pad probes on the inner elements):
   buffer" (ours: DeepStream 8.0 encodes the first frame of the batch only, silently). Put a tiler or a demuxer first.
 - **Framerate:** the output caps carry the input caps' framerate, from the first frame at a new rate (ours: VA restarts
   its sequence on a frame-rate change but keeps the old framerate in its caps, and sends none when nothing else
-  changed).
+  changed). The VUI timing follows: that frame is an IDR frame whose SPS has the new rate (ours: DeepStream 8.0
+  keeps the old rate in the VUI).
 - **Force-key-unit events:** from either direction (an upstream one from downstream, a downstream one from upstream)
   they reach the VA encoder, which makes the next frame (or the frame at the event's running time) an IDR frame with
   parameter sets, whatever `all-headers` says (ours: DeepStream 8.0 ignores them). A downstream one passes the queue in
@@ -1440,9 +1441,16 @@ DeepStream 8.0 bugs the bins don't reproduce (all ours; details in the rows and 
 - **Force-key-unit events:** 8.0 ignores them; here they force an IDR frame with parameter sets.
 - **H.265 resolution change:** 8.0 hangs; here the stream renegotiates, as for H.264.
 - **Caps profile and level:** 8.0 writes "NULL"; here the caps carry the stream's own.
+- **VUI timing after a frame-rate change:** 8.0 keeps the old rate in the VUI (and writes no new SPS); here the next
+  frame is an IDR frame whose SPS has the new rate.
+- **H.265 `force-intra`:** 8.0 gives an I picture in a TRAIL_R NAL unit, not a random access point, yet flagged as a
+  key frame; here it is an IDR frame.
+- **H.264 Constrained-Baseline and Constrained-High:** 8.0 fails to negotiate with either value; here they give
+  constrained-baseline and high.
 - **`copy-meta` and buffer flags:** 8.0 copies the input's flags too, clearing DELTA_UNIT on every buffer; here the
   flags are the encoder's.
-- **Malformed `constqp`, `qp-range` and `initqp` strings:** 8.0 crashes; here they are refused with a warning.
+- **Malformed `constqp`, `qp-range`, `initqp` and `intra-refresh` strings:** 8.0 crashes; here the QP strings are
+  refused with a warning, and `intra-refresh`, a no-op, is stored as given.
 - **Batches:** 8.0 silently encodes the first frame of a batch only; here a batch of more than one frame is an
   element error.
 - **System memory:** 8.0 takes NVMM input only; here system memory works too.
