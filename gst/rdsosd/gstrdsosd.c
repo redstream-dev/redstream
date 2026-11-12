@@ -2,7 +2,7 @@
  * (process-mode 1, the default, and 2: rds-osd-gpu) or on the CPU (process-mode 0: rds-osd-draw), the same bytes in
  * both: hard-edged shapes, Pango text. Property names, ranges and defaults follow DeepStream's nvdsosd as gst-inspect
  * shows it for 8.0; drawing behaviour the docs leave open matches DeepStream 8.0's default GPU mode ("DeepStream 8.0
- * behaviour") except where marked "ours". Every such choice has a row in docs/compat-matrix.md.
+ * behaviour") except where marked "ours". Every such choice has a row in docs/elements/rdsosd.md.
  *
  * In place: the base class hands transform_ip a writable buffer, and the WRITE map gives this element memory it owns
  * (a shared surface or a read-only surface view, as rdsstreamdemux pushes, is replaced by a private copy first, a

@@ -4,7 +4,7 @@
  * element maps and syncs the surface, the tests draw onto plain host buffers.
  *
  * The geometry follows DeepStream 8.0's default (GPU) mode, where its docs are silent ("DeepStream 8.0 behaviour" in
- * rds-osd-draw.c); our own choices say "ours". docs/compat-matrix.md lists both.
+ * rds-osd-draw.c); our own choices say "ours". docs/elements/rdsosd.md lists both.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef RDS_OSD_DRAW_H
 #define RDS_OSD_DRAW_H

@@ -1,7 +1,7 @@
 /* Redstream: rdsmultistreamtiler, composites the frames of a memory:RDS batch into one tiled frame with
  * rds_buf_surf_transform_composite. Property names, ranges and defaults follow DeepStream's nvmultistreamtiler;
  * behaviour the docs leave open matches DeepStream 8.0 ("DeepStream 8.0 behaviour" below) except where marked
- * "ours". Every such choice has a row in docs/compat-matrix.md.
+ * "ours". Every such choice has a row in docs/elements/rdsmultistreamtiler.md.
  *
  * Pixels: the element keeps a canvas, the last tiled grid. Each batch composites its frames into their cells
  * (frame meta pad_index -> cell, pixels from the slot at batch_id), so a source missing from a batch keeps its last

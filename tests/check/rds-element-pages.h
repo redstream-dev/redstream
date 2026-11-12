@@ -21,6 +21,8 @@ static const RdsElementPage rds_element_pages[] = {
   {"rdsvideoconvert", "rdsvideoconvert.md", FALSE},
   {"rdsurisrcbin", "rdsurisrcbin.md", FALSE},
   {"rdsstreammux", "rdsstreammux.md", FALSE},
+  {"rdsmultistreamtiler", "rdsmultistreamtiler.md", FALSE},
+  {"rdsosd", "rdsosd.md", TRUE},
 };
 
 /* CommonMark code fences, for both lints. A line of at most 3 spaces, then 3 or more '`' or '~' (a '`' fence's info

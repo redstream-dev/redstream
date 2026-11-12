@@ -36,6 +36,8 @@ The Description column uses these words from the compatibility matrix:
 | Element | Purpose | DeepStream |
 |---|---|---|
 | [`rdslogger`](rdslogger.md) | prints each stream's frame rate to stdout | `nvdslogger` |
+| [`rdsmultistreamtiler`](rdsmultistreamtiler.md) | composes a batch into one tiled frame, with the metadata scaled into the tiles | `nvmultistreamtiler` |
+| [`rdsosd`](rdsosd.md) | draws boxes, labels, display meta and the clock on RGBA frames, on the GPU or the CPU | `nvdsosd` |
 | [`rdsstreamdemux`](rdsstreamdemux.md) | splits batches back into one stream per source, without copying | `nvstreamdemux` |
 | [`rdsstreammux`](rdsstreammux.md) | batches frames from several sources into fixed-size `memory:RDS` slots | `nvstreammux` |
 | [`rdsurisrcbin`](rdsurisrcbin.md) | decodes a file or RTSP URI to `memory:RDS` frames, with RTSP reconnection | `nvurisrcbin` |
