@@ -340,8 +340,9 @@ set_va (const Codec * c, VaMode mode)
   if (mode == VA_STAND_IN || mode == VA_BAD_SRC || mode == VA_PROPS || mode == VA_SIZED)
     g_assert_true (gst_element_register (NULL, c->va_factory, GST_RANK_NONE, stand_in_type (mode, i)));
   else if (mode == VA_REAL && real_va[i] != NULL) {
+    /* The registry takes a reference of its own (the factory is no longer floating): drop ours. */
     g_assert_true (gst_registry_add_feature (reg, real_va[i]));
-    real_va[i] = NULL;
+    gst_clear_object (&real_va[i]);
   }
 }
 
