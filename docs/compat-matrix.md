@@ -26,8 +26,8 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | DeepStream name | Redstream name | Status | Notes | Source |
 |---|---|---|---|---|
 | `nvurisrcbin` | `rdsurisrcbin` | supported | decodes file and other non-RTSP URIs (uridecodebin3, first video stream only) to `memory:RDS` NV12 on `vsrc_0`, with `file-loop` and `drop-frame-interval`; RTSP URIs through `rtspsrc` and `rdsvideodec` (H.264 and H.265), with reconnection after timeouts, errors and the server's EOS; properties and reconnection behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin) |
-| `nvv4l2decoder` | `rdsvideodec` | supported | rocDecode: H.264/H.265 8-bit 4:2:0 to NV12; rank primary+10, so `uridecodebin` picks it over the VA decoders; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideo4linux2), [name](https://docs.nvidia.com/deepstream/text/DS_FAQ) |
-| `nvvideoconvert` | `rdsvideoconvert` | supported | single frames (batch size 1); `memory:RDS` and system memory on either side; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideoconvert) |
+| `nvv4l2decoder` | `rdsvideodec` | supported | rocDecode: H.264/H.265 8-bit 4:2:0 to NV12; rank primary+10, so `uridecodebin` picks it over the VA decoders; properties below, behaviour on [its page](elements/rdsvideodec.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideo4linux2), [name](https://docs.nvidia.com/deepstream/text/DS_FAQ) |
+| `nvvideoconvert` | `rdsvideoconvert` | supported | single frames (batch size 1); `memory:RDS` and system memory on either side; properties below, behaviour on [its page](elements/rdsvideoconvert.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideoconvert) |
 | `nvstreammux` | `rdsstreammux` | supported | the default (scaling) mux only; the new mux is not implemented yet. GstAggregator-based; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreammux) |
 | `nvstreamdemux` | `rdsstreamdemux` | supported | zero-copy read-only views of the batch slots; properties below, behaviour on [its page](elements/rdsstreamdemux.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreamdemux) |
 | `nvinfer` | `rdsinfer` | supported | primary detector only (`process-mode=1`, `network-type` 0 or 100) on MIGraphX; nvinfer config files (key file or YAML); properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
@@ -129,49 +129,45 @@ on GStreamer's thread pool, one at a time; the watchdog ticks once a second on t
 
 ### `rdsvideoconvert` (`nvvideoconvert`) properties
 
+Reference: [rdsvideoconvert](elements/rdsvideoconvert.md).
+
 Names and integers as on NVIDIA's [nvvideoconvert page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideoconvert.html)
 (checked 2026-10-24). That page names no enum nicks except for `nvbuf-memory-type`; the other nicks are Redstream's.
 
-| Property | Status | Notes |
+| Property | Status | Difference |
 |---|---|---|
-| `src-crop` | supported | clamped to the frame (a crop that is empty after clamping is an error); when the input buffer has a `GstVideoCropMeta`, relative to that crop (offset by its x/y, clamped to its size) |
-| `dest-crop` | supported | clamped to the frame (a crop that is empty after clamping is an error); the rest of the output is filled with black: Y 16, U/V 128 for YUV, every byte 0 for GRAY8 and RGB formats, so **alpha is 0** outside the rect on RGBA/BGRA |
-| `allow-odd-crop` | supported | odd 4:2:0 destination rects are widened to even coordinates; without it they are an error. Source rects may always be odd |
-| `interpolation-method` | supported | filters as in "Transform semantics" (`Algo1`-`Algo3` run bilinear, `Algo4` nearest) |
-| `compute-hw` | supported | `2` (VIC) fails at start; set while playing, it fails on the next frame that is converted (not while in passthrough) |
-| `flip-method` | unsupported | any value but `0` fails at start; set while playing, it fails on the next frame (a flip turns passthrough off) |
-| `contiguous-buffers`, `copy-hw`, `bl-output` | accepted no-op | batches are always contiguous, copies run on the GPU, output is pitch-linear |
-| `gpu-id` | supported | default `0`; changeable only in NULL or READY |
-| `nvbuf-memory-type` | supported | memory of the `memory:RDS` output buffers: `0` `nvbuf-mem-default` (HIP device memory, the default), `1` `nvbuf-mem-cuda-pinned`, `2` `nvbuf-mem-cuda-device`, `3` `nvbuf-mem-cuda-unified`; changeable only in NULL or READY |
-| `output-buffers` | supported | minimum buffers in the output pool, default `4`; changeable only in NULL or READY |
-| `disable-passthrough` | supported | passthrough happens when input and output caps are equal (memory type included) and no crop or flip is set |
-| `silent` | accepted no-op |  |
-
-System-memory input or output is converted through device staging surfaces (upload, transform, download).
-
-Known limits: a batch (batch size above 1) is an element error; when downstream fixes only the width or only the
-height, the other dimension keeps the input's value (no aspect-ratio-preserving fixation); metas tagged with
-anything but `video` (for example size- or orientation-dependent ones) are dropped, as are `GstVideoMeta` (the
-output pool adds its own) and `GstVideoCropMeta` (the crop is applied).
+| `src-crop` | supported | |
+| `dest-crop` | supported | alpha is 0 outside the rect on RGBA/BGRA |
+| `allow-odd-crop` | supported | |
+| `interpolation-method` | supported | `algo-1` to `algo-3` run bilinear, `algo-4` nearest |
+| `compute-hw` | supported | `2` (VIC) fails |
+| `flip-method` | unsupported | any value but `0` fails |
+| `contiguous-buffers` | accepted no-op | |
+| `copy-hw` | accepted no-op | |
+| `bl-output` | accepted no-op | |
+| `gpu-id` | supported | |
+| `nvbuf-memory-type` | supported | |
+| `output-buffers` | supported | |
+| `disable-passthrough` | supported | |
+| `silent` | accepted no-op | |
 
 ### `rdsvideodec` (`nvv4l2decoder`) properties
 
+Reference: [rdsvideodec](elements/rdsvideodec.md).
+
 Names, ranges, enum integers and enum nicks as on NVIDIA's
 [nvv4l2decoder page](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html)
-(checked 2026-10-24). Input: H.264 and H.265 byte-stream access units (`h264parse`/`h265parse` in front), 8-bit
-4:2:0 only. Output: NV12 in `memory:RDS` when downstream accepts it, otherwise system memory.
+(checked 2026-10-24). Jetson-only properties, `capture-io-mode`/`output-io-mode` and the SEI properties are not
+exposed.
 
-| Property | Status | Notes |
+| Property | Status | Difference |
 |---|---|---|
-| `gpu-id` | supported | changeable only in NULL or READY; a GPU that does not exist fails the start |
-| `cudadec-memtype` | different default | `0` `memtype_device`, `1` `memtype_pinned`, `2` `memtype_unified`: the memory of the `memory:RDS` output surfaces. **Default `0` (device)**; DeepStream's is `2` (unified), which is slow on discrete AMD GPUs. No effect on system-memory output |
-| `num-extra-surfaces` | supported | 0-24 decode surfaces on top of the stream's minimum (plus 4 of headroom that Redstream always adds) |
-| `drop-frame-interval` | supported | 0-30: outputs displayed frames 0, N, 2N, ...; 0 and 1 output every frame. Counted from the start or the last flush |
-| `skip-frames` | supported | `0` `decode_all`; `2` `decode_key` drops delta frames before decoding; `1` `decode_non_ref` (Jetson-only on DeepStream) decodes every frame and logs a warning |
-| `low-latency-mode` | accepted no-op | pictures are always output as soon as the stream order allows |
-
-NVIDIA's page gives `num-extra-surfaces` as 1-24 and `drop-frame-interval` as 1-30, both with default 0; Redstream
-accepts 0 for both. Jetson-only properties, `capture-io-mode`/`output-io-mode` and the SEI properties are not exposed.
+| `gpu-id` | supported | |
+| `cudadec-memtype` | different default | `0` (device); DeepStream's is `2` (unified) |
+| `num-extra-surfaces` | supported | accepts 0 (NVIDIA's page: 1-24) |
+| `drop-frame-interval` | supported | accepts 0 (NVIDIA's page: 1-30) |
+| `skip-frames` | supported | `1` `decode_non_ref` (Jetson-only) decodes every frame |
+| `low-latency-mode` | accepted no-op | |
 
 ### `rdsstreammux` (`nvstreammux`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvstreammux.html))
 

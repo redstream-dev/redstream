@@ -64,8 +64,8 @@ Buffers pass through untouched (in place, passthrough), with their memory and me
 ## Properties
 
 None of the properties is tied to a state: each writable one can be set at any time (`last-message` is
-read-only). Ranges are those of the GParamSpec; a value outside one is refused by GObject with a warning, and the
-property keeps its value.
+read-only). Ranges are those of the GParamSpec; a value outside one is refused by GObject with a GLib warning, and
+the property keeps its value.
 
 | Property | Type | Default | Values | Changeable | Description |
 |---|---|---|---|---|---|
@@ -74,7 +74,7 @@ property keeps its value.
 | `signal-handoffs` | boolean | `true` | | any state | emit `handoff` for every buffer |
 | `last-message` | string | `NULL` | | read-only | always `NULL` |
 | `qos` | boolean | `false` | | any state | GstBaseTransform's |
-| `check-imperfect-offset`, `check-imperfect-timestamp`, `drop-allocation`, `dump`, `single-segment`, `sync` | boolean | `false` | | any state | accepted no-op (identity's); stored and read back |
+| `check-imperfect-offset`, `check-imperfect-timestamp`, `drop-allocation`, `dump`, `single-segment`, `sync` | boolean | `false` | | any state | accepted no-op (identity's) |
 | `datarate` | int | `0` | 0–2147483647 | any state | accepted no-op |
 | `drop-buffer-flags` | flags `GstBufferFlags` | `0` | `GstBufferFlags` nicks | any state | accepted no-op |
 | `drop-probability` | float | `0` | 0–1 | any state | accepted no-op |
@@ -84,7 +84,7 @@ property keeps its value.
 
 The no-op properties are the ones `identity` has, which DeepStream 8.0's `nvdslogger` shows too. Setting one to a value
 other than its default logs one GLib warning per element and property ("… is not implemented; the property is
-accepted and has no effect"); the value is kept and read back.
+accepted and has no effect").
 
 ## Signals
 

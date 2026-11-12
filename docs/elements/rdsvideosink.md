@@ -42,13 +42,13 @@ the value converts to its type and fits its range. They are applied when the inn
 `autovideosink` adds the sink it picked (at READY), and on every change. A property the inner sink lacks, or a value
 it can't take, is stored and does nothing, silently. `gpu-id` is also set on the inner `rdsvideoconvert`.
 
-**Accepted no-op** properties are stored and read back, and do nothing. Setting one to a value other than its default
-logs one GLib warning per element and property ("… is not implemented; the property is accepted and has no effect").
+Setting an accepted no-op property to a value other than its default logs one GLib warning per element and property
+("… is not implemented; the property is accepted and has no effect").
 
 `video-sink` and `gpu-id` can be changed only in NULL or READY. In PAUSED or PLAYING (or on the way there) a new value
 is refused with a GLib warning ("… can only be changed in the NULL or READY state; keeping the current value"), and
 the property keeps its value. The other properties can be set in any state. A value outside a property's range is
-refused by GObject with a warning. GstBin's `async-handling` and `message-forward` are not listed.
+refused by GObject with a GLib warning. GstBin's `async-handling` and `message-forward` are not listed.
 
 | Property | Type | Default | Values | Changeable | Description |
 |---|---|---|---|---|---|
