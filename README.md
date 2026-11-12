@@ -361,9 +361,9 @@ Two more come from the stack under the encoders, Mesa's VA driver and GStreamer 
 - **H.265 widths that are not a multiple of 64.** `vah265enc` on Mesa 25.2.8 (radeonsi, as in `redstream:dev`)
   signals them too wide (720×480 decodes 768 wide). `rdsh265enc` rewrites the SPS conformance window, so its
   output decodes at the right size; bare `vah265enc` is affected.
-- **GStreamer 1.28's VA encoders.** They leak one `GstCaps` per frame-rate renegotiation. After a resolution change
-  they keep copying system-memory frames at the old size, so after a resize the bins write into VA's own surfaces
-  instead: correct, but slower.
+- **GStreamer 1.28's VA encoders.** They leak one `GstCaps` per reconfiguration (a frame-rate or size change, a
+  live bitrate change). After a resolution change they keep copying system-memory frames at the old size, so after
+  a resize the bins write into VA's own surfaces instead: correct, but slower.
 
 ## Getting started (development)
 

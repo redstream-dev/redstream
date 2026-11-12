@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# LeakSanitizer suppressions for element_enc_reconfig only (the element_enc subtests that reconfigure the VA encoder,
+# in ASan builds; see tests/meson.build): tests/lsan.supp, then the upstream leak below.
+@LSAN_SUPP@
+# GStreamer 1.28's vah26xenc leaks one GstCaps (5 allocations, about 510 bytes) per reconfiguration of the encoder: a
+# frame-rate or size change, and a live bitrate change too. Its reconfig asks for the allowed src caps, and the caps
+# that gst_va_create_coded_caps () makes (via gst_va_profile_caps) in gst_va_encoder_get_srcpad_caps () are never
+# freed. It reproduces with the stock encoder alone (videotestsrc ! capsfilter ! vah264enc ! fakesink, the capsfilter's
+# frame rate changed mid-stream). libgstva and libgstreamer have no frame pointers, so ASan's default (fast) unwinder
+# stops in GStreamer's caps functions and never sees the VA frames: the entries after the first match those
+# functions, which hides any GstCaps leak, so this file is only for the subtests that hit VA's.
+leak:gst_va_create_coded_caps
+leak:gst_caps_from_string
+leak:gst_caps_new_empty
+leak:gst_structure_new_take_id_str_empty_with_size
+leak:gst_value_deserialize_string

@@ -528,8 +528,38 @@ element_enc_exe = executable('element_enc', 'check' / 'element_enc.c',
   dependencies : test_deps + [gst_app_dep, gst_video_dep])
 test('element_enc_cpu', element_enc_exe, args : ['-p', '/cpu/enc'],
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
-test('element_enc', element_enc_exe, args : ['-p', '/gpu/enc'],
+# The subtests that reconfigure the VA encoder hit GStreamer 1.28's vah26xenc GstCaps leak, which LeakSanitizer can
+# only match by GStreamer's caps functions: in ASan builds they run as element_enc_reconfig, with
+# lsan-va-reconfig.supp, and element_enc skips them, so a GstCaps leak of ours in the others is still caught. A new
+# subtest that changes the frame rate, the size or the bitrate while playing goes in this list.
+element_enc_reconfig = []
+foreach t : ['live-bitrate', 'framerate-change', 'resize', 'resize-back', 'level-renegotiation']
+  element_enc_reconfig += ['/gpu/enc/@0@-h264'.format(t), '/gpu/enc/@0@-h265'.format(t)]
+endforeach
+element_enc_args = ['-p', '/gpu/enc']
+if asan
+  foreach t : element_enc_reconfig
+    element_enc_args += ['-s', t]
+  endforeach
+endif
+test('element_enc', element_enc_exe, args : element_enc_args,
   suite : 'gpu', env : test_env, protocol : 'tap', is_parallel : false, timeout : 300, depends : rds_plugins)
+if asan
+  lsan_va_reconfig_supp = configure_file(input : 'lsan-va-reconfig.supp.in', output : 'lsan-va-reconfig.supp',
+    configuration : {'LSAN_SUPP' : fs.read('lsan.supp').strip()})
+  element_enc_reconfig_args = []
+  foreach t : element_enc_reconfig
+    element_enc_reconfig_args += ['-p', t]
+  endforeach
+  # Not TAP: GLib prints a plan per -p path, which isn't valid TAP.
+  test('element_enc_reconfig', element_enc_exe, args : element_enc_reconfig_args,
+    suite : 'gpu', is_parallel : false, timeout : 300, depends : rds_plugins,
+    env : environment(common_test_env + {
+      'LSAN_OPTIONS' : 'suppressions=@0@:print_suppressions=0'.format(lsan_va_reconfig_supp.full_path()),
+      'GST_PLUGIN_PATH_1_0' : meson.project_build_root() / 'gst',
+      'GST_REGISTRY_1_0' : meson.current_build_dir() / 'registry.bin',
+    }))
+endif
 
 # rdsh264enc / rdsh265enc in pipelines: a round trip per codec through rdsvideodec (frame count, PTS and every frame's
 # PSNR against the source), two sources through rdsstreammux and rdsstreamdemux into one encoder each (gpu); and (its

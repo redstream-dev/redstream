@@ -150,11 +150,12 @@ Known gotchas:
   known then: a stream that stops mid-flow (an RTSP reconnection) gets its last picture out only when new data or an
   EOS comes. `rdsurisrcbin` tells such a leftover from the new session's frames by PTS.
 - Stock `vah26xdec` exports tiled NV12 DMABufs (AMD modifier `0x0200000000401b03`). Never read them as linear.
-- GStreamer 1.28's `vah26xenc` leaks one `GstCaps` per frame-rate renegotiation (reproduced without our bins), and
-  builds its copy pool for system-memory input once per start, so after a resolution change it would copy at the old
-  size (a `gst_video_frame_copy` critical on a shrink, a partial frame on a grow). The bins let their convert write
-  plain memory only at a run's first size and VA's own surfaces after a resize, which is slower. So in a soak that
-  changes the frame rate, leaked caps are VA's, not the bins'; one that changes the size runs slower after it.
+- GStreamer 1.28's `vah26xenc` leaks one `GstCaps` per reconfiguration, a frame-rate or size change or a live bitrate
+  change (reproduced without our bins), and builds its copy pool for system-memory input once per start, so after a
+  resolution change it would copy at the old size (a `gst_video_frame_copy` critical on a shrink, a partial frame on a
+  grow). The bins let their convert write plain memory only at a run's first size and VA's own surfaces after a resize,
+  which is slower. So in a soak that changes the frame rate, leaked caps are VA's, not the bins'; one that changes the
+  size runs slower after it.
 - In a git worktree whose `.cache/media` and `.cache/models` are symlinks to the main checkout's, mount the main
   checkout's `.cache` in the container at its host path too (`-v /path/to/main/.cache:/path/to/main/.cache`), or the
   links dangle and the tests that need the clips and models skip.
@@ -471,7 +472,11 @@ meson test -C build-rel --print-errorlogs
   `rds_test3_output` (`rds-test3 --output` on the street clip) skip without `vah264enc` / `vah265enc`.
   `pipeline_enc_soak` (also in the `soak` suite) encodes 3000 1080p frames per codec with the soak memory checks; it
   checks the fps only when `RDS_TEST_ENC_MIN_FPS` is set (the shared iGPU's fps varies too much for a fixed floor).
-  `element_compat_matrix` checks the encoders' property tables.
+  `element_compat_matrix` checks the encoders' property tables. In ASan builds `element_enc` skips the subtests that
+  reconfigure the VA encoder (a frame-rate, size or live bitrate change), and `element_enc_reconfig` runs them with
+  `tests/lsan-va-reconfig.supp.in`: VA's caps leak (Known gotchas) can only be suppressed by GStreamer's caps
+  functions, which would hide our own caps leaks in the other subtests. Add a new such subtest to the list in
+  `tests/meson.build`.
 - The compat-matrix lints (`/cpu/infer-config/compat-matrix`, `/cpu/tracker-config/compat-matrix`) run only in
   builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
   check the rdsinfer key tables in `docs/compat-matrix.md`. `/cpu/analytics-config/compat-matrix` (rdsanalytics is
