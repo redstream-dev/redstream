@@ -74,7 +74,8 @@ To remove a branch, block or unlink `src_N` first, then set its elements to NULL
 ## Pads
 
 The stream events below, written `rds-stream-eos (N)`, `rds-pad-deleted (N)` and so on, are `rdsstreammux`'s custom
-downstream events; each carries the id of the source it is about. Their types and parsers are in `rds/rds-event.h`.
+downstream events; each carries the id of the source it is about. Their types and parsers are in `rds/rds-event.h`;
+[rdsstreammux](rdsstreammux.md) lists when each is sent.
 
 | Pad | Direction | Presence | Caps |
 |---|---|---|---|

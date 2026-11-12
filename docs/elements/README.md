@@ -37,6 +37,7 @@ The Description column uses these words from the compatibility matrix:
 |---|---|---|
 | [`rdslogger`](rdslogger.md) | prints each stream's frame rate to stdout | `nvdslogger` |
 | [`rdsstreamdemux`](rdsstreamdemux.md) | splits batches back into one stream per source, without copying | `nvstreamdemux` |
+| [`rdsstreammux`](rdsstreammux.md) | batches frames from several sources into fixed-size `memory:RDS` slots | `nvstreammux` |
 | [`rdsurisrcbin`](rdsurisrcbin.md) | decodes a file or RTSP URI to `memory:RDS` frames, with RTSP reconnection | `nvurisrcbin` |
 | [`rdsvideoconvert`](rdsvideoconvert.md) | converts, scales and crops single frames on the GPU | `nvvideoconvert` |
 | [`rdsvideodec`](rdsvideodec.md) | decodes H.264 and H.265 with rocDecode into `memory:RDS` | `nvv4l2decoder` |

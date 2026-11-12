@@ -28,7 +28,7 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvurisrcbin` | `rdsurisrcbin` | supported | decodes file and other non-RTSP URIs (uridecodebin3, first video stream only) to `memory:RDS` NV12 on `vsrc_0`, with `file-loop` and `drop-frame-interval`; RTSP URIs through `rtspsrc` and `rdsvideodec` (H.264 and H.265), with reconnection after timeouts, errors and the server's EOS; properties below, behaviour on [its page](elements/rdsurisrcbin.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin) |
 | `nvv4l2decoder` | `rdsvideodec` | supported | rocDecode: H.264/H.265 8-bit 4:2:0 to NV12; rank primary+10, so `uridecodebin` picks it over the VA decoders; properties below, behaviour on [its page](elements/rdsvideodec.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideo4linux2), [name](https://docs.nvidia.com/deepstream/text/DS_FAQ) |
 | `nvvideoconvert` | `rdsvideoconvert` | supported | single frames (batch size 1); `memory:RDS` and system memory on either side; properties below, behaviour on [its page](elements/rdsvideoconvert.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvvideoconvert) |
-| `nvstreammux` | `rdsstreammux` | supported | the default (scaling) mux only; the new mux is not implemented yet. GstAggregator-based; properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreammux) |
+| `nvstreammux` | `rdsstreammux` | supported | the default (scaling) mux only; the new mux is not implemented yet. GstAggregator-based; properties below, behaviour on [its page](elements/rdsstreammux.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreammux) |
 | `nvstreamdemux` | `rdsstreamdemux` | supported | zero-copy read-only views of the batch slots; properties below, behaviour on [its page](elements/rdsstreamdemux.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreamdemux) |
 | `nvinfer` | `rdsinfer` | supported | primary detector only (`process-mode=1`, `network-type` 0 or 100) on MIGraphX; nvinfer config files (key file or YAML); properties below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
 | `nvtracker` | `rdstracker` | supported | the IOU and NvSORT trackers of NvMultiObjectTracker, on the CPU, with its YAML config files; NvDCF and NvDeepSORT configs run as NvSORT. Matches observed DeepStream 8.0 behaviour where the docs are silent; properties, config keys and behaviour below | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker) |
@@ -136,114 +136,48 @@ exposed.
 
 ### `rdsstreammux` (`nvstreammux`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvstreammux.html))
 
-Names, types and enum integers as on NVIDIA's nvstreammux page (checked 2026-10-24). Only the default ("legacy")
-mux is implemented: every frame is scaled into a fixed `width`×`height` slot of the batch. The new mux (zero-copy
-batches of the decoder surfaces, `config-file-path`, adaptive batching, per-source frame limits) is not written yet.
+Reference: [rdsstreammux](elements/rdsstreammux.md).
 
-NVIDIA's page lists example values, not defaults, for most properties. The Default column gives Redstream's
-default; **ours** marks a default the page does not document, so it may differ from DeepStream's.
+Names, types and enum integers as on NVIDIA's nvstreammux page (checked 2026-10-24); the page marks the defaults it
+doesn't document as ours. Only the default ("legacy") mux is implemented.
 
-| Property | Type | Default | Status | Notes |
-|---|---|---|---|---|
-| `batch-size` | uint | `1` (ours) | supported | frames per batch, 1 and up (NVIDIA's range starts at 0); changeable only in NULL or READY |
-| `batched-push-timeout` | int, µs | `-1` (ours) | supported | `-1`: no timeout. See "Batching and timeout" below; changeable only in NULL or READY |
-| `width`, `height` | uint | `0` | supported | the slot size, **required**: `0` fails negotiation with a message naming both properties (the new mux, which can pass sizes through, is not implemented). Range 0-16384 (NVIDIA: up to `G_MAXUINT`); changeable only in NULL or READY |
-| `enable-padding` | boolean | `FALSE` (ours) | supported | keeps the aspect ratio; the frame is placed **top-left** (see below) |
-| `gpu-id` | uint | `0` (ours) | supported | GPU for the scaling and the output batches; a GPU that does not exist is an error at the first batch; changeable only in NULL or READY |
-| `nvbuf-memory-type` | enum | `0` (ours) | supported | `0` `nvbuf-mem-default` (HIP device memory), `1` `nvbuf-mem-cuda-pinned`, `2` `nvbuf-mem-cuda-device`, `3` `nvbuf-mem-cuda-unified`. `4` (Jetson surface array) is not a value of the enum: `g_object_set` rejects it with a warning and keeps the old value. Changeable only in NULL or READY |
-| `buffer-pool-size` | uint | `4` (ours) | supported | batches in the output pool, 1-1024, allocated up front (`buffer-pool-size` × `batch-size` frames); the pool never grows, so a stalled downstream back-pressures the sources. Demux branches whose sinks keep their last buffer (appsink always, other sinks with `enable-last-sample`) pin one batch each, since a demuxed frame keeps its whole batch alive: set `buffer-pool-size` larger than the number of such branches, or the mux stalls for good. It is not raised automatically: that would cost memory in every pipeline without a demux. Changeable only in NULL or READY |
-| `compute-hw` | enum | `0` (ours) | supported | `0` default (the GPU), `1` GPU; `2` (VIC) fails at start |
-| `interpolation-method` | enum | `6` (ours) | supported | integers as `NvBufSurfTransform_Inter`, filters as in "Transform semantics" (`6` default and `5` `algo-4` run nearest, `2`-`4` bilinear) |
-| `num-surfaces-per-frame` | uint | `1` (ours) | supported | only `1`; 2-4 fail at start |
-| `live-source` | boolean | `FALSE` (ours) | supported | changes only the batch timestamp (see below), not the waiting |
-| `attach-sys-ts` | boolean | `TRUE` (ours) | supported | each frame's `ntp_timestamp` is the system (wall-clock) time in ns; `FALSE` gives 0. RTCP sender-report time is not implemented |
-| `sync-inputs` | boolean | `FALSE` (ours) | supported | see "Batching and timeout"; changeable only in NULL or READY |
-| `max-latency` | uint, ns | `0` (ours) | supported | reported downstream in the latency query, and waited for (on top of the timeout) before a partial batch goes out in live mode; changeable only in NULL or READY |
-| `sort-batch` | boolean | `FALSE` (ours) | supported | slots in sink pad order; otherwise in the order the frames were collected |
-| `drop-pipeline-eos` | boolean | `FALSE` | supported | no EOS downstream when every source has ended; the per-source `stream-eos` events still go |
-| `frame-num-reset-on-eos` | boolean | `FALSE` (ours) | supported | a source's `frame_num` restarts at 0 after its EOS |
-| `frame-num-reset-on-stream-reset` | boolean | `FALSE` (ours) | supported | a source's `frame_num` restarts at 0 after a flush of that source |
-| `frame-duration` | uint64 | `-1` (`G_MAXUINT64`) | accepted no-op | NTP correction is not implemented |
-| `failsafe-flush-count` | uint | `10` (ours) | accepted no-op | range 1-1024 and not tied to `buffer-pool-size` (NVIDIA: 1 to `buffer-pool-size`, capped at one less) |
-| `align-first-buffer`, `align-inputs`, `cache-buffer`, `extract-sei-sim-time`, `extract-sei-type5-data`, `drop-backward-sei`, `async-process` | boolean | `FALSE` (ours) | accepted no-op |  |
-| `cache-buffer-timeout` | int, µs | `-1` (ours) | accepted no-op |  |
-| `sync-inputs-ntp` | int, ns | `0` (ours) | accepted no-op |  |
-| `latency`, `min-upstream-latency`, `start-time`, `start-time-selection`, `emit-signals` | | `GstAggregator`'s | Redstream only | inherited from `GstAggregator`, not on NVIDIA's page. `latency` belongs to `batched-push-timeout`: it is set from it (or to 0) at every start, so a value set directly has no effect |
-
-Setting an accepted no-op property logs one INFO message per element (the first time any of them is set).
-
-Pads: `sink_%u` request pads (sink pad N is source N) and `src`. Inputs: `video/x-raw(memory:RDS)` or
-`video/x-raw` in system memory (uploaded through a per-pad staging surface), formats NV12, I420, RGBA, BGRA,
-RGBx, BGRx, RGB, BGR and GRAY8, one frame per buffer (a batch as input is an element error). A `GstVideoCropMeta`
-on an input is honoured: only that rect is scaled. Output: `video/x-raw(memory:RDS)`, `width`×`height`, the format
-downstream picks (NV12 when it does not care), PAR 1/1, the inputs' framerate when they all agree, else `0/1`.
-
-#### Frame meta
-
-One `RdsBatchMeta` per batch with `max_frames_in_batch` = `batch-size`, and per frame: `source_id` and `pad_index`
-= the sink pad number; `batch_id` = the slot; `frame_num` = a per-source counter from 0; `buf_pts` = the input
-buffer's PTS (in the source's own segment); `ntp_timestamp` (see `attach-sys-ts`); `source_frame_width`/`height` =
-the input size (after its crop meta); `pipeline_width`/`height` = the slot size; one surface per frame.
-
-#### Scaling and padding
-
-Every frame goes through `rds_buf_surf_transform` into its slot. With `enable-padding`, the frame is scaled to fit
-with its aspect ratio kept (even width and height for NV12 and I420) and placed at the **top-left** of the slot; the
-rest of the slot is black (Y 16, U/V 128 for YUV; every byte 0, alpha included, for RGB and GRAY8). NVIDIA's page
-says only that black bands keep the aspect ratio, not where they go. Top-left keeps the mapping from slot to source
-coordinates a pure scale (divide by `pipeline_width / source_frame_width`, no offset).
-
-#### Batching and timeout
-
-- One batch takes at most one frame per sink pad. The pads are visited round robin, the first one rotating every
-  batch, and a batch is closed at `batch-size` frames.
-- `batched-push-timeout` `-1` (no timeout): a batch goes out once every source that has not ended has a frame
-  queued, or `batch-size` frames are collected. A stalled source therefore stalls the batch; set a timeout for live
-  or unreliable sources.
-- `batched-push-timeout` ≥ 0: a partial batch goes out one timeout after its **first frame arrived**, whether the
-  frames are ahead of the clock (a file decoding faster than real time) or behind it, and also when that frame
-  queued up while the previous batch was still waiting (it does not wait a full timeout after that batch). A live source's upstream
-  latency is not added. During the first upstream-latency of running time, though, the timer cannot start before
-  running time 0, so the first partial batches go out late by up to that latency.
-- `sync-inputs=TRUE`: a partial batch goes out once the clock reaches its earliest frame's running time plus the
-  latency (`batched-push-timeout` or 0, plus `max-latency` and the upstream latency). A frame already due goes out
-  at once with whatever else is queued. As in every mode, a batch with a frame from every source goes out as soon
-  as it is complete: frames are never held back to the clock. NVIDIA documents only "synchronizes input frames using
-  PTS".
-- A live (or timed) mux's sink pads queue at least two frames plus a latency's worth before blocking upstream,
-  on top of the one being batched: upstream buffer pools must allow for that.
-
-#### Batch timestamps
-
-- `live-source=TRUE`: the batch PTS is the running time of the last frame copied into it (as documented).
-- `live-source=FALSE`: the running time of the earliest frame in the batch. NVIDIA instead derives it from the
-  framerate of the first source that negotiated caps.
-- Either way, batch timestamps never go backwards: a batch earlier than the previous one (a source joining late, or
-  with another segment) gets the previous batch's PTS. DTS and duration are unset. The output segment is TIME from
-  0, so the PTS is the running time.
-
-#### Stream events
-
-The mux sends the stream events of the "Stream events" section downstream, in order with the batches, after its
-own stream-start, caps and segment:
-
-- `pad-added (N)` when source N's **first event or frame** comes through (NVIDIA: when the mux receives data from a
-  new source), not when the pad is requested;
-- `stream-start (N)` and `stream-segment (N)` from that pad's STREAM_START and SEGMENT;
-- `stream-eos (N)` from that pad's EOS, after the batch with its last frame and before any later batch;
-- `stream-reset (N)` before the source's first event or frame after a flush of that pad;
-- `pad-deleted (N)` when the pad is released (only if its `pad-added` went out), after a batch being built at that
-  moment (it may hold the pad's last frame).
-
-The pipeline EOS goes downstream when every source has ended, unless `drop-pipeline-eos` is set.
-
-Releasing a sink pad sends `pad-deleted` from the releasing thread. If a prerolled sink downstream is blocking (the
-pipeline is PAUSED and the mux idle), that push, and so the release, blocks until the pipeline goes to PLAYING:
-release pads while PLAYING, or from a thread that may wait.
-
-To remove a source cleanly, send EOS into its sink pad and wait for its `stream-eos (N)` downstream before releasing
-the pad: the EOS reaches the mux's batching thread only after the frames queued in front of it, and a pad released
-before that loses the frames still queued and its `stream-eos` (only `pad-deleted` goes out).
+| Property | Status | Difference |
+|---|---|---|
+| `batch-size` | supported | range from 1 (NVIDIA: from 0) |
+| `batched-push-timeout` | supported | counts from a batch's first frame |
+| `width` | supported | required |
+| `height` | supported | required |
+| `enable-padding` | supported | frame placed top-left |
+| `gpu-id` | supported | |
+| `nvbuf-memory-type` | supported | `4` (Jetson surface array) is not a value |
+| `buffer-pool-size` | supported | |
+| `compute-hw` | supported | `2` (VIC) fails at start |
+| `interpolation-method` | supported | `algo-1` to `algo-3` run bilinear, `algo-4` nearest |
+| `num-surfaces-per-frame` | supported | only `1` |
+| `live-source` | supported | changes only the batch timestamp |
+| `attach-sys-ts` | supported | system time; no RTCP sender-report time |
+| `sync-inputs` | supported | |
+| `max-latency` | supported | |
+| `sort-batch` | supported | |
+| `drop-pipeline-eos` | supported | |
+| `frame-num-reset-on-eos` | supported | |
+| `frame-num-reset-on-stream-reset` | supported | |
+| `frame-duration` | accepted no-op | |
+| `failsafe-flush-count` | accepted no-op | range 1-1024, not tied to `buffer-pool-size` |
+| `align-first-buffer` | accepted no-op | |
+| `align-inputs` | accepted no-op | |
+| `cache-buffer` | accepted no-op | |
+| `cache-buffer-timeout` | accepted no-op | |
+| `extract-sei-sim-time` | accepted no-op | |
+| `extract-sei-type5-data` | accepted no-op | |
+| `drop-backward-sei` | accepted no-op | |
+| `sync-inputs-ntp` | accepted no-op | |
+| `async-process` | accepted no-op | |
+| `latency` | ours | GstAggregator's; set from `batched-push-timeout` at every start |
+| `min-upstream-latency` | ours | GstAggregator's |
+| `start-time` | ours | GstAggregator's |
+| `start-time-selection` | ours | GstAggregator's |
+| `emit-signals` | ours | GstAggregator's |
 
 ### `rdsstreamdemux` (`nvstreamdemux`) properties ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvstreamdemux.html))
 
@@ -1750,7 +1684,8 @@ NvDs metadata types and functions Redstream doesn't implement yet (segmentation,
 ## Stream events (gst-nvevent)
 
 Events are custom events with their own `GstEventType` numbers, so dispatching on `GST_EVENT_TYPE` works.
-`rdsstreammux` sends them and `rdsstreamdemux` routes them per source (see their sections above).
+`rdsstreammux` sends them and `rdsstreamdemux` routes them per source (see their pages,
+[rdsstreammux](elements/rdsstreammux.md) and [rdsstreamdemux](elements/rdsstreamdemux.md)).
 
 | DeepStream name | Redstream name | Status | Notes | Source |
 |---|---|---|---|---|
