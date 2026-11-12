@@ -7,3 +7,5 @@ are in the [compatibility matrix](../compat-matrix.md).
 | Element | Purpose | DeepStream |
 |---|---|---|
 | [`rdslogger`](rdslogger.md) | prints each stream's frame rate to stdout | `nvdslogger` |
+| [`rdsstreamdemux`](rdsstreamdemux.md) | splits batches back into one stream per source, without copying | `nvstreamdemux` |
+| [`rdsvideosink`](rdsvideosink.md) | shows single frames through a stock GStreamer video sink | `nveglglessink`, `nv3dsink` |

@@ -15,6 +15,8 @@ typedef struct
 
 static const RdsElementPage rds_element_pages[] = {
   {"rdslogger", "rdslogger.md", FALSE},
+  {"rdsvideosink", "rdsvideosink.md", FALSE},
+  {"rdsstreamdemux", "rdsstreamdemux.md", FALSE},
 };
 
 /* CommonMark code fences, for both lints. A line of at most 3 spaces, then 3 or more '`' or '~' (a '`' fence's info

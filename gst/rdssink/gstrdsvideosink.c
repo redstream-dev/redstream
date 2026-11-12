@@ -8,7 +8,7 @@
  * their names and defaults; those the inner sink also has (sync, qos, max-lateness, window-x, ...) are forwarded to
  * it, and to the sinks inside it when it is a bin (autovideosink picks its sink at READY); the others are stored
  * and do nothing. Behaviour the docs leave open matches DeepStream 8.0 ("DeepStream 8.0 behaviour") except where
- * marked "ours"; every such choice has a row in docs/compat-matrix.md.
+ * marked "ours"; every such choice is listed in docs/elements/rdsvideosink.md.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "gstrdsvideosink.h"
 

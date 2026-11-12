@@ -491,9 +491,9 @@ meson test -C build-rel --print-errorlogs
   `rdsh265enc` match observed DeepStream 8.0 behaviour, except where 8.0 is clearly broken; there they do the sane
   thing. Code comments say "DeepStream 8.0 behaviour" or "ours", and every such choice has a row in the compat
   matrix's behaviour tables ("Tracking behaviour", "Analytics element behaviour", "Analytics behaviour", "Analytics
-  drawing behaviour", "Tiling behaviour", "Drawing behaviour", "Display behaviour"), in the analytics config section
-  and key table, or in the encoders' property tables and stream behaviour lists; `rdslogger`'s are on its page,
-  `docs/elements/rdslogger.md`: keep them in step.
+  drawing behaviour", "Tiling behaviour", "Drawing behaviour"), in the analytics config section and key table, or
+  in the encoders' property tables and stream behaviour lists; `rdslogger`'s and `rdsvideosink`'s are on their pages
+  in `docs/elements/`: keep them in step.
 - **Analytics metas (C++).** `RdsAnalyticsFrameMeta` and `RdsAnalyticsObjInfo` are C++ structs (std::string,
   std::vector, std::unordered_map) with libstdc++'s layout, so code that reads their fields must be built with the
   same `_GLIBCXX_USE_CXX11_ABI` as libgstrds-analytics (the default). Include `rds/rds-analytics-meta.h` at file
