@@ -1,5 +1,7 @@
 # rdsvideosink
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 A display sink for single frames: it converts them on the GPU, copies them to system memory and shows them with a
 stock GStreamer video sink (`autovideosink` by default), under the DeepStream sinks' property names. DeepStream
 counterparts: `nveglglessink` and `nv3dsink`
@@ -52,7 +54,7 @@ refused by GObject with a GLib warning. GstBin's `async-handling` and `message-f
 
 | Property | Type | Default | Values | Changeable | Description |
 |---|---|---|---|---|---|
-| `video-sink` | string | `"autovideosink"` | a sink factory name | NULL, READY | the stock sink that shows the frames (ours); see "Changing `video-sink`" |
+| `video-sink` | string | `"autovideosink"` | a sink factory name | NULL, READY | the stock sink that shows the frames (ours); see [Changing `video-sink`](#changing-video-sink) |
 | `sync` | boolean | `true` | | any state | forwarded: sync on the clock |
 | `qos` | boolean | `true` | | any state | forwarded: QoS events upstream |
 | `max-lateness` | int64 | `5000000` | −1–9223372036854775807 (−1: unlimited) | any state | forwarded: nanoseconds a buffer may be late before it is dropped |
@@ -87,7 +89,7 @@ refused by GObject with a GLib warning. GstBin's `async-handling` and `message-f
 **Display path.** `rdsvideoconvert` converts the frame to BGRx on the GPU and copies it to system memory;
 `videoconvert` passes it through (or converts, when the inner sink wants another format); the inner sink shows it.
 
-**Changing `video-sink`** (in NULL or READY):
+<a id="changing-video-sink"></a>**Changing `video-sink`** (in NULL or READY):
 - The current inner sink is set to NULL and removed. A new element of the named factory is made, linked after
   `videoconvert`, given every forwarded value and brought to the bin's state.
 - NULL or an empty string means `autovideosink`. Only a factory name is accepted, not an element instance.

@@ -1,5 +1,7 @@
 # rdsh264enc, rdsh265enc
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 <a id="rdsh264enc"></a><a id="rdsh265enc"></a>
 `rdsh264enc` encodes single frames to H.264 and `rdsh265enc` to H.265, with DeepStream 8.0's encoder properties.
 Each is a bin over GStreamer's stock VA encoder (`vah264enc`, `vah265enc`, on the GPU's VCN engine): the frames,
@@ -8,7 +10,8 @@ counterparts: `nvv4l2h264enc` and `nvv4l2h265enc`
 ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html)).
 Built when: always. At run time they need the stock `va` plugin and a Mesa VA driver that encodes the codec: without
 them the elements still register, and going to READY is an element error (see [Errors](#errors)). The two share this
-page: what only one of them has is under "Only on".
+page: what only one of them has is under [Only on `rdsh264enc`](#only-on-rdsh264enc) and
+[Only on `rdsh265enc`](#only-on-rdsh265enc).
 
 ## Example
 
@@ -32,7 +35,7 @@ Redstream pipeline has them; the encoders also take system memory directly. Batc
 
 | Pad | Direction | Presence | Caps |
 |---|---|---|---|
-| `sink` | sink | always | `video/x-raw(memory:RDS)` or `video/x-raw`, format NV12, I420, RGBA, BGRA, RGBx, BGRx, RGB, BGR or GRAY8, 1–16384 × 1–16384: what `rdsvideoconvert` takes. The sizes the VA encoder takes are narrower: see "Sizes" under [Stream](#stream) |
+| `sink` | sink | always | `video/x-raw(memory:RDS)` or `video/x-raw`, format NV12, I420, RGBA, BGRA, RGBx, BGRx, RGB, BGR or GRAY8, 1–16384 × 1–16384: what `rdsvideoconvert` takes. The sizes the VA encoder takes are narrower: see the Sizes row under [Stream](#stream) |
 | `src` | src | always | `rdsh264enc`: `video/x-h264`, `stream-format=byte-stream`, `alignment=au`; `rdsh265enc`: `video/x-h265`, the same |
 
 Both are ghost pads. Inside the bin, made when it first goes to READY:
@@ -73,7 +76,7 @@ GstBin's `async-handling` and `message-forward` are not listed.
 | `vbvbufsize` | uint | `0` | 0–4294967295 | any state (stored with a GLib warning, applied at the next start) | bits: VA's `cpb-size` in kbit (0: VA's choice) |
 | `idrinterval` | uint | `256` | 0–4294967295 | any state (stored with a GLib warning, applied at the next start) | VA's `key-int-max`; 0 means 256 (DeepStream 8.0 behaviour); above 1024, 1024 with a GLib warning (ours) |
 | `iframeinterval` | uint | `4294967295` | 0–4294967295 | any state (stored with a GLib warning, applied at the next start) | 0 and 4294967295: no I frames between IDR frames (DeepStream 8.0 behaviour; the docs say 30). Otherwise VA's `i-frames` = ⌈idrinterval / N⌉ − 1, which VA spaces evenly: the same frames as 8.0 when N divides idrinterval (ours) |
-| `force-idr` | boolean | `false` | | any state | `true` makes the next frame into the VA encoder's queue an IDR frame with parameter sets; reads back `false`. See "Forced key frames" under [Stream](#stream) |
+| `force-idr` | boolean | `false` | | any state | `true` makes the next frame into the VA encoder's queue an IDR frame with parameter sets; reads back `false`. See the Forced key frames rows under [Stream](#stream) |
 | `force-intra` | boolean | `false` | | any state | as `force-idr`: the frame is an IDR frame too (ours: VA can't force a non-IDR intra frame) |
 | `num-B-Frames` | uint | `0` | 0–2 | any state (stored with a GLib warning, applied at the next start) | VA's `b-frames`. `rdsh264enc` with a Baseline profile (from the property or from downstream caps): a GLib warning and no B frames (ours: DeepStream 8.0 hangs, and VA alone writes B slices into the Baseline stream); when downstream allows Baseline and another profile and the property's isn't allowed, B frames pick the other (ours). `rdsh265enc`: VA on VCN 3 writes no B frames whatever the value |
 | `num-Ref-Frames` | uint | `0` | 0–8 | any state (stored with a GLib warning, applied at the next start) | VA's `ref-frames` when above 0; 0 keeps VA's default, 3, the number DeepStream 8.0 uses |
@@ -123,7 +126,8 @@ GstBin's `async-handling` and `message-forward` are not listed.
 - **`copy-meta=false`:** the encoded buffers carry no `RdsBatchMeta` (DeepStream 8.0 behaviour).
 - Buffer flags come from the encoder either way (ours: DeepStream 8.0 copies the input's flags too, clearing
   DELTA_UNIT on every buffer).
-- **Reads:** the frame count of each input buffer, from its `RdsBatchMeta` (see "Batches" under [Stream](#stream)).
+- **Reads:** the frame count of each input buffer, from its `RdsBatchMeta` (see the Batches row under
+  [Stream](#stream)).
 
 ## Behaviour
 

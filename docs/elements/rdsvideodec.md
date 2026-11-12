@@ -1,7 +1,10 @@
 # rdsvideodec
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 Decodes H.264 and H.265 with rocDecode (the GPU's VCN decoder) into NV12 frames in `memory:RDS`, or in system memory
-when downstream can't take `memory:RDS`. DeepStream counterpart: `nvv4l2decoder`
+when downstream can't take `memory:RDS`, bit-exact with the stock VA decoders (`element_videodec` compares them).
+DeepStream counterpart: `nvv4l2decoder`
 ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideo4linux2.html)).
 Built when: always.
 

@@ -1,5 +1,7 @@
 # rdstracker config file
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 The low-level config file `rdstracker` reads (`ll-config-file`): NvMultiObjectTracker's YAML, with every key's type,
 default, range, the trackers that use it and its status. The element is on its own page, [rdstracker](rdstracker.md).
 

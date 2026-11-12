@@ -3,6 +3,11 @@
 What `rds/rds_compat.h` maps, and how well. Every DeepStream name here was checked against NVIDIA's public
 online documentation (the Source column links the page); Redstream's implementation is independent.
 
+This page lists DeepStream's names and their status: the compat header's aliases, the element mapping and, per
+element, a short status table of its properties. How each element behaves, its pads, metadata, differences from
+DeepStream 8.0 and known issues are on its reference page in [`docs/elements/`](elements/README.md), which each
+section links; the config files' keys are on the config pages there.
+
 Status values: **supported** (same meaning), **accepted no-op** (compiles and is ignored), **unsupported**
 (compiles, then fails at run time), **different default** (supported, but the default value differs), **planned**
 (aliased, element not written yet), **in progress** (partly written: the Notes say what is done). In element property
@@ -31,10 +36,11 @@ Factory names are remapped by `gst_element_factory_make` and `gst_parse_launch` 
 | `nvstreammux` | `rdsstreammux` | supported | the default (scaling) mux only; the new mux is not implemented yet. GstAggregator-based; properties below, behaviour on [its page](elements/rdsstreammux.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreammux) |
 | `nvstreamdemux` | `rdsstreamdemux` | supported | zero-copy read-only views of the batch slots; properties below, behaviour on [its page](elements/rdsstreamdemux.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvstreamdemux) |
 | `nvinfer` | `rdsinfer` | supported | primary and secondary detectors, secondary classifiers and tensor-output networks (`network-type` 0, 1 and 100) on MIGraphX; nvinfer config files (key file or YAML); properties below, behaviour on [its page](elements/rdsinfer.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvinfer) |
-| `nvtracker` | `rdstracker` | supported | the IOU and NvSORT trackers of NvMultiObjectTracker, on the CPU, with its YAML config files; NvDCF and NvDeepSORT configs run as NvSORT. Matches observed DeepStream 8.0 behaviour where the docs are silent; properties below, config keys and behaviour on [its page](elements/rdstracker.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker) |
+| `nvtracker` | `rdstracker` | supported | the IOU and NvSORT trackers of NvMultiObjectTracker, on the CPU, with its YAML config files; NvDCF and NvDeepSORT configs run as NvSORT. Matches observed DeepStream 8.0 behaviour where the docs are silent; properties below, behaviour on [its page](elements/rdstracker.md), config keys on [rdstracker-config](elements/rdstracker-config.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvtracker) |
 | `nvmultistreamtiler` | `rdsmultistreamtiler` | supported | NV12 and RGBA `memory:RDS` batches into one tiled frame of the same format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties below, behaviour on [its page](elements/rdsmultistreamtiler.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler) |
 | `nvdsosd` | `rdsosd` | supported | RGBA `memory:RDS` frames (single or batched), drawn on the GPU (`process-mode` 1, the default) or the CPU (`process-mode=0`), the same pixels either way, in the geometry of DeepStream 8.0's default GPU mode (Pango for text); masks and blur not yet; optional (`-Dosd`, needs cairo and pangocairo); properties below, behaviour on [its page](elements/rdsosd.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsosd) |
-| `nvdsanalytics` | `rdsanalytics` | supported | memory:RDS batches, any format; ROI filtering, overcrowding, direction (with STOPPED) and line crossing on the CPU, with DeepStream-shaped frame and object metas (`rds/rds-analytics-meta.h`, libgstrds-analytics) and nvdsanalytics config files; matches observed DeepStream 8.0 behaviour where the docs are silent, except where 8.0 is clearly broken; properties below, behaviour, drawing and config keys on [its page](elements/rdsanalytics.md). The `osd-mode` overlays are display meta, drawn by `rdsosd` | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsanalytics) |
+| `nvdsanalytics` | `rdsanalytics` | supported | memory:RDS batches, any format; ROI filtering, overcrowding, direction (with STOPPED) and line crossing on the CPU, with DeepStream-shaped frame and object metas (`rds/rds-analytics-meta.h`, libgstrds-analytics) and nvdsanalytics config files; matches observed DeepStream 8.0 behaviour where the docs are silent, except where 8.0 is clearly broken; properties below, behaviour and drawing on [its page](elements/rdsanalytics.md), config keys on
+[rdsanalytics-config](elements/rdsanalytics-config.md). The `osd-mode` overlays are display meta, drawn by `rdsosd` | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdsanalytics) |
 | `nvdslogger` | `rdslogger` | supported | passthrough, any caps; prints each stream's frame rate to stdout in DeepStream 8.0's `**PERF` line format; matches observed DeepStream 8.0 behaviour where the docs are silent; properties below, behaviour on [its page](elements/rdslogger.md) | [ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger) |
 | `nveglglessink` | `rdsvideosink` | supported | display bin: `rdsvideoconvert` to system-memory BGRx, then a stock GStreamer sink (`video-sink`, default `autovideosink`); one frame per buffer; properties below, behaviour on [its page](elements/rdsvideosink.md) | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
 | `nv3dsink` | `rdsvideosink` | supported | as `nveglglessink` (nv3dsink's properties are a subset of nveglglessink's) | [ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/sources_2apps_2apps-common_2includes_2deepstream__config_8h.html) |
@@ -138,8 +144,8 @@ exposed.
 
 Reference: [rdsstreammux](elements/rdsstreammux.md).
 
-Names, types and enum integers as on NVIDIA's nvstreammux page (checked 2026-10-24); the page marks the defaults it
-doesn't document as ours. Only the default ("legacy") mux is implemented.
+Names, types and enum integers as on NVIDIA's nvstreammux page (checked 2026-10-24); the element page marks the
+defaults NVIDIA's page doesn't document as ours. Only the default ("legacy") mux is implemented.
 
 | Property | Status | Difference |
 |---|---|---|
@@ -163,7 +169,7 @@ doesn't document as ours. Only the default ("legacy") mux is implemented.
 | `frame-num-reset-on-eos` | supported | |
 | `frame-num-reset-on-stream-reset` | supported | |
 | `frame-duration` | accepted no-op | |
-| `failsafe-flush-count` | accepted no-op | range 1-1024, not tied to `buffer-pool-size` |
+| `failsafe-flush-count` | accepted no-op | range 1–1024, not tied to `buffer-pool-size` |
 | `align-first-buffer` | accepted no-op | |
 | `align-inputs` | accepted no-op | |
 | `cache-buffer` | accepted no-op | |
@@ -376,8 +382,8 @@ Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream
 Reference: [rdsh264enc](elements/rdsh26xenc.md), the page it shares with `rdsh265enc`.
 
 Names, types, ranges and defaults as `gst-inspect-1.0` shows them for DeepStream 8.0's nvv4l2h264enc (the enum type
-names are ours). Every property other than `bitrate`, `force-idr` and `force-intra` is read at start; set later, it
-warns and applies at the next start (8.0's flags are wrong both ways).
+names are ours). Every other property that does something (not `bitrate`, `force-idr`, `force-intra` or the no-ops)
+is read at start; set later, it warns and applies at the next start (8.0's flags are wrong both ways).
 
 | Property | Status | Difference |
 |---|---|---|
@@ -860,7 +866,7 @@ recompiles unchanged. `rdsinfer` loads the parser named by `custom-lib-path` and
 | `NvDsInferParseCustomFunc` | `RdsInferParseCustomFunc` | supported | C++ only, `rds_compat_infer.h` | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
 | `CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | `RDS_CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE` | supported | C++ only, `rds_compat_infer.h`; a mismatched signature fails to compile | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
 | `NvDsInferAttribute` | `RdsInferAttribute` | supported | C++ only, `rds_compat_infer.h`; the parser `strdup`s `attributeLabel` and rdsinfer frees it (also after a false return or an exception); NULL is an empty label (ours) | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/structNvDsInferAttribute.html) |
-| `NvDsInferClassiferParseCustomFunc` | `RdsInferClassifierParseCustomFunc` | supported | C++ only, `rds_compat_infer.h`; NVIDIA's spelling for the alias, ours spelled out; see "Classifier output (classifier meta)" | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
+| `NvDsInferClassiferParseCustomFunc` | `RdsInferClassifierParseCustomFunc` | supported | C++ only, `rds_compat_infer.h`; NVIDIA's spelling for the alias, ours spelled out; see [Classifier output (classifier meta)](elements/rdsinfer.md#classifier-output-classifier-meta) | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
 | `CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE` | `RDS_CHECK_CUSTOM_CLASSIFIER_PARSE_FUNC_PROTOTYPE` | supported | C++ only, `rds_compat_infer.h`; a mismatched signature fails to compile | [ref](https://archive.docs.nvidia.com/metropolis/deepstream/7.1/sdk-api/nvdsinfer__custom__impl_8h.html) |
 
 Not aliased (no Redstream counterpart yet, or none on ROCm):

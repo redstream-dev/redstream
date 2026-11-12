@@ -1,5 +1,7 @@
 # rdsurisrcbin
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 A source bin for file and RTSP URIs: it decodes the first video stream to NV12 frames in `memory:RDS` and exposes them
 on the pad `vsrc_0`. RTSP sources can reconnect when they stall or drop. File sources can loop. DeepStream
 counterpart: `nvurisrcbin` ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvurisrcbin)).
@@ -101,21 +103,21 @@ listed; `async-handling` starts at `true` here, as in nvurisrcbin
 
 | Property | Type | Default | Values | Changeable | Description |
 |---|---|---|---|---|---|
-| `uri` | string | `NULL` | a URI | any state (applied at the next start: see "When each value is read") | the source; NULL and the empty string both count as unset. Checked going to READY; see "Errors". `rtsp*://` URIs (rtsp, rtsps, …) go through the RTSP path, every other one through `uridecodebin3` |
-| `type` | enum `GstRdsUriSrcBinType` | `auto` | `0` `auto`, `1` `uri`, `2` `rtsp` | any state (applied at the next start: see "When each value is read") | the path follows the URI's scheme whatever the value. `rtsp` with a URI that isn't `rtsp*://` is an error at start (ours: DeepStream 8.0 accepts the URI and plays it) |
-| `file-loop` | boolean | `false` | | any state | play a `file://` URI again from the start at its end, as one stream (see "File loop"). On another URI, a debug-log warning at start, and the URI plays once |
+| `uri` | string | `NULL` | a URI | any state (applied at the next start: see [When each value is read](#when-each-value-is-read)) | the source; NULL and the empty string both count as unset. Checked going to READY; see [Errors](#errors). `rtsp*://` URIs (rtsp, rtsps, …) go through the RTSP path, every other one through `uridecodebin3` |
+| `type` | enum `GstRdsUriSrcBinType` | `auto` | `0` `auto`, `1` `uri`, `2` `rtsp` | any state (applied at the next start: see [When each value is read](#when-each-value-is-read)) | the path follows the URI's scheme whatever the value. `rtsp` with a URI that isn't `rtsp*://` is an error at start (ours: DeepStream 8.0 accepts the URI and plays it) |
+| `file-loop` | boolean | `false` | | any state | play a `file://` URI again from the start at its end, as one stream (see [File loop](#file-loop)). On another URI, a debug-log warning at start, and the URI plays once |
 | `drop-frame-interval` | uint | `0` | 0–30 | any state | keep decoded frames 0, N, 2N, … and drop the rest, counted across file loops, durations unchanged; 0 and 1 keep every frame (DeepStream 8.0 behaviour). Dropped before any conversion; RTSP too |
-| `latency` | uint | `100` | 0–4294967295 | any state (applied at the next start: see "When each value is read") | milliseconds: `rtspsrc`'s `latency` (RTSP) |
-| `drop-on-latency` | boolean | `true` | | any state (applied at the next start: see "When each value is read") | `rtspsrc`'s `drop-on-latency` (RTSP) |
-| `select-rtp-protocol` | enum `GstRdsUriSrcBinRtpProtocol` | `rtp-udp-udpmcast-tcp` | `0` `rtp-unknown` (the docs' `rtp-multi`), `1` `rtp-udp`, `2` `rtp-udp-mcast`, `4` `rtp-tcp`, `7` `rtp-udp-udpmcast-tcp`, `10` `rtp-http`, `20` `rtp-tls` | any state (applied at the next start: see "When each value is read") | `rtspsrc`'s `protocols` (RTSP): UDP, UDP multicast, TCP, all three, HTTP + TCP, TLS + TCP; 0 leaves `rtspsrc`'s default (UDP, UDP multicast and TCP). DeepStream 8.0 behaviour; the docs' default is 0 |
-| `udp-buffer-size` | uint | `524288` | 0–4294967295 | any state (applied at the next start: see "When each value is read") | bytes: `rtspsrc`'s `udp-buffer-size` (RTSP); a value above 2147483647 is passed as 2147483647 |
-| `rtsp-reconnect-interval` | uint | `0` | 0–4294967295 | any state (applied at the next start: see "When each value is read") | seconds without a buffer from the RTSP session before an attempt; 0: no reconnection. See "Reconnection". DeepStream 8.0 behaviour; the docs' example value is 10 |
-| `rtsp-reconnect-attempts` | int | `-1` | −2147483648–2147483647; negative: unlimited | any state (applied at the next start: see "When each value is read") | consecutive failed attempts before giving up; a buffer resets the count (ours: any negative value is unlimited; the docs give −1 and a range from −1). The docs' example value is 4 |
-| `init-rtsp-reconnect-interval` | uint | `0` | 0–4294967295 | any state (applied at the next start: see "When each value is read") | seconds between retries while the first connection fails (ours: DeepStream 8.0 accepts it and does nothing); 0: retry every `rtsp-reconnect-interval` (DeepStream 8.0 behaviour); with both 0 the first failure is an error |
-| `source-id` | int | `-1` | −1–2147483647 | any state | the `source-id` of the bin's messages (see "Messages"). DeepStream 8.0 behaviour; the docs' example value is 0 |
+| `latency` | uint | `100` | 0–4294967295 | any state (applied at the next start: see [When each value is read](#when-each-value-is-read)) | milliseconds: `rtspsrc`'s `latency` (RTSP) |
+| `drop-on-latency` | boolean | `true` | | any state (applied at the next start: see [When each value is read](#when-each-value-is-read)) | `rtspsrc`'s `drop-on-latency` (RTSP) |
+| `select-rtp-protocol` | enum `GstRdsUriSrcBinRtpProtocol` | `rtp-udp-udpmcast-tcp` | `0` `rtp-unknown` (the docs' `rtp-multi`), `1` `rtp-udp`, `2` `rtp-udp-mcast`, `4` `rtp-tcp`, `7` `rtp-udp-udpmcast-tcp`, `10` `rtp-http`, `20` `rtp-tls` | any state (applied at the next start: see [When each value is read](#when-each-value-is-read)) | `rtspsrc`'s `protocols` (RTSP): UDP, UDP multicast, TCP, all three, HTTP + TCP, TLS + TCP; 0 leaves `rtspsrc`'s default (UDP, UDP multicast and TCP). DeepStream 8.0 behaviour; the docs' default is 0 |
+| `udp-buffer-size` | uint | `524288` | 0–4294967295 | any state (applied at the next start: see [When each value is read](#when-each-value-is-read)) | bytes: `rtspsrc`'s `udp-buffer-size` (RTSP); a value above 2147483647 is passed as 2147483647 |
+| `rtsp-reconnect-interval` | uint | `0` | 0–4294967295 | any state (applied at the next start: see [When each value is read](#when-each-value-is-read)) | seconds without a buffer from the RTSP session before an attempt; 0: no reconnection. See [Reconnection](#reconnection). DeepStream 8.0 behaviour; the docs' example value is 10 |
+| `rtsp-reconnect-attempts` | int | `-1` | −2147483648–2147483647; negative: unlimited | any state (applied at the next start: see [When each value is read](#when-each-value-is-read)) | consecutive failed attempts before giving up; a buffer resets the count (ours: any negative value is unlimited; the docs give −1 and a range from −1). The docs' example value is 4 |
+| `init-rtsp-reconnect-interval` | uint | `0` | 0–4294967295 | any state (applied at the next start: see [When each value is read](#when-each-value-is-read)) | seconds between retries while the first connection fails (ours: DeepStream 8.0 accepts it and does nothing); 0: retry every `rtsp-reconnect-interval` (DeepStream 8.0 behaviour); with both 0 the first failure is an error |
+| `source-id` | int | `-1` | −1–2147483647 | any state | the `source-id` of the bin's messages (see [Messages](#messages)). DeepStream 8.0 behaviour; the docs' example value is 0 |
 | `gpu-id` | uint | `0` | 0–4294967295 | any state | accepted no-op, without a warning for a non-default value: the decoder uses GPU 0 |
-| `disable-audio` | boolean | `true` | | any state (applied at the next start: see "When each value is read") | audio is never decoded or exposed, whatever the value. Files: only the first video stream is selected. RTSP: `true` refuses every stream that isn't video before SETUP; `false` sets them up and discards them inside the bin |
-| `smart-record` | enum `GstRdsUriSrcBinSmartRecord` | `smart-rec-disable` | `0` `smart-rec-disable`, `1` `smart-rec-cloud`, `2` `smart-rec-multi` | any state (applied at the next start: see "When each value is read") | unsupported: anything but 0 is an error at start, "Smart record is not supported: set smart-record=0" (CORE, NOT_IMPLEMENTED) |
+| `disable-audio` | boolean | `true` | | any state (applied at the next start: see [When each value is read](#when-each-value-is-read)) | audio is never decoded or exposed, whatever the value. Files: only the first video stream is selected. RTSP: `true` refuses every stream that isn't video before SETUP; `false` sets them up and discards them inside the bin |
+| `smart-record` | enum `GstRdsUriSrcBinSmartRecord` | `smart-rec-disable` | `0` `smart-rec-disable`, `1` `smart-rec-cloud`, `2` `smart-rec-multi` | any state (applied at the next start: see [When each value is read](#when-each-value-is-read)) | unsupported: anything but 0 is an error at start, "Smart record is not supported: set smart-record=0" (CORE, NOT_IMPLEMENTED) |
 | `smart-rec-status` | boolean | `false` | | read-only | always `false`: smart record never runs |
 | `smart-rec-dir-path` | string | `NULL` | | any state | accepted no-op |
 | `smart-rec-file-prefix` | string | `"Smart_Record"` | | any state | accepted no-op |
@@ -178,7 +180,7 @@ accepts a change to any property in any state, without a warning; the value is u
 
 | Property | Read when |
 |---|---|
-| `uri`, `type`, `smart-record` | going from NULL to READY, where the path is chosen and the start checks run (for RTSP, `uri` also at every new session: see "Known issues and limits") |
+| `uri`, `type`, `smart-record` | going from NULL to READY, where the path is chosen and the start checks run (for RTSP, `uri` also at every new session: see [Known issues and limits](#known-issues-and-limits)) |
 | `latency`, `drop-on-latency`, `select-rtp-protocol`, `udp-buffer-size`, `disable-audio` | every new RTSP session: going from READY to PAUSED and at each reconnection attempt |
 | `rtsp-reconnect-interval`, `rtsp-reconnect-attempts`, `init-rtsp-reconnect-interval` | going from READY to PAUSED |
 
@@ -196,7 +198,8 @@ accepts a change to any property in any state, without a warning; the value is u
 - Without reconnection (`rtsp-reconnect-interval` 0, the default), an `rtspsrc` error reaches the bus as it is, and
   the end of the stream (the server's EOS, or a closed TCP connection) is an EOS on `vsrc_0`.
 
-**File loop** (DeepStream 8.0 behaviour). At the end of a `file://` URI the file plays again from the start:
+<a id="file-loop"></a>**File loop** (DeepStream 8.0 behaviour). At the end of a `file://` URI the file plays again from
+the start:
 - nothing downstream sees the loop: no EOS, flush, second segment or stream-start. The one segment is open-ended;
 - PTS go on from the end of the previous pass, and DTS too (ours: DeepStream 8.0 offsets PTS only);
 - each pass's first buffer is DISCONT;
@@ -206,15 +209,16 @@ accepts a change to any property in any state, without a warning; the value is u
 - if seeking back to the start fails, a WARNING message ("Could not seek back to the start of the file for
   file-loop", STREAM, FAILED) and an EOS on `vsrc_0`.
 
-**Reconnection.** An attempt replaces the RTSP session; the parser and `rdsvideodec` stay. Attempts run on
-GStreamer's thread pool, one at a time; the watchdog ticks once a second on the system clock while PLAYING.
+<a id="reconnection"></a>**Reconnection.** An attempt replaces the RTSP session; the parser and `rdsvideodec` stay.
+Attempts run on GStreamer's thread pool, one at a time; the watchdog ticks once a second on the system clock while
+PLAYING.
 
 | Behaviour | DeepStream 8.0 | `rdsurisrcbin` |
 |---|---|---|
 | no buffer for `rtsp-reconnect-interval` s | an attempt (watchdog) | the same; reason `timeout` |
 | an ERROR, or the server's EOS (or a closed TCP connection) | waits for the watchdog | an attempt at once (ours); reason `error` or `eos`; the EOS never leaves the bin. The EOS the application sends goes through |
 | the session's ERRORs while reconnection is on | posted as WARNINGs | the same; the bin's own about a session it can't use (no video stream, a codec it can't decode) too, each a failed attempt (ours) |
-| the application's EOS | not observed while the source is down | ends the stream in any state (ours): no attempt after it, EOS on `vsrc_0` through the decoder. With no `vsrc_0` yet the attempts just stop (see "Known issues and limits") |
+| the application's EOS | not observed while the source is down | ends the stream in any state (ours): no attempt after it, EOS on `vsrc_0` through the decoder. With no `vsrc_0` yet the attempts just stop (see [Known issues and limits](#known-issues-and-limits)) |
 | each attempt | a WARNING for the first two attempts only | a WARNING (STREAM, FAILED) on every attempt, and the element message `rds-reconnect` (both ours) |
 | a failed attempt (an error, or no buffer within the interval) | the next attempt | the next attempt an interval after it started; nothing goes downstream |
 | attempts run out (`rtsp-reconnect-attempts` N ≥ 0 failed) | the element message `attempt-exceeded`; nothing downstream, so a muxer waits for the source forever | a WARNING (ours: "Could not reconnect to the RTSP source: giving up after N attempts"), then the same message, then EOS on `vsrc_0` (ours: `rdsstreammux` ends the source and batches the others). Before any connection, the message and then an ERROR (RESOURCE, OPEN_READ; ours). No attempt after it |
@@ -230,8 +234,8 @@ An ERROR or WARNING from a session being stopped, or from the current one while 
 about the teardown. A picture of the old session that the decoder still held goes out before the reconnection's
 flush (`rdsvideodec` holds the last picture until the next one arrives).
 
-**Errors** going from NULL to READY, as element errors. The messages name the URI's scheme, never the whole URI, which
-may hold credentials:
+<a id="errors"></a>**Errors** going from NULL to READY, as element errors. The messages name the URI's scheme, never the
+whole URI, which may hold credentials:
 - no URI: "No URI: set the uri property" (RESOURCE, NOT_FOUND);
 - not a valid URI: "The uri property is not a valid URI: it needs a scheme, …" (RESOURCE, NOT_FOUND);
 - a scheme no source element handles: "No source element handles the scheme '…' of the uri property" (CORE,
@@ -264,6 +268,7 @@ CODEC_NOT_FOUND), or with reconnection on, a WARNING and a failed attempt.
 ## Known issues and limits
 
 - One video stream per source; audio is never exposed.
+- RTSP is tested against gst-rtsp-server, with a fault relay in front, not yet against real cameras.
 - RTSP: H.264 and H.265 only. Files: whatever `uridecodebin3` decodes, through `rdsvideoconvert` when the decoder isn't
   `rdsvideodec`.
 - `gpu-id` is not passed on: decoding and conversion run on GPU 0.

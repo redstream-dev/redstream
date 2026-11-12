@@ -1,5 +1,7 @@
 # rdsmultistreamtiler
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 Composes a batch from `rdsstreammux` into one frame on the GPU: a rows × columns grid with one cell per source, and
 one merged frame meta whose objects and display metas are scaled into the cells. DeepStream counterpart:
 `nvmultistreamtiler` ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvmultistreamtiler)).
@@ -41,7 +43,7 @@ effect").
 
 | Property | Type | Default | Values | Changeable | Description |
 |---|---|---|---|---|---|
-| `rows`, `columns` | uint | `1` | 1–4294967295 | any state | the grid; grown when the sources don't fit (see "Grid"). A change applies from the next batch |
+| `rows`, `columns` | uint | `1` | 1–4294967295 | any state | the grid; grown when the sources don't fit (see the Grid row under [Behaviour](#behaviour)). A change applies from the next batch |
 | `width` | uint | `1920` | 16–4294967295 | any state | the output width, rounded up to a multiple of 4; at most 16384 negotiates. A change renegotiates the output caps |
 | `height` | uint | `1080` | 16–4294967295 | any state | the output height, as `width` |
 | `show-source` | int | `-1` | −1–2147483647 | any state | a pad index: that source alone, scaled to the whole output; `-1` tiles them all. Read on every batch |
@@ -80,7 +82,7 @@ are silent, or **ours**: where 8.0 settles nothing or is clearly broken. The pix
 | Cell geometry | matches nvmultistreamtiler (DeepStream 8.0) | output size rounded up to a multiple of 4 (1001×701 gives 1004×704); cells ⌊W / columns⌋ × ⌊H / rows⌋, each rounded down to even, at (column·cell width, row·cell height) |
 | Scaling | matches nvmultistreamtiler (DeepStream 8.0) | each frame stretched over its whole cell (no letterbox), with its own size |
 | Unused cells and the strip right and below the cells | matches nvmultistreamtiler (DeepStream 8.0) | black on every output frame: NV12 Y 16, U/V 128; RGBA all bytes 0 (ours for the alpha byte, as `rdsvideoconvert`'s fill) |
-| Output meta | matches nvmultistreamtiler (DeepStream 8.0) | one merged frame meta, as under "Metadata" |
+| Output meta | matches nvmultistreamtiler (DeepStream 8.0) | one merged frame meta, as under [Metadata](#metadata) |
 | Order of the merged objects | ours | by pad index, each pad's objects (then display metas) in its list order |
 | Meta coordinates | matches nvmultistreamtiler (DeepStream 8.0) | `rect_params` of objects and display rects: x' = cell x + x·sx, y' = cell y + y·sy, w·sx, h·sy as floats (sx = cell width / frame width); text offsets, line and arrow end points and circle centres the same, truncated to integers; circle radius × min (sx, sy), truncated. Unchanged: `font_size`, all widths, `detector_bbox_info`, `tracker_bbox_info`, `mask_params`, ids, class, confidence, labels. Not clipped to the cell. Example: a 1280-wide frame in a 640-wide cell at (640, 0), so sx 0.5: x 100 becomes 640 + 100 × 0.5 = 690 |
 | A source missing from a batch | matches nvmultistreamtiler (DeepStream 8.0) | its cell keeps its last pixels and its last objects and display metas are repeated, until its `rds-stream-eos` (or `rds-pad-deleted`); then the cell is black and its meta gone. Its pixels survive a grid change (moved into the new cell) |

@@ -8,6 +8,24 @@ The examples run from the repository root after a build, with `GST_PLUGIN_PATH_1
 build tree's plugins (they find `libgstrds` through their run path). A program built against `libgstrds` from the
 build tree also needs `LD_LIBRARY_PATH=build/gst-libs/rds`.
 
+## Typical pipeline
+
+```text
+rdsurisrcbin, one per source
+  └─ rdsstreammux ─ rdsinfer ─ rdstracker ─ rdsanalytics ─┬─ rdsmultistreamtiler ─ rdsvideoconvert ─ rdsosd ─┐
+                                                          │   ┌──────────────────────────────────────────────┘
+                                                          │   └─ rdsvideosink, or rdsh264enc / rdsh265enc
+                                                          └─ rdsstreamdemux ─ a queue and a branch per source
+rdslogger: anywhere after the mux, to print each stream's frame rate
+```
+
+Sources are decoded by `rdsurisrcbin` (or `rdsvideodec`, with `rdsvideoconvert` for other formats and sizes) and batched
+by `rdsstreammux`. `rdsinfer` can run again after the tracker (secondary classifiers on the tracked objects). After
+analytics, a batch is either tiled into one frame, drawn on and shown or encoded, or split again per source by
+`rdsstreamdemux`. The config files of `rdsinfer`, `rdstracker` and `rdsanalytics` have pages of their own:
+[rdsinfer-config](rdsinfer-config.md), [rdstracker-config](rdstracker-config.md) and
+[rdsanalytics-config](rdsanalytics-config.md).
+
 ## How to read these pages
 
 The Changeable column of the property tables says when a property can be set:
@@ -36,7 +54,10 @@ The Description column uses these words from the compatibility matrix:
 - **accepted**: stored and read back, and does what the row says rather than what DeepStream does with it.
 
 Behaviour tables have the columns `| Behaviour | Status | Notes |`. A status is "matches nvX (DeepStream 8.0)", observed
-DeepStream 8.0 behaviour where NVIDIA's docs are silent, or "ours", where Redstream decides.
+DeepStream 8.0 behaviour where NVIDIA's docs are silent, or "ours", where Redstream decides; a row that is both says
+"matches nvX (DeepStream 8.0); ours: …" and names the part that is ours. Every such choice has a row in a behaviour
+table or an entry in the page's Differences from DeepStream 8.0 section; pages with little behaviour of their own
+(`rdslogger`, `rdsvideosink`) have no table.
 
 ## Elements
 

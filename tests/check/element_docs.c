@@ -1,6 +1,6 @@
 /* docs/elements/<page>.md, for every factory in rds-element-pages.h: the page has a row for each property, pad
  * template and signal of the element, and none for one it lacks; each property row has the property's type and
- * default (cpu). Also: every relative link in docs/ and docs/elements/ resolves.
+ * default (cpu). Also: every relative link in docs/, docs/elements/, README.md and AGENTS.md resolves.
  *
  * The page format:
  * - A table belongs to the "## " or "### " heading above it, up to the next heading of the same or a higher level,
@@ -1088,6 +1088,14 @@ test_links (void)
 
   n_bad += check_links_in_dir (RDS_DOCS, &n_files, &n_links);
   n_bad += check_links_in_dir (RDS_DOCS_ELEMENTS, &n_files, &n_links);
+  /* the top-level files that link into docs/ */
+  for (guint i = 0; i < 2; i++) {
+    gchar *path = g_build_filename (RDS_SOURCE_ROOT, i == 0 ? "README.md" : "AGENTS.md", NULL);
+
+    n_bad += check_links_in (path, &n_links);
+    n_files++;
+    g_free (path);
+  }
   g_test_message ("%u relative links in %u files checked", n_links, n_files);
   g_assert_cmpuint (n_bad, ==, 0);
 }

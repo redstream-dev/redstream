@@ -1,5 +1,7 @@
 # rdsosd
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 Draws object boxes and labels, display meta (rectangles, text, lines, arrows, circles) and the clock on RGBA
 `memory:RDS` frames, in place, in the geometry of DeepStream 8.0's default GPU mode. It draws on the GPU by default,
 so the frames never leave it, or on the CPU with `process-mode=0`: the same pixels either way, with Pango for the
@@ -104,7 +106,7 @@ where the docs are silent, or **ours**: where 8.0 settles nothing or is clearly 
 | Other `arrow_head` values, zero-length arrows | ours | the shaft only |
 | Circles | matches nvdsosd (DeepStream 8.0) | a ring straddling the radius: `circle_width` w covers the pixels at distances r − ⌊w/2⌋ .. r + ⌈w/2⌉ from the centre (w 3, r 60: 59..62); `has_bg_color` fills inside the ring with `bg_color`; clipped at the frame |
 | `circle_width` 0 | matches nvdsosd (DeepStream 8.0) | still outlined, 3 px centred on the radius (r 60: 59..61), so zeroed circles stay visible |
-| Huge coordinates and widths | ours | drawn only up to the size limits under "Known issues and limits" |
+| Huge coordinates and widths | ours | drawn only up to the size limits under [Known issues and limits](#known-issues-and-limits) |
 | Clock | matches nvdsosd (DeepStream 8.0) | `YYYY-MM-DD HH:MM:SS`, the process's local time read once per buffer, drawn like text without a box at the clock offsets; default font a serif; one per frame |
 | A buffer without frame meta | ours | passes through untouched, except that it gets the clock on every frame when `display-clock` is on |
 | Masks | ours | not drawn yet (`display-mask` accepted, one warning); 8.0 draws them only with `display-mask=1` |

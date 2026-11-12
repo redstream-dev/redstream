@@ -1,5 +1,7 @@
 # rdsinfer config file
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 The config file `rdsinfer` reads (`config-file-path`), with every key: its type, default, range, status and meaning.
 It has nvinfer's groups and keys, so DeepStream's nvinfer config files load as they are, where the features map. The
 element is on its own page, [rdsinfer](rdsinfer.md).

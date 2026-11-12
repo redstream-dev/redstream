@@ -41,69 +41,40 @@ Jetson-specific hardware blocks.
 
 ## What works
 
-- **`libgstrds`:** batched GPU surfaces (`RdsBufSurface`, the `memory:RDS` caps feature), buffer pools,
-  DeepStream-shaped metadata (batch, frame, object, user and display meta) and stream events.
-- **`rds_buf_surf_transform`:** batched crop, scale (nearest, bilinear) and colour conversion between NV12, I420,
-  RGBA, BGRA, RGBx, BGRx, RGB, BGR and GRAY8 on the GPU, shaped like `NvBufSurfTransform`; and
-  `rds_buf_surf_transform_composite`, many surfaces into one (`NvBufSurfTransformComposite`).
-- **`rdsurisrcbin`** (`nvurisrcbin`): a source bin for file and RTSP URIs, decoded with `rdsvideodec` to
-  `memory:RDS` NV12 on `vsrc_0`, with `nvurisrcbin`'s properties: `file-loop`, `drop-frame-interval`, RTSP latency
-  and transport, and reconnection (`rtsp-reconnect-interval`, `rtsp-reconnect-attempts`,
-  `init-rtsp-reconnect-interval`). An RTSP source that stalls, drops the connection or refuses it is reconnected
-  without ending the stream (same pad, running time going on), also when it comes back at another size or in another
-  codec; the reconnection messages are DeepStream 8.0's, plus a few of ours. Tested against gst-rtsp-server (with a
-  fault relay), not yet against real cameras.
-- **`rdsvideodec`** (`nvv4l2decoder`): H.264 and H.265 (8-bit 4:2:0) decoding with rocDecode into `memory:RDS` NV12,
-  bit-exact with the stock VA decoders. It ranks above them, so `uridecodebin` picks it; it falls back to system
-  memory for ordinary sinks.
-- **`rdsvideoconvert`** (`nvvideoconvert`): conversion, scaling and cropping between `memory:RDS` and system memory,
-  with `nvvideoconvert`'s property names.
-- **`rdsstreammux`** (`nvstreammux`, the default mux): batches frames from any number of sources into one
-  `memory:RDS` buffer, each frame scaled into a fixed `width`×`height` slot (optionally with aspect-ratio padding),
-  with per-frame metadata, `batched-push-timeout`, live sources, DeepStream's stream events (pad added/deleted,
-  per-stream EOS, …) and sources added or removed while playing. The zero-copy "new" mux and its config file are not
-  implemented yet.
-- **`rdsstreamdemux`** (`nvstreamdemux`): splits a batch back into per-source streams without copying: each output
-  buffer is a read-only view of its slot (a writer gets its own copy), with the source's own timestamps, segment and
-  stream events.
-- **`rdsinfer`** (`nvinfer`): a primary or secondary detector, or a secondary classifier, on MIGraphX. It reads
-  nvinfer config files (key file or YAML), runs ONNX models (YOLO11n tested) on whole batches on the GPU, and
-  attaches object meta and, optionally, tensor output meta. Bounding boxes come from the built-in YOLO parser or from
-  a DeepStream custom bbox parser library, recompiled against `rds/rds_compat_infer.h`. Secondary mode
-  (`process-mode=2`) runs detectors, classifiers (classifier meta, with the built-in argmax parser or a DeepStream
-  custom classifier parser) and tensor-output models on the crops of objects that upstream elements found.
-  A compiled MIGraphX program has a fixed batch, so a partial batch normally costs as much as a full one. With
-  `dynamic-batch=1` (ours, off by default) `rdsinfer` also compiles programs for the powers of two below
-  `batch-size` and runs each batch or chunk on the smallest that holds it: YOLO11n with one frame in a
-  `batch-size` 4 pipeline takes about 31 ms instead of 95 ms. It costs one compile per size on a cold cache and about
-  80–115 MB of GPU memory per extra program. In primary mode the highest occupied slot decides, not the number of
-  frames: one frame in slot 3 still runs on the batch-4 program.
-- **`rdstracker`** (`nvtracker`): gives detected objects persistent IDs with the IOU and NvSORT trackers of
-  NvMultiObjectTracker, on the CPU, reading the same YAML low-level config files (NvDCF and NvDeepSORT configs run
-  as NvSORT). Where NVIDIA's docs leave behaviour open, it follows observed DeepStream 8.0 behaviour, and the compat
-  matrix lists every point where it differs. Our own tuned configs are in `samples/tracker/`.
-- **`rdsanalytics`** (`nvdsanalytics`): ROI filtering, overcrowding, direction (with the stopped state) and line
-  crossing on the tracked objects, on the CPU, from nvdsanalytics config files, with DeepStream-shaped frame and
-  object metas and the `osd-mode` overlays as display meta (see "Analytics" below).
-- **`rdsmultistreamtiler`** (`nvmultistreamtiler`): composes a batch into one rows × columns frame on the GPU and
-  merges the sources' metadata into it, scaled into the tiles, as DeepStream 8.0 does; `show-source` shows one
-  source alone.
-- **`rdsosd`** (`nvdsosd`): draws object boxes and labels, and display meta (rectangles, text, lines, arrows,
-  circles) and the clock, in the geometry of DeepStream 8.0's GPU mode. It draws on the GPU by default, so frames
-  never leave it, or on the CPU with `process-mode=0`, the same pixels either way (Pango renders the text). Masks
-  and blur are not drawn yet.
-- **`rdslogger`** (`nvdslogger`): prints each stream's frame rate in DeepStream's `**PERF` line format.
-- **`rdsvideosink`** (`nveglglessink`, `nv3dsink`): shows frames in a window through a stock GStreamer sink
-  (`autovideosink` by default), with the DeepStream sinks' property names.
-- **`rdsh264enc`, `rdsh265enc`** (`nvv4l2h264enc`, `nvv4l2h265enc`): H.264 and H.265 encoding, as bins over
-  GStreamer's VA-API encoders (`vah264enc`, `vah265enc`), from `memory:RDS` or system memory. DeepStream 8.0's
-  property names and defaults are mapped onto VA's (`bitrate`, also while playing, `control-rate`, `idrinterval`,
-  `profile`, `num-B-Frames`, …); the rest are accepted and do nothing. Parameter sets precede every IDR frame, CBR
-  filler is stripped, and without B frames the output has the input's timestamps. Also `copy-meta`, forced key frames
-  (`force-idr`, force-key-unit events), a profile and level set by downstream caps, and resolution changes mid-stream.
-  Sizes outside VA's range (128 to 4096 for H.264) are refused. The compat matrix has the details, and the
-  DeepStream 8.0 bugs they don't reproduce.
-- **`rds-compile`** (`trtexec`): compiles and caches `rdsinfer`'s MIGraphX program ahead of time.
+Each element has a reference page in [`docs/elements/`](docs/elements/README.md): its pads, properties, metadata,
+behaviour, how it differs from DeepStream 8.0, and its known issues.
+
+- **Sources and decode.** [`rdsurisrcbin`](docs/elements/rdsurisrcbin.md) (`nvurisrcbin`) plays file and RTSP URIs, with
+  `nvurisrcbin`'s properties; it reconnects RTSP sources without ending the stream, also when they come back at another
+  size or in another codec (tested against gst-rtsp-server with a fault relay, not yet against real cameras).
+  [`rdsvideodec`](docs/elements/rdsvideodec.md) (`nvv4l2decoder`) decodes H.264 and H.265 with rocDecode into
+  `memory:RDS`, bit-exact with the VA decoders, and [`rdsvideoconvert`](docs/elements/rdsvideoconvert.md)
+  (`nvvideoconvert`) converts, scales and crops on the GPU.
+- **Batching.** [`rdsstreammux`](docs/elements/rdsstreammux.md) (`nvstreammux`, the default mux) batches any number
+  of sources into fixed-size GPU slots, with DeepStream's stream events and sources added or removed while playing;
+  [`rdsstreamdemux`](docs/elements/rdsstreamdemux.md) (`nvstreamdemux`) splits a batch again without copying.
+- **Inference.** [`rdsinfer`](docs/elements/rdsinfer.md) (`nvinfer`) runs ONNX models on MIGraphX from nvinfer
+  config files ([keys](docs/elements/rdsinfer-config.md)): primary and secondary detectors, secondary classifiers with
+  the per-object cache, tensor output, and DeepStream custom parser libraries recompiled against
+  `rds/rds_compat_infer.h`. It runs YOLO11n on four 720p sources at about 50 fps on a small iGPU (see
+  [Hardware](#hardware)), and with `dynamic-batch` a partial batch costs less (one frame of four: about 31 ms
+  instead of 95 ms). `rds-compile` (`trtexec`) compiles its programs ahead of time.
+- **Tracking and analytics.** [`rdstracker`](docs/elements/rdstracker.md) (`nvtracker`) runs the IOU and NvSORT
+  trackers on the CPU from NvMultiObjectTracker configs ([keys](docs/elements/rdstracker-config.md)); our tuned
+  configs are in `samples/tracker/`. [`rdsanalytics`](docs/elements/rdsanalytics.md) (`nvdsanalytics`) does ROI
+  filtering, overcrowding, direction and line crossing from nvdsanalytics configs
+  ([keys](docs/elements/rdsanalytics-config.md)), with DeepStream-shaped metas.
+- **Display and encode.** [`rdsmultistreamtiler`](docs/elements/rdsmultistreamtiler.md) (`nvmultistreamtiler`)
+  tiles a batch into one frame; [`rdsosd`](docs/elements/rdsosd.md) (`nvdsosd`) draws boxes, labels, display meta
+  and the clock, on the GPU by default; [`rdsvideosink`](docs/elements/rdsvideosink.md) (`nveglglessink`,
+  `nv3dsink`) shows frames through a stock sink; [`rdslogger`](docs/elements/rdslogger.md) (`nvdslogger`) prints
+  `**PERF` lines; [`rdsh264enc` and `rdsh265enc`](docs/elements/rdsh26xenc.md) (`nvv4l2h264enc`, `nvv4l2h265enc`)
+  encode through GStreamer's VA encoders, with DeepStream 8.0's properties.
+- **Libraries.** `libgstrds` has the batched GPU surfaces (`RdsBufSurface`, the `memory:RDS` caps feature), buffer
+  pools, DeepStream-shaped metadata (batch, frame, object, user and display meta) and stream events.
+  `rds_buf_surf_transform` does batched crop, scale (nearest, bilinear) and colour conversion between NV12, I420,
+  RGBA, BGRA, RGBx, BGRx, RGB, BGR and GRAY8 on the GPU, shaped like `NvBufSurfTransform`, and
+  `rds_buf_surf_transform_composite` composes many surfaces into one (`NvBufSurfTransformComposite`).
 - **Compat header** `rds/rds_compat.h`: DeepStream names for the above, plus runtime remapping of element names
   (`nvurisrcbin` → `rdsurisrcbin`, `nvv4l2decoder` → `rdsvideodec`, `nvstreammux` → `rdsstreammux`, `nvinfer` →
   `rdsinfer`, `nvtracker` → `rdstracker`, `nvdsanalytics` → `rdsanalytics`, `nvdsosd` → `rdsosd`, …).
@@ -223,23 +194,11 @@ and the rest, 93.7 %, were served from the cache. Classifying every vehicle on e
 
 ### Analytics
 
-`rdsanalytics` (`nvdsanalytics`) goes after the tracker. It reads nvdsanalytics config files
-(`[property]` with `config-width` and `config-height`, then `[roi-filtering-stream-<n>]`, `[overcrowding-stream-<n>]`,
-`[direction-detection-stream-<n>]` and `[line-crossing-stream-<n>]` groups, `<n>` the stream's mux pad), scales the
-rules to the mux output and, per frame, attaches the frame meta (`objInROIcnt`, `ocStatus`, `objLCCurrCnt`,
-`objLCCumCnt`, `objCnt`) and, on each object with something to report, the object meta (`roiStatus`, `ocStatus`,
-`lcStatus`, `dirStatus`, `objStatus`), as user metas of DeepStream 8.0's types 32 and 33. `osd-mode` 1 and 2 add
-the rules, counts and statuses as display meta for `rdsosd`.
-
-The metas are DeepStream's C++ structs, with the same field names and types, in `rds/rds-analytics-meta.h`
-(library `redstream-analytics-1.0`, which replaces `nvds_analytics_meta.h`), so C++ code reads them as on
-DeepStream (`m->objInROIcnt["RF"]`); C code uses its C API (`rds_analytics_frame_meta_get_roi_count`,
-`rds_analytics_frame_meta_foreach_lc_cum_count`, `rds_analytics_obj_info_get_obj_status`, …).
-
-Where the docs are silent it follows observed DeepStream 8.0 behaviour, except where 8.0 is clearly broken: objects
-without a tracker id no longer turn off direction and line crossing for their stream, a config that 8.0 would crash
-on or misread (empty values, short lines, `config-width=0`, duplicate labels, …) fails at start naming the key, and
-stream resets clear a stream's state. The compat matrix lists every such choice.
+`rdsanalytics` goes after the tracker. It reads nvdsanalytics config files, attaches DeepStream 8.0's frame and
+object metas (user meta types 32 and 33; C++ code reads them as on DeepStream, C code through a C API), and with
+`osd-mode` 1 or 2 adds the rules, counts and statuses as display meta for `rdsosd`. Where DeepStream 8.0 is clearly
+broken it does the sane thing instead. [Its page](docs/elements/rdsanalytics.md) has the metas, the behaviour and
+every such choice; [rdsanalytics-config](docs/elements/rdsanalytics-config.md) has the config keys.
 
 ```bash
 GST_PLUGIN_PATH_1_0=build/gst gst-launch-1.0 filesrc location=.cache/media/crosswalk-720p.h264 ! h264parse \
@@ -280,10 +239,11 @@ or GPU to GPU. Frames leave the GPU only where a stock GStreamer element takes o
 
 - **Encoding (`rdsh264enc`, `rdsh265enc`).** These are bins over GStreamer's VA-API encoders (`vah264enc`,
   `vah265enc`). Those encoders take NV12 in system memory or AMD-tiled VA surfaces, but Redstream's GPU surfaces are
-  linear, so the bins convert to NV12 on the GPU and copy each frame into plain system memory, about 0.5 ms per
-  1080p frame on the Ryzen 7000 iGPU (on an APU the "system memory" is the same DRAM); the VA encoder then uploads
-  it. The encode runs on a thread of its own, so it overlaps the next frame's conversion. A zero-copy path, with the
-  GPU writing straight into VA surfaces, is still planned behind the same elements.
+  linear, so the bins convert to NV12 on the GPU and copy each frame into plain system memory (on an APU the
+  "system memory" is the same DRAM); the VA encoder then uploads it. On the Ryzen 7000 iGPU at 1080p the copy alone
+  takes about 0.5 ms per frame (release build), the RGBA to NV12 conversion and the copy together about 1.4 ms (a
+  rougher timing). The encode runs on a thread of its own, so it overlaps the next frame's conversion. A zero-copy
+  path, with the GPU writing straight into VA surfaces, is still planned behind the same elements.
 - **Display (`rdsvideosink`).** It converts on the GPU, then hands system-memory frames to a stock video sink.
 - **`rdsosd process-mode=0`.** That mode draws on the CPU by design. The default mode draws on the GPU.
 
@@ -352,18 +312,12 @@ configuration AMD does not support. Whether officially supported GPUs are affect
   pixels at worst. `rdsosd`'s GPU drawing (`process-mode` 1 and 2, the default) can instead read a stale command
   block and fault the GPU: `Memory access fault` in `rds_osd_upload_kernel` or `rds_osd_draw_kernel`, then the
   process aborts. Under a synthetic load (parallel `dd bs=64M` and busy loops) the OSD tests failed in 30 of 38 runs;
-  on an idle host they never failed. `HSA_DISABLE_CACHE=1` avoids it (0 of 80 runs) but costs about 23 % of
-  `rds-test3`'s throughput, so only the test suite sets it. On affected systems, `process-mode=0` (drawing on the
-  CPU) is not exposed.
+  on an idle host they never failed. `HSA_DISABLE_CACHE=1` avoids it (0 of 80 runs, with `HSA_ENABLE_SDMA=0` as
+  well, as the test suite runs) but costs about 23 % of `rds-test3`'s throughput, so only the test suite sets it.
+  On affected systems, `process-mode=0` (drawing on the CPU) doesn't have the fault.
 
-Two more come from the stack under the encoders, Mesa's VA driver and GStreamer 1.28's `va` plugin:
-
-- **H.265 widths that are not a multiple of 64.** `vah265enc` on Mesa 25.2.8 (radeonsi, as in `redstream:dev`)
-  signals them too wide (720×480 decodes 768 wide). `rdsh265enc` rewrites the SPS conformance window, so its
-  output decodes at the right size; bare `vah265enc` is affected.
-- **GStreamer 1.28's VA encoders.** They leak one `GstCaps` per reconfiguration (a frame-rate or size change, a
-  live bitrate change). After a resolution change they keep copying system-memory frames at the old size, so after
-  a resize the bins write into VA's own surfaces instead: correct, but slower.
+Element-specific issues are listed on each element's page in [`docs/elements/`](docs/elements/README.md), under
+"Known issues and limits" (the VA encoders' ones on [rdsh26xenc](docs/elements/rdsh26xenc.md)).
 
 ## Getting started (development)
 

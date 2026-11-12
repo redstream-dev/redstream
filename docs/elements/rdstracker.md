@@ -1,5 +1,7 @@
 # rdstracker
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 Gives the objects of each stream a tracking ID: the IOU and NvSORT trackers of NvMultiObjectTracker, on the CPU,
 configured by its YAML files. It works on the metadata only and writes the IDs and the tracked boxes into the object
 metas, under the batch's metadata lock. DeepStream counterpart: `nvtracker`

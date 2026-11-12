@@ -334,12 +334,15 @@ gst/rdsenc/        libgstrdsenc plugin (plugin.c): rdsh264enc and rdsh265enc, on
                    QP string parsers) are what the cpu tests link. Always built; at run time it needs the stock `va`
                    plugin (vah264enc, vah265enc) and a Mesa VA driver that encodes: without them the elements
                    register, and going to READY is an error naming the missing encoder
-docs/              compat-matrix.md: what the compat header and the elements map, with status and sources;
-                   elements/: a reference page per element. The config-key tables of elements/rdsinfer-config.md,
-                   rdstracker-config.md and rdsanalytics-config.md must match the key tables: the infer_config,
-                   tracker_config and analytics_config tests check every row;
-                   element_compat_matrix checks the tiler, OSD, logger, sink, URI source bin, analytics and encoder
-                   property tables against the elements' properties)
+docs/              compat-matrix.md: what the compat header and the elements map, with status and sources, and a
+                   short status table per element (property, status, a one-line difference) linking to its page;
+                   element_compat_matrix checks those tables against the elements' properties.
+                   elements/: the element reference (README.md, the index and a typical pipeline), a page per element
+                   (rdsh26xenc.md for both encoders) with its pads, properties, signals, metadata, behaviour,
+                   differences from DeepStream 8.0 and known issues, checked by element_docs; and the config pages
+                   rdsinfer-config.md, rdstracker-config.md and rdsanalytics-config.md, whose key tables the
+                   infer_config, tracker_config and analytics_config tests check row by row against the parsers'
+                   key tables. rds-element-pages.h (tests/check) maps each factory to its page
 samples/rds-test2/ clean-room sample with a secondary classifier: YOLO11n, NvSORT, YOLO11n-cls on the vehicles
                    (per-frame object, vehicle and labelled counts, label totals; --dry-run, --no-display,
                    --pgie-config, --sgie-config, --tracker-config)
@@ -483,17 +486,26 @@ meson test -C build-rel --print-errorlogs
   check the rdsinfer key tables in `docs/elements/rdsinfer-config.md` (the tracker's are in
   `docs/elements/rdstracker-config.md`). `/cpu/analytics-config/compat-matrix` (rdsanalytics is always built)
   checks `docs/elements/rdsanalytics-config.md` in every build. A new or changed config key needs its row there; the
-  test's message prints the expected row. `/cpu/elements/compat-matrix` does the same for the property tables of
-  `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger`, `rdsvideosink`, `rdsurisrcbin`, `rdsanalytics`,
-  `rdsh264enc` and `rdsh265enc`:
-  every property except those of GstObject, GstElement and GstBin needs a row (GstBaseTransform's `qos` included;
-  GstBin's may have one), and a row naming no property fails too.
+  test's message prints the expected row. `/cpu/elements/compat-matrix` checks the matrix's status tables
+  (`| Property | Status | Difference |`) of `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger`,
+  `rdsvideosink`, `rdsurisrcbin`, `rdsanalytics`, `rdsh264enc` and `rdsh265enc`: every property except those of
+  GstObject, GstElement and GstBin needs a row (GstBaseTransform's `qos` included; GstBin's may have one), a row
+  naming no property fails too, and each element's section links to its page in `docs/elements/`. Details belong on
+  the page; a status table row says only the status and, in one line, the difference.
+- **Element pages.** A change to an element's properties, pads, signals or behaviour updates its page in
+  `docs/elements/` in the same commit. `element_docs` (cpu) checks every factory in `tests/check/rds-element-pages.h`:
+  a row per property (its type and default against the GParamSpec, and the range, when the Values cell gives one),
+  pad template and signal, none for one the element lacks, the table shapes, and every relative link in `docs/`,
+  `README.md` and `AGENTS.md`. Its messages print the expected row. Run the docs lints (cpu suite) with
+  `meson test -C build element_docs element_compat_matrix --print-errorlogs`. A new element gets a page, a row in
+  `rds-element-pages.h`, one in the index (`docs/elements/README.md`) and a status table in `docs/compat-matrix.md`,
+  and a config page if it reads a config file.
 - **Tracker, analytics, tiler, OSD, logger, sink and encoder behaviour.** Where NVIDIA's docs are silent,
   `rdstracker`, `rdsanalytics`, `rdsmultistreamtiler`, `rdsosd`, `rdslogger`, `rdsvideosink`, `rdsh264enc` and
   `rdsh265enc` match observed DeepStream 8.0 behaviour, except where 8.0 is clearly broken; there they do the sane
   thing. Code comments say "DeepStream 8.0 behaviour" or "ours", and every such choice has a row in the behaviour
-  tables on the element pages in `docs/elements/` (the analytics config's in `rdsanalytics-config.md`): keep them in
-  step.
+  table of the element's page in `docs/elements/`, or an entry in its Differences from DeepStream 8.0 section (the
+  analytics config's in `rdsanalytics-config.md`): keep them in step.
 - **Analytics metas (C++).** `RdsAnalyticsFrameMeta` and `RdsAnalyticsObjInfo` are C++ structs (std::string,
   std::vector, std::unordered_map) with libstdc++'s layout, so code that reads their fields must be built with the
   same `_GLIBCXX_USE_CXX11_ABI` as libgstrds-analytics (the default). Include `rds/rds-analytics-meta.h` at file

@@ -1,5 +1,7 @@
 # rdsvideoconvert
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 Converts, scales and crops single video frames on the GPU, in `memory:RDS` or in system memory on either side.
 DeepStream counterpart: `nvvideoconvert`
 ([ref](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_plugin_gst-nvvideoconvert.html)).
@@ -37,8 +39,8 @@ of the enums are DeepStream's; only `nvbuf-memory-type`'s nicks are DeepStream's
 
 | Property | Type | Default | Values | Changeable | Description |
 |---|---|---|---|---|---|
-| `src-crop` | string | `""` | `left:top:width:height` | any state | the part of the input to convert; empty: all of it. See "Crops" |
-| `dest-crop` | string | `""` | `left:top:width:height` | any state | where the picture goes in the output; empty: the whole frame. See "Crops" |
+| `src-crop` | string | `""` | `left:top:width:height` | any state | the part of the input to convert; empty: all of it. See [Crops](#crops) |
+| `dest-crop` | string | `""` | `left:top:width:height` | any state | where the picture goes in the output; empty: the whole frame. See [Crops](#crops) |
 | `allow-odd-crop` | boolean | `true` | | any state | on NV12 and I420 output, widen an odd `dest-crop` to even coordinates; `false`: an odd one is an element error. Source rects may always be odd |
 | `interpolation-method` | enum `GstRdsInterpolationMethod` | `default` | `0` `nearest`, `1` `bilinear`, `2` `algo-1`, `3` `algo-2`, `4` `algo-3`, `5` `algo-4`, `6` `default` | any state | the scaling filter: `default` and `algo-4` sample the nearest pixel, `algo-1` to `algo-3` run bilinear |
 | `compute-hw` | enum `GstRdsComputeHW` | `default` | `0` `default`, `1` `gpu`, `2` `vic` | any state | `0` and `1` run on the GPU; `2` (Jetson's VIC) is an element error ("compute-hw=VIC is not available"): at start, or on the next converted frame when set while playing (passthrough frames are not affected) |
@@ -59,7 +61,7 @@ of the enums are DeepStream's; only `nvbuf-memory-type`'s nicks are DeepStream's
 - `RdsMeta` (the `RdsBatchMeta` with its frames and objects), untagged metas, and metas tagged only `video` are kept.
   Object coordinates are not rescaled: they stay in the input's coordinates.
 - `GstVideoMeta` is dropped (the output buffer carries its own layout), and so is `GstVideoCropMeta` (the crop is
-  applied, see "Crops").
+  applied, see [Crops](#crops)).
 - Any other tagged meta (size-, orientation- or memory-dependent) is dropped.
 
 ## Behaviour
@@ -67,7 +69,7 @@ of the enums are DeepStream's; only `nvbuf-memory-type`'s nicks are DeepStream's
 **Conversion.** Each frame goes through `rds_buf_surf_transform` on the element's own HIP stream, synchronously: the
 output is complete when it is pushed. What the transform computes, byte for byte (filters, BT.601 colour, odd 4:2:0
 rects, alpha), is in the compatibility matrix's
-["Transform semantics"](../compat-matrix.md#transform-semantics).
+[Transform semantics](../compat-matrix.md#transform-semantics).
 
 **Passthrough.** When the input and output caps are equal (memory included), and no `src-crop`, `dest-crop` or flip is
 set, buffers pass through untouched; `disable-passthrough=true` turns that off. A property change that turns
@@ -85,7 +87,7 @@ frame is converted into a staging surface and downloaded; `memory:RDS` sides are
 are made at the first frame and again only when the input or output video info changes. A system-memory output pool
 is a video pool (downstream's when it offers one), with `GstVideoMeta` when downstream supports it.
 
-**Crops.**
+<a id="crops"></a>**Crops.**
 - Both crops are `left:top:width:height` in pixels: four decimal integers, no sign or spaces. An invalid string is
   refused with a GLib warning ("invalid src-crop … (expected left:top:width:height); keeping …"). `0:0:0:0` and the
   empty string mean no crop.
@@ -96,9 +98,9 @@ is a video pool (downstream's when it offers one), with `GstVideoMeta` when down
 - Outside `dest-crop`, the output is filled with black: Y 16 and U, V 128 for NV12 and I420, every byte 0 for GRAY8
   and the RGB formats, so **alpha is 0** outside the rect on RGBA and BGRA.
 
-**Batches.** A `memory:RDS` buffer holding more than one frame (a batch from `rdsstreammux`) is an element error when
-it has to be converted: "Batched input (batch size above 1) is not supported yet" (STREAM, NOT_IMPLEMENTED). In
-passthrough, a batch goes through untouched.
+<a id="batches"></a>**Batches.** A `memory:RDS` buffer holding more than one frame (a batch from `rdsstreammux`) is an
+element error when it has to be converted: "Batched input (batch size above 1) is not supported yet" (STREAM,
+NOT_IMPLEMENTED). In passthrough, a batch goes through untouched.
 
 **Errors**, all element errors, besides those above:
 - `compute-hw=2` and a `flip-method` other than `0`: RESOURCE, SETTINGS (see their rows);
@@ -113,12 +115,13 @@ passthrough, a batch goes through untouched.
   the integers only); `interpolation-method`'s `algo-1` to `algo-4` are bilinear or nearest filters, as listed.
 - `flip-method` is not implemented yet; `compute-hw=2` (VIC) is Jetson hardware and fails.
 - `contiguous-buffers`, `copy-hw`, `bl-output` and `silent` are accepted and do nothing.
-- One frame per buffer: a batch that needs converting is an element error (see "Batches").
+- One frame per buffer: a batch that needs converting is an element error (see [Batches](#batches)).
 
 ## Known issues and limits
 
-- Batches are refused (see "Batches"): convert before `rdsstreammux`, or after `rdsstreamdemux` or a tiler.
+- Batches are refused (see [Batches](#batches)): convert before `rdsstreammux`, or after `rdsstreamdemux` or a tiler.
 - No flips or rotations.
-- BT.601 limited-range colour only, and chroma siting is ignored (see "Transform semantics").
+- BT.601 limited-range colour only, and chroma siting is ignored (see [Transform
+  semantics](../compat-matrix.md#transform-semantics)).
 - When downstream fixes one dimension only, the aspect ratio is not kept.
 - Object metas are carried over without rescaling their coordinates.

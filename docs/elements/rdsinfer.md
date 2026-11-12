@@ -1,5 +1,7 @@
 # rdsinfer
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 Runs an ONNX model with MIGraphX on the batches from `rdsstreammux`, and attaches what it finds as metadata: a primary
 or secondary detector (object meta), a secondary classifier (classifier meta, with DeepStream's per-object cache), or
 any network's raw output (tensor meta). It reads nvinfer config files, and supports custom bbox and classifier parsers
@@ -49,8 +51,8 @@ gst-launch-1.0 videotestsrc num-buffers=10 pattern=red ! video/x-raw,format=NV12
 
 The first start compiles each model for its batch size, input size and GPU (seconds for these tiny models, minutes
 for a real one) and caches the program next to the ONNX file: `fixeddet_b1_3x64x64_<gfx>_fp32.mxr` and
-`meancls_b8_3x32x32_<gfx>_fp32.mxr` in `tests/models/` (git ignores them). Later starts load them. See "Models and
-compiled programs".
+`meancls_b8_3x32x32_<gfx>_fp32.mxr` in `tests/models/` (git ignores them). Later starts load them. See [Models and
+compiled programs](#models-and-compiled-programs).
 
 ## Pads
 
@@ -170,7 +172,7 @@ A classifier (`network-type=1`, `process-mode=2`) attaches what it finds to each
 | Description without attributes | ours | a custom parser that sets `descString` but returns no attributes attaches nothing: no classifier meta, and the display text is unchanged (8.0 not observed) |
 | Custom parser | matches nvinfer (DeepStream 8.0) | `parse-classifier-func-name` in `custom-lib-path`, called once per object with that object's output layers (dims without the batch), the network info and `classifier-threshold`; each attribute becomes a label (`attributeLabel` → `result_label`, `attributeValue` → `result_class_id`, `attributeIndex` → `label_id`, `attributeConfidence` → `result_prob`), not thresholded again. rdsinfer frees the `attributeLabel`s |
 | Custom parser label | ours | a NULL `attributeLabel` is an empty label |
-| Unknown parse function | matches nvinfer (DeepStream 8.0), ours | a `parse-classifier-func-name` the library doesn't have fails start (DeepStream 8.0 behaviour); the error names the key (ours) |
+| Unknown parse function | matches nvinfer (DeepStream 8.0); ours: the message | a `parse-classifier-func-name` the library doesn't have fails start (DeepStream 8.0 behaviour); the error names the key (ours) |
 | Parser returns false or throws | ours | one warning per element; that object gets no new classifier meta (a tracked object keeps its stored result, if any, see [Per-object cache](#per-object-cache)), the others are unaffected (8.0 crashes) |
 | Tensor meta | matches nvinfer (DeepStream 8.0) | with `output-tensor-meta=1` a classified object gets its tensor meta too; it doesn't change the classification |
 | Chained classifiers | matches nvinfer (DeepStream 8.0) | a second classifier on the same objects attaches its own meta to each |
@@ -249,7 +251,7 @@ which has no properties for them. Their rows are in [rdsinfer-config](rdsinfer-c
 |---|---|---|
 | Which frames | matches nvinfer (DeepStream 8.0) | every frame of every batch, with `bInferDone` TRUE or FALSE; `interval` is ignored (a warning when set). `bInferDone` is never set or cleared |
 | Which objects | matches nvinfer (DeepStream 8.0) | `operate-on-gie-id` (-1: every GIE, this element's own id included; 0 is a real id), `operate-on-class-ids` (empty: every class) and `input-object-min/max-width/height` (inclusive, on the float `rect_params` size, 0: no limit); objects added by this element in the same buffer are not inferred on |
-| Class id -1, negative class ids | ours, matches nvinfer (DeepStream 8.0) | `-1` in `operate-on-class-ids` in the config file is every class, as the property's `-1` is in 8.0 (8.0 aborts on the config value); with a class list set, an object with a negative `class_id` is not selected (8.0 aborts); with no list it is (DeepStream 8.0 behaviour) |
+| Class id -1, negative class ids | matches nvinfer (DeepStream 8.0); ours: the config file's `-1` and negative ids with a class list | `-1` in `operate-on-class-ids` in the config file is every class, as the property's `-1` is in 8.0 (8.0 aborts on the config value); with a class list set, an object with a negative `class_id` is not selected (8.0 aborts); with no list it is (DeepStream 8.0 behaviour) |
 | Crop | matches nvinfer (DeepStream 8.0) | the object's `rect_params` (`detector_bbox_info` and `tracker_bbox_info` are not used): origin floored, then rounded up to even (11 → 12, 43.7 → 44), size floored, then down to even, at least 2 (15.6 → 14, 1 → 2); a side under 1 pixel is skipped; overflow past the right or bottom edge is clipped and the rest stretched to the network |
 | Crop outside the frame | ours | a negative origin, a box larger than the frame or wholly outside it is clipped too (8.0 fails the pipeline); a crop with less than 2 pixels left is skipped (logged at debug level). The origin is aligned before the clip |
 | Crop in the network input | matches nvinfer (DeepStream 8.0) | stretched to the network, or with `maintain-aspect-ratio` scaled by min(W/w, H/h) with the scaled size floored to even (24×16 into 16×16 is 16×10), at the top-left, or with `symmetric-padding` at floor((net − exact scaled size) / 2); padding is pixel value 0 before normalisation. The crop is resampled to 8 bits, then normalised as in primary mode |
@@ -262,7 +264,7 @@ which has no properties for them. Their rows are in [rdsinfer-config](rdsinfer-c
 | Child geometry | ours | network → crop → frame pixels with one consistent mapping; `rect_params` clipped to the frame, `detector_bbox_info` the unclipped box (8.0 maps with the unaligned parent origin, so it can be a pixel off, doesn't clip, and moves negative coordinates to the parent's origin without shrinking the box). A child wholly outside its crop is dropped; one partly outside keeps its part inside the frame |
 | Child order | ours | appended to the frame's object list after the existing objects, crop by crop (8.0 prepends) |
 | Detector chains | matches nvinfer (DeepStream 8.0) | a second `rdsinfer` with `infer-on-gie-id` = the detector's `gie-unique-id` infers on its children |
-| `roi-top-offset`, `roi-bottom-offset` | matches nvinfer (DeepStream 8.0), ours | applied to the children with the child's class attributes, in crop pixels (frame pixels from the top of the aligned crop the parent was sampled from): a child is kept when its top − the crop's top ≥ `roi-top-offset` (DeepStream 8.0 behaviour) and its bottom − the crop's top ≤ the crop's height − `roi-bottom-offset` (ours: 8.0 compares with the frame's height minus the offset); a `roi-bottom-offset` of the crop's height or more drops every child of that crop (ours). Boundaries included, each offset only when set. The parents are never filtered (DeepStream 8.0 behaviour); no warning |
+| `roi-top-offset`, `roi-bottom-offset` | matches nvinfer (DeepStream 8.0); ours: the bottom offset | applied to the children with the child's class attributes, in crop pixels (frame pixels from the top of the aligned crop the parent was sampled from): a child is kept when its top − the crop's top ≥ `roi-top-offset` (DeepStream 8.0 behaviour) and its bottom − the crop's top ≤ the crop's height − `roi-bottom-offset` (ours: 8.0 compares with the frame's height minus the offset); a `roi-bottom-offset` of the crop's height or more drops every child of that crop (ours). Boundaries included, each offset only when set. The parents are never filtered (DeepStream 8.0 behaviour); no warning |
 | Parser returns false | ours | one warning per element, that object gets no children but its tensor meta is still attached (as in primary mode), the other objects are unaffected (8.0 crashes) |
 | Classifiers (`network-type=1`) | ours | secondary mode only for now: a classifier in primary mode fails at start; see [Classifier output (classifier meta)](#classifier-output-classifier-meta) and [Per-object cache](#per-object-cache) |
 
@@ -300,6 +302,8 @@ behaviour, or **ours**.
 - `batch-size` keeps its meaning: the most images one run takes. With `batch-size` 1 there is no smaller program, so
   it changes nothing.
 - A model with a fixed batch dimension falls back to the `batch-size` program alone, with a warning at start.
+- YOLO11n with one frame in a `batch-size` 4 pipeline, on the gfx1036 iGPU: about 31 ms on the batch-1 program
+  instead of 95 ms on the batch-4 one.
 - The costs, compiling and caching are under [Models and compiled programs](#models-and-compiled-programs).
 
 ### Models and compiled programs

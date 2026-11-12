@@ -495,11 +495,12 @@ test('element_compat_matrix', executable('element_compat_matrix', 'check' / 'ele
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
 # docs/elements/<page>.md: each listed factory's page has a row per property (type and default as in the class), per
-# pad template and per signal; relative links in docs/ resolve.
+# pad template and per signal; relative links in docs/, README.md and AGENTS.md resolve.
 test('element_docs', executable('element_docs', 'check' / 'element_docs.c',
     dependencies : test_deps,
     c_args : ['-DRDS_DOCS_ELEMENTS="@0@"'.format(meson.project_source_root() / 'docs' / 'elements'),
-      '-DRDS_DOCS="@0@"'.format(meson.project_source_root() / 'docs')]),
+      '-DRDS_DOCS="@0@"'.format(meson.project_source_root() / 'docs'),
+      '-DRDS_SOURCE_ROOT="@0@"'.format(meson.project_source_root())]),
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
 # rdsh264enc / rdsh265enc property mapping and QP string parsers, on their own (GLib only, no GStreamer).

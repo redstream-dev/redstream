@@ -1,5 +1,7 @@
 # rdsstreammux
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 Batches frames from several sources into one `memory:RDS` buffer with an `RdsBatchMeta`: every frame is scaled (and
 colour-converted) into its own fixed-size slot of a pooled batch surface. This is DeepStream's default ("legacy")
 mux; the new mux is not implemented. DeepStream counterpart: `nvstreammux`
@@ -79,8 +81,9 @@ add_source (GstElement * pipeline, GstElement * mux, guint id)
 ```
 
 The mux's `sink_N` pads stay across a restart (PLAYING to READY and back), so this needs no `pad-added` handling. For a
-source bin whose pad comes and goes, as `rdsurisrcbin`'s does, link from its `pad-added` and reuse an existing
-`sink_N` ([rdsurisrcbin](rdsurisrcbin.md) has the snippet). To remove a source, see "Adding and removing sources".
+source bin whose pad comes and goes, as `rdsurisrcbin`'s does, link from its `pad-added` and reuse an existing `sink_N`
+([rdsurisrcbin](rdsurisrcbin.md) has the snippet). To remove a source, see [Adding and removing
+sources](#adding-and-removing-sources).
 
 ## Pads
 
@@ -109,18 +112,18 @@ time any of them is set ("property '…' is accepted for compatibility but has n
 | Property | Type | Default | Values | Changeable | Description |
 |---|---|---|---|---|---|
 | `batch-size` | uint | `1` | 1–4294967295 | NULL, READY | frames per batch (ours: NVIDIA's range starts at 0) |
-| `batched-push-timeout` | int | `-1` | −1–2147483647 | NULL, READY | microseconds before a partial batch goes out; `-1`: no timeout (ours). See "Batching and timeout" |
+| `batched-push-timeout` | int | `-1` | −1–2147483647 | NULL, READY | microseconds before a partial batch goes out; `-1`: no timeout (ours). See [Batching and timeout](#batching-and-timeout) |
 | `width`, `height` | uint | `0` | 0–16384 | NULL, READY | the slot size, **required**: `0` fails negotiation (NVIDIA's range goes to 4294967295) |
-| `enable-padding` | boolean | `false` | | any state | keep the aspect ratio; the frame goes at the **top-left** of its slot (see "Scaling and padding"). Default ours |
+| `enable-padding` | boolean | `false` | | any state | keep the aspect ratio; the frame goes at the **top-left** of its slot (see [Scaling and padding](#scaling-and-padding)). Default ours |
 | `gpu-id` | uint | `0` | 0–4294967295: a visible ROCm device | NULL, READY | the GPU that scales and holds the batches; one that doesn't exist is an element error at the first batch, "GPU N is not available" (RESOURCE, NOT_FOUND). Default ours |
 | `nvbuf-memory-type` | enum `GstRdsStreamMuxMemoryType` | `nvbuf-mem-default` | `0` `nvbuf-mem-default` (HIP device memory), `1` `nvbuf-mem-cuda-pinned`, `2` `nvbuf-mem-cuda-device`, `3` `nvbuf-mem-cuda-unified` | NULL, READY | the memory of the output batches. `4` (Jetson's surface array) is not a value, so GObject refuses it. Default ours |
-| `buffer-pool-size` | uint | `4` | 1–1024 | NULL, READY | batches in the output pool, allocated up front (`buffer-pool-size` × `batch-size` slots); see "Buffers and branches". Default ours |
+| `buffer-pool-size` | uint | `4` | 1–1024 | NULL, READY | batches in the output pool, allocated up front (`buffer-pool-size` × `batch-size` slots); see [Buffers and branches](#buffers-and-branches). Default ours |
 | `compute-hw` | enum `GstRdsStreamMuxComputeHW` | `default` | `0` `default`, `1` `gpu`, `2` `vic` | NULL, READY | `0` and `1` run on the GPU; `2` (Jetson's VIC) is an element error at start, "compute-hw=VIC is not available" (RESOURCE, SETTINGS). Default ours |
 | `interpolation-method` | enum `GstRdsStreamMuxInterpolationMethod` | `default` | `0` `nearest`, `1` `bilinear`, `2` `algo-1`, `3` `algo-2`, `4` `algo-3`, `5` `algo-4`, `6` `default` | any state | the scaling filter (integers as `NvBufSurfTransform_Inter`): `default` and `algo-4` sample the nearest pixel, `algo-1` to `algo-3` run bilinear. Default ours |
 | `num-surfaces-per-frame` | uint | `1` | 1–4 | NULL, READY | only `1`; 2–4 are an element error at start (RESOURCE, SETTINGS). Default ours |
-| `live-source` | boolean | `false` | | any state | changes only the batch timestamp (see "Batch timestamps"), not the waiting. Default ours |
+| `live-source` | boolean | `false` | | any state | changes only the batch timestamp (see [Batch timestamps](#batch-timestamps)), not the waiting. Default ours |
 | `attach-sys-ts` | boolean | `true` | | any state | each frame's `ntp_timestamp` is the system (wall-clock) time in ns; `false` gives 0. RTCP sender-report time is not implemented. Default ours |
-| `sync-inputs` | boolean | `false` | | NULL, READY | push a partial batch once the clock reaches its earliest frame's running time plus the latency; see "Batching and timeout". Default ours |
+| `sync-inputs` | boolean | `false` | | NULL, READY | push a partial batch once the clock reaches its earliest frame's running time plus the latency; see [Batching and timeout](#batching-and-timeout). Default ours |
 | `max-latency` | uint | `0` | 0–4294967295 | NULL, READY | nanoseconds: reported downstream in the latency query, and waited for (on top of the timeout) before a partial batch goes out in live mode. Default ours |
 | `sort-batch` | boolean | `false` | | any state | slots in sink pad order; otherwise in the order the frames were collected. Default ours |
 | `drop-pipeline-eos` | boolean | `false` | | any state | no EOS downstream when every source has ended; the per-source `rds-stream-eos` events still go |
@@ -156,14 +159,14 @@ The batch's `RdsBufSurface` has one entry per slot in `surfaceList`; `numFilled`
 
 ## Behaviour
 
-**Scaling and padding.** Every frame goes through `rds_buf_surf_transform` into its slot (the exact rules are in the
-compatibility matrix's ["Transform semantics"](../compat-matrix.md#transform-semantics)). With `enable-padding`, the
-frame is scaled to fit with its aspect ratio kept (even width and height for NV12 and I420) and placed at the
-**top-left** of the slot; the rest of the slot is black (Y 16, U/V 128 for YUV; every byte 0, alpha included, for RGB
-and GRAY8). Top-left keeps the mapping from slot to source coordinates a pure scale: divide by
+<a id="scaling-and-padding"></a>**Scaling and padding.** Every frame goes through `rds_buf_surf_transform` into its slot
+(the exact rules are in the compatibility matrix's ["Transform semantics"](../compat-matrix.md#transform-semantics)).
+With `enable-padding`, the frame is scaled to fit with its aspect ratio kept (even width and height for NV12 and I420)
+and placed at the **top-left** of the slot; the rest of the slot is black (Y 16, U/V 128 for YUV; every byte 0, alpha
+included, for RGB and GRAY8). Top-left keeps the mapping from slot to source coordinates a pure scale: divide by
 `pipeline_width / source_frame_width`, with no offset.
 
-**Batching and timeout.**
+<a id="batching-and-timeout"></a>**Batching and timeout.**
 - One batch takes at most one frame per sink pad. The pads are visited round robin, the first one rotating every
   batch, and a batch is closed at `batch-size` frames. A partial batch has fewer frames than `batch-size`: its
   surface's `numFilled` and its frame metas say how many.
@@ -181,7 +184,7 @@ and GRAY8). Top-left keeps the mapping from slot to source coordinates a pure sc
 - In every mode, a batch with a frame from every source goes out as soon as it is complete: frames are never held
   back to the clock.
 
-**Batch timestamps.**
+<a id="batch-timestamps"></a>**Batch timestamps.**
 - `live-source=true`: the batch PTS is the running time of the last frame copied into it (as documented).
 - `live-source=false`: the running time of the earliest frame in the batch.
 - Either way, batch timestamps never go backwards: a batch earlier than the previous one (a source joining late, or
@@ -208,7 +211,7 @@ The pipeline EOS goes downstream when every source has ended, unless `drop-pipel
 `drop-pipeline-eos` and every source ended, the mux waits for a new source; its `rds-pad-added` goes out with the new
 source's first data.
 
-**Adding and removing sources.**
+<a id="adding-and-removing-sources"></a>**Adding and removing sources.**
 - Sink pads can be requested while PLAYING; the new source joins the next batches once its frames arrive.
 - To remove a source cleanly, send EOS into its sink pad and wait for its `rds-stream-eos (N)` downstream, then
   release the pad. The EOS reaches the batching thread only after the frames queued in front of it; a pad released
@@ -217,7 +220,7 @@ source's first data.
   (the pipeline PAUSED and the mux idle), that push, and so the release, blocks until the pipeline goes to PLAYING:
   release pads while PLAYING, or from a thread that may wait.
 
-**Buffers and branches.**
+<a id="buffers-and-branches"></a>**Buffers and branches.**
 - The output pool holds `buffer-pool-size` batches and never grows, so a stalled downstream back-pressures the
   sources.
 - A live (or timed) mux's sink pads queue at least two frames plus a latency's worth before blocking upstream, on top

@@ -1,5 +1,7 @@
 # rdslogger
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 A passthrough element that counts each stream's frames and prints their frame rates to stdout, one `**PERF` line per
 interval, in DeepStream 8.0's format. Put it after `rdsstreammux` (or anywhere after it) to see every source's rate.
 DeepStream counterpart: `nvdslogger` ([ref](https://docs.nvidia.com/deepstream/text/DS_plugin_gst-nvdslogger.md)).

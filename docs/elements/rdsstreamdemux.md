@@ -1,5 +1,7 @@
 # rdsstreamdemux
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 Splits the batches `rdsstreammux` makes back into one stream per source, without copying: each output buffer is a
 read-only view of the frame's slot in the batch, with the source's own timestamps, segment and stream events.
 DeepStream counterpart: `nvstreamdemux`
@@ -158,10 +160,10 @@ go upstream.
   branch before stopping it.**
 - **Give every branch a `queue`.** The branches share the demux's streaming thread: without queues the first sink to
   preroll blocks the others, and the pipeline never finishes prerolling.
-- **Views pin batches.** A view keeps its whole batch out of the mux's pool until it is released, and most sinks keep
-  their last buffer (`appsink` always; base sinks with `enable-last-sample`, the default). So N branches can pin N
-  batches: set `rdsstreammux`'s `buffer-pool-size` (default 4) larger than the number of such branches, or the mux
-  stalls.
+- <a id="views-pin-batches"></a>**Views pin batches.** A view keeps its whole batch out of the mux's pool until it is
+  released, and most sinks keep their last buffer (`appsink` always; base sinks with `enable-last-sample`, the default).
+  So N branches can pin N batches: set `rdsstreammux`'s `buffer-pool-size` (default 4) larger than the number of such
+  branches, or the mux stalls.
 - **Removing a source:** send EOS into its mux pad and wait for `rds-stream-eos (N)` downstream before releasing the
   mux pad. Releasing right after the EOS drops the stream-eos.
 
@@ -179,5 +181,6 @@ Where it is silent, ours:
 ## Known issues and limits
 
 - Frames are not scaled back to their source's size (DeepStream doesn't either).
-- Each branch pins batches until its sink drops them: see "Views pin batches" for `buffer-pool-size`.
+- Each branch pins batches until its sink drops them: see [Views pin batches](#views-pin-batches) for
+  `buffer-pool-size`.
 - Video only; audio batches (as DeepStream's new mux makes) are planned, on request.

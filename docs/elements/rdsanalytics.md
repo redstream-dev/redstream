@@ -1,5 +1,7 @@
 # rdsanalytics
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 ROI filtering, overcrowding, direction (with the STOPPED state) and line crossing on the tracked objects of each
 stream, on the CPU, from nvdsanalytics config files. It attaches DeepStream-shaped frame and object metas, and, with
 `osd-mode`, display meta that draws the rules and the counts. DeepStream counterpart: `nvdsanalytics`
@@ -110,7 +112,8 @@ Names, types, ranges and defaults are those `gst-inspect-1.0` shows for DeepStre
     and border (see [Drawing](#drawing)).
 
 The two structs are C++ (`std::string`, `std::vector`, `std::unordered_map`) with DeepStream's field names, declared
-in `rds/rds-analytics-meta.h` and owned by `libgstrds-analytics-1.0` (pkg-config `redstream-analytics-1.0`).
+in `rds/rds-analytics-meta.h` (in place of DeepStream's `nvds_analytics_meta.h`) and owned by
+`libgstrds-analytics-1.0` (pkg-config `redstream-analytics-1.0`).
 - C++ reads the fields directly (`m->objInROIcnt["ALL"]`). It must be built with the library's
   `_GLIBCXX_USE_CXX11_ABI` (the default), and include the header at file scope, never inside `extern "C" {}`.
 - C sees opaque types and uses the accessors. Those of the frame meta start with `rds_analytics_frame_meta_`:

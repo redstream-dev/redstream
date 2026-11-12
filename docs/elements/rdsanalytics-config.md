@@ -1,5 +1,7 @@
 # rdsanalytics config file
 
+How to read this page, and how to run the examples: [element reference](README.md).
+
 The config file `rdsanalytics` reads (`config-file`): nvdsanalytics' key file, with every key's groups, type,
 default, range and status. The element is on its own page, [rdsanalytics](rdsanalytics.md).
 
