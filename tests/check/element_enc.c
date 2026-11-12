@@ -2,12 +2,12 @@
  * shows them for DeepStream 8.0's nvv4l2h264enc / nvv4l2h265enc, the enum types, the accepted no-ops' warning,
  * malformed QP strings, the inner chain, a missing VA encoder, one that doesn't link, the unsupported profiles, what a
  * start sets on the VA encoder, the output probes on a stand-in's pushes: a buffer of filler only dropped, a segment
- * sent again, caps sent again before a frame-rate change; force-idr before the start, the input size limits from a
- * stand-in's template (cpu; a stand-in element takes the VA encoder's factory name where the bin has to reach
- * READY); the preferred-profile caps answer of a started bin, with the stand-in (gpu: the start needs
- * rdsvideoconvert's GPU); per codec on the real VA encoders: a short
- * encode, properties set while PLAYING, GOP layouts and parameter sets, profiles and levels in the SPS and the caps, a
- * downstream level, CBR rates, a live bitrate change, B frames and Baseline, preset-id and gpu-id, and what the bin's
+ * sent again, caps sent again before a frame-rate change (with and without timestamps); force-idr before the start,
+ * the input size limits from a stand-in's template (cpu; a stand-in element takes the VA encoder's factory name where
+ * the bin has to reach READY); the preferred-profile caps answer of a started bin, with the stand-in (gpu: the
+ * start needs rdsvideoconvert's GPU); per codec on the real VA encoders: a short encode, properties set while
+ * PLAYING, GOP layouts and parameter sets, profiles and levels in the SPS and the caps, a downstream level, CBR
+ * rates, a live bitrate change, B frames and Baseline, preset-id and gpu-id, and what the bin's
  * pad probes do: no filler, the H.265 size, input timestamps (also after a seek and with B frames), copy-meta,
  * memory:RDS and system-memory input, VA's input in plain memory on a thread of its own, the latency, batch refusal,
  * DELTA_UNIT, a frame-rate change; forced key frames (force-idr, also in PAUSED with the queue full, force-intra,
@@ -1613,6 +1613,45 @@ test_caps_again (void)
   g_assert_cmpint (gst_pad_push (h.va_src, buf), ==, GST_FLOW_OK);
   g_assert_cmpint (harness_fps (&h), ==, 15);
   g_assert_cmpuint (h.got->len, ==, 2);
+  gst_caps_unref (va_caps);
+  harness_stop (&h, c);
+}
+
+/* Without timestamps nothing tells the frames of the new rate from the older ones: VA's caps after a frame-rate
+ * change bring the new framerate in at once, also when they are the same caps again. */
+static void
+test_caps_again_no_pts (void)
+{
+  const Codec *c = &codecs[1];
+  Harness h;
+  GstCaps *raw, *va_caps;
+  GstBuffer *buf;
+
+  harness_start (&h, c);
+  gst_pad_set_chain_function (h.va_sink, drop_chain);
+  g_assert_true (gst_pad_send_event (h.va_sink, gst_event_new_stream_start ("caps-again-no-pts")));
+  raw = gst_caps_from_string ("video/x-raw,format=NV12,width=320,height=240,framerate=30/1");
+  g_assert_true (gst_pad_send_event (h.va_sink, gst_event_new_caps (raw)));
+  gst_caps_unref (raw);
+  g_assert_true (gst_pad_send_event (h.va_sink, segment_event (0, GST_SEQNUM_INVALID)));
+  va_caps = gst_caps_make_writable (gst_pad_get_current_caps (h.va_src));
+  gst_caps_set_simple (va_caps, "profile", G_TYPE_STRING, "main", NULL);
+  g_assert_true (gst_pad_push_event (h.va_src, gst_event_new_caps (va_caps)));
+  g_assert_true (gst_pad_push_event (h.va_src, segment_event (0, GST_SEQNUM_INVALID)));
+  g_assert_cmpint (harness_fps (&h), ==, 30);
+
+  raw = gst_caps_from_string ("video/x-raw,format=NV12,width=320,height=240,framerate=15/1");
+  g_assert_true (gst_pad_send_event (h.va_sink, gst_event_new_caps (raw)));
+  gst_caps_unref (raw);
+  g_assert_cmpint (gst_pad_chain (h.va_sink, gst_buffer_new ()), ==, GST_FLOW_OK);
+
+  g_assert_true (gst_pad_push_event (h.va_src, gst_event_new_caps (va_caps)));
+  g_assert_cmpint (harness_fps (&h), ==, 15);
+  buf = gst_buffer_new_memdup ("\0\0\0\1\x02\x01\xd0\x80", 8);
+  GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
+  g_assert_cmpint (gst_pad_push (h.va_src, buf), ==, GST_FLOW_OK);
+  g_assert_cmpint (harness_fps (&h), ==, 15);
+  g_assert_cmpuint (h.got->len, ==, 1);
   gst_caps_unref (va_caps);
   harness_stop (&h, c);
 }
@@ -3905,6 +3944,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/enc/filler-only-dropped", test_filler_only_dropped);
   g_test_add_func ("/cpu/enc/segment-again", test_segment_again);
   g_test_add_func ("/cpu/enc/caps-again", test_caps_again);
+  g_test_add_func ("/cpu/enc/caps-again-no-pts", test_caps_again_no_pts);
   g_test_add_func ("/cpu/enc/force-before-start", test_force_before_start);
   g_test_add_func ("/cpu/enc/size-accept-caps", test_size_accept_caps);
   g_test_add_func ("/gpu/enc/preferred-profile", test_preferred_profile);

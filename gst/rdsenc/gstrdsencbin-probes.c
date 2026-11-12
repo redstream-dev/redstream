@@ -512,8 +512,10 @@ va_sink_buffer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   }
 
   g_mutex_lock (&priv->probe_lock);
-  if (!GST_CLOCK_TIME_IS_VALID (priv->in_since) && !same_size (&priv->in_size, &priv->out_size))
+  if (!GST_CLOCK_TIME_IS_VALID (priv->in_since) && !same_size (&priv->in_size, &priv->out_size)) {
     priv->in_since = GST_BUFFER_PTS_IS_VALID (buf) ? GST_BUFFER_PTS (buf) : 0;
+    priv->in_since_pts = GST_BUFFER_PTS_IS_VALID (buf);
+  }
   g_mutex_unlock (&priv->probe_lock);
   return GST_PAD_PROBE_OK;
 }
@@ -568,8 +570,8 @@ va_sink_event_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointe
  * - CAPS: from here on the frames are those of the latest input caps (VA drains the older frames first); a framerate
  *   other than the input's is replaced by the input's (ours: VA keeps the old one after a frame-rate change, and
  *   when its caps don't change otherwise it sends none: then va_src_buffer_probe sends them). Caps equal to the last
- *   ones out, or to VA's last ones, are those sent again (sticky events re-sent): no renegotiation, and VA's go out
- *   as the last ones did.
+ *   ones out, or to VA's last ones, while a frame-rate change waits for its first frame by PTS, are those sent again
+ *   (sticky events re-sent): no renegotiation, and VA's go out as the last ones did.
  * - force-key-unit (VA's, before the IDR frame it forced): its timestamp is the frame's PTS, shifted like the
  *   buffers, and the shift is removed from it as from them; its stream time and running time VA computes against its
  *   own (shifted) segment, so they are the input's already.
@@ -633,10 +635,13 @@ va_src_event_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer
     case GST_EVENT_CAPS:
       gst_event_parse_caps (ev, &caps);
       g_mutex_lock (&priv->probe_lock);
-      if (priv->out_caps != NULL && (gst_caps_is_equal (caps, priv->out_caps) || (priv->va_caps != NULL
+      if (priv->out_caps != NULL && GST_CLOCK_TIME_IS_VALID (priv->in_since) && priv->in_since_pts
+          && (gst_caps_is_equal (caps, priv->out_caps) || (priv->va_caps != NULL
                   && gst_caps_is_equal (caps, priv->va_caps)))) {
-        /* the same caps again (a pad re-sending its sticky events): no renegotiation, so a frame-rate change still
-         * waiting for its first frame keeps waiting; VA's own caps again go out as they went last time (ours) */
+        /* the same caps again (a pad re-sending its sticky events) while a frame-rate change waits for its first
+         * frame by PTS: no renegotiation, so it keeps waiting, and VA's own caps again go out as they went last time
+         * (ours). With nothing waiting by PTS (no frame of the new caps into VA yet, or one without a PTS, which
+         * va_src_buffer_probe can't match), the caps switch here, as any others */
         GstCaps *last = gst_caps_is_equal (caps, priv->out_caps) ? NULL : gst_caps_ref (priv->out_caps);
 
         g_mutex_unlock (&priv->probe_lock);
