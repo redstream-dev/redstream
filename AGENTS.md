@@ -481,17 +481,18 @@ meson test -C build-rel --print-errorlogs
   `tests/lsan-va-reconfig.supp.in`: VA's caps leak (Known gotchas) can only be suppressed by GStreamer's caps
   functions, which would hide our own caps leaks in the other subtests. Add a new such subtest to the list in
   `tests/meson.build`.
-- The compat-matrix lints (`/cpu/infer-config/compat-matrix`, `/cpu/tracker-config/compat-matrix`) run only in
+- The config-page lints (`/cpu/infer-config/config-doc`, `/cpu/tracker-config/config-doc`) run only in
   builds with rdsinfer and rdstracker respectively: a build without MIGraphX, such as a hosted CI runner, doesn't
   check the rdsinfer key tables in `docs/elements/rdsinfer-config.md` (the tracker's are in
-  `docs/elements/rdstracker-config.md`). `/cpu/analytics-config/compat-matrix` (rdsanalytics is always built)
+  `docs/elements/rdstracker-config.md`). `/cpu/analytics-config/config-doc` (rdsanalytics is always built)
   checks `docs/elements/rdsanalytics-config.md` in every build. A new or changed config key needs its row there; the
   test's message prints the expected row. `/cpu/elements/compat-matrix` checks the matrix's status tables
-  (`| Property | Status | Difference |`) of `rdsmultistreamtiler`, `rdsosd` (when built), `rdslogger`,
-  `rdsvideosink`, `rdsurisrcbin`, `rdsanalytics`, `rdsh264enc` and `rdsh265enc`: every property except those of
-  GstObject, GstElement and GstBin needs a row (GstBaseTransform's `qos` included; GstBin's may have one), a row
-  naming no property fails too, and each element's section links to its page in `docs/elements/`. Details belong on
-  the page; a status table row says only the status and, in one line, the difference.
+  (`| Property | Status | Difference |`) of every element in `tests/check/rds-element-pages.h` (the optional ones when
+  built): every property except those of GstObject, GstElement and GstBin and of GStreamer's base classes
+  (GstVideoDecoder, GstBaseTransform, GstAggregator, GstBaseSink, GstBaseSrc; these are on the pages) needs a row
+  (GstBaseTransform's `qos` included; a row for one of the others is allowed), a row naming no property fails too,
+  and each element's section links to its page in `docs/elements/`. Details belong on the page; a status table row
+  says only the status and, in one line, the difference.
 - **Element pages.** A change to an element's properties, pads, signals or behaviour updates its page in
   `docs/elements/` in the same commit. `element_docs` (cpu) checks every factory in `tests/check/rds-element-pages.h`:
   a row per property (its type and default against the GParamSpec, and the range, when the Values cell gives one),

@@ -1424,7 +1424,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/infer-config/validate", test_validate);
   g_test_add_func ("/cpu/infer-config/key-table", test_key_table);
   g_test_add_func ("/cpu/infer-config/config-doc-parse", test_config_doc_parse);
-  g_test_add_func ("/cpu/infer-config/compat-matrix", test_config_doc);
+  g_test_add_func ("/cpu/infer-config/config-doc", test_config_doc);
   g_test_add_func ("/cpu/infer-config/sample-test3", test_sample_test3);
   return g_test_run ();
 }

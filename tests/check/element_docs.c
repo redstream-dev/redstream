@@ -1,6 +1,7 @@
 /* docs/elements/<page>.md, for every factory in rds-element-pages.h: the page has a row for each property, pad
  * template and signal of the element, and none for one it lacks; each property row has the property's type and
- * default (cpu). Also: every relative link in docs/, docs/elements/, README.md and AGENTS.md resolves.
+ * default (cpu). Also: every relative link in docs/, docs/elements/, README.md, AGENTS.md, tests/models/README.md
+ * and .agents/skills/<skill>/SKILL.md resolves, #anchors included.
  *
  * The page format:
  * - A table belongs to the "## " or "### " heading above it, up to the next heading of the same or a higher level,
@@ -130,58 +131,6 @@ heading_is (const gchar * line, const gchar * heading)
   return n == strlen (heading) && strncmp (line, heading, n) == 0;
 }
 
-/* The cells of a table row, stripped; '|' inside backticks or escaped as "\|" does not split. */
-static gchar **
-split_cells (const gchar * row)
-{
-  GPtrArray *cells = g_ptr_array_new ();
-  GString *cell = NULL;
-  gboolean code = FALSE;
-
-  for (const gchar * p = row; *p; p++) {
-    if (*p == '\\' && p[1] == '|') {
-      if (cell)
-        g_string_append_c (cell, '|');
-      p++;
-      continue;
-    }
-    if (*p == '`')
-      code = !code;
-    if (*p == '|' && !code) {
-      if (cell)
-        g_ptr_array_add (cells, g_strstrip (g_string_free (cell, FALSE)));
-      cell = g_string_new (NULL);
-      continue;
-    }
-    if (cell)
-      g_string_append_c (cell, *p);
-  }
-  /* what follows the last '|' is not a cell */
-  if (cell)
-    g_string_free (cell, TRUE);
-  g_ptr_array_add (cells, NULL);
-  return (gchar **) g_ptr_array_free (cells, FALSE);
-}
-
-/* The names in backticks in a first cell ("`a`, `b`"). */
-static gchar **
-cell_names (const gchar * cell)
-{
-  GPtrArray *names = g_ptr_array_new ();
-  const gchar *p = cell;
-
-  while ((p = strchr (p, '`'))) {
-    const gchar *close = strchr (p + 1, '`');
-
-    if (!close)
-      break;
-    g_ptr_array_add (names, g_strndup (p + 1, close - p - 1));
-    p = close + 1;
-  }
-  g_ptr_array_add (names, NULL);
-  return (gchar **) g_ptr_array_free (names, FALSE);
-}
-
 static const gchar *const prop_columns[] = { "Property", "Type", "Default", "Values", "Changeable", "Description",
   NULL
 };
@@ -206,7 +155,7 @@ take_table (Ctx * ctx, GArray * table, const gchar * heading, const gchar * cons
   if (table->len == 0)
     return;
   head = &g_array_index (table, Row, 0);
-  header = split_cells (head->text);
+  header = rds_md_split_cells (head->text);
   if (!g_strv_equal ((const gchar * const *) header, columns)) {
     gchar *want = g_strjoinv (" | ", (gchar **) columns);
 
@@ -219,7 +168,7 @@ take_table (Ctx * ctx, GArray * table, const gchar * heading, const gchar * cons
     fail_at (ctx, head->line, "a table under \"%s\" has no separator row after its header", heading);
   for (guint r = 2; r < table->len; r++) {
     const Row *row = &g_array_index (table, Row, r);
-    gchar **cells = split_cells (row->text);
+    gchar **cells = rds_md_split_cells (row->text);
     guint n = g_strv_length (cells);
 
     g_strfreev (cells);
@@ -300,7 +249,7 @@ check_only_on_headings (Ctx * ctx, const Page * page)
       in_props = h == 2 && heading_is (page->lines[i], "## Properties");
     if (!in_props || h != 3 || !g_str_has_prefix (page->lines[i] + h + 1, "Only on "))
       continue;
-    names = cell_names (page->lines[i] + h + 1);
+    names = rds_md_cell_names (page->lines[i] + h + 1);
     for (guint e = 0; names[0] != NULL && names[1] == NULL && e < G_N_ELEMENTS (rds_element_pages); e++)
       ok |= strcmp (rds_element_pages[e].factory, names[0]) == 0 && strcmp (rds_element_pages[e].page,
           ctx->page) == 0;
@@ -326,8 +275,8 @@ table_init (Ctx * ctx, Table * t, GArray * rows)
   t->by_name = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
   for (guint r = 0; r < rows->len; r++) {
     const Row *row = &g_array_index (rows, Row, r);
-    gchar **cells = split_cells (row->text);
-    gchar **names = cell_names (cells[0] ? cells[0] : "");
+    gchar **cells = rds_md_split_cells (row->text);
+    gchar **names = rds_md_cell_names (cells[0] ? cells[0] : "");
 
     g_ptr_array_add (t->cells, cells);
     g_array_append_val (t->lines, row->line);
@@ -669,8 +618,7 @@ typedef gboolean (*SkipFunc) (GParamSpec * pspec);
 static gboolean
 skip_element_property (GParamSpec * pspec)
 {
-  return pspec->owner_type == GST_TYPE_OBJECT || pspec->owner_type == GST_TYPE_ELEMENT
-      || pspec->owner_type == GST_TYPE_BIN;
+  return rds_md_is_common_property (pspec);
 }
 
 static gboolean
@@ -912,11 +860,14 @@ test_pages (void)
     guint n_props, n_checked, n_pads, n_signals;
     Page page;
 
+    if (!ep->configured) {
+      g_test_message ("%s is not in this build: its page is not checked", ep->factory);
+      if (el != NULL)
+        gst_object_unref (el);
+      goto next;
+    }
     if (el == NULL) {
-      if (!ep->optional)
-        fail_at (&ctx, 0, "%s is not built", ep->factory);
-      else
-        g_test_message ("%s is not built: its page is not checked", ep->factory);
+      fail_at (&ctx, 0, "%s is in this build but does not load", ep->factory);
       goto next;
     }
     if (!read_page (path, &page)) {
@@ -956,10 +907,11 @@ test_pages (void)
 
 /* ---- links ---- */
 
-/* One link target: "<path>" or "path" with an optional title; NULL when it is not a relative file path (empty,
- * in-page, or with a "scheme:" prefix, a ':' before any '/'). A #anchor is dropped. */
-static gchar *
-link_path (const gchar * raw)
+/* One link target: "<path>" or "path" with an optional title, split into *file (empty for an in-page link) and
+ * *anchor (after '#', NULL without one). FALSE, with nothing set, when it is not a relative link: empty, or with a
+ * "scheme:" prefix (a ':' before any '/'). */
+static gboolean
+link_target (const gchar * raw, gchar ** file, gchar ** anchor)
 {
   gchar *target;
   gchar *cut, *colon;
@@ -975,42 +927,128 @@ link_path (const gchar * raw)
     if ((cut = strpbrk (target, " \t")))
       *cut = '\0';             /* a title: ](x.md "title") */
   }
-  if ((cut = strchr (target, '#')))
-    *cut = '\0';
   colon = strchr (target, ':');
   cut = strchr (target, '/');
   if (target[0] == '\0' || (colon != NULL && (cut == NULL || colon < cut))) {
     g_free (target);
-    return NULL;
+    return FALSE;
   }
-  return target;
+  *anchor = NULL;
+  if ((cut = strchr (target, '#'))) {
+    *anchor = g_strdup (cut + 1);
+    *cut = '\0';
+  }
+  *file = target;
+  return TRUE;
 }
 
-static guint
-check_target (const gchar * path, const gchar * dir, guint line, const gchar * raw, guint * n_links)
+/* GitHub's anchor for a heading's text: links reduced to their text, then lowercased; letters, digits, marks, '-'
+ * and '_' kept, spaces made '-', everything else (backticks, punctuation, symbols) dropped. */
+static gchar *
+heading_slug (const gchar * text)
 {
-  gchar *target = link_path (raw), *full;
+  GRegex *link = g_regex_new ("\\[([^\\]]*)\\]\\([^)]*\\)", 0, 0, NULL);
+  gchar *plain = g_regex_replace (link, text, -1, 0, "\\1", 0, NULL);
+  GString *slug = g_string_new (NULL);
+
+  for (const gchar * p = plain; *p; p = g_utf8_next_char (p)) {
+    gunichar c = g_utf8_get_char (p);
+
+    if (c == ' ')
+      g_string_append_c (slug, '-');
+    else if (c == '-' || c == '_' || g_unichar_isalnum (c) || g_unichar_ismark (c))
+      g_string_append_unichar (slug, g_unichar_tolower (c));
+  }
+  g_free (plain);
+  g_regex_unref (link);
+  return g_string_free (slug, FALSE);
+}
+
+/* The anchors of a Markdown file: its headings' slugs (a repeated slug gets "-1", "-2", ... as on GitHub) and the
+ * explicit <a id="..."> and <a name="..."> anchors, outside code fences. NULL when the file can't be read. */
+static GHashTable *
+file_anchors (const gchar * path)
+{
+  GHashTable *anchors;
+  GRegex *html = g_regex_new ("<a\\s+(?:id|name)=\"([^\"]+)\"", 0, 0, NULL);
+  Page page;
+
+  if (!read_page (path, &page)) {
+    g_regex_unref (html);
+    return NULL;
+  }
+  anchors = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  for (guint i = 0; page.lines[i]; i++) {
+    guint h = heading_level (&page, i);
+    GMatchInfo *m;
+
+    if (page.in_fence[i])
+      continue;
+    if (h > 0) {
+      gchar *text = g_strstrip (g_strdup (page.lines[i] + h));
+      gchar *base = heading_slug (text), *slug = g_strdup (base);
+
+      for (guint n = 1; g_hash_table_contains (anchors, slug); n++) {
+        g_free (slug);
+        slug = g_strdup_printf ("%s-%u", base, n);
+      }
+      g_hash_table_add (anchors, slug);
+      g_free (base);
+      g_free (text);
+    }
+    g_regex_match (html, page.lines[i], 0, &m);
+    while (g_match_info_matches (m)) {
+      g_hash_table_add (anchors, g_match_info_fetch (m, 1));
+      g_match_info_next (m, NULL);
+    }
+    g_match_info_free (m);
+  }
+  page_clear (&page);
+  g_regex_unref (html);
+  return anchors;
+}
+
+typedef struct
+{
+  guint n_links;
+  GHashTable *anchors;          /* path -> its anchors (GHashTable), read once */
+} LinkCtx;
+
+static guint
+check_target (LinkCtx * lc, const gchar * path, const gchar * dir, guint line, const gchar * raw)
+{
+  gchar *file, *anchor, *full;
   guint n_bad = 0;
 
-  if (target == NULL)
+  if (!link_target (raw, &file, &anchor))
     return 0;
-  full = g_build_filename (dir, target, NULL);
-  (*n_links)++;
+  full = file[0] ? g_build_filename (dir, file, NULL) : g_strdup (path);
+  lc->n_links++;
   if (!g_file_test (full, G_FILE_TEST_EXISTS)) {
-    g_test_message ("%s:%u: link target %s does not exist", path, line, target);
+    g_test_message ("%s:%u: link target %s does not exist", path, line, file);
     n_bad = 1;
+  } else if (anchor != NULL && g_str_has_suffix (full, ".md")) {
+    GHashTable *anchors = g_hash_table_lookup (lc->anchors, full);
+
+    if (anchors == NULL && (anchors = file_anchors (full)) != NULL)
+      g_hash_table_insert (lc->anchors, g_strdup (full), anchors);
+    if (anchors == NULL || !g_hash_table_contains (anchors, anchor)) {
+      g_test_message ("%s:%u: %s has no heading or anchor #%s", path, line, file[0] ? file : "this page", anchor);
+      n_bad = 1;
+    }
   }
   g_free (full);
-  g_free (target);
+  g_free (file);
+  g_free (anchor);
   return n_bad;
 }
 
 /* Relative link targets in a Markdown file resolve, from the file's directory: inline links "](target)", with the
- * target in angle brackets or not, and reference definitions "[label]: target" (not footnotes, "[^label]:"). Links
- * in fences and in inline code are not read; links with a scheme (http:, mailto:, ...) and in-page (#) links are
- * skipped, and a target's #anchor is dropped. */
+ * target in angle brackets or not, and reference definitions "[label]: target" (not footnotes, "[^label]:"); a
+ * #anchor, in-page or in another Markdown file, must be one of that file's heading slugs or <a id> anchors. Links in
+ * fences and in inline code are not read; links with a scheme (http:, mailto:, ...) are skipped. */
 static guint
-check_links_in (const gchar * path, guint * n_links)
+check_links_in (LinkCtx * lc, const gchar * path)
 {
   Page page;
   gchar *dir = g_path_get_dirname (path);
@@ -1032,7 +1070,7 @@ check_links_in (const gchar * path, guint * n_links)
 
       if (close != NULL && close[1] == ':' && memchr (l, '`', close - l) == NULL) {
         if (l[1] != '^')
-          n_bad += check_target (path, dir, i + 1, close + 2, n_links);
+          n_bad += check_target (lc, path, dir, i + 1, close + 2);
         continue;
       }
     }
@@ -1049,7 +1087,7 @@ check_links_in (const gchar * path, guint * n_links)
       if (end == NULL)
         continue;
       raw = g_strndup (p + 2, end - p - 2);
-      n_bad += check_target (path, dir, i + 1, raw, n_links);
+      n_bad += check_target (lc, path, dir, i + 1, raw);
       g_free (raw);
       p = end;
     }
@@ -1059,8 +1097,9 @@ check_links_in (const gchar * path, guint * n_links)
   return n_bad;
 }
 
+/* The Markdown files in @dir_path (with @name, when given, in each of its subdirectories instead). */
 static guint
-check_links_in_dir (const gchar * dir_path, guint * n_files, guint * n_links)
+check_links_in_dir (LinkCtx * lc, const gchar * dir_path, const gchar * name_in_subdirs, guint * n_files)
 {
   GDir *dir = g_dir_open (dir_path, 0, NULL);
   const gchar *name;
@@ -1068,13 +1107,13 @@ check_links_in_dir (const gchar * dir_path, guint * n_files, guint * n_links)
 
   g_assert_nonnull (dir);
   while ((name = g_dir_read_name (dir))) {
-    gchar *path;
+    gchar *path = name_in_subdirs ? g_build_filename (dir_path, name, name_in_subdirs, NULL)
+        : g_build_filename (dir_path, name, NULL);
 
-    if (!g_str_has_suffix (name, ".md"))
-      continue;
-    path = g_build_filename (dir_path, name, NULL);
-    n_bad += check_links_in (path, n_links);
-    (*n_files)++;
+    if ((name_in_subdirs || g_str_has_suffix (name, ".md")) && g_file_test (path, G_FILE_TEST_IS_REGULAR)) {
+      n_bad += check_links_in (lc, path);
+      (*n_files)++;
+    }
     g_free (path);
   }
   g_dir_close (dir);
@@ -1084,20 +1123,49 @@ check_links_in_dir (const gchar * dir_path, guint * n_files, guint * n_links)
 static void
 test_links (void)
 {
-  guint n_bad = 0, n_files = 0, n_links = 0;
+  static const gchar *const top[] = { "README.md", "AGENTS.md", "tests/models/README.md" };
+  LinkCtx lc = { 0, g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_hash_table_unref) };
+  guint n_bad = 0, n_files = 0;
+  gchar *skills = g_build_filename (RDS_SOURCE_ROOT, ".agents", "skills", NULL);
 
-  n_bad += check_links_in_dir (RDS_DOCS, &n_files, &n_links);
-  n_bad += check_links_in_dir (RDS_DOCS_ELEMENTS, &n_files, &n_links);
-  /* the top-level files that link into docs/ */
-  for (guint i = 0; i < 2; i++) {
-    gchar *path = g_build_filename (RDS_SOURCE_ROOT, i == 0 ? "README.md" : "AGENTS.md", NULL);
+  n_bad += check_links_in_dir (&lc, RDS_DOCS, NULL, &n_files);
+  n_bad += check_links_in_dir (&lc, RDS_DOCS_ELEMENTS, NULL, &n_files);
+  n_bad += check_links_in_dir (&lc, skills, "SKILL.md", &n_files);
+  for (guint i = 0; i < G_N_ELEMENTS (top); i++) {
+    gchar *path = g_build_filename (RDS_SOURCE_ROOT, top[i], NULL);
 
-    n_bad += check_links_in (path, &n_links);
+    n_bad += check_links_in (&lc, path);
     n_files++;
     g_free (path);
   }
-  g_test_message ("%u relative links in %u files checked", n_links, n_files);
+  g_test_message ("%u relative links in %u files checked", lc.n_links, n_files);
   g_assert_cmpuint (n_bad, ==, 0);
+  g_hash_table_unref (lc.anchors);
+  g_free (skills);
+}
+
+/* GitHub's heading slugs, on the forms the docs use. */
+static void
+test_slugs (void)
+{
+  static const gchar *const cases[][2] = {
+    {"Differences from DeepStream 8.0", "differences-from-deepstream-80"},
+    {"Only on `rdsh264enc`", "only-on-rdsh264enc"},
+    {"Classifier output (classifier meta)", "classifier-output-classifier-meta"},
+    {"`rdsh264enc` (`nvv4l2h264enc`) properties ([ref](https://example.invalid/x.html))",
+        "rdsh264enc-nvv4l2h264enc-properties-ref"},
+    {"Zero-copy and where it stops", "zero-copy-and-where-it-stops"},
+    {"nvinfer custom parser ABI (nvdsinfer.h, nvdsinfer_custom_impl.h)",
+        "nvinfer-custom-parser-abi-nvdsinferh-nvdsinfer_custom_implh"},
+    {"A \xe2\x80\x94 b", "a--b"},
+  };
+
+  for (guint i = 0; i < G_N_ELEMENTS (cases); i++) {
+    gchar *slug = heading_slug (cases[i][0]);
+
+    g_assert_cmpstr (slug, ==, cases[i][1]);
+    g_free (slug);
+  }
 }
 
 /* ---- the cell formatting on its own ---- */
@@ -1223,6 +1291,7 @@ main (int argc, char **argv)
   g_test_init (&argc, &argv, NULL);
   g_test_add_func ("/cpu/elements/doc-cells", test_cells);
   g_test_add_func ("/cpu/elements/docs", test_pages);
+  g_test_add_func ("/cpu/elements/doc-slugs", test_slugs);
   g_test_add_func ("/cpu/elements/doc-links", test_links);
   ret = g_test_run ();
   gst_deinit ();

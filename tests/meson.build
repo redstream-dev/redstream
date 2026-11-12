@@ -486,11 +486,13 @@ test('element_tiler', element_tiler_exe, args : ['-p', '/gpu/tiler'],
 test('element_logger', executable('element_logger', 'check' / 'element_logger.c', dependencies : test_deps),
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
-# docs/compat-matrix.md has a property-table row for every property of rdsmultistreamtiler, rdsosd (when built),
-# rdslogger, rdsvideosink, rdsurisrcbin, rdsanalytics, rdsh264enc and rdsh265enc, and none for a property they lack.
+# docs/compat-matrix.md has a status-table row for every property of each element in rds-element-pages.h (optional
+# ones when built), none for a property it lacks, and a link to the element's page.
 test('element_compat_matrix', executable('element_compat_matrix', 'check' / 'element_compat_matrix.c',
     dependencies : test_deps,
     c_args : ['-DRDS_HAVE_OSD=@0@'.format(rds_osd_enabled ? 1 : 0),
+      '-DRDS_HAVE_INFER=@0@'.format(rds_infer_enabled ? 1 : 0),
+      '-DRDS_HAVE_TRACKER=@0@'.format(rds_tracker_enabled ? 1 : 0),
       '-DRDS_COMPAT_MATRIX="@0@"'.format(meson.project_source_root() / 'docs' / 'compat-matrix.md')]),
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)
 
@@ -498,7 +500,10 @@ test('element_compat_matrix', executable('element_compat_matrix', 'check' / 'ele
 # pad template and per signal; relative links in docs/, README.md and AGENTS.md resolve.
 test('element_docs', executable('element_docs', 'check' / 'element_docs.c',
     dependencies : test_deps,
-    c_args : ['-DRDS_DOCS_ELEMENTS="@0@"'.format(meson.project_source_root() / 'docs' / 'elements'),
+    c_args : ['-DRDS_HAVE_OSD=@0@'.format(rds_osd_enabled ? 1 : 0),
+      '-DRDS_HAVE_INFER=@0@'.format(rds_infer_enabled ? 1 : 0),
+      '-DRDS_HAVE_TRACKER=@0@'.format(rds_tracker_enabled ? 1 : 0),
+      '-DRDS_DOCS_ELEMENTS="@0@"'.format(meson.project_source_root() / 'docs' / 'elements'),
       '-DRDS_DOCS="@0@"'.format(meson.project_source_root() / 'docs'),
       '-DRDS_SOURCE_ROOT="@0@"'.format(meson.project_source_root())]),
   suite : 'cpu', env : test_env, protocol : 'tap', depends : rds_plugins)

@@ -773,7 +773,7 @@ test_config_doc_parse (void)
       "## Tracker config keys: `BaseConfig`\n"
       "| `a` | int | `0` | | IOU, NvSORT | supported | |\n"
       "### A subgroup\n"
-      "| `b` | int | `0` | | IOU, NvSORT | supported | |\n"
+      "| `b` | int | `0` | | IOU, NvSORT | supported | `x|y` and \\| are not cell breaks |\n"
       "```yaml\n# a comment, not a heading\n| `fenced` | int | `0` | | IOU | supported | |\n```\n"
       "| `c` | int | `0` | | IOU, NvSORT | supported | |\n"
       "## Something else\n"
@@ -839,6 +839,6 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/tracker-config/bom", test_bom);
   g_test_add_func ("/cpu/tracker-config/key-table", test_key_table);
   g_test_add_func ("/cpu/tracker-config/config-doc-parse", test_config_doc_parse);
-  g_test_add_func ("/cpu/tracker-config/compat-matrix", test_config_doc);
+  g_test_add_func ("/cpu/tracker-config/config-doc", test_config_doc);
   return g_test_run ();
 }

@@ -1,11 +1,13 @@
-/* Markdown helpers for the docs lints (element_docs, element_compat_matrix and the config-key lints).
+/* Markdown helpers for the docs lints (element_docs, element_compat_matrix and the config-key lints), so they all read
+ * one Markdown dialect.
  * SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <glib.h>
+#include <glib-object.h>
 #include <string.h>
 
-/* CommonMark code fences, for both lints. A line of at most 3 spaces, then 3 or more '`' or '~' (a '`' fence's info
+/* CommonMark code fences. A line of at most 3 spaces, then 3 or more '`' or '~' (a '`' fence's info
  * string has no '`') opens a fence; a line of at most 3 spaces, then at least as many of the same character and only
  * blanks after, closes it. Returns whether `line` is a fence line or inside a fence. `fence` is the open fence's
  * character (0: none) and `fence_len` its length; start both at 0. */
@@ -38,6 +40,75 @@ rds_md_fence_line (const char *line, char *fence, guint * fence_len)
   return TRUE;
 }
 
+/* The cells of a table row, stripped; '|' inside backticks or escaped as "\|" does not split. */
+static inline gchar **
+rds_md_split_cells (const gchar * row)
+{
+  GPtrArray *cells = g_ptr_array_new ();
+  GString *cell = NULL;
+  gboolean code = FALSE;
+
+  for (const gchar * p = row; *p; p++) {
+    if (*p == '\\' && p[1] == '|') {
+      if (cell)
+        g_string_append_c (cell, '|');
+      p++;
+      continue;
+    }
+    if (*p == '`')
+      code = !code;
+    if (*p == '|' && !code) {
+      if (cell)
+        g_ptr_array_add (cells, g_strstrip (g_string_free (cell, FALSE)));
+      cell = g_string_new (NULL);
+      continue;
+    }
+    if (cell)
+      g_string_append_c (cell, *p);
+  }
+  /* what follows the last '|' is not a cell */
+  if (cell)
+    g_string_free (cell, TRUE);
+  g_ptr_array_add (cells, NULL);
+  return (gchar **) g_ptr_array_free (cells, FALSE);
+}
+
+/* The names in backticks in a first cell ("`a`, `b`"). */
+static inline gchar **
+rds_md_cell_names (const gchar * cell)
+{
+  GPtrArray *names = g_ptr_array_new ();
+  const gchar *p = cell;
+
+  while ((p = strchr (p, '`'))) {
+    const gchar *close = strchr (p + 1, '`');
+
+    if (!close)
+      break;
+    g_ptr_array_add (names, g_strndup (p + 1, close - p - 1));
+    p = close + 1;
+  }
+  g_ptr_array_add (names, NULL);
+  return (gchar **) g_ptr_array_free (names, FALSE);
+}
+
+/* A property every GStreamer element has, from GstObject, GstElement or GstBin (`name`, `parent`, `async-handling`,
+ * `message-forward`): the pages and the matrix need no row for it, and may have one. The types are looked up by name,
+ * so the config lints need no GStreamer. */
+static inline gboolean
+rds_md_is_common_property (GParamSpec * pspec)
+{
+  static const char *const owners[] = { "GstObject", "GstElement", "GstBin" };
+
+  for (guint i = 0; i < G_N_ELEMENTS (owners); i++) {
+    GType t = g_type_from_name (owners[i]);
+
+    if (t != 0 && pspec->owner_type == t)
+      return TRUE;
+  }
+  return FALSE;
+}
+
 /* A config page's key tables, for rds_md_read_key_rows. */
 typedef struct
 {
@@ -51,7 +122,7 @@ typedef struct
 
 /* The key rows ("| `key` | ... |") of the key sections in @text, into @rows ("group.key" -> the row's cells, a
  * gchar ** whose cells[0] is the key without its backticks). @rows frees its keys with g_free and its values with
- * g_strfreev. Cells are split on every '|', also inside backticks, so a key table's cells hold none. A "#" or "##"
+ * g_strfreev. Cells are split as rds_md_split_cells splits them. A "#" or "##"
  * heading starts or ends a key section; "###" subheadings stay in it, and a "###" heading that would start one is an
  * error. Nothing inside code fences is read.
  * Returns the number of errors (malformed and duplicate rows, misplaced key sections), each with a message. */
@@ -85,11 +156,8 @@ rds_md_read_key_rows (const char *text, const RdsMdKeyTable * t, GHashTable * ro
     }
     if (!group || !g_str_has_prefix (lines[i], "| `"))
       continue;
-    /* "| a | b |" splits into "", " a ", " b ", "" */
-    cells = g_strsplit (lines[i] + 1, "|", -1);
-    for (guint c = 0; cells[c]; c++)
-      g_strstrip (cells[c]);
-    if (g_strv_length (cells) != t->n_cells + 1 || !g_str_has_prefix (cells[0], "`")
+    cells = rds_md_split_cells (lines[i]);
+    if (g_strv_length (cells) != t->n_cells || !g_str_has_prefix (cells[0], "`")
         || !g_str_has_suffix (cells[0], "`")) {
       g_test_message ("%s:%u: %s: expected %u cells, the first a `key`", t->doc, i + 1, lines[i], t->n_cells);
       n_bad++;

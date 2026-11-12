@@ -831,6 +831,6 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/analytics-config/unknown-keys", test_unknown_keys);
   g_test_add_func ("/cpu/analytics-config/key-table", test_key_table);
   g_test_add_func ("/cpu/analytics-config/config-doc-parse", test_config_doc_parse);
-  g_test_add_func ("/cpu/analytics-config/compat-matrix", test_config_doc);
+  g_test_add_func ("/cpu/analytics-config/config-doc", test_config_doc);
   return g_test_run ();
 }

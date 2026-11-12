@@ -121,6 +121,7 @@ Names and integers as on NVIDIA's [nvvideoconvert page](https://docs.nvidia.com/
 | `output-buffers` | supported | |
 | `disable-passthrough` | supported | |
 | `silent` | accepted no-op | |
+| `qos` | supported | GstBaseTransform's |
 
 ### `rdsvideodec` (`nvv4l2decoder`) properties
 
