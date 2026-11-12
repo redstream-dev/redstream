@@ -2,9 +2,10 @@
  * shows them for DeepStream 8.0's nvv4l2h264enc / nvv4l2h265enc, the enum types, the accepted no-ops' warning,
  * malformed QP strings, the inner chain, a missing VA encoder, one that doesn't link, the unsupported profiles, what a
  * start sets on the VA encoder, the output probes on a stand-in's pushes: a buffer of filler only dropped, a segment
- * sent again; force-idr before the start, the input size limits from a stand-in's template (cpu; a stand-in element
- * takes the VA encoder's factory name where the bin has to reach READY); the preferred-profile caps answer of a started
- * bin, with the stand-in (gpu: the start needs rdsvideoconvert's GPU); per codec on the real VA encoders: a short
+ * sent again, caps sent again before a frame-rate change; force-idr before the start, the input size limits from a
+ * stand-in's template (cpu; a stand-in element takes the VA encoder's factory name where the bin has to reach
+ * READY); the preferred-profile caps answer of a started bin, with the stand-in (gpu: the start needs
+ * rdsvideoconvert's GPU); per codec on the real VA encoders: a short
  * encode, properties set while PLAYING, GOP layouts and parameter sets, profiles and levels in the SPS and the caps, a
  * downstream level, CBR rates, a live bitrate change, B frames and Baseline, preset-id and gpu-id, and what the bin's
  * pad probes do: no filler, the H.265 size, input timestamps (also after a seek and with B frames), copy-meta,
@@ -1348,6 +1349,7 @@ typedef struct
   GstPad *va_sink, *va_src, *ghost, *sink;
   GPtrArray *got;               /* buffers */
   GArray *segs;                 /* GstSegment */
+  GPtrArray *caps;              /* GstCaps, of the CAPS events */
 } Harness;
 
 static GstFlowReturn
@@ -1369,9 +1371,25 @@ harness_event (GstPad * pad, G_GNUC_UNUSED GstObject * parent, GstEvent * ev)
 
     gst_event_copy_segment (ev, &seg);
     g_array_append_val (h->segs, seg);
+  } else if (GST_EVENT_TYPE (ev) == GST_EVENT_CAPS) {
+    GstCaps *caps;
+
+    gst_event_parse_caps (ev, &caps);
+    g_ptr_array_add (h->caps, gst_caps_ref (caps));
   }
   gst_event_unref (ev);
   return TRUE;
+}
+
+/* The test pad takes any caps. */
+static gboolean
+harness_query (GstPad * pad, GstObject * parent, GstQuery * q)
+{
+  if (GST_QUERY_TYPE (q) == GST_QUERY_ACCEPT_CAPS) {
+    gst_query_set_accept_caps_result (q, TRUE);
+    return TRUE;
+  }
+  return gst_pad_query_default (pad, parent, q);
 }
 
 static gboolean
@@ -1390,6 +1408,7 @@ harness_start (Harness * h, const Codec * c)
   h->e = gst_element_factory_make (c->element, NULL);
   h->got = g_ptr_array_new_with_free_func ((GDestroyNotify) gst_buffer_unref);
   h->segs = g_array_new (FALSE, FALSE, sizeof (GstSegment));
+  h->caps = g_ptr_array_new_with_free_func ((GDestroyNotify) gst_caps_unref);
   g_assert_cmpint (gst_element_set_state (h->e, GST_STATE_READY), ==, GST_STATE_CHANGE_SUCCESS);
   h->va = gst_bin_get_by_name (GST_BIN (h->e), "encoder");
   h->out = gst_bin_get_by_name (GST_BIN (h->e), "srccaps");
@@ -1398,6 +1417,7 @@ harness_start (Harness * h, const Codec * c)
   g_object_set_data (G_OBJECT (h->sink), "harness", h);
   gst_pad_set_chain_function (h->sink, harness_chain);
   gst_pad_set_event_function (h->sink, harness_event);
+  gst_pad_set_query_function (h->sink, harness_query);
   g_assert_cmpint (gst_pad_link (h->ghost, h->sink), ==, GST_PAD_LINK_OK);
   gst_pad_set_active (h->sink, TRUE);
   gst_pad_set_active (h->ghost, TRUE);
@@ -1432,6 +1452,7 @@ harness_stop (Harness * h, const Codec * c)
   gst_object_unref (h->e);
   g_ptr_array_unref (h->got);
   g_array_unref (h->segs);
+  g_ptr_array_unref (h->caps);
   set_va (c, VA_REAL);
 }
 
@@ -1526,6 +1547,73 @@ test_segment_again (void)
   g_assert_cmpuint (g_array_index (h.segs, GstSegment, 0).start, ==, 0);
   g_assert_cmpuint (g_array_index (h.segs, GstSegment, 1).start, ==, 0);
   g_assert_cmpuint (g_array_index (h.segs, GstSegment, 2).start, ==, 5 * GST_SECOND);
+  harness_stop (&h, c);
+}
+
+static GstFlowReturn
+drop_chain (G_GNUC_UNUSED GstPad * pad, G_GNUC_UNUSED GstObject * parent, GstBuffer * buf)
+{
+  gst_buffer_unref (buf);
+  return GST_FLOW_OK;
+}
+
+/* The framerate of the last caps that left the bin (0 without one). */
+static gint
+harness_fps (const Harness * h)
+{
+  gint n = 0, d = 0;
+
+  g_assert_cmpuint (h->caps->len, >, 0);
+  if (!gst_structure_get_fraction (gst_caps_get_structure (g_ptr_array_index (h->caps, h->caps->len - 1), 0),
+          "framerate", &n, &d))
+    return 0;
+  return n;
+}
+
+/* A frame-rate change waits for its first frame out of the VA encoder: the encoder's output caps sent again in the
+ * meantime (equal caps, as when sticky events are re-sent) keep the old framerate, and the frame at the new rate
+ * then brings it, in caps the bin sends itself. */
+static void
+test_caps_again (void)
+{
+  const Codec *c = &codecs[1];
+  Harness h;
+  GstCaps *raw, *va_caps;
+  GstBuffer *buf;
+
+  harness_start (&h, c);
+  gst_pad_set_chain_function (h.va_sink, drop_chain);
+  g_assert_true (gst_pad_send_event (h.va_sink, gst_event_new_stream_start ("caps-again")));
+  raw = gst_caps_from_string ("video/x-raw,format=NV12,width=320,height=240,framerate=30/1");
+  g_assert_true (gst_pad_send_event (h.va_sink, gst_event_new_caps (raw)));
+  gst_caps_unref (raw);
+  g_assert_true (gst_pad_send_event (h.va_sink, segment_event (0, GST_SEQNUM_INVALID)));
+  /* VA's caps for that input: new caps (a profile now), without a framerate */
+  va_caps = gst_caps_make_writable (gst_pad_get_current_caps (h.va_src));
+  gst_caps_set_simple (va_caps, "profile", G_TYPE_STRING, "main", NULL);
+  g_assert_true (gst_pad_push_event (h.va_src, gst_event_new_caps (va_caps)));
+  g_assert_true (gst_pad_push_event (h.va_src, segment_event (0, GST_SEQNUM_INVALID)));
+  g_assert_cmpint (harness_fps (&h), ==, 30);
+
+  /* 15 fps from the frame at 1 s into the VA encoder; its frames before that are still to come out */
+  raw = gst_caps_from_string ("video/x-raw,format=NV12,width=320,height=240,framerate=15/1");
+  g_assert_true (gst_pad_send_event (h.va_sink, gst_event_new_caps (raw)));
+  gst_caps_unref (raw);
+  buf = gst_buffer_new ();
+  GST_BUFFER_PTS (buf) = GST_SECOND;
+  g_assert_cmpint (gst_pad_chain (h.va_sink, buf), ==, GST_FLOW_OK);
+
+  g_assert_true (gst_pad_push_event (h.va_src, gst_event_new_caps (va_caps)));
+  g_assert_cmpint (harness_fps (&h), ==, 30);
+  g_assert_cmpint (push_bytes (h.va_src, (const guint8 *) "\0\0\0\1\x02\x01\xd0\x80", 8), ==, GST_FLOW_OK);
+  g_assert_cmpint (harness_fps (&h), ==, 30);
+  buf = gst_buffer_new_memdup ("\0\0\0\1\x02\x01\xd0\x80", 8);
+  GST_BUFFER_PTS (buf) = GST_SECOND;
+  GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
+  g_assert_cmpint (gst_pad_push (h.va_src, buf), ==, GST_FLOW_OK);
+  g_assert_cmpint (harness_fps (&h), ==, 15);
+  g_assert_cmpuint (h.got->len, ==, 2);
+  gst_caps_unref (va_caps);
   harness_stop (&h, c);
 }
 
@@ -3816,6 +3904,7 @@ main (int argc, char **argv)
   g_test_add_func ("/cpu/enc/configure", test_configure);
   g_test_add_func ("/cpu/enc/filler-only-dropped", test_filler_only_dropped);
   g_test_add_func ("/cpu/enc/segment-again", test_segment_again);
+  g_test_add_func ("/cpu/enc/caps-again", test_caps_again);
   g_test_add_func ("/cpu/enc/force-before-start", test_force_before_start);
   g_test_add_func ("/cpu/enc/size-accept-caps", test_size_accept_caps);
   g_test_add_func ("/gpu/enc/preferred-profile", test_preferred_profile);

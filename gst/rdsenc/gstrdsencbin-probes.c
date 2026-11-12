@@ -351,6 +351,7 @@ gst_rds_enc_bin_reset_probes (GstRdsEncBin * self, gboolean copy_meta)
   priv->in_since = GST_CLOCK_TIME_NONE;
   priv->out_size = (VideoSize) { 0 };
   gst_clear_caps (&priv->out_caps);
+  gst_clear_caps (&priv->va_caps);
   priv->hevc_extra_bits = 0;
   priv->level = NULL;
   priv->copy_size = (VideoSize) { 0 };
@@ -566,7 +567,9 @@ va_sink_event_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointe
  *   (sticky events re-sent): it takes no input segment from the queue.
  * - CAPS: from here on the frames are those of the latest input caps (VA drains the older frames first); a framerate
  *   other than the input's is replaced by the input's (ours: VA keeps the old one after a frame-rate change, and
- *   when its caps don't change otherwise it sends none: then va_src_buffer_probe sends them).
+ *   when its caps don't change otherwise it sends none: then va_src_buffer_probe sends them). Caps equal to the last
+ *   ones out, or to VA's last ones, are those sent again (sticky events re-sent): no renegotiation, and VA's go out
+ *   as the last ones did.
  * - force-key-unit (VA's, before the IDR frame it forced): its timestamp is the frame's PTS, shifted like the
  *   buffers, and the shift is removed from it as from them; its stream time and running time VA computes against its
  *   own (shifted) segment, so they are the input's already.
@@ -630,6 +633,21 @@ va_src_event_probe (G_GNUC_UNUSED GstPad * pad, GstPadProbeInfo * info, gpointer
     case GST_EVENT_CAPS:
       gst_event_parse_caps (ev, &caps);
       g_mutex_lock (&priv->probe_lock);
+      if (priv->out_caps != NULL && (gst_caps_is_equal (caps, priv->out_caps) || (priv->va_caps != NULL
+                  && gst_caps_is_equal (caps, priv->va_caps)))) {
+        /* the same caps again (a pad re-sending its sticky events): no renegotiation, so a frame-rate change still
+         * waiting for its first frame keeps waiting; VA's own caps again go out as they went last time (ours) */
+        GstCaps *last = gst_caps_is_equal (caps, priv->out_caps) ? NULL : gst_caps_ref (priv->out_caps);
+
+        g_mutex_unlock (&priv->probe_lock);
+        GST_DEBUG_OBJECT (self, "caps %" GST_PTR_FORMAT " again: no change", caps);
+        if (last != NULL) {
+          out = gst_event_new_caps (last);
+          gst_caps_unref (last);
+        }
+        break;
+      }
+      gst_caps_replace (&priv->va_caps, caps);
       priv->out_size = priv->in_size;
       priv->in_since = GST_CLOCK_TIME_NONE;
       v = priv->out_size;

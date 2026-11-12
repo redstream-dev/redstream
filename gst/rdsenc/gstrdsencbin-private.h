@@ -161,6 +161,7 @@ struct _GstRdsEncBinPrivate
   GstClockTime in_since;        /* input PTS of the first frame with in_size (NONE: none yet, or out_size is it) */
   VideoSize out_size;           /* the input caps of the frames now leaving it */
   GstCaps *out_caps;            /* the last caps that left the VA encoder, as they left it */
+  GstCaps *va_caps;             /* the last caps the VA encoder sent, before the framerate rewrite */
   guint hevc_extra_bits;        /* num_extra_slice_header_bits of the last PPS */
   const gchar *level;           /* the downstream level written into the parameter sets (a static string; NULL: VA's
                                  * own), set by each CAPS event out of the VA encoder */
