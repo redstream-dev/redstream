@@ -15,7 +15,10 @@
  *   name in backticks; otherwise the GType name in backticks. The default, in backticks: integers in decimal,
  *   floats with %g, `true`/`false`, a string in double quotes or `NULL`, an enum by its nick (by its number when it
  *   has none), flags by their nicks joined with '+' (`0`: none; bits no flag covers as "+0x..."). "—" (no
- *   backticks) for every other type, and for write-only properties.
+ *   backticks) for every other type, and for write-only properties. A Values cell that starts with a range "A–B"
+ *   (numbers, an en dash, '-' or U+2212 for a minus) must start with the property's whole range, its minimum and
+ *   maximum written as defaults are; narrower practical limits go in words after it. "N-M" with an ASCII hyphen
+ *   fails; any other Values cell is not checked.
  *   GstObject's, GstElement's and GstBin's properties need no row (as in element_compat_matrix); a row for one is
  *   still checked. A page shared by two factories puts the rows they have in common there, and the others under
  *   "### Only on `<factory>`".
@@ -538,6 +541,127 @@ default_cell (GParamSpec * pspec)
   return quoted;
 }
 
+static gchar *
+format_double (gdouble v)
+{
+  gchar buf[G_ASCII_DTOSTR_BUF_SIZE];
+
+  return g_strdup (g_ascii_formatd (buf, sizeof (buf), "%g", v));
+}
+
+/* The range of a numeric property, its bounds formatted as defaults are (decimal, %g for floats). FALSE for other
+ * types. */
+static gboolean
+range_cells (GParamSpec * pspec, gchar ** lo, gchar ** hi)
+{
+  *lo = *hi = NULL;
+  if (G_IS_PARAM_SPEC_CHAR (pspec)) {
+    *lo = g_strdup_printf ("%d", G_PARAM_SPEC_CHAR (pspec)->minimum);
+    *hi = g_strdup_printf ("%d", G_PARAM_SPEC_CHAR (pspec)->maximum);
+  } else if (G_IS_PARAM_SPEC_UCHAR (pspec)) {
+    *lo = g_strdup_printf ("%u", G_PARAM_SPEC_UCHAR (pspec)->minimum);
+    *hi = g_strdup_printf ("%u", G_PARAM_SPEC_UCHAR (pspec)->maximum);
+  } else if (G_IS_PARAM_SPEC_INT (pspec)) {
+    *lo = g_strdup_printf ("%d", G_PARAM_SPEC_INT (pspec)->minimum);
+    *hi = g_strdup_printf ("%d", G_PARAM_SPEC_INT (pspec)->maximum);
+  } else if (G_IS_PARAM_SPEC_UINT (pspec)) {
+    *lo = g_strdup_printf ("%u", G_PARAM_SPEC_UINT (pspec)->minimum);
+    *hi = g_strdup_printf ("%u", G_PARAM_SPEC_UINT (pspec)->maximum);
+  } else if (G_IS_PARAM_SPEC_LONG (pspec)) {
+    *lo = g_strdup_printf ("%ld", G_PARAM_SPEC_LONG (pspec)->minimum);
+    *hi = g_strdup_printf ("%ld", G_PARAM_SPEC_LONG (pspec)->maximum);
+  } else if (G_IS_PARAM_SPEC_ULONG (pspec)) {
+    *lo = g_strdup_printf ("%lu", G_PARAM_SPEC_ULONG (pspec)->minimum);
+    *hi = g_strdup_printf ("%lu", G_PARAM_SPEC_ULONG (pspec)->maximum);
+  } else if (G_IS_PARAM_SPEC_INT64 (pspec)) {
+    *lo = g_strdup_printf ("%" G_GINT64_FORMAT, G_PARAM_SPEC_INT64 (pspec)->minimum);
+    *hi = g_strdup_printf ("%" G_GINT64_FORMAT, G_PARAM_SPEC_INT64 (pspec)->maximum);
+  } else if (G_IS_PARAM_SPEC_UINT64 (pspec)) {
+    *lo = g_strdup_printf ("%" G_GUINT64_FORMAT, G_PARAM_SPEC_UINT64 (pspec)->minimum);
+    *hi = g_strdup_printf ("%" G_GUINT64_FORMAT, G_PARAM_SPEC_UINT64 (pspec)->maximum);
+  } else if (G_IS_PARAM_SPEC_FLOAT (pspec)) {
+    *lo = format_double (G_PARAM_SPEC_FLOAT (pspec)->minimum);
+    *hi = format_double (G_PARAM_SPEC_FLOAT (pspec)->maximum);
+  } else if (G_IS_PARAM_SPEC_DOUBLE (pspec)) {
+    *lo = format_double (G_PARAM_SPEC_DOUBLE (pspec)->minimum);
+    *hi = format_double (G_PARAM_SPEC_DOUBLE (pspec)->maximum);
+  }
+  return *lo != NULL;
+}
+
+/* One number at *p: an optional sign ('-' or U+2212, returned as '-'), then digits, '.', 'e', 'E' and a sign after
+ * an exponent mark. Advances *p; NULL when there are no digits. */
+static gchar *
+take_number (const gchar ** p)
+{
+  GString *n = g_string_new (NULL);
+  const gchar *q = *p;
+  gchar prev = '\0';
+  gboolean digits = FALSE;
+
+  if (*q == '-') {
+    g_string_append_c (n, '-');
+    q++;
+  } else if (g_str_has_prefix (q, "\xe2\x88\x92")) {
+    g_string_append_c (n, '-');
+    q += 3;
+  }
+  for (; *q; prev = *q, q++) {
+    if (g_ascii_isdigit (*q))
+      digits = TRUE;
+    else if (!(*q == '.' || *q == 'e' || *q == 'E' || ((*q == '+' || *q == '-') && (prev == 'e' || prev == 'E'))))
+      break;
+    g_string_append_c (n, *q);
+  }
+  if (!digits) {
+    g_string_free (n, TRUE);
+    return NULL;
+  }
+  *p = q;
+  return g_string_free (n, FALSE);
+}
+
+typedef enum
+{
+  RANGE_NONE,                   /* the cell doesn't start with a range */
+  RANGE_FOUND,
+  RANGE_HYPHEN,                 /* "N-M": a range written with an ASCII hyphen */
+} RangeParse;
+
+/* A Values cell that starts with "A–B" (en dash, spaces allowed around it; '-' or U+2212 as the minus sign): its
+ * bounds, with any U+2212 written as '-'. RANGE_HYPHEN for "N-M" (a digit on both sides of an ASCII hyphen). */
+static RangeParse
+parse_range (const gchar * cell, gchar ** lo, gchar ** hi)
+{
+  const gchar *p = cell;
+
+  *lo = *hi = NULL;
+  if ((*lo = take_number (&p)) == NULL)
+    return RANGE_NONE;
+  if (p[0] == '-' && g_ascii_isdigit (p[1]) && p > cell && g_ascii_isdigit (p[-1])) {
+    g_clear_pointer (lo, g_free);
+    return RANGE_HYPHEN;
+  }
+  while (*p == ' ')
+    p++;
+  if (g_str_has_prefix (p, "\xe2\x80\x93")) {
+    p += 3;
+    while (*p == ' ')
+      p++;
+    *hi = take_number (&p);
+  }
+  if (*hi == NULL)
+    g_clear_pointer (lo, g_free);
+  return *lo != NULL ? RANGE_FOUND : RANGE_NONE;
+}
+
+/* A bound as the pages write it: U+2212 for the minus sign. */
+static gchar *
+page_number (const gchar * n)
+{
+  return n[0] == '-' ? g_strconcat ("\xe2\x88\x92", n + 1, NULL) : g_strdup (n);
+}
+
 /* ---- checks ---- */
 
 typedef gboolean (*SkipFunc) (GParamSpec * pspec);
@@ -555,6 +679,35 @@ skip_pad_property (GParamSpec * pspec)
   return pspec->owner_type == GST_TYPE_OBJECT || pspec->owner_type == GST_TYPE_PAD
       || pspec->owner_type == GST_TYPE_PROXY_PAD || pspec->owner_type == GST_TYPE_GHOST_PAD
       || pspec->owner_type == g_type_from_name ("GstAggregatorPad");
+}
+
+/* A Values cell that starts with a range "A–B" must give the property's whole range, its minimum and maximum
+ * (narrower practical limits go in words after it); "N-M" with a hyphen fails. */
+static void
+check_range_cell (Ctx * ctx, guint line, const gchar * what, GParamSpec * pspec, const gchar * values)
+{
+  gchar *lo, *hi, *want_lo, *want_hi, *show_lo, *show_hi;
+  RangeParse r;
+
+  if (!range_cells (pspec, &want_lo, &want_hi))
+    return;
+  show_lo = page_number (want_lo);
+  show_hi = page_number (want_hi);
+  r = parse_range (values, &lo, &hi);
+  if (r == RANGE_HYPHEN) {
+    fail_at (ctx, line, "%s `%s` writes its range with a hyphen: use an en dash (\xe2\x80\x93) for a range; "
+        "expected: | ... | %s\xe2\x80\x93%s | ...", what, pspec->name, show_lo, show_hi);
+  } else if (r == RANGE_FOUND) {
+    if (strcmp (lo, want_lo) != 0 || strcmp (hi, want_hi) != 0)
+      fail_at (ctx, line, "%s `%s` has the range %s to %s; expected: | ... | %s\xe2\x80\x93%s | ...", what,
+          pspec->name, lo, hi, show_lo, show_hi);
+    g_free (lo);
+    g_free (hi);
+  }
+  g_free (show_lo);
+  g_free (show_hi);
+  g_free (want_lo);
+  g_free (want_hi);
 }
 
 /* The rows against the properties: each needed one has a row, each row names a property, and type and default
@@ -578,6 +731,8 @@ check_props (Ctx * ctx, const gchar * what, GPtrArray * pspecs, GArray * rows, S
     } else if (cells != NULL && (strcmp (cell (cells, 1), type) != 0 || strcmp (cell (cells, 2), def) != 0)) {
       fail_at (ctx, line, "%s `%s` has type \"%s\", default \"%s\"; expected: | `%s` | %s | %s | ...", what,
           pspec->name, cell (cells, 1), cell (cells, 2), pspec->name, type, def);
+    } else if (cells != NULL) {
+      check_range_cell (ctx, line, what, pspec, cell (cells, 3));
     }
     if (cells != NULL || !skip (pspec))
       n_checked++;
@@ -955,6 +1110,35 @@ check_cells (GParamSpec * pspec, const gchar * type, const gchar * def)
 }
 
 static void
+check_range (GParamSpec * pspec, const gchar * lo, const gchar * hi)
+{
+  gchar *l = NULL, *h = NULL;
+  gboolean ok;
+
+  g_param_spec_ref_sink (pspec);
+  ok = range_cells (pspec, &l, &h);
+  g_assert_true (ok == (lo != NULL));
+  g_assert_cmpstr (l, ==, lo);
+  g_assert_cmpstr (h, ==, hi);
+  g_free (l);
+  g_free (h);
+  g_param_spec_unref (pspec);
+}
+
+static void
+check_parse (const gchar * cell, const gchar * lo, const gchar * hi)
+{
+  gchar *l = NULL, *h = NULL;
+  RangeParse r = parse_range (cell, &l, &h);
+
+  g_assert_cmpint (r, ==, lo != NULL ? RANGE_FOUND : RANGE_NONE);
+  g_assert_cmpstr (l, ==, lo);
+  g_assert_cmpstr (h, ==, hi);
+  g_free (l);
+  g_free (h);
+}
+
+static void
 test_cells (void)
 {
   const GParamFlags rw = G_PARAM_READWRITE;
@@ -980,6 +1164,38 @@ test_cells (void)
   check_cells (g_param_spec_boxed ("caps", NULL, NULL, GST_TYPE_CAPS, rw), "`GstCaps`", NO_DEFAULT);
   check_cells (g_param_spec_object ("o", NULL, NULL, GST_TYPE_ELEMENT, rw), "`GstElement`", NO_DEFAULT);
   check_cells (g_param_spec_int ("w", NULL, NULL, 0, 10, 3, G_PARAM_WRITABLE), "int", NO_DEFAULT);
+
+  check_range (g_param_spec_uint ("r1", NULL, NULL, 1, G_MAXUINT, 1, rw), "1", "4294967295");
+  check_range (g_param_spec_int ("r2", NULL, NULL, G_MININT, G_MAXINT, 0, rw), "-2147483648", "2147483647");
+  check_range (g_param_spec_int64 ("r3", NULL, NULL, -1, G_MAXINT64, 0, rw), "-1", "9223372036854775807");
+  check_range (g_param_spec_uint64 ("r4", NULL, NULL, 0, G_MAXUINT64, 0, rw), "0", "18446744073709551615");
+  check_range (g_param_spec_float ("r5", NULL, NULL, 0, 1, 0, rw), "0", "1");
+  check_range (g_param_spec_double ("r6", NULL, NULL, -0.5, 1e9, 0, rw), "-0.5", "1e+09");
+  check_range (g_param_spec_boolean ("r7", NULL, NULL, FALSE, rw), NULL, NULL);
+  check_range (g_param_spec_string ("r8", NULL, NULL, NULL, rw), NULL, NULL);
+#define EN_DASH "\xe2\x80\x93"
+#define MINUS "\xe2\x88\x92"
+  check_parse ("0" EN_DASH "4294967295", "0", "4294967295");
+  check_parse (MINUS "1" EN_DASH "30, more", "-1", "30");
+  check_parse ("-2147483648 " EN_DASH " 2147483647", "-2147483648", "2147483647");
+  check_parse ("0" EN_DASH "1e+09", "0", "1e+09");
+  check_parse ("the uint64 range", NULL, NULL);
+  check_parse ("`0` `fast`, `1` `exact`", NULL, NULL);
+  check_parse ("-1", NULL, NULL);
+  check_parse ("1e-5" EN_DASH "2", "1e-5", "2");
+  check_parse ("+1" EN_DASH "2", NULL, NULL);       /* a leading '+' is no number: nothing read before the cell */
+  {
+    gchar *l = NULL, *h = NULL;
+
+    /* a hyphen between digits is a range written wrongly: reported, not skipped */
+    g_assert_cmpint (parse_range ("0-30", &l, &h), ==, RANGE_HYPHEN);
+    g_assert_cmpint (parse_range ("-1-30", &l, &h), ==, RANGE_HYPHEN);
+    g_assert_null (l);
+    g_assert_null (h);
+  }
+#undef EN_DASH
+#undef MINUS
+  check_parse ("", NULL, NULL);
 
   /* values a GParamSpec refuses as a default, but a class could still produce */
   s = enum_text (GST_TYPE_STATE, 42);

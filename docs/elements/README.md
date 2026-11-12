@@ -21,7 +21,9 @@ The Changeable column of the property tables says when a property can be set:
   and that section of the page says when.
 - `read-only`: it can't be set.
 
-A value outside a property's range is refused by GObject with a GLib warning. "Debug-log warning" means a
+A value outside a property's range is refused by GObject with a GLib warning. A Values cell that starts with a range
+(`0–4294967295`) gives the property's whole range, as GObject checks it; narrower practical limits are in words after
+it (`0–4294967295: a visible ROCm device`). "Debug-log warning" means a
 `GST_WARNING` in the element's debug category, usually its name (seen with `GST_DEBUG=<category>:2`); "GLib warning"
 means a `g_warning` on stderr. A "debug-log INFO message" is a `GST_INFO` in the element's debug category (seen with
 `GST_DEBUG=<category>:4`).
