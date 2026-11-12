@@ -19,6 +19,8 @@ The Changeable column of the property tables says when a property can be set:
   starts, READY to PAUSED; a running element keeps the value it started with. When the start is another state
   change, or the value is read more than once, the cell says `any state (applied at the next start: see <section>)`
   and that section of the page says when.
+- `any state (stored with a GLib warning, applied at the next start)`: as the previous form, but a value set while
+  the element is started also logs a GLib warning saying so.
 - `read-only`: it can't be set.
 
 A value outside a property's range is refused by GObject with a GLib warning. A Values cell that starts with a range
@@ -41,6 +43,7 @@ DeepStream 8.0 behaviour where NVIDIA's docs are silent, or "ours", where Redstr
 | Element | Purpose | DeepStream |
 |---|---|---|
 | [`rdsanalytics`](rdsanalytics.md) | ROI filtering, overcrowding, direction and line crossing, with DeepStream-shaped metas; config keys on [rdsanalytics-config](rdsanalytics-config.md) | `nvdsanalytics` |
+| [`rdsh264enc`, `rdsh265enc`](rdsh26xenc.md) | encode single frames to H.264 or H.265 with the stock VA encoders, under DeepStream 8.0's properties | `nvv4l2h264enc`, `nvv4l2h265enc` |
 | [`rdsinfer`](rdsinfer.md) | runs an ONNX model with MIGraphX: detectors, classifiers, tensor output; config keys on [rdsinfer-config](rdsinfer-config.md) | `nvinfer` |
 | [`rdslogger`](rdslogger.md) | prints each stream's frame rate to stdout | `nvdslogger` |
 | [`rdsmultistreamtiler`](rdsmultistreamtiler.md) | composes a batch into one tiled frame, with the metadata scaled into the tiles | `nvmultistreamtiler` |

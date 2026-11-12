@@ -27,4 +27,6 @@ static const RdsElementPage rds_element_pages[] = {
   {"rdsinfer", "rdsinfer.md", FALSE},
   {"rdstracker", "rdstracker.md", FALSE},
   {"rdsanalytics", "rdsanalytics.md", FALSE},
+  {"rdsh264enc", "rdsh26xenc.md", FALSE},
+  {"rdsh265enc", "rdsh26xenc.md", FALSE},
 };

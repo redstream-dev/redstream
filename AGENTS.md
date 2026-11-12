@@ -492,8 +492,8 @@ meson test -C build-rel --print-errorlogs
   `rdstracker`, `rdsanalytics`, `rdsmultistreamtiler`, `rdsosd`, `rdslogger`, `rdsvideosink`, `rdsh264enc` and
   `rdsh265enc` match observed DeepStream 8.0 behaviour, except where 8.0 is clearly broken; there they do the sane
   thing. Code comments say "DeepStream 8.0 behaviour" or "ours", and every such choice has a row in the behaviour
-  tables on the element pages in `docs/elements/` (the analytics config's in `rdsanalytics-config.md`), or in the
-  encoders' property tables and stream behaviour lists in the compat matrix: keep them in step.
+  tables on the element pages in `docs/elements/` (the analytics config's in `rdsanalytics-config.md`): keep them in
+  step.
 - **Analytics metas (C++).** `RdsAnalyticsFrameMeta` and `RdsAnalyticsObjInfo` are C++ structs (std::string,
   std::vector, std::unordered_map) with libstdc++'s layout, so code that reads their fields must be built with the
   same `_GLIBCXX_USE_CXX11_ABI` as libgstrds-analytics (the default). Include `rds/rds-analytics-meta.h` at file
